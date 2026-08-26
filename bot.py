@@ -8,6 +8,7 @@ TELEGRAM_BOT_TOKEN = "8840031344:AAGDJmeIC6yJPSUazE72tn32qZcFsdDvXP0"
 TELEGRAM_CHAT_ID = "369244706"
 
 TRACKED_CRYPTO = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
 # ---------------------------------------------------------------------------
 # TELEGRAM NOTIFICATIE FUNCTIE
 # ---------------------------------------------------------------------------
@@ -57,7 +58,6 @@ def check_live_crypto_signals():
     
     for symbol in TRACKED_CRYPTO:
         try:
-            # Binance klines endpoint for 5m interval
             url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit=20"
             res = requests.get(url, timeout=5)
             if res.status_code == 200:
@@ -66,20 +66,36 @@ def check_live_crypto_signals():
                 
                 ema_5 = calculate_ema(closes, 5)
                 ema_15 = calculate_ema(closes, 15)
-                current_price = closes[-1]
                 
-                # Crossover check (EMA 5 kruist boven EMA 15)
-                if ema_5 > ema_15 and closes[-2] <= calculate_ema(closes[:-1], 15):
-                    coin_name = symbol.replace("USDT", "")
+                prev_closes = closes[:-1]
+                prev_ema_5 = calculate_ema(prev_closes, 5)
+                prev_ema_15 = calculate_ema(prev_closes, 15)
+                
+                current_price = closes[-1]
+                coin_name = symbol.replace("USDT", "")
+                
+                # 1. Bullish Crossover (UP signal)
+                if ema_5 > ema_15 and prev_ema_5 <= prev_ema_15:
                     alert_msg = (
-                        f"🚨 **LIVE CRYPTO 5M BREAKOUT DETECTED** 📈\n\n"
+                        f"🚨 **CRYPTO 5M BREAKOUT (UP)** 📈\n\n"
                         f"**Pair:** {coin_name}/USDT (5-Min Window)\n"
                         f"**Live Prijs:** ${current_price:,.2f}\n"
                         f"**EMA 5:** ${ema_5:,.2f} | **EMA 15:** ${ema_15:,.2f}\n\n"
-                        f"💰 **Status:** Bullish EMA Crossover opgetreden!\n"
-                        f"💡 **Actie:** Check de actieve {coin_name} markt op Polymarket."
+                        f"💡 **Actie:** Zet **€5.00** of **€10.00** in op **'UP'** (5 min)"
                     )
-                    send_telegram_alert(alert_msg, target_url=f"https://polymarket.com/crypto")
+                    send_telegram_alert(alert_msg, target_url="https://polymarket.com/crypto")
+                
+                # 2. Bearish Crossover (DOWN signal)
+                elif ema_5 < ema_15 and prev_ema_5 >= prev_ema_15:
+                    alert_msg = (
+                        f"🚨 **CRYPTO 5M BREAKDOWN (DOWN)** 📉\n\n"
+                        f"**Pair:** {coin_name}/USDT (5-Min Window)\n"
+                        f"**Live Prijs:** ${current_price:,.2f}\n"
+                        f"**EMA 5:** ${ema_5:,.2f} | **EMA 15:** ${ema_15:,.2f}\n\n"
+                        f"💡 **Actie:** Zet **€5.00** of **€10.00** in op **'DOWN'** (5 min)"
+                    )
+                    send_telegram_alert(alert_msg, target_url="https://polymarket.com/crypto")
+                    
         except Exception as e:
             print(f"Fout bij ophalen Binance data voor {symbol}: {e}")
 
@@ -94,7 +110,6 @@ def check_live_polymarket_events():
         res = requests.get(url, timeout=5)
         if res.status_code == 200:
             events = res.json()
-            # De bot scant hier de live geopende markten
             print(f"Succesvol {len(events)} live Polymarket events opgehaald.")
     except Exception as e:
         print(f"Fout bij ophalen Polymarket API: {e}")
@@ -106,10 +121,8 @@ if __name__ == "__main__":
     print("🤖 Polymarket Live Scanner is gestart!")
     
     send_telegram_alert(
-        "⚡ **Polymarket Bot staat nu op LIVE DATA!**\n\n"
-        "• Nepberichten zijn uitgeschakeld.\n"
-        "• Scant continu live prijzen op Binance & Polymarket.\n"
-        "• Meldingen verschijnen alleen bij echte markttriggers met een inzetknop.",
+        "⚡ **Polymarket Bot is Geüpdatet!**\n\n"
+        "Meldingen tonen nu inzetadviezen voor **€5.00 of €10.00** op zowel UP als DOWN.",
         target_url="https://polymarket.com"
     )
     
@@ -117,6 +130,6 @@ if __name__ == "__main__":
         while True:
             check_live_crypto_signals()
             check_live_polymarket_events()
-            time.sleep(120)  # Scant elke 2 minuten
+            time.sleep(120)
     except KeyboardInterrupt:
         send_telegram_alert("🔴 **Polymarket Bot is gestopt.**")
