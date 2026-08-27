@@ -7,7 +7,17 @@ import requests
 TELEGRAM_BOT_TOKEN = "8840031344:AAGDJmeIC6yJPSUazE72tn32qZcFsdDvXP0"
 TELEGRAM_CHAT_ID = "369244706"
 
-TRACKED_CRYPTO = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+# Nu inclusief SOL, BNB en TRX
+TRACKED_CRYPTO = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "TRXUSDT"]
+
+# Directe Polymarket URLs per coin
+POLYMARKET_URLS = {
+    "BTC": "https://polymarket.com/event/bitcoin-price-5-min",
+    "ETH": "https://polymarket.com/event/ethereum-price-5-min",
+    "SOL": "https://polymarket.com/event/solana-price-5-min",
+    "BNB": "https://polymarket.com/event/binance-coin-price-5-min",
+    "TRX": "https://polymarket.com/event/tron-price-5-min"
+}
 
 # ---------------------------------------------------------------------------
 # TELEGRAM NOTIFICATIE FUNCTIE
@@ -74,27 +84,30 @@ def check_live_crypto_signals():
                 current_price = closes[-1]
                 coin_name = symbol.replace("USDT", "")
                 
+                # Bepaal de specifieke link voor deze specifieke coin
+                market_url = POLYMARKET_URLS.get(coin_name, "https://polymarket.com/crypto")
+                
                 # 1. Bullish Crossover (UP signal)
                 if ema_5 > ema_15 and prev_ema_5 <= prev_ema_15:
                     alert_msg = (
                         f"🚨 **CRYPTO 5M BREAKOUT (UP)** 📈\n\n"
                         f"**Pair:** {coin_name}/USDT (5-Min Window)\n"
-                        f"**Live Prijs:** ${current_price:,.2f}\n"
-                        f"**EMA 5:** ${ema_5:,.2f} | **EMA 15:** ${ema_15:,.2f}\n\n"
+                        f"**Live Prijs:** ${current_price:,.4f}\n"
+                        f"**EMA 5:** ${ema_5:,.4f} | **EMA 15:** ${ema_15:,.4f}\n\n"
                         f"💡 **Actie:** Zet **€5.00** of **€10.00** in op **'UP'** (5 min)"
                     )
-                    send_telegram_alert(alert_msg, target_url="https://polymarket.com/crypto")
+                    send_telegram_alert(alert_msg, target_url=market_url)
                 
                 # 2. Bearish Crossover (DOWN signal)
                 elif ema_5 < ema_15 and prev_ema_5 >= prev_ema_15:
                     alert_msg = (
                         f"🚨 **CRYPTO 5M BREAKDOWN (DOWN)** 📉\n\n"
                         f"**Pair:** {coin_name}/USDT (5-Min Window)\n"
-                        f"**Live Prijs:** ${current_price:,.2f}\n"
-                        f"**EMA 5:** ${ema_5:,.2f} | **EMA 15:** ${ema_15:,.2f}\n\n"
+                        f"**Live Prijs:** ${current_price:,.4f}\n"
+                        f"**EMA 5:** ${ema_5:,.4f} | **EMA 15:** ${ema_15:,.4f}\n\n"
                         f"💡 **Actie:** Zet **€5.00** of **€10.00** in op **'DOWN'** (5 min)"
                     )
-                    send_telegram_alert(alert_msg, target_url="https://polymarket.com/crypto")
+                    send_telegram_alert(alert_msg, target_url=market_url)
                     
         except Exception as e:
             print(f"Fout bij ophalen Binance data voor {symbol}: {e}")
@@ -122,8 +135,9 @@ if __name__ == "__main__":
     
     send_telegram_alert(
         "⚡ **Polymarket Bot is Geüpdatet!**\n\n"
-        "Meldingen tonen nu inzetadviezen voor **€5.00 of €10.00** op zowel UP als DOWN.",
-        target_url="https://polymarket.com"
+        "Gemonitorde coins: **BTC, ETH, SOL, BNB en TRX**.\n"
+        "Elke melding linkt nu direct naar de specifieke coin-pagina.",
+        target_url="https://polymarket.com/crypto"
     )
     
     try:
