@@ -7,16 +7,14 @@ import requests
 TELEGRAM_BOT_TOKEN = "8840031344:AAGDJmeIC6yJPSUazE72tn32qZcFsdDvXP0"
 TELEGRAM_CHAT_ID = "369244706"
 
-# Nu inclusief SOL, BNB en TRX
-TRACKED_CRYPTO = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "TRXUSDT"]
+# Alleen munten met een actieve 5m-markt op Polymarket
+TRACKED_CRYPTO = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
-# Directe Polymarket URLs per coin
+# Directe werkende Polymarket URLs
 POLYMARKET_URLS = {
     "BTC": "https://polymarket.com/event/bitcoin-price-5-min",
     "ETH": "https://polymarket.com/event/ethereum-price-5-min",
-    "SOL": "https://polymarket.com/event/solana-price-5-min",
-    "BNB": "https://polymarket.com/event/binance-coin-price-5-min",
-    "TRX": "https://polymarket.com/event/tron-price-5-min"
+    "SOL": "https://polymarket.com/event/solana-price-5-min"
 }
 
 # ---------------------------------------------------------------------------
@@ -84,7 +82,6 @@ def check_live_crypto_signals():
                 current_price = closes[-1]
                 coin_name = symbol.replace("USDT", "")
                 
-                # Bepaal de specifieke link voor deze specifieke coin
                 market_url = POLYMARKET_URLS.get(coin_name, "https://polymarket.com/crypto")
                 
                 # 1. Bullish Crossover (UP signal)
@@ -92,8 +89,8 @@ def check_live_crypto_signals():
                     alert_msg = (
                         f"🚨 **CRYPTO 5M BREAKOUT (UP)** 📈\n\n"
                         f"**Pair:** {coin_name}/USDT (5-Min Window)\n"
-                        f"**Live Prijs:** ${current_price:,.4f}\n"
-                        f"**EMA 5:** ${ema_5:,.4f} | **EMA 15:** ${ema_15:,.4f}\n\n"
+                        f"**Live Prijs:** ${current_price:,.2f}\n"
+                        f"**EMA 5:** ${ema_5:,.2f} | **EMA 15:** ${ema_15:,.2f}\n\n"
                         f"💡 **Actie:** Zet **€5.00** of **€10.00** in op **'UP'** (5 min)"
                     )
                     send_telegram_alert(alert_msg, target_url=market_url)
@@ -103,8 +100,8 @@ def check_live_crypto_signals():
                     alert_msg = (
                         f"🚨 **CRYPTO 5M BREAKDOWN (DOWN)** 📉\n\n"
                         f"**Pair:** {coin_name}/USDT (5-Min Window)\n"
-                        f"**Live Prijs:** ${current_price:,.4f}\n"
-                        f"**EMA 5:** ${ema_5:,.4f} | **EMA 15:** ${ema_15:,.4f}\n\n"
+                        f"**Live Prijs:** ${current_price:,.2f}\n"
+                        f"**EMA 5:** ${ema_5:,.2f} | **EMA 15:** ${ema_15:,.2f}\n\n"
                         f"💡 **Actie:** Zet **€5.00** of **€10.00** in op **'DOWN'** (5 min)"
                     )
                     send_telegram_alert(alert_msg, target_url=market_url)
@@ -134,9 +131,8 @@ if __name__ == "__main__":
     print("🤖 Polymarket Live Scanner is gestart!")
     
     send_telegram_alert(
-        "⚡ **Polymarket Bot is Geüpdatet!**\n\n"
-        "Gemonitorde coins: **BTC, ETH, SOL, BNB en TRX**.\n"
-        "Elke melding linkt nu direct naar de specifieke coin-pagina.",
+        "⚡ **Polymarket Bot Opschoning Geüpdatet!**\n\n"
+        "De bot scant nu uitsluitend actieve Polymarket 5m markten: **BTC, ETH en SOL**.",
         target_url="https://polymarket.com/crypto"
     )
     
