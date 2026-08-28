@@ -1,5 +1,6 @@
 import time
 import requests
+from datetime import datetime
 
 # ---------------------------------------------------------------------------
 # CONFIGURATIE
@@ -7,10 +8,10 @@ import requests
 TELEGRAM_BOT_TOKEN = "8840031344:AAGDJmeIC6yJPSUazE72tn32qZcFsdDvXP0"
 TELEGRAM_CHAT_ID = "369244706"
 
-# Alleen verhandelbare markten
+# Alleen verhandelbare markten op Polymarket
 TRACKED_CRYPTO = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
-# Dynamische zoek/gefilterde links die 100% gegarandeerd nooit 404 geven
+# Directe werkende links naar Polymarket
 POLYMARKET_URLS = {
     "BTC": "https://polymarket.com/crypto?via=search&q=BTC",
     "ETH": "https://polymarket.com/crypto?via=search&q=ETH",
@@ -83,18 +84,37 @@ def calculate_rsi(prices, period=14):
     return 100.0 - (100.0 / (1.0 + rs))
 
 # ---------------------------------------------------------------------------
-# CONFLUENTIE SCANNER (EMA + RSI + 15M TREND)
+# TIMING CHECK (POLYMARKET 5M SYNC)
+# ---------------------------------------------------------------------------
+def get_remaining_seconds_in_5m_window():
+    """Berekent hoeveel seconden er nog over zijn in het huidige 5-minuten blok"""
+    now = datetime.utcnow()
+    # Bereken verstreken seconden in het huidige 5m-blok
+    seconds_into_5m = (now.minute % 5) * 60 + now.second
+    remaining_seconds = 300 - seconds_into_5m
+    return remaining_seconds
+
+# ---------------------------------------------------------------------------
+# CONFLUENTIE SCANNER
 # ---------------------------------------------------------------------------
 def check_live_crypto_signals():
-    print("Scannen van live Binance Crypto data op confluentie...")
+    remaining_time = get_remaining_seconds_in_5m_window()
+    remaining_minutes = remaining_time / 60.0
+    
+    # FILTER: Negeer signalen als er minder dan 2.5 minuut (150 sec) over is in het blok
+    if remaining_time < 150:
+        print(f"⏰ Te laat in het 5m-blok ({remaining_minutes:.1f} min over). Signalen gepauzeerd tot het volgende blok.")
+        return
+
+    print(f"Scannen van live Binance Crypto data ({remaining_minutes:.1f} min over in dit blok)...")
     
     for symbol in TRACKED_CRYPTO:
         try:
-            # 1. Haal 5-minuten klines op (voor EMA 5/15 crossover & RSI 14)
+            # 1. Haal 5-minuten klines op
             url_5m = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit=30"
             res_5m = requests.get(url_5m, timeout=5)
             
-            # 2. Haal 15-minuten klines op (voor 15m Trend met EMA 50)
+            # 2. Haal 15-minuten klines op
             url_15m = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=15m&limit=60"
             res_15m = requests.get(url_15m, timeout=5)
             
@@ -105,14 +125,12 @@ def check_live_crypto_signals():
                 closes_5m = [float(c[4]) for c in data_5m]
                 closes_15m = [float(c[4]) for c in data_15m]
                 
-                # Bereken 5m indicatoren
                 ema_5 = calculate_ema(closes_5m, 5)
                 ema_15 = calculate_ema(closes_5m, 15)
                 prev_ema_5 = calculate_ema(closes_5m[:-1], 5)
                 prev_ema_15 = calculate_ema(closes_5m[:-1], 15)
                 rsi = calculate_rsi(closes_5m, 14)
                 
-                # Bereken 15m Trend indicator
                 ema_50_15m = calculate_ema(closes_15m, 50)
                 
                 current_price = closes_5m[-1]
@@ -128,7 +146,8 @@ def check_live_crypto_signals():
                     alert_msg = (
                         f"🚨 **HIGH CONFIDENCE BREAKOUT (UP)** 📈\n\n"
                         f"**Pair:** {coin_name}/USDT\n"
-                        f"**Live Prijs:** ${current_price:,.2f}\n\n"
+                        f"**Live Prijs:** ${current_price:,.2f}\n"
+                        f"**Tijd over in ronde:** ~{remaining_minutes:.1f} minuten\n\n"
                         f"**Confluentie Check (3/3):**\n"
                         f"✅ **5M EMA Crossover:** EMA 5 (${ema_5:,.2f}) > EMA 15 (${ema_15:,.2f})\n"
                         f"✅ **RSI (14):** {rsi:.1f} (Sterk momentum)\n"
@@ -146,7 +165,8 @@ def check_live_crypto_signals():
                     alert_msg = (
                         f"🚨 **HIGH CONFIDENCE BREAKDOWN (DOWN)** 📉\n\n"
                         f"**Pair:** {coin_name}/USDT\n"
-                        f"**Live Prijs:** ${current_price:,.2f}\n\n"
+                        f"**Live Prijs:** ${current_price:,.2f}\n"
+                        f"**Tijd over in ronde:** ~{remaining_minutes:.1f} minuten\n\n"
                         f"**Confluentie Check (3/3):**\n"
                         f"✅ **5M EMA Crossover:** EMA 5 (${ema_5:,.2f}) < EMA 15 (${ema_15:,.2f})\n"
                         f"✅ **RSI (14):** {rsi:.1f} (Zwak momentum)\n"
@@ -162,17 +182,18 @@ def check_live_crypto_signals():
 # MAIN LOOP
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("🤖 Polymarket Confluence Scanner is gestart!")
+    print("🤖 Polymarket Confluence & Timer-Synced Scanner is gestart!")
     
     send_telegram_alert(
-        "⚡ **Polymarket Links Hersteld!**\n\n"
-        "Alle knoppen linken nu altijd direct en zonder foutmeldingen door naar de actieve coin-pagina's.",
+        "⚡ **Polymarket Bot Geüpdatet met Timer-Sync!**\n\n"
+        "De bot stuurt nu **alleen nog meldingen aan het begin van een 5m-ronde** (minstens 2.5 - 5 min resterend).",
         target_url="https://polymarket.com/crypto"
     )
     
     try:
         while True:
             check_live_crypto_signals()
-            time.sleep(120)
+            # Scan elke 30 seconden voor nauwkeurige timing
+            time.sleep(30)
     except KeyboardInterrupt:
         send_telegram_alert("🔴 **Polymarket Bot is gestopt.**")
