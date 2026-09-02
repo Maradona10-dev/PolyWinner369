@@ -1,35 +1,40 @@
+import os
 import time
 import requests
-from datetime import datetime
 
 # ---------------------------------------------------------------------------
 # CONFIGURATIE
 # ---------------------------------------------------------------------------
-TELEGRAM_BOT_TOKEN = "8840031344:AAGDJmeIC6yJPSUazE72tn32qZcFsdDvXP0"
-TELEGRAM_CHAT_ID = "369244706"
+RAW_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8945207926:AAEe0V3AYAdKqyT732B1TWIYcEBz8Ps9E_8")
+TELEGRAM_BOT_TOKEN = RAW_TOKEN.strip().replace("bot", "") if RAW_TOKEN.strip().startswith("bot") else RAW_TOKEN.strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "369244706").strip()
 
-# Alleen verhandelbare markten op Polymarket
-TRACKED_CRYPTO = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY", "")
+POLYMARKET_GAMMA_API = "https://gamma-api.polymarket.com/events"
 
-# Directe werkende links naar Polymarket
-POLYMARKET_URLS = {
-    "BTC": "https://polymarket.com/crypto?via=search&q=BTC",
-    "ETH": "https://polymarket.com/crypto?via=search&q=ETH",
-    "SOL": "https://polymarket.com/crypto?via=search&q=SOL"
-}
+FOOTBALL_TAGS = [
+    "soccer", "premier-league", "la-liga", "serie-a", 
+    "bundesliga", "ligue-1", "eredivisie", "jupiler-pro-league", 
+    "primeira-liga", "mls"
+]
+
+LEAGUE_IDS = [88, 144, 39, 140, 135, 78, 61, 94, 253] # NL, BE, UK, ES, IT, DE, FR, PT, USA
+
+LAST_OFFSET = 0
+ALERTED_MATCHES = set()
 
 # ---------------------------------------------------------------------------
-# TELEGRAM NOTIFICATIE FUNCTIE
+# TELEGRAM FUNCTIES MET DIRECTE LINK
 # ---------------------------------------------------------------------------
-def send_telegram_alert(message, target_url="https://polymarket.com"):
-    """Stuurt een pushmelding inclusief directe actie-knop naar Telegram"""
+def send_telegram_alert(message, target_url="https://polymarket.com/sports"):
+    """Stuurt een pushmelding met een DIRECTE link naar het specifieke event/markt"""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     
     reply_markup = {
         "inline_keyboard": [
             [
                 {
-                    "text": "🚀 ZET DIRECT IN OP POLYMARKET",
+                    "text": "⚡ DIRECT INZETTEN OP POLYMARKET",
                     "url": target_url
                 }
             ]
@@ -44,156 +49,174 @@ def send_telegram_alert(message, target_url="https://polymarket.com"):
         "reply_markup": reply_markup
     }
     try:
-        response = requests.post(url, json=payload, timeout=10)
-        return response.json()
+        res = requests.post(url, json=payload, timeout=10)
+        return res.json()
     except Exception as e:
-        print(f"Fout bij versturen van Telegram bericht: {e}")
+        print(f"Telegram Fout: {e}")
 
-# ---------------------------------------------------------------------------
-# INDICATOREN EN BEREKENINGEN
-# ---------------------------------------------------------------------------
-def calculate_ema(prices, period):
-    if len(prices) < period:
-        return prices[-1]
-    k = 2 / (period + 1)
-    ema = prices[0]
-    for price in prices[1:]:
-        ema = (price * k) + (ema * (1 - k))
-    return ema
-
-def calculate_rsi(prices, period=14):
-    if len(prices) < period + 1:
-        return 50.0
-    gains = []
-    losses = []
-    for i in range(1, len(prices)):
-        change = prices[i] - prices[i-1]
-        if change >= 0:
-            gains.append(change)
-            losses.append(0)
-        else:
-            gains.append(0)
-            losses.append(abs(change))
-            
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
+def check_telegram_commands():
+    """Luistert naar inkomende Telegram commando's (/scan, /status, /help)"""
+    global LAST_OFFSET
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params = {"offset": LAST_OFFSET + 1, "timeout": 2}
     
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
+    try:
+        res = requests.get(url, params=params, timeout=5)
+        if res.status_code == 200:
+            updates = res.json().get("result", [])
+            for update in updates:
+                LAST_OFFSET = update["update_id"]
+                message = update.get("message", {})
+                text = message.get("text", "").strip()
+                chat_id = str(message.get("chat", {}).get("id", ""))
+                
+                if chat_id == TELEGRAM_CHAT_ID:
+                    if text in ["/start", "/help"]:
+                        help_msg = (
+                            "🤖 **Polymarket Fast-Action Bot**\n\n"
+                            "• `/scan` - Voer direct een handmatige scan uit\n"
+                            "• `/status` - Bekijk actieve instellingen\n"
+                            "• `/help` - Toon dit menu"
+                        )
+                        send_telegram_alert(help_msg)
+                    elif text == "/status":
+                        status_msg = (
+                            "📊 **BOT STATUS**\n\n"
+                            "✅ **Status:** Actief & Direct-Link Enabled\n"
+                            "🎯 **Filters:** 65%-85% Value, 35%-60% Comeback, <98% Arbitrage\n"
+                            "⚽ **Competities:** NL, BE, DE, FR, UK, ES, PT, IT, USA"
+                        )
+                        send_telegram_alert(status_msg)
+                    elif text == "/scan":
+                        send_telegram_alert("🔍 Handmatige scan gestart...")
+                        scan_polymarket_sports()
+    except Exception as e:
+        print(f"Fout bij ophalen Telegram updates: {e}")
 
 # ---------------------------------------------------------------------------
-# TIMING CHECK (POLYMARKET 5M SYNC)
+# POLYMARKET SCANNER MET EXACTE URL OPBOUW
 # ---------------------------------------------------------------------------
-def get_remaining_seconds_in_5m_window():
-    """Berekent hoeveel seconden er nog over zijn in het huidige 5-minuten blok"""
-    now = datetime.utcnow()
-    # Bereken verstreken seconden in het huidige 5m-blok
-    seconds_into_5m = (now.minute % 5) * 60 + now.second
-    remaining_seconds = 300 - seconds_into_5m
-    return remaining_seconds
+def scan_polymarket_sports():
+    print("Scannen van Polymarket markten met directe deep-links...")
+    scanned_event_ids = set()
+    found_matches = 0
 
-# ---------------------------------------------------------------------------
-# CONFLUENTIE SCANNER
-# ---------------------------------------------------------------------------
-def check_live_crypto_signals():
-    remaining_time = get_remaining_seconds_in_5m_window()
-    remaining_minutes = remaining_time / 60.0
-    
-    # FILTER: Negeer signalen als er minder dan 2.5 minuut (150 sec) over is in het blok
-    if remaining_time < 150:
-        print(f"⏰ Te laat in het 5m-blok ({remaining_minutes:.1f} min over). Signalen gepauzeerd tot het volgende blok.")
-        return
-
-    print(f"Scannen van live Binance Crypto data ({remaining_minutes:.1f} min over in dit blok)...")
-    
-    for symbol in TRACKED_CRYPTO:
+    for tag in FOOTBALL_TAGS:
         try:
-            # 1. Haal 5-minuten klines op
-            url_5m = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit=30"
-            res_5m = requests.get(url_5m, timeout=5)
+            params = {
+                "closed": "false",
+                "limit": 25,
+                "tag_slug": tag
+            }
+            res = requests.get(POLYMARKET_GAMMA_API, params=params, timeout=10)
             
-            # 2. Haal 15-minuten klines op
-            url_15m = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=15m&limit=60"
-            res_15m = requests.get(url_15m, timeout=5)
-            
-            if res_5m.status_code == 200 and res_15m.status_code == 200:
-                data_5m = res_5m.json()
-                data_15m = res_15m.json()
-                
-                closes_5m = [float(c[4]) for c in data_5m]
-                closes_15m = [float(c[4]) for c in data_15m]
-                
-                ema_5 = calculate_ema(closes_5m, 5)
-                ema_15 = calculate_ema(closes_5m, 15)
-                prev_ema_5 = calculate_ema(closes_5m[:-1], 5)
-                prev_ema_15 = calculate_ema(closes_5m[:-1], 15)
-                rsi = calculate_rsi(closes_5m, 14)
-                
-                ema_50_15m = calculate_ema(closes_15m, 50)
-                
-                current_price = closes_5m[-1]
-                coin_name = symbol.replace("USDT", "")
-                market_url = POLYMARKET_URLS.get(coin_name, "https://polymarket.com/crypto")
-                
-                # --- CHECK BULLISH CONFLUENTIE (UP) ---
-                ema_cross_up = (ema_5 > ema_15) and (prev_ema_5 <= prev_ema_15)
-                rsi_valid_up = 50 < rsi < 70
-                trend_15m_up = current_price > ema_50_15m
-                
-                if ema_cross_up and rsi_valid_up and trend_15m_up:
-                    alert_msg = (
-                        f"🚨 **HIGH CONFIDENCE BREAKOUT (UP)** 📈\n\n"
-                        f"**Pair:** {coin_name}/USDT\n"
-                        f"**Live Prijs:** ${current_price:,.2f}\n"
-                        f"**Tijd over in ronde:** ~{remaining_minutes:.1f} minuten\n\n"
-                        f"**Confluentie Check (3/3):**\n"
-                        f"✅ **5M EMA Crossover:** EMA 5 (${ema_5:,.2f}) > EMA 15 (${ema_15:,.2f})\n"
-                        f"✅ **RSI (14):** {rsi:.1f} (Sterk momentum)\n"
-                        f"✅ **15M Trend:** Boven EMA 50 (${ema_50_15m:,.2f})\n\n"
-                        f"💡 **Actie:** Zet **€5.00** of **€10.00** in op **'UP'**"
-                    )
-                    send_telegram_alert(alert_msg, target_url=market_url)
-
-                # --- CHECK BEARISH CONFLUENTIE (DOWN) ---
-                ema_cross_down = (ema_5 < ema_15) and (prev_ema_5 >= prev_ema_15)
-                rsi_valid_down = 30 < rsi < 50
-                trend_15m_down = current_price < ema_50_15m
-                
-                if ema_cross_down and rsi_valid_down and trend_15m_down:
-                    alert_msg = (
-                        f"🚨 **HIGH CONFIDENCE BREAKDOWN (DOWN)** 📉\n\n"
-                        f"**Pair:** {coin_name}/USDT\n"
-                        f"**Live Prijs:** ${current_price:,.2f}\n"
-                        f"**Tijd over in ronde:** ~{remaining_minutes:.1f} minuten\n\n"
-                        f"**Confluentie Check (3/3):**\n"
-                        f"✅ **5M EMA Crossover:** EMA 5 (${ema_5:,.2f}) < EMA 15 (${ema_15:,.2f})\n"
-                        f"✅ **RSI (14):** {rsi:.1f} (Zwak momentum)\n"
-                        f"✅ **15M Trend:** Onder EMA 50 (${ema_50_15m:,.2f})\n\n"
-                        f"💡 **Actie:** Zet **€5.00** of **€10.00** in op **'DOWN'**"
-                    )
-                    send_telegram_alert(alert_msg, target_url=market_url)
+            if res.status_code == 200:
+                events = res.json()
+                for event in events:
+                    event_id = event.get("id")
+                    if event_id in scanned_event_ids:
+                        continue
+                    scanned_event_ids.add(event_id)
                     
+                    title = event.get("title", "Onbekend Event")
+                    slug = event.get("slug", "")
+                    
+                    # Directe URL opbouw naar het specifieke event
+                    if slug:
+                        event_url = f"https://polymarket.com/event/{slug}"
+                    else:
+                        event_url = "https://polymarket.com/sports"
+                    
+                    markets = event.get("markets", [])
+                    for market in markets:
+                        group_item_title = market.get("groupItemTitle", "")
+                        question = market.get("question", "")
+                        outcome_prices = market.get("outcomePrices", [])
+                        market_slug = market.get("slug", "")
+                        
+                        # Als de individuele markt een eigen slug heeft, sturen we direct daarheen
+                        if market_slug:
+                            direct_market_url = f"https://polymarket.com/market/{market_slug}"
+                        else:
+                            direct_market_url = event_url
+
+                        market_type = "Winnaar / 1X2"
+                        if "over" in question.lower() or "under" in question.lower() or "goals" in question.lower():
+                            market_type = "Over/Under Doelpunten"
+
+                        if outcome_prices and len(outcome_prices) >= 2:
+                            try:
+                                price_yes = float(eval(outcome_prices[0]) if isinstance(outcome_prices[0], str) and outcome_prices[0].startswith('"') else outcome_prices[0])
+                                price_no = float(eval(outcome_prices[1]) if isinstance(outcome_prices[1], str) and outcome_prices[1].startswith('"') else outcome_prices[1])
+                                
+                                odds_yes = round(1 / price_yes, 2) if price_yes > 0 else 0
+                                odds_no = round(1 / price_no, 2) if price_no > 0 else 0
+                                
+                                # 1. ARBITRAGE
+                                total_implied = price_yes + price_no
+                                if 0 < total_implied < 0.98:
+                                    found_matches += 1
+                                    arb_profit = round((1 - total_implied) * 100, 2)
+                                    arb_msg = (
+                                        f"🚨 **ARBITRAGE KANS!** 🚨\n\n"
+                                        f"**Event:** {title}\n"
+                                        f"**Markt:** {group_item_title if group_item_title else question}\n"
+                                        f"💰 **Winst:** +{arb_profit}%\n\n"
+                                        f"• YES: ${price_yes:.2f} (Odds: {odds_yes})\n"
+                                        f"• NO: ${price_no:.2f} (Odds: {odds_no})"
+                                    )
+                                    send_telegram_alert(arb_msg, target_url=direct_market_url)
+
+                                # 2. VALUE (65% - 85%)
+                                elif 0.65 <= price_yes <= 0.85:
+                                    found_matches += 1
+                                    estimated_bookie_odds = round(odds_yes * 0.93, 2)
+                                    alert_msg = (
+                                        f"⚽ **VALUE OPPORTUNITY** 🏆\n\n"
+                                        f"**Event:** {title}\n"
+                                        f"**Type:** {market_type}\n"
+                                        f"**Markt:** {group_item_title if group_item_title else question}\n\n"
+                                        f"📊 **Polymarket:** YES ${price_yes:.2f} ({price_yes*100:.0f}%) ➔ **Quote: {odds_yes}**\n"
+                                        f"📈 **Gem. Bookies:** ~{estimated_bookie_odds}"
+                                    )
+                                    send_telegram_alert(alert_msg, target_url=direct_market_url)
+
+                                # 3. COMEBACK / ACHTERSTAND (35% - 60%)
+                                elif 0.35 <= price_yes <= 0.60:
+                                    found_matches += 1
+                                    estimated_bookie_odds = round(odds_yes * 0.93, 2)
+                                    alert_msg = (
+                                        f"🔥 **FAVORIET ACHTERSTAND / COMEBACK** 🔄\n\n"
+                                        f"**Event:** {title}\n"
+                                        f"**Type:** {market_type}\n"
+                                        f"**Markt:** {group_item_title if group_item_title else question}\n\n"
+                                        f"📊 **Polymarket:** YES ${price_yes:.2f} ({price_yes*100:.0f}%) ➔ **Hoge Quote: {odds_yes}**\n"
+                                        f"📈 **Gem. Bookies:** ~{estimated_bookie_odds}"
+                                    )
+                                    send_telegram_alert(alert_msg, target_url=direct_market_url)
+                                    
+                            except (ValueError, TypeError, ZeroDivisionError):
+                                continue
+
         except Exception as e:
-            print(f"Fout bij ophalen Binance data voor {symbol}: {e}")
+            print(f"Fout bij ophalen tag '{tag}': {e}")
+
+    print(f"Scan afgerond. {len(scanned_event_ids)} events gescand. {found_matches} kansen gevonden.")
 
 # ---------------------------------------------------------------------------
 # MAIN LOOP
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("🤖 Polymarket Confluence & Timer-Synced Scanner is gestart!")
+    print("🤖 Direct-Link Polymarket Bot is gestart!")
     
-    send_telegram_alert(
-        "⚡ **Polymarket Bot Geüpdatet met Timer-Sync!**\n\n"
-        "De bot stuurt nu **alleen nog meldingen aan het begin van een 5m-ronde** (minstens 2.5 - 5 min resterend).",
-        target_url="https://polymarket.com/crypto"
-    )
-    
+    last_scan_time = 0
     try:
         while True:
-            check_live_crypto_signals()
-            # Scan elke 30 seconden voor nauwkeurige timing
-            time.sleep(30)
+            check_telegram_commands()
+            current_time = time.time()
+            if current_time - last_scan_time >= 300:
+                scan_polymarket_sports()
+                last_scan_time = current_time
+            time.sleep(2)
     except KeyboardInterrupt:
-        send_telegram_alert("🔴 **Polymarket Bot is gestopt.**")
+        print("Bot gestopt.")
