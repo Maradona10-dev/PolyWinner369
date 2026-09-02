@@ -18,10 +18,16 @@ LAST_OFFSET = 0
 
 # PAPER TRADING CONFIGURATIE
 PAPER_STAKE = 10.0
+TEST_DURATION_HOURS = 24
+START_TIME = time.time()
+
 PAPER_STATE = {
     "balance": 100.0,
+    "start_balance": 100.0,
     "trades": [],
-    "total_trades": 0
+    "total_trades": 0,
+    "wins": 0,
+    "losses": 0
 }
 
 # ---------------------------------------------------------------------------
@@ -33,10 +39,7 @@ def send_telegram_alert(message, target_url=POLYMARKET_5MIN_URL):
     reply_markup = {
         "inline_keyboard": [
             [
-                {
-                    "text": "🚀 ZET DIRECT IN OP POLYMARKET",
-                    "url": target_url
-                }
+                {"text": "🚀 ZET DIRECT IN OP POLYMARKET", "url": target_url}
             ]
         ]
     }
@@ -55,112 +58,14 @@ def send_telegram_alert(message, target_url=POLYMARKET_5MIN_URL):
         print(f"Telegram Fout: {e}")
 
 # ---------------------------------------------------------------------------
-# PAPER TRADING LOGICA
-# ---------------------------------------------------------------------------
-def execute_paper_trade(direction, price):
-    global PAPER_STATE
-    
-    if PAPER_STATE["balance"] < PAPER_STAKE:
-        send_telegram_alert("⚠️ **Paper Trading Alert:** Onvoldoende virtueel saldo voor een nieuwe positie.")
-        return
-
-    PAPER_STATE["balance"] -= PAPER_STAKE
-    PAPER_STATE["total_trades"] += 1
-
-    trade_entry = {
-        "id": PAPER_STATE["total_trades"],
-        "asset": "BTC/USDT",
-        "direction": direction,
-        "price": price,
-        "stake": PAPER_STAKE,
-        "status": "OPEN",
-        "timestamp": time.strftime("%H:%M:%S")
-    }
-    
-    PAPER_STATE["trades"].append(trade_entry)
-
-    report = (
-        f"📝 **PAPER TRADE GEOPEND (SIMULATIE)** 🤖\n\n"
-        f"**Asset:** BTC/USDT 5M\n"
-        f"🎯 **Richting:** {direction}\n"
-        f"💰 **Virtuele Inzet:** ${PAPER_STAKE:.2f} @ Koers: ${price:,.2f}\n"
-        f"💵 **Resterend Virtueel Saldo:** ${PAPER_STATE['balance']:.2f}"
-    )
-    send_telegram_alert(report)
-
-def show_paper_portfolio():
-    open_trades = [t for t in PAPER_STATE["trades"] if t["status"] == "OPEN"]
-    
-    msg = (
-        f"📊 **CRYPTO PAPER TRADING PORTFOLIO**\n\n"
-        f"💵 **Virtueel Saldo:** ${PAPER_STATE['balance']:.2f}\n"
-        f"🔢 **Totaal Trades Executed:** {PAPER_STATE['total_trades']}\n"
-        f"📂 **Openstaande Posities:** {len(open_trades)}\n\n"
-    )
-    
-    if open_trades:
-        msg += "**Laatste Simulaties:**\n"
-        for t in open_trades[-3:]:
-            msg += f"• #{t['id']} BTC 5M ({t['direction']}) - ${t['stake']} @ ${t['price']:,.2f} ({t['timestamp']})\n"
-    else:
-        msg += "*Nog geen actieve virtuele trades.*"
-        
-    send_telegram_alert(msg)
-
-# ---------------------------------------------------------------------------
-# TELEGRAM COMMANDOS
-# ---------------------------------------------------------------------------
-def check_telegram_commands():
-    global LAST_OFFSET
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    params = {"offset": LAST_OFFSET + 1, "timeout": 2}
-    
-    try:
-        res = requests.get(url, params=params, timeout=5)
-        if res.status_code == 200:
-            updates = res.json().get("result", [])
-            for update in updates:
-                LAST_OFFSET = update["update_id"]
-                message = update.get("message", {})
-                text = message.get("text", "").strip()
-                chat_id = str(message.get("chat", {}).get("id", ""))
-                
-                if chat_id == TELEGRAM_CHAT_ID:
-                    if text in ["/start", "/help"]:
-                        help_msg = (
-                            "🤖 **Crypto 5M Confluentie & Paper Bot**\n\n"
-                            "• `/portfolio` - Bekijk virtueel saldo en openstaande sim-trades\n"
-                            "• `/status` - Bekijk actieve bot instellingen\n"
-                            "• `/scan` - Voer direct een handmatige koerscheck uit"
-                        )
-                        send_telegram_alert(help_msg)
-                    elif text == "/portfolio":
-                        show_paper_portfolio()
-                    elif text == "/status":
-                        status_msg = (
-                            "📊 **BOT STATUS**\n\n"
-                            "✅ **Status:** Actief (Binance + Chainlink Oracle)\n"
-                            "💰 **Virtueel Saldo:** $" + str(PAPER_STATE['balance']) + "\n"
-                            "⏱ **Strategie:** 5M Confluentie (EMA + RSI + 15M Trend)"
-                        )
-                        send_telegram_alert(status_msg)
-                    elif text == "/scan":
-                        send_telegram_alert("🔍 Handmatige markt-scan wordt uitgevoerd...")
-                        check_crypto_confluence()
-    except Exception as e:
-        print(f"Fout bij Telegram updates: {e}")
-
-# ---------------------------------------------------------------------------
-# DATA OPHALEN: BINANCE & CHAINLINK
+# DATA OPHALEN & METRICS
 # ---------------------------------------------------------------------------
 def fetch_binance_klines(interval="5m", limit=60):
     params = {"symbol": "BTCUSDT", "interval": interval, "limit": limit}
     try:
         res = requests.get(BINANCE_KLINES_URL, params=params, timeout=5)
         if res.status_code == 200:
-            data = res.json()
-            closes = [float(k[4]) for k in data]
-            return closes
+            return [float(k[4]) for k in res.json()]
     except Exception as e:
         print(f"Fout bij ophalen Binance data: {e}")
     return []
@@ -177,9 +82,6 @@ def fetch_chainlink_price():
         pass
     return None
 
-# ---------------------------------------------------------------------------
-# TECHNISCHE INDICATOREN
-# ---------------------------------------------------------------------------
 def calculate_ema(prices, period):
     if len(prices) < period:
         return 0
@@ -204,11 +106,133 @@ def calculate_rsi(prices, period=14):
             
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
-    
     if avg_loss == 0:
         return 100
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
+
+# ---------------------------------------------------------------------------
+# PAPER TRADING LOGICA (SETTLEMENT & REPORTING)
+# ---------------------------------------------------------------------------
+def execute_paper_trade(direction, price):
+    global PAPER_STATE
+    
+    if PAPER_STATE["balance"] < PAPER_STAKE:
+        send_telegram_alert("⚠️ **Paper Trading Alert:** Onvoldoende virtueel saldo voor een nieuwe positie.")
+        return
+
+    PAPER_STATE["balance"] -= PAPER_STAKE
+    PAPER_STATE["total_trades"] += 1
+
+    trade_entry = {
+        "id": PAPER_STATE["total_trades"],
+        "asset": "BTC/USDT",
+        "direction": direction,
+        "entry_price": price,
+        "stake": PAPER_STAKE,
+        "status": "OPEN",
+        "entry_time": time.time(),
+        "entry_time_str": time.strftime("%H:%M:%S")
+    }
+    
+    PAPER_STATE["trades"].append(trade_entry)
+
+    report = (
+        f"📝 **PAPER TRADE GEOPEND (SIMULATIE)** 🤖\n\n"
+        f"**Asset:** BTC/USDT 5M\n"
+        f"🎯 **Richting:** {direction}\n"
+        f"💰 **Virtuele Inzet:** ${PAPER_STAKE:.2f} @ Koers: ${price:,.2f}\n"
+        f"💵 **Resterend Saldo:** ${PAPER_STATE['balance']:.2f}\n"
+        f"⏱ **Verwachte Afloop:** over ~5 minuten"
+    )
+    send_telegram_alert(report)
+
+def process_open_trades():
+    """Controleert na 5 minuten of geopende paper trades gewonnen of verloren zijn"""
+    global PAPER_STATE
+    current_time = time.time()
+    
+    chainlink_price = fetch_chainlink_price()
+    closes = fetch_binance_klines(interval="5m", limit=5)
+    exit_price = chainlink_price if chainlink_price else (closes[-1] if closes else None)
+
+    if not exit_price:
+        return
+
+    for trade in PAPER_STATE["trades"]:
+        # Na 5 minuten (300 sec) wikkelen we de positie af
+        if trade["status"] == "OPEN" and (current_time - trade["entry_time"]) >= 300:
+            win = False
+            if trade["direction"] == "UP" and exit_price > trade["entry_price"]:
+                win = True
+            elif trade["direction"] == "DOWN" and exit_price < trade["entry_price"]:
+                win = True
+
+            if win:
+                profit = trade["stake"] * 1.85  # Gemiddelde uitbetaling op Polymarket (~1.85x)
+                PAPER_STATE["balance"] += profit
+                PAPER_STATE["wins"] += 1
+                trade["status"] = "WIN"
+                res_msg = f"✅ **PAPER TRADE GEWONNEN!** 🎉\n\nTrade #{trade['id']} ({trade['direction']})\nEntry: ${trade['entry_price']:,.2f} ➔ Exit: ${exit_price:,.2f}\n💰 +${profit - trade['stake']:.2f} Winst | Saldo: ${PAPER_STATE['balance']:.2f}"
+            else:
+                PAPER_STATE["losses"] += 1
+                trade["status"] = "LOSS"
+                res_msg = f"❌ **PAPER TRADE VERLOREN** 📉\n\nTrade #{trade['id']} ({trade['direction']})\nEntry: ${trade['entry_price']:,.2f} ➔ Exit: ${exit_price:,.2f}\n💸 -${trade['stake']:.2f} | Saldo: ${PAPER_STATE['balance']:.2f}"
+            
+            send_telegram_alert(res_msg)
+
+def show_paper_portfolio():
+    open_trades = [t for t in PAPER_STATE["trades"] if t["status"] == "OPEN"]
+    elapsed_hours = round((time.time() - START_TIME) / 3600, 1)
+    winrate = (PAPER_STATE["wins"] / (PAPER_STATE["wins"] + PAPER_STATE["losses"]) * 100) if (PAPER_STATE["wins"] + PAPER_STATE["losses"]) > 0 else 0
+    
+    msg = (
+        f"📊 **24H TEST PORTFOLIO OVERZICHT** ({elapsed_hours}u/24u)\n\n"
+        f"💵 **Huidig Saldo:** ${PAPER_STATE['balance']:.2f} (Start: $100.00)\n"
+        f"📈 **Netto PnL:** ${PAPER_STATE['balance'] - PAPER_STATE['start_balance']:.2f}\n"
+        f"🎯 **Winrate:** {winrate:.1f}% ({PAPER_STATE['wins']}W - {PAPER_STATE['losses']}L)\n"
+        f"🔢 **Totaal Trades Executed:** {PAPER_STATE['total_trades']}\n"
+        f"📂 **Openstaande Posities:** {len(open_trades)}"
+    )
+    send_telegram_alert(msg)
+
+# ---------------------------------------------------------------------------
+# TELEGRAM COMMANDOS
+# ---------------------------------------------------------------------------
+def check_telegram_commands():
+    global LAST_OFFSET
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params = {"offset": LAST_OFFSET + 1, "timeout": 2}
+    
+    try:
+        res = requests.get(url, params=params, timeout=5)
+        if res.status_code == 200:
+            updates = res.json().get("result", [])
+            for update in updates:
+                LAST_OFFSET = update["update_id"]
+                message = update.get("message", {})
+                text = message.get("text", "").strip()
+                chat_id = str(message.get("chat", {}).get("id", ""))
+                
+                if chat_id == TELEGRAM_CHAT_ID:
+                    if text in ["/start", "/help"]:
+                        help_msg = (
+                            "🤖 **Crypto 5M 24H Test Bot**\n\n"
+                            "• `/portfolio` - Bekijk live PnL, winrate en saldo\n"
+                            "• `/status` - Bekijk actieve bot instellingen\n"
+                            "• `/scan` - Voer direct een handmatige koerscheck uit"
+                        )
+                        send_telegram_alert(help_msg)
+                    elif text == "/portfolio":
+                        show_paper_portfolio()
+                    elif text == "/status":
+                        status_msg = f"📊 **BOT STATUS**\n\n✅ **Status:** 24H Paper Test Actief\n💰 **Saldo:** ${PAPER_STATE['balance']:.2f}"
+                        send_telegram_alert(status_msg)
+                    elif text == "/scan":
+                        send_telegram_alert("🔍 Handmatige markt-scan wordt uitgevoerd...")
+                        check_crypto_confluence()
+    except Exception as e:
+        print(f"Fout bij Telegram updates: {e}")
 
 # ---------------------------------------------------------------------------
 # CRYPTO SCANNER LOGICA
@@ -275,19 +299,21 @@ def check_crypto_confluence():
 # MAIN LOOP
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("🤖 Dual-Source Crypto Paper Trading Bot gestart!")
+    print("🤖 24-Uurs Paper Trading Test Bot Gestart!")
     send_telegram_alert(
-        "⚡ **Polymarket Crypto Bot Geüpdatet!**\n\n"
-        "• Directe link gefixt naar de 5-Minuten Crypto-pagina.\n"
+        "🚀 **24-UURS PAPER TRADING TEST GESTART!** 🧪\n\n"
         "• **Startsaldo:** $100.00 (Virtueel)\n"
         "• **Inzet per trade:** $10.00\n"
-        "💬 *Gebruik `/portfolio` om je posities te checken.*"
+        "• **Automatische Settlement:** Na 5 minuten op basis van Oracle koers\n"
+        "• **Testduur:** Exact 24 uur\n\n"
+        "💬 *Gebruik `/portfolio` om de tussenstand te bekijken.*"
     )
     
     while True:
         try:
             check_telegram_commands()
             check_crypto_confluence()
+            process_open_trades()  # Controleer afloop van simulaties
             time.sleep(15)
         except Exception as e:
             print(f"Fout in main loop: {e}")
