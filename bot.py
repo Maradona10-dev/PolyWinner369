@@ -11,7 +11,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "369244706").strip()
 
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 DOME_CHAINLINK_URL = "https://api.domeapi.io/v1/crypto-prices/chainlink"
-POLYMARKET_BTC_5MIN_URL = "https://polymarket.com/market/btc-updown-5m"
+POLYMARKET_BTC_5MIN_URL = "https://polymarket.com/"
 
 LAST_SIGNAL = None
 LAST_OFFSET = 0
@@ -300,8 +300,8 @@ def check_crypto_confluence():
 if __name__ == "__main__":
     print("🤖 PolyWinner 24-Uurs Paper Trading Bot Gestart!")
     send_telegram_alert(
-        "🏆 **POLYWINNER BOT HERSTART MET GEFIXTE LINK!** 🚀\n\n"
-        "• **Directe Link:** Direct werkende route naar BTC 5M-markt\n"
+        "🏆 **POLYWINNER BOT HERSTART MET AFGEWERKTE LINK!** 🚀\n\n"
+        "• **Directe Link:** Verwijst nu betrouwbaar naar de hoofd-site\n"
         "• **Startsaldo:** $100.00 (Virtueel)\n"
         "• **Inzet per trade:** $10.00\n"
         "💬 *Gebruik `/portfolio` om de tussenstand te bekijken.*"
