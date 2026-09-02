@@ -11,7 +11,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "369244706").strip()
 
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 DOME_CHAINLINK_URL = "https://api.domeapi.io/v1/crypto-prices/chainlink"
-POLYMARKET_5MIN_URL = "https://polymarket.com/crypto/5-min"
+POLYMARKET_BTC_5MIN_URL = "https://polymarket.com/market/btc-updown-5m"
 
 LAST_SIGNAL = None
 LAST_OFFSET = 0
@@ -33,24 +33,25 @@ PAPER_STATE = {
 # ---------------------------------------------------------------------------
 # TELEGRAM FUNCTIES
 # ---------------------------------------------------------------------------
-def send_telegram_alert(message, target_url=POLYMARKET_5MIN_URL):
+def send_telegram_alert(message, target_url=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    
-    reply_markup = {
-        "inline_keyboard": [
-            [
-                {"text": "🚀 ZET DIRECT IN OP POLYMARKET", "url": target_url}
-            ]
-        ]
-    }
     
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
         "parse_mode": "Markdown",
-        "disable_web_page_preview": True,
-        "reply_markup": reply_markup
+        "disable_web_page_preview": True
     }
+
+    if target_url:
+        payload["reply_markup"] = {
+            "inline_keyboard": [
+                [
+                    {"text": "🚀 ZET DIRECT IN OP POLYMARKET", "url": target_url}
+                ]
+            ]
+        }
+        
     try:
         res = requests.post(url, json=payload, timeout=10)
         return res.json()
@@ -274,7 +275,7 @@ def check_crypto_confluence():
             f"✅ **15M Trend:** Onder EMA 50 (${ema_50_15m:,.2f})\n\n"
             f"💡 **Actie:** Zet €5.00 of €10.00 in op **'DOWN'**"
         )
-        send_telegram_alert(msg)
+        send_telegram_alert(msg, target_url=POLYMARKET_BTC_5MIN_URL)
         execute_paper_trade("DOWN", active_price)
 
     elif bullish_confluence and LAST_SIGNAL != "UP":
@@ -290,7 +291,7 @@ def check_crypto_confluence():
             f"✅ **15M Trend:** Boven EMA 50 (${ema_50_15m:,.2f})\n\n"
             f"💡 **Actie:** Zet €5.00 of €10.00 in op **'UP'**"
         )
-        send_telegram_alert(msg)
+        send_telegram_alert(msg, target_url=POLYMARKET_BTC_5MIN_URL)
         execute_paper_trade("UP", active_price)
 
 # ---------------------------------------------------------------------------
@@ -299,11 +300,10 @@ def check_crypto_confluence():
 if __name__ == "__main__":
     print("🤖 PolyWinner 24-Uurs Paper Trading Bot Gestart!")
     send_telegram_alert(
-        "🏆 **POLYWINNER BOT IS NU LIVE!** 🚀\n\n"
-        "• **Token Geüpdatet:** Koppelingskanaal actief\n"
+        "🏆 **POLYWINNER BOT HERSTART MET GEFIXTE LINK!** 🚀\n\n"
+        "• **Directe Link:** Direct werkende route naar BTC 5M-markt\n"
         "• **Startsaldo:** $100.00 (Virtueel)\n"
         "• **Inzet per trade:** $10.00\n"
-        "• **Testduur:** 24 uur\n\n"
         "💬 *Gebruik `/portfolio` om de tussenstand te bekijken.*"
     )
     
