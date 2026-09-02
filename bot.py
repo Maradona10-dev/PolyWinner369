@@ -11,14 +11,23 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "369244706").strip()
 
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 DOME_CHAINLINK_URL = "https://api.domeapi.io/v1/crypto-prices/chainlink"
-POLYMARKET_BTC_URL = "https://polymarket.com/market/bitcoin-5-min"
+POLYMARKET_5MIN_URL = "https://polymarket.com/crypto/5-min"
 
 LAST_SIGNAL = None
+LAST_OFFSET = 0
+
+# PAPER TRADING CONFIGURATIE
+PAPER_STAKE = 10.0
+PAPER_STATE = {
+    "balance": 100.0,
+    "trades": [],
+    "total_trades": 0
+}
 
 # ---------------------------------------------------------------------------
 # TELEGRAM FUNCTIES
 # ---------------------------------------------------------------------------
-def send_telegram_alert(message, target_url=POLYMARKET_BTC_URL):
+def send_telegram_alert(message, target_url=POLYMARKET_5MIN_URL):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     
     reply_markup = {
@@ -46,10 +55,105 @@ def send_telegram_alert(message, target_url=POLYMARKET_BTC_URL):
         print(f"Telegram Fout: {e}")
 
 # ---------------------------------------------------------------------------
+# PAPER TRADING LOGICA
+# ---------------------------------------------------------------------------
+def execute_paper_trade(direction, price):
+    global PAPER_STATE
+    
+    if PAPER_STATE["balance"] < PAPER_STAKE:
+        send_telegram_alert("⚠️ **Paper Trading Alert:** Onvoldoende virtueel saldo voor een nieuwe positie.")
+        return
+
+    PAPER_STATE["balance"] -= PAPER_STAKE
+    PAPER_STATE["total_trades"] += 1
+
+    trade_entry = {
+        "id": PAPER_STATE["total_trades"],
+        "asset": "BTC/USDT",
+        "direction": direction,
+        "price": price,
+        "stake": PAPER_STAKE,
+        "status": "OPEN",
+        "timestamp": time.strftime("%H:%M:%S")
+    }
+    
+    PAPER_STATE["trades"].append(trade_entry)
+
+    report = (
+        f"📝 **PAPER TRADE GEOPEND (SIMULATIE)** 🤖\n\n"
+        f"**Asset:** BTC/USDT 5M\n"
+        f"🎯 **Richting:** {direction}\n"
+        f"💰 **Virtuele Inzet:** ${PAPER_STAKE:.2f} @ Koers: ${price:,.2f}\n"
+        f"💵 **Resterend Virtueel Saldo:** ${PAPER_STATE['balance']:.2f}"
+    )
+    send_telegram_alert(report)
+
+def show_paper_portfolio():
+    open_trades = [t for t in PAPER_STATE["trades"] if t["status"] == "OPEN"]
+    
+    msg = (
+        f"📊 **CRYPTO PAPER TRADING PORTFOLIO**\n\n"
+        f"💵 **Virtueel Saldo:** ${PAPER_STATE['balance']:.2f}\n"
+        f"🔢 **Totaal Trades Executed:** {PAPER_STATE['total_trades']}\n"
+        f"📂 **Openstaande Posities:** {len(open_trades)}\n\n"
+    )
+    
+    if open_trades:
+        msg += "**Laatste Simulaties:**\n"
+        for t in open_trades[-3:]:
+            msg += f"• #{t['id']} BTC 5M ({t['direction']}) - ${t['stake']} @ ${t['price']:,.2f} ({t['timestamp']})\n"
+    else:
+        msg += "*Nog geen actieve virtuele trades.*"
+        
+    send_telegram_alert(msg)
+
+# ---------------------------------------------------------------------------
+# TELEGRAM COMMANDOS
+# ---------------------------------------------------------------------------
+def check_telegram_commands():
+    global LAST_OFFSET
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params = {"offset": LAST_OFFSET + 1, "timeout": 2}
+    
+    try:
+        res = requests.get(url, params=params, timeout=5)
+        if res.status_code == 200:
+            updates = res.json().get("result", [])
+            for update in updates:
+                LAST_OFFSET = update["update_id"]
+                message = update.get("message", {})
+                text = message.get("text", "").strip()
+                chat_id = str(message.get("chat", {}).get("id", ""))
+                
+                if chat_id == TELEGRAM_CHAT_ID:
+                    if text in ["/start", "/help"]:
+                        help_msg = (
+                            "🤖 **Crypto 5M Confluentie & Paper Bot**\n\n"
+                            "• `/portfolio` - Bekijk virtueel saldo en openstaande sim-trades\n"
+                            "• `/status` - Bekijk actieve bot instellingen\n"
+                            "• `/scan` - Voer direct een handmatige koerscheck uit"
+                        )
+                        send_telegram_alert(help_msg)
+                    elif text == "/portfolio":
+                        show_paper_portfolio()
+                    elif text == "/status":
+                        status_msg = (
+                            "📊 **BOT STATUS**\n\n"
+                            "✅ **Status:** Actief (Binance + Chainlink Oracle)\n"
+                            "💰 **Virtueel Saldo:** $" + str(PAPER_STATE['balance']) + "\n"
+                            "⏱ **Strategie:** 5M Confluentie (EMA + RSI + 15M Trend)"
+                        )
+                        send_telegram_alert(status_msg)
+                    elif text == "/scan":
+                        send_telegram_alert("🔍 Handmatige markt-scan wordt uitgevoerd...")
+                        check_crypto_confluence()
+    except Exception as e:
+        print(f"Fout bij Telegram updates: {e}")
+
+# ---------------------------------------------------------------------------
 # DATA OPHALEN: BINANCE & CHAINLINK
 # ---------------------------------------------------------------------------
 def fetch_binance_klines(interval="5m", limit=60):
-    """Haalt snelle candles op van Binance voor technische indicatoren"""
     params = {"symbol": "BTCUSDT", "interval": interval, "limit": limit}
     try:
         res = requests.get(BINANCE_KLINES_URL, params=params, timeout=5)
@@ -62,7 +166,6 @@ def fetch_binance_klines(interval="5m", limit=60):
     return []
 
 def fetch_chainlink_price():
-    """Haalt de Chainlink Oracle prijs op (het officiële Polymarket settlement-commando)"""
     params = {"currency": "btc/usd"}
     try:
         res = requests.get(DOME_CHAINLINK_URL, params=params, timeout=5)
@@ -113,7 +216,6 @@ def calculate_rsi(prices, period=14):
 def check_crypto_confluence():
     global LAST_SIGNAL
     
-    # 1. Binance Technische Data (EMA & RSI)
     closes_5m = fetch_binance_klines(interval="5m", limit=60)
     if not closes_5m:
         return
@@ -126,17 +228,14 @@ def check_crypto_confluence():
     closes_15m = fetch_binance_klines(interval="15m", limit=60)
     ema_50_15m = calculate_ema(closes_15m, 50) if closes_15m else binance_price
 
-    # 2. Chainlink Oracle Prijs (Polymarket Validatie)
     chainlink_price = fetch_chainlink_price()
     active_price = chainlink_price if chainlink_price else binance_price
     price_source = "Chainlink Oracle" if chainlink_price else "Binance Feed"
 
-    # Tijd in de huidige 5-minuten cyclus berekenen
     current_time_sec = time.time()
     seconds_in_5m = 300
     time_remaining_min = round((seconds_in_5m - (current_time_sec % seconds_in_5m)) / 60, 1)
 
-    # Signal Condities
     bullish_confluence = (ema_5 > ema_15) and (rsi > 60) and (active_price > ema_50_15m)
     bearish_confluence = (ema_5 < ema_15) and (rsi < 40) and (active_price < ema_50_15m)
 
@@ -154,6 +253,7 @@ def check_crypto_confluence():
             f"💡 **Actie:** Zet €5.00 of €10.00 in op **'DOWN'**"
         )
         send_telegram_alert(msg)
+        execute_paper_trade("DOWN", active_price)
 
     elif bullish_confluence and LAST_SIGNAL != "UP":
         LAST_SIGNAL = "UP"
@@ -169,18 +269,26 @@ def check_crypto_confluence():
             f"💡 **Actie:** Zet €5.00 of €10.00 in op **'UP'**"
         )
         send_telegram_alert(msg)
+        execute_paper_trade("UP", active_price)
 
 # ---------------------------------------------------------------------------
 # MAIN LOOP
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("🤖 Dual-Source (Binance + Chainlink) Crypto Bot gestart!")
-    send_telegram_alert("🤖 **Crypto 5M Confluentie Bot is actief (Binance + Chainlink)...**")
+    print("🤖 Dual-Source Crypto Paper Trading Bot gestart!")
+    send_telegram_alert(
+        "⚡ **Polymarket Crypto Bot Geüpdatet!**\n\n"
+        "• Directe link gefixt naar de 5-Minuten Crypto-pagina.\n"
+        "• **Startsaldo:** $100.00 (Virtueel)\n"
+        "• **Inzet per trade:** $10.00\n"
+        "💬 *Gebruik `/portfolio` om je posities te checken.*"
+    )
     
     while True:
         try:
+            check_telegram_commands()
             check_crypto_confluence()
-            time.sleep(20)  # Scant elke 20 seconden voor snelle updates
+            time.sleep(15)
         except Exception as e:
             print(f"Fout in main loop: {e}")
             time.sleep(10)
