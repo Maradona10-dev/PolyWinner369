@@ -4,16 +4,16 @@ import math
 import requests
 
 # ---------------------------------------------------------------------------
-# CONFIGURATIE (POLYWINNER CRYPTO BOT - PAPER TRADING V2)
+# CONFIGURATIE (POLYWINNER CRYPTO BOT - PAPER TRADING V3)
 # ---------------------------------------------------------------------------
 RAW_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8840031344:AAGDJmeIC6yJPSUazE72tn32qZcFsdDvXP0")
 TELEGRAM_BOT_TOKEN = RAW_TOKEN.strip().replace("bot", "") if RAW_TOKEN.strip().startswith("bot") else RAW_TOKEN.strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "369244706").strip()
 
 SCAN_INTERVAL = 10         # Scant elke 10 seconden
-MIN_EDGE_TO_ENTRY = 0.05   # Versoepeld naar 5% (was 8%)
-PROFIT_TAKE_EDGE = 0.02    # Bij <2% edge: positie afbouwen
-REVERSAL_THRESHOLD = 0.35  # Bij <35% winstkans: swappen/hedgen
+MIN_EDGE_TO_ENTRY = 0.025  # Verlaagd naar 2.5% (was 5%)
+PROFIT_TAKE_EDGE = 0.01    # Bij <1% edge: positie sluiten/winst pakken
+REVERSAL_THRESHOLD = 0.40  # Bij <40% winstkans: swappen/hedgen
 
 # PAPER TRADING INSTELLINGEN
 INITIAL_BALANCE = 1000.0   # Startsaldo in virtuele USDC
@@ -93,7 +93,7 @@ def calculate_model_probability(spot_price, strike_price, time_left_seconds, vol
     return round(1.0 / (1.0 + math.exp(-1.6 * z_score)), 4)
 
 # ---------------------------------------------------------------------------
-# PAPER TRADING ENGINE (OPTIMIZED ENTRY)
+# PAPER TRADING ENGINE (HIGH FREQUENCY TEST)
 # ---------------------------------------------------------------------------
 class PaperTradingPolyWinner:
     def __init__(self):
@@ -103,6 +103,7 @@ class PaperTradingPolyWinner:
         self.shares = 0.0
         self.total_trades = 0
         self.winning_trades = 0
+        self.max_edge_seen = 0.0
 
     def check_technical_confluence(self, symbol="BTCUSDT"):
         klines_5m = get_binance_klines(symbol, "5m", 50)
@@ -115,7 +116,6 @@ class PaperTradingPolyWinner:
         rsi_14 = calculate_rsi(klines_5m, 14)
         ema_50_15m = calculate_ema(klines_15m, 50)
 
-        # Versoepelde RSI drempels (>50 voor Bullish, <50 voor Bearish)
         bullish_score = (1 if ema_5 > ema_15 else 0) + (1 if rsi_14 >= 50 else 0) + (1 if current_spot > ema_50_15m else 0)
         bearish_score = (1 if ema_5 < ema_15 else 0) + (1 if rsi_14 <= 50 else 0) + (1 if current_spot < ema_50_15m else 0)
 
@@ -134,13 +134,17 @@ class PaperTradingPolyWinner:
         model_prob_down = 1.0 - model_prob_up
         polymarket_down_price = round(1.0 - polymarket_up_price, 4)
 
-        # 1. POSITIE OPENEN (BUY ENTRY)
-        if self.active_position is None:
-            edge_up = model_prob_up - polymarket_up_price
-            edge_down = model_prob_down - polymarket_down_price
+        edge_up = model_prob_up - polymarket_up_price
+        edge_down = model_prob_down - polymarket_down_price
 
-            # BUY UP ENTRY: Edge >= 5% en Confluentie >= 2/3
-            if edge_up >= MIN_EDGE_TO_ENTRY and tech["bullish_score"] >= 2:
+        # Sla hoogste edge op voor Heartbeat status
+        current_max = max(edge_up, edge_down)
+        if current_max > self.max_edge_seen:
+            self.max_edge_seen = current_max
+
+        # 1. POSITIE OPENEN (BUY ENTRY - DREMPEL: 2.5% EDGE)
+        if self.active_position is None:
+            if edge_up >= MIN_EDGE_TO_ENTRY and tech["bullish_score"] >= 1:
                 self.active_position = "UP"
                 self.entry_price = polymarket_up_price
                 self.shares = TRADE_SIZE / polymarket_up_price
@@ -152,15 +156,14 @@ class PaperTradingPolyWinner:
                     f"📍 **Markt:** {market_title}\n"
                     f"💰 **Spot:** ${spot_price:,.2f} | **Strike:** ${strike_price:,.2f}\n"
                     f"📊 **Model Prob:** {model_prob_up*100:.1f}% | **Poly Price:** ${polymarket_up_price:.2f}\n"
-                    f"🔥 **Edge:** +{edge_up*100:.1f}%\n\n"
-                    f"✅ **Confluentie Score:** {tech['bullish_score']}/3 Passed\n"
-                    f"💼 **Virtuele Inzet:** ${TRADE_SIZE:.2f} ({self.shares:.1f} Shares)\n"
+                    f"🔥 **Edge:** +{edge_up*100:.1f}%\n"
+                    f"✅ **Confluentie:** {tech['bullish_score']}/3\n"
+                    f"💼 **Virtuele Inzet:** ${TRADE_SIZE:.2f}\n"
                     f"💵 **Resterend Saldo:** ${self.balance:.2f}"
                 )
                 send_telegram_alert(msg, target_url=market_url)
 
-            # BUY DOWN ENTRY: Edge >= 5% en Confluentie >= 2/3
-            elif edge_down >= MIN_EDGE_TO_ENTRY and tech["bearish_score"] >= 2:
+            elif edge_down >= MIN_EDGE_TO_ENTRY and tech["bearish_score"] >= 1:
                 self.active_position = "DOWN"
                 self.entry_price = polymarket_down_price
                 self.shares = TRADE_SIZE / polymarket_down_price
@@ -172,18 +175,17 @@ class PaperTradingPolyWinner:
                     f"📍 **Markt:** {market_title}\n"
                     f"💰 **Spot:** ${spot_price:,.2f} | **Strike:** ${strike_price:,.2f}\n"
                     f"📊 **Model Prob:** {model_prob_down*100:.1f}% | **Poly Price:** ${polymarket_down_price:.2f}\n"
-                    f"🔥 **Edge:** +{edge_down*100:.1f}%\n\n"
-                    f"✅ **Confluentie Score:** {tech['bearish_score']}/3 Passed\n"
-                    f"💼 **Virtuele Inzet:** ${TRADE_SIZE:.2f} ({self.shares:.1f} Shares)\n"
+                    f"🔥 **Edge:** +{edge_down*100:.1f}%\n"
+                    f"✅ **Confluentie:** {tech['bearish_score']}/3\n"
+                    f"💼 **Virtuele Inzet:** ${TRADE_SIZE:.2f}\n"
                     f"💵 **Resterend Saldo:** ${self.balance:.2f}"
                 )
                 send_telegram_alert(msg, target_url=market_url)
 
-        # 2. ACTIEVE POSITIE MONITOREN & SLUITEN
+        # 2. ACTIEVE POSITIE MONITOREN
         else:
             if self.active_position == "UP":
                 current_edge = model_prob_up - polymarket_up_price
-                
                 if current_edge < PROFIT_TAKE_EDGE or model_prob_up < REVERSAL_THRESHOLD:
                     payout = self.shares * polymarket_up_price
                     pnl = payout - TRADE_SIZE
@@ -202,7 +204,6 @@ class PaperTradingPolyWinner:
 
             elif self.active_position == "DOWN":
                 current_edge = model_prob_down - polymarket_down_price
-                
                 if current_edge < PROFIT_TAKE_EDGE or model_prob_down < REVERSAL_THRESHOLD:
                     payout = self.shares * polymarket_down_price
                     pnl = payout - TRADE_SIZE
@@ -220,23 +221,34 @@ class PaperTradingPolyWinner:
                     self.active_position = None
 
 # ---------------------------------------------------------------------------
-# MAIN LOOP (24-UUR TEST RUNNER)
+# MAIN LOOP
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("🚀 24-Uur Paper Trading Test (Versoepeld) Gestart!")
+    print("🚀 Paper Trading V3 Gestart!")
     send_telegram_alert(
-        "🧪 **PAPER TRADING TEST V2 GESTART!** 🧪\n\n"
-        "• **Minimale Edge:** 5% (was 8%)\n"
-        "• **Confluentie:** Minimaal 2/3 (was 3/3)\n"
-        "• **RSI Thresholds:** Neutraal gesteld op 50\n\n"
-        "De bot zal nu sneller reageren op kansen!"
+        "⚡ **PAPER TRADING V3 GEUPDATE!** ⚡\n\n"
+        "• **Minimale Edge:** 2.5% (was 5%)\n"
+        "• **Confluentie:** Minimaal 1/3 vereist\n"
+        "• **Heartbeat:** Bot stuurt elk uur een statusupdate over de hoogst gemeten edge."
     )
     
     paper_bot = PaperTradingPolyWinner()
-    start_time = time.time()
+    last_heartbeat = time.time()
     
-    while time.time() - start_time < 86400:
+    while True:
         try:
+            # Heartbeat update om de 60 minuten
+            if time.time() - last_heartbeat > 3600:
+                send_telegram_alert(
+                    f"💓 **BOT HEARTBEAT CHECK**\n\n"
+                    f"• Bot is online en scant elke 10s.\n"
+                    f"• **Hoogst gemeten Edge afgelopen uur:** {paper_bot.max_edge_seen*100:.2f}%\n"
+                    f"• **Totaal Trades:** {paper_bot.total_trades}\n"
+                    f"• **Huidig Saldo:** ${paper_bot.balance:.2f}"
+                )
+                paper_bot.max_edge_seen = 0.0
+                last_heartbeat = time.time()
+
             time.sleep(SCAN_INTERVAL)
         except Exception as e:
             print(f"Fout in loop: {e}")
