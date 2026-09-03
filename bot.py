@@ -4,16 +4,16 @@ import math
 import requests
 
 # ---------------------------------------------------------------------------
-# CONFIGURATIE (POLYWINNER CRYPTO BOT - PAPER TRADING)
+# CONFIGURATIE (POLYWINNER CRYPTO BOT - PAPER TRADING V2)
 # ---------------------------------------------------------------------------
 RAW_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8840031344:AAGDJmeIC6yJPSUazE72tn32qZcFsdDvXP0")
 TELEGRAM_BOT_TOKEN = RAW_TOKEN.strip().replace("bot", "") if RAW_TOKEN.strip().startswith("bot") else RAW_TOKEN.strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "369244706").strip()
 
 SCAN_INTERVAL = 10         # Scant elke 10 seconden
-MIN_EDGE_TO_ENTRY = 0.08   # Minimaal 8% prijsverschil
-PROFIT_TAKE_EDGE = 0.02    # Bij <2% edge: signaal om positie af te bouwen
-REVERSAL_THRESHOLD = 0.35  # Bij <35% winstkans: signaal om te swappen/hedgen
+MIN_EDGE_TO_ENTRY = 0.05   # Versoepeld naar 5% (was 8%)
+PROFIT_TAKE_EDGE = 0.02    # Bij <2% edge: positie afbouwen
+REVERSAL_THRESHOLD = 0.35  # Bij <35% winstkans: swappen/hedgen
 
 # PAPER TRADING INSTELLINGEN
 INITIAL_BALANCE = 1000.0   # Startsaldo in virtuele USDC
@@ -93,7 +93,7 @@ def calculate_model_probability(spot_price, strike_price, time_left_seconds, vol
     return round(1.0 / (1.0 + math.exp(-1.6 * z_score)), 4)
 
 # ---------------------------------------------------------------------------
-# PAPER TRADING ENGINE
+# PAPER TRADING ENGINE (OPTIMIZED ENTRY)
 # ---------------------------------------------------------------------------
 class PaperTradingPolyWinner:
     def __init__(self):
@@ -115,8 +115,9 @@ class PaperTradingPolyWinner:
         rsi_14 = calculate_rsi(klines_5m, 14)
         ema_50_15m = calculate_ema(klines_15m, 50)
 
-        bullish_score = (1 if ema_5 > ema_15 else 0) + (1 if rsi_14 >= 55 else 0) + (1 if current_spot > ema_50_15m else 0)
-        bearish_score = (1 if ema_5 < ema_15 else 0) + (1 if rsi_14 <= 45 else 0) + (1 if current_spot < ema_50_15m else 0)
+        # Versoepelde RSI drempels (>50 voor Bullish, <50 voor Bearish)
+        bullish_score = (1 if ema_5 > ema_15 else 0) + (1 if rsi_14 >= 50 else 0) + (1 if current_spot > ema_50_15m else 0)
+        bearish_score = (1 if ema_5 < ema_15 else 0) + (1 if rsi_14 <= 50 else 0) + (1 if current_spot < ema_50_15m else 0)
 
         return {
             "spot": current_spot, "ema_5": ema_5, "ema_15": ema_15,
@@ -138,8 +139,8 @@ class PaperTradingPolyWinner:
             edge_up = model_prob_up - polymarket_up_price
             edge_down = model_prob_down - polymarket_down_price
 
-            # BUY UP ENTRY
-            if edge_up >= MIN_EDGE_TO_ENTRY and tech["bullish_score"] == 3:
+            # BUY UP ENTRY: Edge >= 5% en Confluentie >= 2/3
+            if edge_up >= MIN_EDGE_TO_ENTRY and tech["bullish_score"] >= 2:
                 self.active_position = "UP"
                 self.entry_price = polymarket_up_price
                 self.shares = TRADE_SIZE / polymarket_up_price
@@ -152,14 +153,14 @@ class PaperTradingPolyWinner:
                     f"💰 **Spot:** ${spot_price:,.2f} | **Strike:** ${strike_price:,.2f}\n"
                     f"📊 **Model Prob:** {model_prob_up*100:.1f}% | **Poly Price:** ${polymarket_up_price:.2f}\n"
                     f"🔥 **Edge:** +{edge_up*100:.1f}%\n\n"
-                    f"✅ **Confluentie Check (3/3) Passed**\n"
+                    f"✅ **Confluentie Score:** {tech['bullish_score']}/3 Passed\n"
                     f"💼 **Virtuele Inzet:** ${TRADE_SIZE:.2f} ({self.shares:.1f} Shares)\n"
                     f"💵 **Resterend Saldo:** ${self.balance:.2f}"
                 )
                 send_telegram_alert(msg, target_url=market_url)
 
-            # BUY DOWN ENTRY
-            elif edge_down >= MIN_EDGE_TO_ENTRY and tech["bearish_score"] == 3:
+            # BUY DOWN ENTRY: Edge >= 5% en Confluentie >= 2/3
+            elif edge_down >= MIN_EDGE_TO_ENTRY and tech["bearish_score"] >= 2:
                 self.active_position = "DOWN"
                 self.entry_price = polymarket_down_price
                 self.shares = TRADE_SIZE / polymarket_down_price
@@ -172,7 +173,7 @@ class PaperTradingPolyWinner:
                     f"💰 **Spot:** ${spot_price:,.2f} | **Strike:** ${strike_price:,.2f}\n"
                     f"📊 **Model Prob:** {model_prob_down*100:.1f}% | **Poly Price:** ${polymarket_down_price:.2f}\n"
                     f"🔥 **Edge:** +{edge_down*100:.1f}%\n\n"
-                    f"✅ **Confluentie Check (3/3) Passed**\n"
+                    f"✅ **Confluentie Score:** {tech['bearish_score']}/3 Passed\n"
                     f"💼 **Virtuele Inzet:** ${TRADE_SIZE:.2f} ({self.shares:.1f} Shares)\n"
                     f"💵 **Resterend Saldo:** ${self.balance:.2f}"
                 )
@@ -183,7 +184,6 @@ class PaperTradingPolyWinner:
             if self.active_position == "UP":
                 current_edge = model_prob_up - polymarket_up_price
                 
-                # Afbouwen / Sluiten bij winst of verslechterde condities
                 if current_edge < PROFIT_TAKE_EDGE or model_prob_up < REVERSAL_THRESHOLD:
                     payout = self.shares * polymarket_up_price
                     pnl = payout - TRADE_SIZE
@@ -193,43 +193,51 @@ class PaperTradingPolyWinner:
                     msg = (
                         f"📝 **PAPER TRADE CLOSED: UP**\n\n"
                         f"💵 **Verkoopprijs:** ${polymarket_up_price:.2f}\n"
-                        f"📊 **PnL voor deze trade:** {'+' if pnl>=0 else ''}${pnl:.2f}\n"
-                        f"💰 **Nieuwe Saldo:** ${self.balance:.2f}\n"
+                        f"📊 **PnL:** {'+' if pnl>=0 else ''}${pnl:.2f}\n"
+                        f"💰 **Saldo:** ${self.balance:.2f}\n"
+                        f"📈 **Win Rate:** {(self.winning_trades/self.total_trades)*100:.1f}% ({self.winning_trades}/{self.total_trades})"
+                    )
+                    send_telegram_alert(msg, target_url=market_url)
+                    self.active_position = None
+
+            elif self.active_position == "DOWN":
+                current_edge = model_prob_down - polymarket_down_price
+                
+                if current_edge < PROFIT_TAKE_EDGE or model_prob_down < REVERSAL_THRESHOLD:
+                    payout = self.shares * polymarket_down_price
+                    pnl = payout - TRADE_SIZE
+                    self.balance += payout
+                    if pnl > 0: self.winning_trades += 1
+
+                    msg = (
+                        f"📝 **PAPER TRADE CLOSED: DOWN**\n\n"
+                        f"💵 **Verkoopprijs:** ${polymarket_down_price:.2f}\n"
+                        f"📊 **PnL:** {'+' if pnl>=0 else ''}${pnl:.2f}\n"
+                        f"💰 **Saldo:** ${self.balance:.2f}\n"
                         f"📈 **Win Rate:** {(self.winning_trades/self.total_trades)*100:.1f}% ({self.winning_trades}/{self.total_trades})"
                     )
                     send_telegram_alert(msg, target_url=market_url)
                     self.active_position = None
 
 # ---------------------------------------------------------------------------
-# MAIN LOOP (24-UUR TEST)
+# MAIN LOOP (24-UUR TEST RUNNER)
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("🚀 24-Uur Paper Trading Test Gestart!")
+    print("🚀 24-Uur Paper Trading Test (Versoepeld) Gestart!")
     send_telegram_alert(
-        "🧪 **24-UUR PAPER TRADING TEST GESTART!** 🧪\n\n"
-        f"• **Virtueel Startsaldo:** ${INITIAL_BALANCE:.2f}\n"
-        f"• **Trade Grootte:** ${TRADE_SIZE:.2f} per kans\n"
-        "• **Strategie:** Model-Based Edge (≥8%) + 3/3 Confluentie Check\n\n"
-        "De bot voert gesimuleerde trades uit en geeft live updates in deze chat."
+        "🧪 **PAPER TRADING TEST V2 GESTART!** 🧪\n\n"
+        "• **Minimale Edge:** 5% (was 8%)\n"
+        "• **Confluentie:** Minimaal 2/3 (was 3/3)\n"
+        "• **RSI Thresholds:** Neutraal gesteld op 50\n\n"
+        "De bot zal nu sneller reageren op kansen!"
     )
     
     paper_bot = PaperTradingPolyWinner()
     start_time = time.time()
     
-    while time.time() - start_time < 86400:  # Draait exact 24 uur (86.400 seconden)
+    while time.time() - start_time < 86400:
         try:
             time.sleep(SCAN_INTERVAL)
         except Exception as e:
             print(f"Fout in loop: {e}")
             time.sleep(5)
-
-    # EINDAPPORT NA 24 UUR
-    total_pnl = paper_bot.balance - INITIAL_BALANCE
-    send_telegram_alert(
-        f"🏁 **24-UUR PAPER TRADING TEST AFGEROND!** 📊\n\n"
-        f"• **Eindsaldo:** ${paper_bot.balance:.2f}\n"
-        f"• **Totale PnL:** {'+' if total_pnl>=0 else ''}${total_pnl:.2f}\n"
-        f"• **Totaal Trades:** {paper_bot.total_trades}\n"
-        f"• **Win Rate:** {(paper_bot.winning_trades/max(1, paper_bot.total_trades))*100:.1f}%\n\n"
-        "Evalueer de resultaten voordat je live geld inzet!"
-    )
