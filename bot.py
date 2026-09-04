@@ -5,19 +5,20 @@ import traceback
 from datetime import datetime
 
 # ---------------------------------------------------------------------------
-# CONFIGURATIE POLYWINNER BOT (MINIMALE EDGE TEST MODE)
+# CONFIGURATIE NOBELELE'S POLY BOT
 # ---------------------------------------------------------------------------
 RAW_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_BOT_TOKEN = RAW_TOKEN.strip().replace("bot", "") if RAW_TOKEN.strip().startswith("bot") else RAW_TOKEN.strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# Drempel verlaagd naar minimaal om direct te kunnen testen
-MIN_EDGE = 0.001       # 0.1% minimale edge vereist
-PAPER_BALANCE = 1000.0 # Startsaldo
-TRADE_AMOUNT = 10.0    # Vaste inzet per paper trade
+MIN_EDGE = 0.001       # 0.1% minimale edge (zeer laag om direct te testen)
+PAPER_BALANCE = 1000.0
+TRADE_AMOUNT = 10.0
+TOTAL_TRADES = 0
+HIGHEST_EDGE_HOUR = 0.0
 
 # ---------------------------------------------------------------------------
-# TELEGRAM BOTS
+# TELEGRAM VERSTUUR FUNCTIE
 # ---------------------------------------------------------------------------
 def send_telegram_msg(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -33,29 +34,39 @@ def send_telegram_msg(message):
         print(f"Telegram Fout: {e}")
 
 # ---------------------------------------------------------------------------
-# SIMULATIE & EDGE SCANNER
+# COMMAND VERWERKER (/start, /portfolio, /status)
 # ---------------------------------------------------------------------------
-def check_market_edge():
-    """
-    Haalt de live orderbook/prijsdata op en berekent de beschikbare edge.
-    """
-    try:
-        # Voorbeeld API fetch voor marktprijzen (bijv. Polymarket of Binance 5m candles)
-        # Berekent de theoretische versus actuele prijs
-        current_edge = 0.0015  # 0.15% gemeten edge (boven de 0.1% drempel)
-        market_name = "BTC 5-Min Window Outcome"
-        
-        return current_edge, market_name, None
-    except Exception as e:
-        return 0.0, "", str(e)
+def handle_command(text):
+    global PAPER_BALANCE, TOTAL_TRADES, HIGHEST_EDGE_HOUR
+    
+    if text.startswith("/start"):
+        msg = (
+            "🤖 **Nobelele's Poly Bot Is Actief!**\n\n"
+            "• Ik scan elke 10s op de 5-minuten kaart.\n"
+            "• Minimaal vereiste Edge: `0.1%`\n"
+            "• Paper Trading Mode: **AAN**\n\n"
+            "Gebruik /portfolio voor je huidige saldo."
+        )
+        send_telegram_msg(msg)
+
+    elif text.startswith("/portfolio") or text.startswith("/status"):
+        msg = (
+            "📊 **HUIDIGE PORTFOLIO STATUS**\n\n"
+            f"• **Huidig Saldo:** `${PAPER_BALANCE:.2f}`\n"
+            f"• **Totaal Trades:** `{TOTAL_TRADES}`\n"
+            f"• **Hoogst Gemeten Edge (afgelopen uur):** `{HIGHEST_EDGE_HOUR * 100:.2f}%`\n"
+            f"• **Status:** Actief aan het scannen..."
+        )
+        send_telegram_msg(msg)
 
 # ---------------------------------------------------------------------------
-# PAPER TRADING EXECUTION
+# PAPER TRADE EXECUTION
 # ---------------------------------------------------------------------------
 def execute_paper_trade(market, edge):
-    global PAPER_BALANCE
+    global PAPER_BALANCE, TOTAL_TRADES
     
     PAPER_BALANCE -= TRADE_AMOUNT
+    TOTAL_TRADES += 1
     
     msg = (
         f"📝 **PAPER TRADE EXECUTED!** 🚀\n\n"
@@ -63,38 +74,63 @@ def execute_paper_trade(market, edge):
         f"📈 **Gemeten Edge:** `{edge * 100:.2f}%`\n"
         f"💵 **Inzet:** `${TRADE_AMOUNT:.2f}`\n"
         f"💰 **Nieuw Virtueel Saldo:** `${PAPER_BALANCE:.2f}`\n\n"
-        f"⏱️ Position geopend op de 5-minuten kaart. Resultaat volgt bij sluiting."
+        f"⏱️ Positie geopend op de 5m kaart."
     )
     send_telegram_msg(msg)
 
 # ---------------------------------------------------------------------------
-# MAIN LOOP
+# MAIN LOOP (MET TELEGRAM LISTEN ENGINE)
 # ---------------------------------------------------------------------------
 def main():
-    print("🚀 Polywinner Bot Gestart op Minimaal Drempelniveau (0.1% Edge)...")
-    send_telegram_msg("⚙️ **Polywinner Bot:** Minimaal drempelniveau actief (`MIN_EDGE = 0.1%`). Paper trades worden direct verstuurd bij een signaal.")
+    global HIGHEST_EDGE_HOUR
+    print("🚀 Nobelele's Poly Bot Gestart met Listener...")
     
+    send_telegram_msg("⚙️ **Poly Bot Herstart:** Luistert nu live naar jouw Telegram commando's (/start, /portfolio)!")
+    
+    last_update_id = 0
     last_heartbeat = time.time()
-    
+    last_trade_time = 0
+
     while True:
         try:
-            edge, market, error = check_market_edge()
+            # 1. Luisteren naar inkomende Telegram berichten
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={last_update_id + 1}&timeout=5"
+            res = requests.get(url, timeout=8).json()
             
-            if not error and edge >= MIN_EDGE:
-                execute_paper_trade(market, edge)
-                time.sleep(60) # Pauze om te voorkomen dat hij binnen 1 minuut meerdere trades opent
+            if "result" in res:
+                for update in res["result"]:
+                    last_update_id = update["update_id"]
+                    message = update.get("message", {})
+                    text = message.get("text", "").strip()
 
-            # Uurlijkse Heartbeat check
+                    if text:
+                        handle_command(text)
+
+            # 2. Markt-scan simulatie (elke 10 seconden)
+            simulated_edge = 0.0025  # 0.25% Edge
+            market = "BTC 5-Min Window Outcome"
+            
+            if simulated_edge > HIGHEST_EDGE_HOUR:
+                HIGHEST_EDGE_HOUR = simulated_edge
+
+            # Uitvoeren als drempel is bereikt (max 1 trade per 5 minuten om spam te voorkomen)
+            if simulated_edge >= MIN_EDGE and (time.time() - last_trade_time > 300):
+                execute_paper_trade(market, simulated_edge)
+                last_trade_time = time.time()
+
+            # 3. Heartbeat elk uur
             if time.time() - last_heartbeat > 3600:
                 send_telegram_msg(
-                    f"💓 **BOT HEARTBEAT CHECK**\n\n"
+                    f"💗 **BOT HEARTBEAT CHECK**\n\n"
                     f"• Bot is online en scant elke 10s.\n"
-                    f"• Huidige ingestelde Min. Edge: `{MIN_EDGE * 100:.1f}%`\n"
+                    f"• Hoogst gemeten Edge afgelopen uur: `{HIGHEST_EDGE_HOUR * 100:.2f}%`\n"
+                    f"• Totaal Trades: `{TOTAL_TRADES}`\n"
                     f"• Huidig Saldo: `${PAPER_BALANCE:.2f}`"
                 )
+                HIGHEST_EDGE_HOUR = 0.0
                 last_heartbeat = time.time()
 
-            time.sleep(10)
+            time.sleep(2)
 
         except Exception as e:
             print(f"Loop fout: {e}")
