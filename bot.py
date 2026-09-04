@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import requests
 import traceback
 
@@ -10,14 +11,36 @@ RAW_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_BOT_TOKEN = RAW_TOKEN.strip().replace("bot", "") if RAW_TOKEN.strip().startswith("bot") else RAW_TOKEN.strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# Quant Strategy Parameters - Directe link naar de 5m markt
 POLYMARKET_URL = "https://polymarket.com/crypto/5M"
-PAPER_BALANCE = 1000.0
 INZET_PER_TRADE = 10.0
-TOTAL_TRADES = 0
 HIGHEST_EDGE_HOUR = 0.0
+DATA_FILE = "portfolio.json"
 
-active_trade = None  # Bijhouden van geopende positie
+# ---------------------------------------------------------------------------
+# PERSISTENTIE: DATA OPSLAAN EN INLADEN
+# ---------------------------------------------------------------------------
+def load_portfolio():
+    """ Laadt saldo en trades uit het bestand, of gebruikt standaardwaarden """
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r") as f:
+                data = json.load(f)
+                return data.get("balance", 1000.0), data.get("total_trades", 0)
+        except Exception as e:
+            print(f"Fout bij laden portfolio: {e}")
+    return 1000.0, 0
+
+def save_portfolio(balance, total_trades):
+    """ Slaat de huidige stand direct op in portfolio.json """
+    try:
+        with open(DATA_FILE, "w") as f:
+            json.dump({"balance": balance, "total_trades": total_trades}, f)
+    except Exception as e:
+        print(f"Fout bij opslaan portfolio: {e}")
+
+# Inladen bij opstarten
+PAPER_BALANCE, TOTAL_TRADES = load_portfolio()
+active_trade = None
 
 # ---------------------------------------------------------------------------
 # TELEGRAM UTILITIES
@@ -55,10 +78,9 @@ def send_telegram_msg(message, button_url=None, button_text="🚀 ZET DIRECT IN 
         print(f"Telegram send error: {e}")
 
 # ---------------------------------------------------------------------------
-# BINANCE MARKET DATA & TECHNICAL INDICATORS
+# BINANCE MARKET DATA
 # ---------------------------------------------------------------------------
 def get_binance_data():
-    """ Haalt real-time Binance kandelaren & prijsstroom op voor BTC/USDT """
     try:
         url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=50"
         res = requests.get(url, timeout=5).json()
@@ -66,7 +88,6 @@ def get_binance_data():
         closes = [float(c[4]) for c in res]
         live_price = closes[-1]
         
-        # EMA/RSI berekeningen
         ema5 = round(sum(closes[-5:]) / 5, 2)
         ema15 = round(sum(closes[-15:]) / 15, 2)
         ema50 = round(sum(closes[-50:]) / 50, 2)
@@ -89,7 +110,7 @@ def get_binance_data():
         return None, str(e)
 
 # ---------------------------------------------------------------------------
-# COMMAND HANDLER (/start, /portfolio)
+# COMMAND HANDLER
 # ---------------------------------------------------------------------------
 def handle_command(text):
     global PAPER_BALANCE, TOTAL_TRADES, HIGHEST_EDGE_HOUR
@@ -120,12 +141,12 @@ def handle_command(text):
 # ---------------------------------------------------------------------------
 def main():
     global HIGHEST_EDGE_HOUR, PAPER_BALANCE, TOTAL_TRADES, active_trade
-    print("🚀 Quant Bot gestart met 5M specifieke Polymarket link...")
+    print("🚀 Quant Bot gestart met persistent geheugen...")
     
     clear_telegram_webhooks()
     time.sleep(1)
     
-    send_telegram_msg("⚙️ **Poly Bot Live:** Verbinding hersteld! Knop verwijst nu direct naar de 5M markt op Polymarket.")
+    send_telegram_msg(f"⚙️ **Poly Bot Live:** Onthoudt nu je portfolio historie! Huidig saldo: `${PAPER_BALANCE:.2f}` ({TOTAL_TRADES} trades executed).")
 
     last_update_id = 0
     last_heartbeat = time.time()
@@ -161,11 +182,9 @@ def main():
                 ema50 = data["ema50"]
                 rsi = data["rsi"]
                 
-                # Breakout condities
                 if ema5 > ema15 and rsi > 60 and price > ema50:
                     direction = "UP"
                     
-                    # Signaal Bericht
                     signal_msg = (
                         f"🚀 **HIGH CONFIDENCE BREAKOUT ({direction})**\n📈\n\n"
                         f"Pair: BTC/USDT\n"
@@ -179,9 +198,11 @@ def main():
                     )
                     send_telegram_msg(signal_msg, button_url=POLYMARKET_URL)
 
-                    # Paper Trade Openen
+                    # Paper Trade Openen & Opslaan
                     PAPER_BALANCE -= INZET_PER_TRADE
                     TOTAL_TRADES += 1
+                    save_portfolio(PAPER_BALANCE, TOTAL_TRADES)
+                    
                     active_trade = {
                         "entry": price,
                         "direction": direction,
@@ -211,6 +232,8 @@ def main():
                 result_header = "✅ **PAPER TRADE GEWONNEN** 🎉"
             else:
                 result_header = "❌ **PAPER TRADE VERLOREN** 📉"
+
+            save_portfolio(PAPER_BALANCE, TOTAL_TRADES)
 
             result_msg = (
                 f"{result_header}\n\n"
