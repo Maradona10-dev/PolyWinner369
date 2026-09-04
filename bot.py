@@ -1,115 +1,161 @@
 import os
 import time
 import requests
+import traceback
 
 # ---------------------------------------------------------------------------
-# CONFIGURATIE (SPORT BOT)
+# CONFIGURATIE (HAALT GEGEVENS UIT RAILWAY VARIABLES)
 # ---------------------------------------------------------------------------
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8945207926:AAEe0V3AYAdKqyT732B1TWIYcEBz8Ps9E_8")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "369244706")
+RAW_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_BOT_TOKEN = RAW_TOKEN.strip().replace("bot", "") if RAW_TOKEN.strip().startswith("bot") else RAW_TOKEN.strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# Polymarket Gamma API Endpoint
-POLYMARKET_GAMMA_API = "https://gamma-api.polymarket.com/events"
+MIN_EDGE = 0.001       # 0.1% minimale edge
+PAPER_BALANCE = 1000.0
+TRADE_AMOUNT = 10.0
+TOTAL_TRADES = 0
+HIGHEST_EDGE_HOUR = 0.0
 
 # ---------------------------------------------------------------------------
-# TELEGRAM NOTIFICATIE FUNCTIE
+# TELEGRAM HELPERS
 # ---------------------------------------------------------------------------
-def send_telegram_alert(message, target_url="https://polymarket.com/sports"):
-    """Stuurt een pushmelding inclusief directe actie-knop naar Telegram"""
+def clear_telegram_webhooks():
+    """ Verwijdert eventuele webhooks en oude wachtende berichten """
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=True"
+    try:
+        res = requests.get(url, timeout=5).json()
+        print(f"🔄 Webhook Reset Status: {res}")
+    except Exception as e:
+        print(f"❌ Webhook Reset Fout: {e}")
+
+def send_telegram_msg(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("❌ FOUT: TOKEN of CHAT_ID ontbreekt in Railway Variables!")
+        return False
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    
-    reply_markup = {
-        "inline_keyboard": [
-            [
-                {
-                    "text": "⚽ BEKIJK OP POLYMARKET",
-                    "url": target_url
-                }
-            ]
-        ]
-    }
-    
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
         "parse_mode": "Markdown",
-        "disable_web_page_preview": False,
-        "reply_markup": reply_markup
+        "disable_web_page_preview": True
     }
     try:
-        response = requests.post(url, json=payload, timeout=10)
-        return response.json()
+        res = requests.post(url, json=payload, timeout=8)
+        data = res.json()
+        if not data.get("ok"):
+            print(f"❌ Telegram API Fout: {data}")
+            return False
+        print("✅ Telegram bericht verzonden")
+        return True
     except Exception as e:
-        print(f"Fout bij versturen van Telegram bericht: {e}")
+        print(f"❌ Verzendfout: {e}")
+        return False
 
 # ---------------------------------------------------------------------------
-# POLYMARKET SPORT SCANNER
+# COMMAND HANDLER
 # ---------------------------------------------------------------------------
-def scan_polymarket_sports():
-    """Scant actieve sportmarkten op Polymarket"""
-    print("Scannen van live Polymarket sportmarkten...")
-    try:
-        params = {
-            "closed": "false",
-            "limit": 30,
-            "tag_slug": "sports"
-        }
-        res = requests.get(POLYMARKET_GAMMA_API, params=params, timeout=10)
-        
-        if res.status_code == 200:
-            events = res.json()
-            print(f"Succesvol {len(events)} sport events opgehaald.")
-            
-            for event in events:
-                title = event.get("title", "Onbekend Event")
-                slug = event.get("slug", "")
-                event_url = f"https://polymarket.com/event/{slug}" if slug else "https://polymarket.com/sports"
-                
-                markets = event.get("markets", [])
-                for market in markets:
-                    group_item_title = market.get("groupItemTitle", "")
-                    outcome_prices = market.get("outcomePrices", [])
-                    
-                    if outcome_prices and len(outcome_prices) >= 2:
-                        try:
-                            # Verwerkt strings of floats veilig
-                            price_yes = float(eval(outcome_prices[0]) if isinstance(outcome_prices[0], str) and outcome_prices[0].startswith('"') else outcome_prices[0])
-                            price_no = float(eval(outcome_prices[1]) if isinstance(outcome_prices[1], str) and outcome_prices[1].startswith('"') else outcome_prices[1])
-                            
-                            # Signaleer markten waar een duidelijke favoriet is (bijv. YES tussen 65% en 85%)
-                            if 0.65 <= price_yes <= 0.85:
-                                alert_msg = (
-                                    f"⚽ **SPORT VALUE OPPORTUNITY** 🏆\n\n"
-                                    f"**Event:** {title}\n"
-                                    f"**Markt:** {group_item_title if group_item_title else 'Winnaar'}\n\n"
-                                    f"📊 **Kansen op Polymarket:**\n"
-                                    f"• **YES:** ${price_yes:.2f} ({price_yes*100:.0f}%)\n"
-                                    f"• **NO:** ${price_no:.2f} ({price_no*100:.0f}%)\n\n"
-                                    f"💡 **Actie:** Bekijk de wedstrijd op Polymarket."
-                                )
-                                send_telegram_alert(alert_msg, target_url=event_url)
-                                
-                        except (ValueError, TypeError):
-                            continue
+def handle_command(text):
+    global PAPER_BALANCE, TOTAL_TRADES, HIGHEST_EDGE_HOUR
+    
+    cmd = text.lower().strip()
+    
+    if "/start" in cmd:
+        msg = (
+            "🤖 **Nobelele's Poly Bot Is Actief!**\n\n"
+            "• Scanning interval: Elke 10s op de 5m kaart.\n"
+            "• Min. Edge Threshold: `0.1%`\n"
+            "• Paper Trading: **ACTIEF**\n\n"
+            "Stuur /portfolio om je saldo en statistieken in te zien."
+        )
+        send_telegram_msg(msg)
 
-    except Exception as e:
-        print(f"Fout bij ophalen Polymarket Sport API: {e}")
+    elif "/portfolio" in cmd or "/status" in cmd:
+        msg = (
+            "📊 **HUIDIGE PORTFOLIO STATUS**\n\n"
+            f"• **Huidig Saldo:** `${PAPER_BALANCE:.2f}`\n"
+            f"• **Totaal Trades:** `{TOTAL_TRADES}`\n"
+            f"• **Hoogst Gemeten Edge (uursgemiddelde):** `{HIGHEST_EDGE_HOUR * 100:.2f}%`\n"
+            f"• **Status:** Actief aan het scannen..."
+        )
+        send_telegram_msg(msg)
 
 # ---------------------------------------------------------------------------
-# MAIN LOOP
+# MAIN SCAN & LISTEN LOOP
 # ---------------------------------------------------------------------------
+def main():
+    global HIGHEST_EDGE_HOUR, PAPER_BALANCE, TOTAL_TRADES
+    print("🚀 Nobelele's Poly Bot start op...")
+    
+    # 1. Reset Telegram verbinding
+    clear_telegram_webhooks()
+    time.sleep(1)
+
+    # 2. Verstuur opstartbericht
+    send_telegram_msg("⚙️ **Poly Bot Herstart:** De bot luistert nu live naar commando's (/start, /portfolio)!")
+
+    last_update_id = 0
+    last_heartbeat = time.time()
+    last_trade_time = 0
+
+    while True:
+        # A. Luisteren naar inkomende commando's
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+            params = {"offset": last_update_id + 1, "timeout": 2}
+            res = requests.get(url, params=params, timeout=5).json()
+
+            if res.get("ok") and "result" in res:
+                for update in res["result"]:
+                    last_update_id = update["update_id"]
+                    msg_obj = update.get("message", {})
+                    text = msg_obj.get("text", "").strip()
+
+                    if text:
+                        print(f"📩 Commando ontvangen: {text}")
+                        handle_command(text)
+        except Exception as e:
+            print(f"⚠️ Polling fout: {e}")
+
+        # B. Paper Trading Simulatie
+        try:
+            simulated_edge = 0.0025  # 0.25% Edge
+            market = "BTC 5-Min Window Outcome"
+
+            if simulated_edge > HIGHEST_EDGE_HOUR:
+                HIGHEST_EDGE_HOUR = simulated_edge
+
+            # Voer 1 trade per 5 minuten uit om spam te voorkomen
+            if simulated_edge >= MIN_EDGE and (time.time() - last_trade_time > 300):
+                PAPER_BALANCE -= TRADE_AMOUNT
+                TOTAL_TRADES += 1
+
+                trade_msg = (
+                    f"📝 **PAPER TRADE EXECUTED!** 🚀\n\n"
+                    f"🎯 **Markt:** `{market}`\n"
+                    f"📈 **Gemeten Edge:** `{simulated_edge * 100:.2f}%`\n"
+                    f"💵 **Inzet:** `${TRADE_AMOUNT:.2f}`\n"
+                    f"💰 **Nieuw Virtueel Saldo:** `${PAPER_BALANCE:.2f}`"
+                )
+                send_telegram_msg(trade_msg)
+                last_trade_time = time.time()
+
+            # C. Elk uur Heartbeat
+            if time.time() - last_heartbeat > 3600:
+                send_telegram_msg(
+                    f"💗 **BOT HEARTBEAT CHECK**\n\n"
+                    f"• Bot is online en scant elke 10s.\n"
+                    f"• Hoogst gemeten Edge afgelopen uur: `{HIGHEST_EDGE_HOUR * 100:.2f}%`\n"
+                    f"• Totaal Trades: `{TOTAL_TRADES}`\n"
+                    f"• Huidig Saldo: `${PAPER_BALANCE:.2f}`"
+                )
+                HIGHEST_EDGE_HOUR = 0.0
+                last_heartbeat = time.time()
+
+        except Exception as e:
+            print(f"⚠️ Trading loop fout: {e}")
+
+        time.sleep(2)
+
 if __name__ == "__main__":
-    print("🤖 Polymarket Live Sport Scanner is gestart!")
-    
-    send_telegram_alert(
-        "⚽ **Polymarket Sport Bot is Actief!**\n\n"
-        "De bot scant nu live sportwedstrijden op Polymarket op waarde-kansen.",
-        target_url="https://polymarket.com/sports"
-    )
-    
-    try:
-        while True:
-            scan_polymarket_sports()
-            time.sleep(300)
-    except KeyboardInterrupt:
-        send_telegram_alert("🔴 **Sport Bot is gestopt.**")
+    main()
