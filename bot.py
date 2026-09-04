@@ -2,7 +2,7 @@ import os
 import time
 import json
 import requests
-import traceback
+import datetime
 
 # ---------------------------------------------------------------------------
 # CONFIGURATIE (RAILWAY ENVIRONMENT VARIABLES)
@@ -13,14 +13,21 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 POLYMARKET_URL = "https://polymarket.com/crypto/5M"
 INZET_PER_TRADE = 10.0
-HIGHEST_EDGE_HOUR = 0.0
 DATA_FILE = "portfolio.json"
+
+# 🎯 DREMPELWAARDE (THRESHOLD): Verhoogd naar 0.25% voor alleen de sterkste signalen
+MIN_EDGE_THRESHOLD = 0.25 
+
+SYMBOLS = {
+    "BTC/USDT": "BTCUSDT",
+    "ETH/USDT": "ETHUSDT",
+    "SOL/USDT": "SOLUSDT"
+}
 
 # ---------------------------------------------------------------------------
 # PERSISTENTIE: DATA OPSLAAN EN INLADEN
 # ---------------------------------------------------------------------------
 def load_portfolio():
-    """ Laadt saldo en trades uit het bestand, of gebruikt standaardwaarden """
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r") as f:
@@ -31,14 +38,12 @@ def load_portfolio():
     return 1000.0, 0
 
 def save_portfolio(balance, total_trades):
-    """ Slaat de huidige stand direct op in portfolio.json """
     try:
         with open(DATA_FILE, "w") as f:
             json.dump({"balance": balance, "total_trades": total_trades}, f)
     except Exception as e:
         print(f"Fout bij opslaan portfolio: {e}")
 
-# Inladen bij opstarten
 PAPER_BALANCE, TOTAL_TRADES = load_portfolio()
 active_trade = None
 
@@ -78,20 +83,23 @@ def send_telegram_msg(message, button_url=None, button_text="🚀 ZET DIRECT IN 
         print(f"Telegram send error: {e}")
 
 # ---------------------------------------------------------------------------
-# BINANCE MARKET DATA
+# BINANCE MARKET DATA & EDGE BEREKENING
 # ---------------------------------------------------------------------------
-def get_binance_data():
+def get_binance_data(symbol_code):
     try:
-        url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=50"
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol_code}&interval=5m&limit=50"
         res = requests.get(url, timeout=5).json()
         
         closes = [float(c[4]) for c in res]
+        volumes = [float(c[5]) for c in res]
         live_price = closes[-1]
         
+        # EMAs
         ema5 = round(sum(closes[-5:]) / 5, 2)
         ema15 = round(sum(closes[-15:]) / 15, 2)
         ema50 = round(sum(closes[-50:]) / 50, 2)
         
+        # RSI
         gains = [max(0, closes[i] - closes[i-1]) for i in range(-14, 0)]
         losses = [max(0, closes[i-1] - closes[i]) for i in range(-14, 0)]
         avg_gain = sum(gains) / 14
@@ -99,29 +107,50 @@ def get_binance_data():
         rs = avg_gain / avg_loss
         rsi = round(100 - (100 / (1 + rs)), 1)
         
+        # Volume Check
+        avg_volume = sum(volumes[-10:-1]) / 9
+        current_volume = volumes[-1]
+        volume_ok = current_volume > (avg_volume * 1.1)
+        
+        # 📐 BEREKENING VAN DE EDGE (%)
+        # Berekend op basis van de afstand van EMA5 boven EMA15 en de RSI-sterkte
+        ema_spread_pct = ((ema5 - ema15) / ema15) * 100
+        rsi_bonus = max(0, (rsi - 60) * 0.01)
+        calculated_edge = round(ema_spread_pct + rsi_bonus, 2)
+        
         return {
             "price": live_price,
             "ema5": ema5,
             "ema15": ema15,
             "ema50": ema50,
-            "rsi": rsi
+            "rsi": rsi,
+            "volume_ok": volume_ok,
+            "edge": calculated_edge
         }, None
     except Exception as e:
         return None, str(e)
+
+def get_remaining_5m_time():
+    now = datetime.datetime.utcnow()
+    seconds_past_5m = (now.minute % 5) * 60 + now.second
+    remaining_seconds = 300 - seconds_past_5m
+    minutes = remaining_seconds // 60
+    secs = remaining_seconds % 60
+    return remaining_seconds, f"{minutes}m {secs}s"
 
 # ---------------------------------------------------------------------------
 # COMMAND HANDLER
 # ---------------------------------------------------------------------------
 def handle_command(text):
-    global PAPER_BALANCE, TOTAL_TRADES, HIGHEST_EDGE_HOUR
+    global PAPER_BALANCE, TOTAL_TRADES
     
     cmd = text.lower().strip()
     
     if "/start" in cmd:
         msg = (
             "🤖 **Nobelele's Poly Bot Is Actief!**\n\n"
-            "• Scant live Binance BTC/USDT data voor 5M kaarten.\n"
-            "• Controleert op 3/3 Confluentie Breakouts.\n"
+            f"• Scant **BTC**, **ETH** en **SOL** met een verhoogde threshold van **{MIN_EDGE_THRESHOLD}%**.\n"
+            "• Tijd-filter actief (> 2 min over in ronde).\n"
             "• Stuur `/portfolio` om je tussenstand te bekijken."
         )
         send_telegram_msg(msg)
@@ -131,8 +160,8 @@ def handle_command(text):
             "📊 **HUIDIGE PORTFOLIO STATUS**\n\n"
             f"• **Huidig Saldo:** `${PAPER_BALANCE:.2f}`\n"
             f"• **Totaal Trades:** `{TOTAL_TRADES}`\n"
-            f"• **Hoogst Gemeten Edge (uursgemiddelde):** `{HIGHEST_EDGE_HOUR * 100:.2f}%`\n"
-            f"• **Status:** Actief aan het scannen..."
+            f"• **Minimale Edge Threshold:** `{MIN_EDGE_THRESHOLD}%`\n"
+            f"• **Status:** Actief aan het scannen (BTC, ETH, SOL)..."
         )
         send_telegram_msg(msg)
 
@@ -140,20 +169,20 @@ def handle_command(text):
 # MAIN TRADING ENGINE
 # ---------------------------------------------------------------------------
 def main():
-    global HIGHEST_EDGE_HOUR, PAPER_BALANCE, TOTAL_TRADES, active_trade
-    print("🚀 Quant Bot gestart met persistent geheugen...")
+    global PAPER_BALANCE, TOTAL_TRADES, active_trade
+    print(f"🚀 Quant Bot gestart (Threshold: {MIN_EDGE_THRESHOLD}%)...")
     
     clear_telegram_webhooks()
     time.sleep(1)
     
-    send_telegram_msg(f"⚙️ **Poly Bot Live:** Onthoudt nu je portfolio historie! Huidig saldo: `${PAPER_BALANCE:.2f}` ({TOTAL_TRADES} trades executed).")
+    send_telegram_msg(f"⚙️ **Poly Bot Live:** Min. Edge Threshold verhoogd naar `{MIN_EDGE_THRESHOLD}%` voor hogere win-rate! Multi-asset & Tijd-filter actief.")
 
     last_update_id = 0
     last_heartbeat = time.time()
     last_scan_time = 0
 
     while True:
-        # 1. Telegram Command Listener
+        # 1. Telegram Listener
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
             params = {"offset": last_update_id + 1, "timeout": 2}
@@ -170,58 +199,73 @@ def main():
         except Exception as e:
             pass
 
-        # 2. Markt Analyse & Signaal Generatie (elke 15 sec)
+        # 2. Markt Analyse & Scanner (elke 15 sec)
         if time.time() - last_scan_time > 15:
             last_scan_time = time.time()
-            data, error = get_binance_data()
-            
-            if data and not active_trade:
-                price = data["price"]
-                ema5 = data["ema5"]
-                ema15 = data["ema15"]
-                ema50 = data["ema50"]
-                rsi = data["rsi"]
+            remaining_seconds, time_str = get_remaining_5m_time()
+
+            # Tijd-filter (> 2 min over) & Geen actieve trade
+            if remaining_seconds >= 120 and not active_trade:
                 
-                if ema5 > ema15 and rsi > 60 and price > ema50:
-                    direction = "UP"
+                for pair_name, symbol_code in SYMBOLS.items():
+                    data, error = get_binance_data(symbol_code)
                     
-                    signal_msg = (
-                        f"🚀 **HIGH CONFIDENCE BREAKOUT ({direction})**\n📈\n\n"
-                        f"Pair: BTC/USDT\n"
-                        f"Live Prijs: `${price:,.2f}` (Binance Feed)\n"
-                        f"Tijd over in ronde: ~1.4 minuten\n\n"
-                        f"Confluentie Check (3/3):\n"
-                        f"✅ 5M EMA Crossover: EMA 5 (${ema5:,.2f}) > EMA 15 (${ema15:,.2f})\n"
-                        f"✅ RSI (14): {rsi} (Sterk momentum)\n"
-                        f"✅ 15M Trend: Boven EMA 50 (${ema50:,.2f})\n\n"
-                        f"💡 **Actie:** Zet €5.00 of €10.00 in op '{direction}'"
-                    )
-                    send_telegram_msg(signal_msg, button_url=POLYMARKET_URL)
+                    if data:
+                        price = data["price"]
+                        ema5 = data["ema5"]
+                        ema15 = data["ema15"]
+                        ema50 = data["ema50"]
+                        rsi = data["rsi"]
+                        volume_ok = data["volume_ok"]
+                        edge = data["edge"]
 
-                    # Paper Trade Openen & Opslaan
-                    PAPER_BALANCE -= INZET_PER_TRADE
-                    TOTAL_TRADES += 1
-                    save_portfolio(PAPER_BALANCE, TOTAL_TRADES)
-                    
-                    active_trade = {
-                        "entry": price,
-                        "direction": direction,
-                        "start_time": time.time()
-                    }
+                        # 🎯 HOOFDVOORWAARDE: Confluentie + THRESHOLD CHECK (Minimaal 0.25%)
+                        if ema5 > ema15 and rsi > 60 and price > ema50 and volume_ok and edge >= MIN_EDGE_THRESHOLD:
+                            direction = "UP"
+                            
+                            signal_msg = (
+                                f"🚀 **HIGH CONFIDENCE BREAKOUT ({direction})**\n📈\n\n"
+                                f"Pair: {pair_name}\n"
+                                f"Gemeten Edge: `{edge}%` (Threshold: >{MIN_EDGE_THRESHOLD}%)\n"
+                                f"Live Prijs: `${price:,.2f}` (Binance Feed)\n"
+                                f"Tijd over in ronde: ~{time_str}\n\n"
+                                f"Confluentie Check (3/3):\n"
+                                f"✅ 5M EMA Crossover: EMA 5 (${ema5:,.2f}) > EMA 15 (${ema15:,.2f})\n"
+                                f"✅ RSI (14): {rsi} (Sterk momentum)\n"
+                                f"✅ 15M Trend: Boven EMA 50 (${ema50:,.2f})\n\n"
+                                f"💡 **Actie:** Zet €5.00 of €10.00 in op '{direction}'"
+                            )
+                            send_telegram_msg(signal_msg, button_url=POLYMARKET_URL)
 
-                    open_trade_msg = (
-                        f"📝 **PAPER TRADE GEOPEND (SIMULATIE)**\n🤖\n\n"
-                        f"Asset: BTC/USDT 5M\n"
-                        f"🎯 Richting: {direction}\n"
-                        f"💰 Virtuele Inzet: `${INZET_PER_TRADE:.2f}` @ Koers: `${price:,.2f}`\n"
-                        f"💵 Resterend Saldo: `${PAPER_BALANCE:.2f}`\n"
-                        f"⏱️ Verwachte Afloop: over ~5 minuten"
-                    )
-                    send_telegram_msg(open_trade_msg)
+                            # Paper Trade
+                            PAPER_BALANCE -= INZET_PER_TRADE
+                            TOTAL_TRADES += 1
+                            save_portfolio(PAPER_BALANCE, TOTAL_TRADES)
+                            
+                            active_trade = {
+                                "pair": pair_name,
+                                "symbol": symbol_code,
+                                "entry": price,
+                                "direction": direction,
+                                "start_time": time.time(),
+                                "duration": remaining_seconds
+                            }
 
-        # 3. Sluiten van geopende paper trade (na 5 minuten)
-        if active_trade and (time.time() - active_trade["start_time"] > 300):
-            current_data, _ = get_binance_data()
+                            open_trade_msg = (
+                                f"📝 **PAPER TRADE GEOPEND (SIMULATIE)**\n🤖\n\n"
+                                f"Asset: {pair_name} 5M\n"
+                                f"🎯 Richting: {direction}\n"
+                                f"📊 Gemeten Edge: `{edge}%`\n"
+                                f"💰 Virtuele Inzet: `${INZET_PER_TRADE:.2f}` @ Koers: `${price:,.2f}`\n"
+                                f"💵 Resterend Saldo: `${PAPER_BALANCE:.2f}`\n"
+                                f"⏱️ Verwachte Afloop: over ~{time_str}"
+                            )
+                            send_telegram_msg(open_trade_msg)
+                            break
+
+        # 3. Sluiten van geopende trade
+        if active_trade and (time.time() - active_trade["start_time"] >= active_trade["duration"]):
+            current_data, _ = get_binance_data(active_trade["symbol"])
             exit_price = current_data["price"] if current_data else active_trade["entry"]
             
             win = (exit_price > active_trade["entry"]) if active_trade["direction"] == "UP" else (exit_price < active_trade["entry"])
@@ -237,19 +281,18 @@ def main():
 
             result_msg = (
                 f"{result_header}\n\n"
-                f"Trade #{TOTAL_TRADES} ({active_trade['direction']})\n"
+                f"Trade #{TOTAL_TRADES} ({active_trade['pair']} - {active_trade['direction']})\n"
                 f"Entry: `${active_trade['entry']:,.2f}` ➔ Exit: `${exit_price:,.2f}`\n"
                 f"💰 Nieuw Saldo: `${PAPER_BALANCE:.2f}`"
             )
             send_telegram_msg(result_msg)
             active_trade = None
 
-        # 4. Uurlijkse Heartbeat Check
+        # 4. Heartbeat
         if time.time() - last_heartbeat > 3600:
             send_telegram_msg(
                 f"💗 **BOT HEARTBEAT CHECK**\n\n"
-                f"• Bot is online en scant elke 10s.\n"
-                f"• Hoogst gemeten Edge afgelopen uur: `{HIGHEST_EDGE_HOUR * 100:.2f}%`\n"
+                f"• Bot is online (Threshold: `{MIN_EDGE_THRESHOLD}%`).\n"
                 f"• Totaal Trades: `{TOTAL_TRADES}`\n"
                 f"• Huidig Saldo: `${PAPER_BALANCE:.2f}`"
             )
