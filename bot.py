@@ -5,7 +5,7 @@ import requests
 import datetime
 
 # —————————————————————————
-# CONFIGURATIE (STRENGERE AFSTELLING)
+# CONFIGURATIE (UITGEBREID MET EXTRA MUNTE)
 # —————————————————————————
 
 RAW_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
@@ -24,7 +24,7 @@ MIN_EDGE_THRESHOLD = float(os.environ.get("MIN_EDGE_THRESHOLD", "0.45"))
 RSI_UP_THRESHOLD = float(os.environ.get("RSI_UP_THRESHOLD", "54.0"))
 RSI_DOWN_THRESHOLD = float(os.environ.get("RSI_DOWN_THRESHOLD", "46.0"))
 
-# Alleen traden tussen 120s en 240s resterend in de 5M candle
+# Alleen traden tussen 120s en 250s resterend in de 5M candle
 MIN_TIME_REMAINING_SEC = int(os.environ.get("MIN_TIME_REMAINING_SEC", "120"))
 MAX_TIME_REMAINING_SEC = int(os.environ.get("MAX_TIME_REMAINING_SEC", "250"))
 
@@ -41,7 +41,19 @@ MACD_SIGNAL = 4
 BB_PERIOD = 20
 BB_STD_DEV = 2.0
 
-SYMBOLS_RAW = os.environ.get("SYMBOLS", "BTC/USDT:BTCUSDT,ETH/USDT:ETHUSDT,SOL/USDT:SOLUSDT")
+# Uitgebreide lijst met handelsparen (inclusief HYPE, BNB, XRP, ZEC, DOGE)
+DEFAULT_SYMBOLS = (
+    "BTC/USDT:BTCUSDT,"
+    "ETH/USDT:ETHUSDT,"
+    "SOL/USDT:SOLUSDT,"
+    "HYPE/USDT:HYPEUSDT,"
+    "BNB/USDT:BNBUSDT,"
+    "XRP/USDT:XRPUSDT,"
+    "ZEC/USDT:ZECUSDT,"
+    "DOGE/USDT:DOGEUSDT"
+)
+
+SYMBOLS_RAW = os.environ.get("SYMBOLS", DEFAULT_SYMBOLS)
 SYMBOLS = dict(pair.split(":") for pair in SYMBOLS_RAW.split(","))
 
 # —————————————————————————
@@ -107,6 +119,9 @@ def get_binance_data(symbol_code):
         url = f"https://api.binance.com/api/v3/klines?symbol={symbol_code}&interval=5m&limit=100"
         res = requests.get(url, timeout=5).json()
 
+        if not isinstance(res, list):
+            return None, "Geen geldige data van Binance"
+
         closes = [float(c[4]) for c in res]
         volumes = [float(c[5]) for c in res]
         live_price = closes[-1]
@@ -120,7 +135,7 @@ def get_binance_data(symbol_code):
         period = 14
         deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
         seed_gains = [max(0, d) for d in deltas[:period]]
-        seed_losses = [max(0, -d) for d in deltas[:period]]
+        seed_losses = [max(0, d) for d in deltas[:period]]
         avg_gain = sum(seed_gains) / period
         avg_loss = sum(seed_losses) / period
 
@@ -201,16 +216,18 @@ def get_remaining_5m_time():
 
 def main():
     global PAPER_BALANCE, TOTAL_TRADES, active_trades
-    print(f"🚀 Quant Bot gestart met verhoogde winst-drempel ({MIN_EDGE_THRESHOLD}%)...")
+    print(f"🚀 Quant Bot gestart voor {len(SYMBOLS)} munten met drempel ({MIN_EDGE_THRESHOLD}%)...")
 
     clear_telegram_webhooks()
     time.sleep(1)
 
+    munt_namen = ", ".join(SYMBOLS.keys())
     send_telegram_msg(
         f"⚙️ **Poly Bot Herstart:**\n"
+        f"• Actieve Munten ({len(SYMBOLS)}): `{munt_namen}`\n"
         f"• Min. Edge Drempel: `{MIN_EDGE_THRESHOLD}%`\n"
         f"• Eisen: **Minimaal 2 Indicatoren tegelijk**\n"
-        f"• Huidig Saldo: `${PAPER_BALANCE:.2f}`"
+        f"• Saldo: `${PAPER_BALANCE:.2f}`"
     )
 
     last_scan_time = 0
@@ -220,7 +237,6 @@ def main():
             last_scan_time = time.time()
             remaining_seconds, time_str = get_remaining_5m_time()
 
-            # Alleen scannen in het juiste tijdsvenster
             if MIN_TIME_REMAINING_SEC <= remaining_seconds <= MAX_TIME_REMAINING_SEC:
                 for pair_name, symbol_code in SYMBOLS.items():
                     if pair_name in active_trades:
@@ -260,7 +276,7 @@ def main():
                             direction = "DOWN"
                             sources = down_sources
 
-                        # STRENGERE EIS: Er MOETEN minstens 2 bronnen zijn (bijv. MACD + EMA/RSI)!
+                        # STRENGERE EIS: Er MOETEN minstens 2 bronnen zijn
                         is_strong_confluence = len(sources) >= 2
                         passes_threshold = is_strong_confluence and (edge >= MIN_EDGE_THRESHOLD)
 
@@ -273,7 +289,7 @@ def main():
                                 f"Pair: {pair_name}\n"
                                 f"Bron(nen): `{sources_str}`\n"
                                 f"Gemeten Edge: `{edge}%` (Filter: >{MIN_EDGE_THRESHOLD}%)\n"
-                                f"Koers: `${price:,.2f}`\n"
+                                f"Koers: `${price:,.4f}`\n"
                                 f"Tijd in ronde: ~{time_str}\n\n"
                                 f"💡 **Inzet-advies:** Zet in op Polymarket op '{direction}'"
                             )
@@ -311,7 +327,7 @@ def main():
             send_telegram_msg(
                 f"{res_txt}\n\n"
                 f"Trade #{TOTAL_TRADES} ({trade['pair']} - {trade['direction']})\n"
-                f"Entry: `${trade['entry']:,.2f}` ➔ Exit: `${exit_price:,.2f}`\n"
+                f"Entry: `${trade['entry']:,.4f}` ➔ Exit: `${exit_price:,.4f}`\n"
                 f"Nieuw Saldo: `${PAPER_BALANCE:.2f}`"
             )
             del active_trades[pair_name]
