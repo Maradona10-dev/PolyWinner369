@@ -5,7 +5,7 @@ import requests
 import datetime
 
 # —————————————————————————
-# CONFIGURATIE (UITGEBREID MET EXTRA MUNTE)
+# CONFIGURATIE (2-MINUTEN EXPIRY MOMENTUM STRATEGIE)
 # —————————————————————————
 
 RAW_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
@@ -17,31 +17,24 @@ POLYMARKET_URL = os.environ.get('POLYMARKET_URL', 'https://polymarket.com/crypto
 INZET_PER_TRADE = float(os.environ.get("INZET_PER_TRADE", "10.0"))
 STARTING_BALANCE = float(os.environ.get("STARTING_BALANCE", "1000.0"))
 
-# Vaste harde drempel: minimaal 0.45% edge vereist
-MIN_EDGE_THRESHOLD = float(os.environ.get("MIN_EDGE_THRESHOLD", "0.45"))
+# Minimale uitslag in % in de huidige candle (0.12% komt bij BTC overeen met ~$95)
+MIN_CANDLE_MOVE_PCT = float(os.environ.get("MIN_CANDLE_MOVE_PCT", "0.12"))
 
-# RSI drempels voor momentum
-RSI_UP_THRESHOLD = float(os.environ.get("RSI_UP_THRESHOLD", "54.0"))
-RSI_DOWN_THRESHOLD = float(os.environ.get("RSI_DOWN_THRESHOLD", "46.0"))
+# RSI drempels voor momentum bevestiging
+RSI_UP_THRESHOLD = 52.0
+RSI_DOWN_THRESHOLD = 48.0
 
-# Alleen traden tussen 120s en 250s resterend in de 5M candle
-MIN_TIME_REMAINING_SEC = int(os.environ.get("MIN_TIME_REMAINING_SEC", "120"))
-MAX_TIME_REMAINING_SEC = int(os.environ.get("MAX_TIME_REMAINING_SEC", "250"))
+# Vaste window: Instappen rond 2 minuten voor expiry (tussen 100s en 135s resterend)
+MIN_TIME_REMAINING_SEC = 100
+MAX_TIME_REMAINING_SEC = 135
 
-SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", "15"))
-PAYOUT_MULTIPLIER = float(os.environ.get("PAYOUT_MULTIPLIER", "1.85"))
-VOLUME_MULTIPLIER = float(os.environ.get("VOLUME_MULTIPLIER", "1.25"))
+SCAN_INTERVAL_SEC = 10
+PAYOUT_MULTIPLIER = 1.85
+VOLUME_MULTIPLIER = 1.20
 
 DATA_FILE = os.environ.get("DATA_FILE", "portfolio.json")
 
-# MACD & BB Instellingen
-MACD_FAST = 6
-MACD_SLOW = 13
-MACD_SIGNAL = 4
-BB_PERIOD = 20
-BB_STD_DEV = 2.0
-
-# Uitgebreide lijst met handelsparen (inclusief HYPE, BNB, XRP, ZEC, DOGE)
+# Uitgebreide lijst met handelsparen
 DEFAULT_SYMBOLS = (
     "BTC/USDT:BTCUSDT,"
     "ETH/USDT:ETHUSDT,"
@@ -57,7 +50,7 @@ SYMBOLS_RAW = os.environ.get("SYMBOLS", DEFAULT_SYMBOLS)
 SYMBOLS = dict(pair.split(":") for pair in SYMBOLS_RAW.split(","))
 
 # —————————————————————————
-# PERSISTENTIE & HELPER FUNCTIONS
+# HELPER UTILITIES
 # —————————————————————————
 
 def load_portfolio():
@@ -105,99 +98,54 @@ def send_telegram_msg(message, button_url=None):
     except Exception as e:
         print(f"Telegram error: {e}")
 
-def calculate_ema_series(values, period):
-    if len(values) < period:
-        return []
-    multiplier = 2 / (period + 1)
-    ema_series = [sum(values[:period]) / period]
-    for price in values[period:]:
-        ema_series.append((price - ema_series[-1]) * multiplier + ema_series[-1])
-    return ema_series
-
-def get_binance_data(symbol_code):
+def get_binance_candle_data(symbol_code):
     try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol_code}&interval=5m&limit=100"
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol_code}&interval=5m&limit=50"
         res = requests.get(url, timeout=5).json()
 
-        if not isinstance(res, list):
+        if not isinstance(res, list) or len(res) < 15:
             return None, "Geen geldige data van Binance"
 
+        # Huidige actieve 5M candle
+        current_candle = res[-1]
+        open_price = float(current_candle[1])
+        live_price = float(current_candle[4])
+        current_volume = float(current_candle[5])
+
+        # Bereken de koersuitslag in de huidige candle in %
+        price_move_pct = ((live_price - open_price) / open_price) * 100
+        abs_dollar_move = abs(live_price - open_price)
+
+        # Historische data voor indicatoren
         closes = [float(c[4]) for c in res]
         volumes = [float(c[5]) for c in res]
-        live_price = closes[-1]
 
         # EMAs
-        ema5 = round(sum(closes[-5:]) / 5, 2)
-        ema15 = round(sum(closes[-15:]) / 15, 2)
-        ema50 = round(sum(closes[-50:]) / 50, 2)
+        ema5 = sum(closes[-5:]) / 5
+        ema15 = sum(closes[-15:]) / 15
 
-        # RSI (Wilder's Smoothing)
+        # RSI
         period = 14
         deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-        seed_gains = [max(0, d) for d in deltas[:period]]
-        seed_losses = [max(0, d) for d in deltas[:period]]
-        avg_gain = sum(seed_gains) / period
-        avg_loss = sum(seed_losses) / period
+        gains = [max(0, d) for d in deltas[-period:]]
+        losses = [max(0, -d) for d in deltas[-period:]]
+        avg_gain = sum(gains) / period
+        avg_loss = sum(losses) / period or 1e-9
+        rsi = 100 - (100 / (1 + (avg_gain / avg_loss)))
 
-        for d in deltas[period:]:
-            gain = max(0, d)
-            loss = max(0, -d)
-            avg_gain = (avg_gain * (period - 1) + gain) / period
-            avg_loss = (avg_loss * (period - 1) + loss) / period
-
-        avg_loss = avg_loss or 1e-9
-        rsi = round(100 - (100 / (1 + (avg_gain / avg_loss))), 1)
-
-        # Volume Check
+        # Volume
         avg_volume = sum(volumes[-10:-1]) / 9
-        current_volume = volumes[-1]
         volume_ok = current_volume > (avg_volume * VOLUME_MULTIPLIER)
-
-        # Berekende Edge
-        ema_spread_pct = ((ema5 - ema15) / ema15) * 100
-        rsi_bonus = max(0, (rsi - 50) * 0.015) if ema_spread_pct >= 0 else max(0, (50 - rsi) * 0.015)
-        calculated_edge = round(abs(ema_spread_pct) + rsi_bonus, 2)
-
-        # MACD
-        macd_signal_cross = None
-        ema_fast_series = calculate_ema_series(closes, MACD_FAST)
-        ema_slow_series = calculate_ema_series(closes, MACD_SLOW)
-
-        if len(ema_fast_series) > 1 and len(ema_slow_series) > 1:
-            offset = len(ema_fast_series) - len(ema_slow_series)
-            aligned_fast = ema_fast_series[offset:] if offset > 0 else ema_fast_series
-            aligned_slow = ema_slow_series[-offset:] if offset < 0 else ema_slow_series
-            macd_line = [f - s for f, s in zip(aligned_fast, aligned_slow)]
-
-            signal_line_series = calculate_ema_series(macd_line, MACD_SIGNAL)
-            if len(signal_line_series) >= 2 and len(macd_line) >= len(signal_line_series):
-                if macd_line[-2] <= signal_line_series[-2] and macd_line[-1] > signal_line_series[-1]:
-                    macd_signal_cross = "UP"
-                elif macd_line[-2] >= signal_line_series[-2] and macd_line[-1] < signal_line_series[-1]:
-                    macd_signal_cross = "DOWN"
-
-        # Bollinger Bands
-        bb_signal = None
-        if len(closes) >= BB_PERIOD:
-            bb_window = closes[-BB_PERIOD:]
-            bb_mid = sum(bb_window) / BB_PERIOD
-            variance = sum((c - bb_mid) ** 2 for c in bb_window) / BB_PERIOD
-            bb_std = variance ** 0.5
-            if live_price > (bb_mid + (BB_STD_DEV * bb_std)) and volume_ok:
-                bb_signal = "UP"
-            elif live_price < (bb_mid - (BB_STD_DEV * bb_std)) and volume_ok:
-                bb_signal = "DOWN"
 
         return {
             "price": live_price,
+            "open_price": open_price,
+            "dollar_move": abs_dollar_move,
+            "move_pct": price_move_pct,
             "ema5": ema5,
             "ema15": ema15,
-            "ema50": ema50,
             "rsi": rsi,
-            "volume_ok": volume_ok,
-            "edge": calculated_edge,
-            "macd_signal_cross": macd_signal_cross,
-            "bb_signal": bb_signal,
+            "volume_ok": volume_ok
         }, None
     except Exception as e:
         return None, str(e)
@@ -216,18 +164,18 @@ def get_remaining_5m_time():
 
 def main():
     global PAPER_BALANCE, TOTAL_TRADES, active_trades
-    print(f"🚀 Quant Bot gestart voor {len(SYMBOLS)} munten met drempel ({MIN_EDGE_THRESHOLD}%)...")
+    print(f"🚀 2-Minuten Expiry Momentum Bot Gestart voor {len(SYMBOLS)} munten...")
 
     clear_telegram_webhooks()
     time.sleep(1)
 
     munt_namen = ", ".join(SYMBOLS.keys())
     send_telegram_msg(
-        f"⚙️ **Poly Bot Herstart:**\n"
-        f"• Actieve Munten ({len(SYMBOLS)}): `{munt_namen}`\n"
-        f"• Min. Edge Drempel: `{MIN_EDGE_THRESHOLD}%`\n"
-        f"• Eisen: **Minimaal 2 Indicatoren tegelijk**\n"
-        f"• Saldo: `${PAPER_BALANCE:.2f}`"
+        f"⚡ **2-Minuten Expiry Momentum Bot Actief**\n"
+        f"• Munten ({len(SYMBOLS)}): `{munt_namen}`\n"
+        f"• Entry Window: **~2m voor expiry**\n"
+        f"• Min. Interval Move: `{MIN_CANDLE_MOVE_PCT}%`\n"
+        f"• Huidig Saldo: `${PAPER_BALANCE:.2f}`"
     )
 
     last_scan_time = 0
@@ -237,61 +185,45 @@ def main():
             last_scan_time = time.time()
             remaining_seconds, time_str = get_remaining_5m_time()
 
+            # EXACT WINDOW: Alleen scannen wanneer er rond de 2 minuten over zijn (100s - 135s)
             if MIN_TIME_REMAINING_SEC <= remaining_seconds <= MAX_TIME_REMAINING_SEC:
                 for pair_name, symbol_code in SYMBOLS.items():
                     if pair_name in active_trades:
                         continue
 
-                    data, _ = get_binance_data(symbol_code)
+                    data, _ = get_binance_candle_data(symbol_code)
                     if data:
                         price = data["price"]
+                        move_pct = data["move_pct"]
+                        dollar_move = data["dollar_move"]
                         ema5 = data["ema5"]
                         ema15 = data["ema15"]
-                        ema50 = data["ema50"]
                         rsi = data["rsi"]
                         volume_ok = data["volume_ok"]
-                        edge = data["edge"]
-                        macd_cross = data["macd_signal_cross"]
-                        bb_signal = data["bb_signal"]
 
-                        # 1. EMA Trend & RSI Confluentie
-                        ema_rsi_up = ema5 > ema15 and rsi > RSI_UP_THRESHOLD and price > ema50 and volume_ok
-                        ema_rsi_down = ema5 < ema15 and rsi < RSI_DOWN_THRESHOLD and price < ema50 and volume_ok
+                        # Voorwaarde 1: Voldoende koersuitslag in de huidige 5M ronde
+                        has_enough_movement = abs(move_pct) >= MIN_CANDLE_MOVE_PCT
 
-                        up_sources = []
-                        down_sources = []
-                        if ema_rsi_up: up_sources.append("EMA/RSI")
-                        if ema_rsi_down: down_sources.append("EMA/RSI")
-                        if macd_cross == "UP" and price > ema50: up_sources.append("MACD")
-                        elif macd_cross == "DOWN" and price < ema50: down_sources.append("MACD")
-                        if bb_signal == "UP" and price > ema50: up_sources.append("Bollinger")
-                        elif bb_signal == "DOWN" and price < ema50: down_sources.append("Bollinger")
+                        # Voorwaarde 2: Momentum in de richting van de uitslag
+                        is_up_momentum = (move_pct > 0) and (ema5 > ema15) and (rsi > RSI_UP_THRESHOLD)
+                        is_down_momentum = (move_pct < 0) and (ema5 < ema15) and (rsi < RSI_DOWN_THRESHOLD)
 
                         direction = None
-                        sources = []
-                        if up_sources and not down_sources:
+                        if has_enough_movement and is_up_momentum and volume_ok:
                             direction = "UP"
-                            sources = up_sources
-                        elif down_sources and not up_sources:
+                        elif has_enough_movement and is_down_momentum and volume_ok:
                             direction = "DOWN"
-                            sources = down_sources
 
-                        # STRENGERE EIS: Er MOETEN minstens 2 bronnen zijn
-                        is_strong_confluence = len(sources) >= 2
-                        passes_threshold = is_strong_confluence and (edge >= MIN_EDGE_THRESHOLD)
-
-                        if passes_threshold:
-                            sources_str = " + ".join(sources)
+                        if direction:
                             emoji = "📈" if direction == "UP" else "📉"
-
                             signal_msg = (
-                                f"🚀 **GEVALIDERD HIGH-CONFIDENCE SIGNAAL ({direction})**\n{emoji}\n"
+                                f"🎯 **2M EXPIRY MOMENTUM SIGNAAL ({direction})**\n{emoji}\n"
                                 f"Pair: {pair_name}\n"
-                                f"Bron(nen): `{sources_str}`\n"
-                                f"Gemeten Edge: `{edge}%` (Filter: >{MIN_EDGE_THRESHOLD}%)\n"
-                                f"Koers: `${price:,.4f}`\n"
-                                f"Tijd in ronde: ~{time_str}\n\n"
-                                f"💡 **Inzet-advies:** Zet in op Polymarket op '{direction}'"
+                                f"Beweging in ronde: `{move_pct:+.2f}%` (${dollar_move:,.2f})\n"
+                                f"Huidige Koers: `${price:,.4f}`\n"
+                                f"RSI: `{rsi:.1f}` | Vol: `OK`\n"
+                                f"Tijd resterend: ~{time_str}\n\n"
+                                f"💡 **Advies:** Volg het momentum in op Polymarket ('{direction}')"
                             )
                             send_telegram_msg(signal_msg, button_url=POLYMARKET_URL)
 
@@ -308,11 +240,11 @@ def main():
                                 "duration": remaining_seconds,
                             }
 
-        # Afhandelen geopende trades
+        # Afhandelen geopende trades bij expiry
         finished_pairs = [p for p, t in active_trades.items() if time.time() - t["start_time"] >= t["duration"]]
         for pair_name in finished_pairs:
             trade = active_trades[pair_name]
-            current_data, _ = get_binance_data(trade["symbol"])
+            current_data, _ = get_binance_candle_data(trade["symbol"])
             exit_price = current_data["price"] if current_data else trade["entry"]
 
             win = (exit_price > trade["entry"]) if trade["direction"] == "UP" else (exit_price < trade["entry"])
