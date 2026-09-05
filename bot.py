@@ -6,32 +6,15 @@ import datetime
 
 # —————————————————————————
 
-# ENV VAR NAMEN (uit veiligheid hier als losse constantes, met chr(34) i.p.v.
-
-# losse “ tekens – dit voorkomt dat een toetsenbord/app met “slimme
-
-# aanhalingstekens” deze regels per ongeluk breekt bij kopieren/plakken)
-
-# —————————————————————————
-
-_Q = chr(34)  # het rechte “ teken, opgebouwd via zijn Unicode-code (34 = “)
-
-def _env(name, default=””):
-“”“Haalt een environment variable op via os.environ, zonder dat er een
-losse “ in de aanroep zelf hoeft te staan op de plek waar dat crasht.”””
-return os.environ.get(name, default)
-
-# —————————————————————————
-
 # CONFIGURATIE (RAILWAY ENVIRONMENT VARIABLES)
 
 # —————————————————————————
 
-RAW_TOKEN = _env(‘TELEGRAM_BOT_TOKEN’).strip()
+RAW_TOKEN = os.environ.get(‘TELEGRAM_BOT_TOKEN’, ‘’).strip()
 TELEGRAM_BOT_TOKEN = RAW_TOKEN.replace(‘bot’, ‘’, 1) if RAW_TOKEN.startswith(‘bot’) else RAW_TOKEN
-TELEGRAM_CHAT_ID = _env(‘TELEGRAM_CHAT_ID’).strip()
+TELEGRAM_CHAT_ID = os.environ.get(‘TELEGRAM_CHAT_ID’, ‘’).strip()
 
-POLYMARKET_URL = _env(‘POLYMARKET_URL’, ‘https://polymarket.com/crypto/5M’)
+POLYMARKET_URL = os.environ.get(‘POLYMARKET_URL’, ‘https://polymarket.com/crypto/5M’)
 
 # — Trading parameters (allemaal instelbaar via env vars) —
 
