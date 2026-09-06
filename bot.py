@@ -114,7 +114,7 @@ def check_orderbook_imbalance(symbol):
         return "NEUTRAL"
 
 # —————————————————————————
-# DUBBELE TIMING & STRATEGIE MARKTANALYSE
+# FINE-TUNED STRATEGIE MARKTANALYSE
 # —————————————————————————
 
 def analyze_market_and_get_signal(symbol, rsi, percent_change, time_remaining_sec):
@@ -124,29 +124,30 @@ def analyze_market_and_get_signal(symbol, rsi, percent_change, time_remaining_se
     # FASE 1: VROEG MOMENTUM (3:30m tot 5:00m te gaan / 210s - 300s)
     # -------------------------------------------------------------
     if 210 <= time_remaining_sec <= 300:
-        if 52 <= rsi <= 68 and percent_change >= 0.25 and ob_status == "BULLISH":
-            reason = "🚀 Fase 1 (3:30-5m): Vroeg Bullish Momentum + Koopmuur!"
+        if 52 <= rsi <= 68 and percent_change >= 0.30 and ob_status == "BULLISH":
+            reason = "🚀 Fase 1: Vroeg Bullish Momentum (+0.30% move) + Koopmuur!"
             return "UP", "MOMENTUM", reason
 
-        elif 32 <= rsi <= 48 and percent_change <= -0.25 and ob_status == "BEARISH":
-            reason = "🚀 Fase 1 (3:30-5m): Vroeg Bearish Momentum + Verkoopmuur!"
+        elif 32 <= rsi <= 48 and percent_change <= -0.30 and ob_status == "BEARISH":
+            reason = "🚀 Fase 1: Vroeg Bearish Momentum (-0.30% move) + Verkoopmuur!"
             return "DOWN", "MOMENTUM", reason
 
     # -------------------------------------------------------------
-    # FASE 2: PULLBACK / REVERSION (1:00m tot 3:30m te gaan / 60s - 210s)
+    # FASE 2: PULLBACK / REVERSION (1:00m tot 2:30m te gaan / 60s - 150s)
+    # Alleen bij EXTREME pieken (RSI >= 78 of <= 22) en sterke move
     # -------------------------------------------------------------
-    elif 60 <= time_remaining_sec < 210:
-        # Overbought piek -> Verwachte pullback omlaag
-        if rsi >= 70 and percent_change >= 0.15:
-            reason = f"🔄 Fase 2 (Laatste min): Overbought Piek (RSI {rsi}) -> Trade Pullback DOWN!"
+    elif 60 <= time_remaining_sec <= 150:
+        # Extreme Overbought piek -> Verwachte pullback omlaag
+        if rsi >= 78 and percent_change >= 0.30:
+            reason = f"🔄 Fase 2: Extreme Piek (RSI {rsi} >= 78 & Move {percent_change}%) -> Trade Pullback DOWN!"
             return "DOWN", "PULLBACK", reason
 
-        # Oversold dip -> Verwachte bounce omhoog
-        elif rsi <= 30 and percent_change <= -0.15:
-            reason = f"🔄 Fase 2 (Laatste min): Oversold Dip (RSI {rsi}) -> Trade Bounce UP!"
+        # Extreme Oversold dip -> Verwachte bounce omhoog
+        elif rsi <= 22 and percent_change <= -0.30:
+            reason = f"🔄 Fase 2: Extreme Dip (RSI {rsi} <= 22 & Move {percent_change}%) -> Trade Bounce UP!"
             return "UP", "PULLBACK", reason
 
-    return None, None, "Geen geschikt signaal in deze fase"
+    return None, None, "Geen geschikt signaal (geen extreme piek/dip of verkeerde fase)"
 
 # —————————————————————————
 # BINANCE DATA OPHALEN
@@ -221,11 +222,11 @@ def check_and_evaluate_paper_trades():
 # —————————————————————————
 
 def main():
-    print("🤖 Poly Bot (Gefaseerde Timing & Paper Trading) Gestart...")
+    print("🤖 Poly Bot (Fine-Tuned Strategy & Paper Trading) Gestart...")
     send_telegram_msg(
-        f"🤖 **Poly Bot Online & Paper Trading Actief!**\n"
+        f"🤖 **Poly Bot Online & Fine-Tuned!**\n"
         f"💰 Start Saldo: `${PAPER_BALANCE:.2f}` | Inzet per Trade: `${TRADE_AMOUNT:.2f}`\n"
-        f"⏱️ **Fase 1 (3:30-5m):** Momentum | **Fase 2 (1-3:30m):** Pullback/Bounce"
+        f"🎯 **Strictere Pullback Regels:** RSI >= 78 / <= 22 | Move >= 0.30%"
     )
 
     while True:
