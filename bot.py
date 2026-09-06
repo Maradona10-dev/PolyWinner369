@@ -17,8 +17,13 @@ SCAN_INTERVAL_SEC = 10  # Hoe vaak de bot de markt scant (in seconden)
 # Te scannen handelsparen
 PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ZECUSDT"]
 
-# Status van geopende trades om dubbele signalen te voorkomen
-active_trades = {}
+# —————————————————————————
+# PAPER TRADING INSTELLINGEN
+# —————————————————————————
+PAPER_BALANCE = 1000.0  # Startkapitaal in USD
+TRADE_AMOUNT = 25.0     # Inzet per virtuele trade in USD
+active_paper_trades = []
+active_signals_sent = {}
 
 # —————————————————————————
 # TELEGRAM BERICHTEN STUREN
@@ -44,7 +49,7 @@ def send_telegram_msg(message, button_url=None):
         if not res.get("ok"):
             print(f"❌ Telegram API Fout: {res}")
         else:
-            print("✅ Telegram signaal verzonden!")
+            print("✅ Telegram bericht verzonden!")
     except Exception as e:
         print(f"❌ Fout bij versturen Telegram: {e}")
 
@@ -86,38 +91,23 @@ def calculate_rsi(prices, period=14):
 # —————————————————————————
 
 def analyze_market_and_get_signal(symbol, rsi, percent_change, time_remaining_sec):
-    """
-    Analyseert de markt met de gecombineerde strategie:
-    - Minimale tijd op klok: 3 min 30 sec (210s) tot 5 min (300s)
-    - Stap 1: Gezond Momentum (RSI 52-68 / 32-48)
-    - Stap 2: Pullback / Mean Reversion (RSI >= 75 / <= 25)
-    """
-    
-    # 0. Tijdsfilter: Alleen instappen als er ruim genoeg tijd is (3:30 tot 5:00 min)
+    # 0. Tijdsfilter: Alleen instappen tussen 3:30 (210s) en 5:00 min (300s)
     if time_remaining_sec < 210 or time_remaining_sec > 300:
-        return None, None, "Tijd niet in scope (enkel 3:30m - 5:00m te gaan)"
+        return None, None, "Tijd niet in scope"
 
-    # -------------------------------------------------------------
-    # STAP 1: GEZOND MOMENTUM (Vroeg in de trend instappen)
-    # -------------------------------------------------------------
+    # STAP 1: GEZOND MOMENTUM (Vroeg in de trend)
     if 52 <= rsi <= 68 and percent_change >= 0.25:
-        reason = "🎯 Stap 1: Gezond Bullish Momentum (Beginnende stijging)"
-        return "UP", "MOMENTUM", reason
+        return "UP", "MOMENTUM", "🎯 Stap 1: Gezond Bullish Momentum (Beginnende stijging)"
 
     elif 32 <= rsi <= 48 and percent_change <= -0.25:
-        reason = "🎯 Stap 1: Gezond Bearish Momentum (Beginnende daling)"
-        return "DOWN", "MOMENTUM", reason
+        return "DOWN", "MOMENTUM", "🎯 Stap 1: Gezond Bearish Momentum (Beginnende daling)"
 
-    # -------------------------------------------------------------
-    # STAP 2: PULLBACK / REVERSION (Extremen traden op de top/dal)
-    # -------------------------------------------------------------
+    # STAP 2: PULLBACK / REVERSION (Extremen op de top/dal)
     elif rsi >= 75 and percent_change >= 0.20:
-        reason = "🔄 Stap 2: Overbought Piek (RSI >= 75) -> Verwachte Pullback DOWN"
-        return "DOWN", "PULLBACK", reason
+        return "DOWN", "PULLBACK", "🔄 Stap 2: Overbought Piek (RSI >= 75) -> Verwachte Pullback DOWN"
 
     elif rsi <= 25 and percent_change <= -0.20:
-        reason = "🔄 Stap 2: Oversold Dip (RSI <= 25) -> Verwachte Bounce UP"
-        return "UP", "PULLBACK", reason
+        return "UP", "PULLBACK", "🔄 Stap 2: Oversold Dip (RSI <= 25) -> Verwachte Bounce UP"
 
     return None, None, "Geen sterk signaal gedetecteerd"
 
@@ -127,13 +117,12 @@ def analyze_market_and_get_signal(symbol, rsi, percent_change, time_remaining_se
 
 def fetch_binance_data(symbol):
     try:
-        # Haal 1m klines op voor RSI en prijsverandering
         url = f"{BINANCE_API_URL}/klines?symbol={symbol}&interval=1m&limit=30"
         res = requests.get(url, timeout=5).json()
 
         close_prices = [float(k[4]) for k in res]
         current_price = close_prices[-1]
-        start_price = close_prices[-5]  # Prijs van 5 minuten geleden
+        start_price = close_prices[-5]
 
         percent_change = round(((current_price - start_price) / start_price) * 100, 2)
         rsi = calculate_rsi(close_prices)
@@ -144,44 +133,78 @@ def fetch_binance_data(symbol):
         return None, None, None
 
 # —————————————————————————
-# BERICHT OPBOUW & TELEGRAM TRIGGER
+# PAPER TRADING EVALUATIE ENGINE
 # —————————————————————————
 
-def format_signal_message(symbol, signal, strat_type, current_price, percent_change, rsi, time_remaining_sec, reason):
-    mins = int(time_remaining_sec // 60)
-    secs = int(time_remaining_sec % 60)
-    time_str = f"~{mins}m {secs}s"
+def check_and_evaluate_paper_trades():
+    global PAPER_BALANCE, active_paper_trades
+    now_ts = time.time()
+    remaining_trades = []
 
-    direction_icon = "📈" if signal == "UP" else "📉"
-    type_badge = "🔥 MOMENTUM SIGNAAL" if strat_type == "MOMENTUM" else "🔄 PULLBACK / REVERSION SIGNAAL"
+    for trade in active_paper_trades:
+        # Als de gekozen expiry-tijd voorbij is, sluit de paper trade
+        if now_ts >= trade["expiry_time"]:
+            current_price, _, _ = fetch_binance_data(trade["symbol"])
+            if current_price is None:
+                remaining_trades.append(trade)
+                continue
 
-    msg = (
-        f"🚨 **5M EXPIRY {type_badge}!** {direction_icon}\n\n"
-        f"📍 **Pair:** {symbol}\n"
-        f"📊 **RSI:** `{rsi}` | **3-5M Move:** `{percent_change}%`\n"
-        f"💵 **Huidige Koers:** `${current_price}`\n"
-        f"⏱️ **Resterende Tijd:** `{time_str}`\n\n"
-        f"💡 **Strategie Advies:**\n"
-        f"• {reason}\n"
-        f"👉 **Richting op Polymarket:** **{signal}**"
-    )
-    return msg
+            entry_price = trade["entry_price"]
+            signal = trade["signal"]
+            
+            # Evalueer Win / Loss
+            is_win = False
+            if signal == "UP" and current_price > entry_price:
+                is_win = True
+            elif signal == "DOWN" and current_price < entry_price:
+                is_win = True
+
+            # Saldo bijwerken (Winst uitbetaling ~ 85% rendement, Verlies = inzet kwijt)
+            if is_win:
+                profit = TRADE_AMOUNT * 0.85
+                PAPER_BALANCE += profit
+                badge = f"✅ **PAPER TRADE GEWONNEN!** (+${profit:.2f})"
+            else:
+                PAPER_BALANCE -= TRADE_AMOUNT
+                badge = f"❌ **PAPER TRADE VERLOREN** (-${TRADE_AMOUNT:.2f})"
+
+            # Resultaatbericht versturen
+            msg = (
+                f"{badge}\n\n"
+                f"📍 **Pair:** {trade['symbol']} ({signal})\n"
+                f"🎯 **Type:** {trade['strat_type']}\n"
+                f"💵 **Entry Price:** `${entry_price}` ➔ **Exit Price:** `${current_price}`\n"
+                f"💰 **Nieuw Paper Saldo:** `${PAPER_BALANCE:.2f}`"
+            )
+            send_telegram_msg(msg)
+            print(f"Paper trade afgerond voor {trade['symbol']}: {'WIN' if is_win else 'LOSS'}")
+        else:
+            remaining_trades.append(trade)
+
+    active_paper_trades = remaining_trades
 
 # —————————————————————————
 # MAIN BOT LOOP
 # —————————————————————————
 
 def main():
-    print("🤖 Nobeulele's Poly Bot (Dubbele Strategie: Momentum + Pullback) Gestart...")
-    send_telegram_msg("🤖 **Poly Bot Online**\nGestart met Momentum + Pullback strategie op de 3:30-5:00M timeframes!")
+    print("🤖 Nobeulele's Poly Bot (Met Paper Trading Simulator) Gestart...")
+    send_telegram_msg(
+        f"🤖 **Poly Bot Online & Paper Trading Actief!**\n"
+        f"💰 Start Saldo: `${PAPER_BALANCE:.2f}` | Inzet per Trade: `${TRADE_AMOUNT:.2f}`\n"
+        f"📊 Strategie: Momentum + Pullback op 3:30-5:00M timeframes."
+    )
 
     while True:
         try:
-            # Bereken waar we zitten in de 5-minuten cyclus
             now_sec = time.time()
-            time_in_5m_cycle = now_sec % 300  # 300 sec = 5 min
+            time_in_5m_cycle = now_sec % 300
             time_remaining_sec = 300 - time_in_5m_cycle
 
+            # 1. Controleer geopende paper trades op uitslag
+            check_and_evaluate_paper_trades()
+
+            # 2. Scaam de markt voor nieuwe signalen
             for symbol in PAIRS:
                 price, pct_change, rsi = fetch_binance_data(symbol)
 
@@ -193,27 +216,51 @@ def main():
                 )
 
                 if signal:
-                    # Voorkom dat hetzelfde signaal dubbel wordt gestuurd binnen dezelfde ronde
                     cycle_id = int(now_sec // 300)
                     trade_key = f"{symbol}_{cycle_id}"
 
-                    if trade_key not in active_trades:
-                        active_trades[trade_key] = True
+                    if trade_key not in active_signals_sent:
+                        active_signals_sent[trade_key] = True
 
-                        polymarket_url = "https://polymarket.com"
-                        msg = format_signal_message(
-                            symbol, signal, strat_type, price, pct_change, rsi, time_remaining_sec, reason
+                        # Open Virtuele Trade
+                        expiry_time = now_sec + time_remaining_sec
+                        active_paper_trades.append({
+                            "symbol": symbol,
+                            "signal": signal,
+                            "strat_type": strat_type,
+                            "entry_price": price,
+                            "expiry_time": expiry_time
+                        })
+
+                        # Signaal Bericht Opbouwen
+                        mins = int(time_remaining_sec // 60)
+                        secs = int(time_remaining_sec % 60)
+                        
+                        direction_icon = "📈" if signal == "UP" else "📉"
+                        type_badge = "🔥 MOMENTUM SIGNAAL" if strat_type == "MOMENTUM" else "🔄 PULLBACK / REVERSION SIGNAAL"
+
+                        msg = (
+                            f"🚨 **5M EXPIRY {type_badge}!** {direction_icon}\n\n"
+                            f"📍 **Pair:** {symbol}\n"
+                            f"📊 **RSI:** `{rsi}` | **3-5M Move:** `{pct_change}%`\n"
+                            f"💵 **Huidige Koers (Entry):** `${price}`\n"
+                            f"⏱️ **Resterende Tijd op Klok:** `~{mins}m {secs}s`\n\n"
+                            f"💡 **Strategie Advies:**\n"
+                            f"• {reason}\n"
+                            f"👉 **Richting op Polymarket:** **{signal}**\n\n"
+                            f"📝 *[Paper Trade Geopend: Inzet ${TRADE_AMOUNT}]*"
                         )
                         
+                        polymarket_url = "https://polymarket.com"
                         send_telegram_msg(msg, button_url=polymarket_url)
-                        print(f"🚀 Signaal verzonden voor {symbol}: {signal} ({strat_type})")
+                        print(f"🚀 Signaal + Paper Trade gestart voor {symbol}: {signal}")
 
-            # Oude trades opschonen uit geheugen
-            if len(active_trades) > 100:
-                active_trades.clear()
+            # Opschonen oud geheugen
+            if len(active_signals_sent) > 100:
+                active_signals_sent.clear()
 
         except Exception as e:
-            print(f"Error in main trading loop: {e}")
+            print(f"Error in main loop: {e}")
 
         time.sleep(SCAN_INTERVAL_SEC)
 
