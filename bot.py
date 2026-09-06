@@ -87,29 +87,77 @@ def calculate_rsi(prices, period=14):
     return round(100 - (100 / (1 + rs)), 1)
 
 # —————————————————————————
+# ORDERBOOK LIQUIDITEIT & DRUK CHECK
+# —————————————————————————
+
+def check_orderbook_imbalance(symbol):
+    """
+    Scant het live Binance orderboek op kopers vs verkopers druk.
+    Retourneert 'BULLISH' als er een sterke koopmuur is, 'BEARISH' bij verkoopmuur.
+    """
+    try:
+        url = f"{BINANCE_API_URL}/depth?symbol={symbol}&limit=20"
+        res = requests.get(url, timeout=3).json()
+
+        bid_volume = sum([float(b[1]) for b in res.get('bids', [])])  # Kooporders
+        ask_volume = sum([float(a[1]) for a in res.get('asks', [])])  # Verkooporders
+
+        if ask_volume == 0 or bid_volume == 0:
+            return "NEUTRAL"
+
+        ratio = bid_volume / ask_volume
+
+        if ratio >= 1.8:
+            return "BULLISH"   # Koopdruk overheerst (ondersteuning)
+        elif ratio <= 0.55:
+            return "BEARISH"   # Verkoopdruk overheerst (weerstand)
+
+        return "NEUTRAL"
+    except Exception as e:
+        print(f"Fout bij orderboek check voor {symbol}: {e}")
+        return "NEUTRAL"
+
+# —————————————————————————
 # DUBBELE STRATEGIE MARKTANALYSE
 # —————————————————————————
 
 def analyze_market_and_get_signal(symbol, rsi, percent_change, time_remaining_sec):
-    # 0. Tijdsfilter: Alleen instappen tussen 3:30 (210s) en 5:00 min (300s)
+    """
+    Analyseert de markt met:
+    - Tijdsfilter: 3:30m (210s) - 5:00m (300s)
+    - Momentum & Pullback Logica
+    - Orderbook Imbalance Go/No-Go Filter
+    """
+    # 0. Tijdsfilter
     if time_remaining_sec < 210 or time_remaining_sec > 300:
         return None, None, "Tijd niet in scope"
 
-    # STAP 1: GEZOND MOMENTUM (Vroeg in de trend)
-    if 52 <= rsi <= 68 and percent_change >= 0.25:
-        return "UP", "MOMENTUM", "🎯 Stap 1: Gezond Bullish Momentum (Beginnende stijging)"
+    # 1. Orderboek druk ophalen
+    ob_status = check_orderbook_imbalance(symbol)
 
-    elif 32 <= rsi <= 48 and percent_change <= -0.25:
-        return "DOWN", "MOMENTUM", "🎯 Stap 1: Gezond Bearish Momentum (Beginnende daling)"
+    # -------------------------------------------------------------
+    # STAP 1: GEZOND MOMENTUM + ORDERBOEK BEVESTIGING
+    # -------------------------------------------------------------
+    if 52 <= rsi <= 68 and percent_change >= 0.25 and ob_status == "BULLISH":
+        reason = "🚀 Stap 1: Gezond Bullish Momentum + Koopmuur in Orderboek!"
+        return "UP", "MOMENTUM", reason
 
-    # STAP 2: PULLBACK / REVERSION (Extremen op de top/dal)
-    elif rsi >= 75 and percent_change >= 0.20:
-        return "DOWN", "PULLBACK", "🔄 Stap 2: Overbought Piek (RSI >= 75) -> Verwachte Pullback DOWN"
+    elif 32 <= rsi <= 48 and percent_change <= -0.25 and ob_status == "BEARISH":
+        reason = "🚀 Stap 1: Gezond Bearish Momentum + Verkoopmuur in Orderboek!"
+        return "DOWN", "MOMENTUM", reason
 
-    elif rsi <= 25 and percent_change <= -0.20:
-        return "UP", "PULLBACK", "🔄 Stap 2: Oversold Dip (RSI <= 25) -> Verwachte Bounce UP"
+    # -------------------------------------------------------------
+    # STAP 2: PULLBACK / REVERSION + ORDERBOEK BEVESTIGING
+    # -------------------------------------------------------------
+    elif rsi >= 75 and percent_change >= 0.20 and ob_status == "BEARISH":
+        reason = "🔄 Stap 2: Overbought Piek (RSI >= 75) + Verkoopmuur Drukt Koers Omlaag!"
+        return "DOWN", "PULLBACK", reason
 
-    return None, None, "Geen sterk signaal gedetecteerd"
+    elif rsi <= 25 and percent_change <= -0.20 and ob_status == "BULLISH":
+        reason = "🔄 Stap 2: Oversold Dip (RSI <= 25) + Koopmuur Vangt Daling Op!"
+        return "UP", "PULLBACK", reason
+
+    return None, None, "Geen sterke orderboek/indicator bevestiging"
 
 # —————————————————————————
 # BINANCE DATA OPHALEN
@@ -142,7 +190,6 @@ def check_and_evaluate_paper_trades():
     remaining_trades = []
 
     for trade in active_paper_trades:
-        # Als de gekozen expiry-tijd voorbij is, sluit de paper trade
         if now_ts >= trade["expiry_time"]:
             current_price, _, _ = fetch_binance_data(trade["symbol"])
             if current_price is None:
@@ -152,14 +199,12 @@ def check_and_evaluate_paper_trades():
             entry_price = trade["entry_price"]
             signal = trade["signal"]
             
-            # Evalueer Win / Loss
             is_win = False
             if signal == "UP" and current_price > entry_price:
                 is_win = True
             elif signal == "DOWN" and current_price < entry_price:
                 is_win = True
 
-            # Saldo bijwerken (Winst uitbetaling ~ 85% rendement, Verlies = inzet kwijt)
             if is_win:
                 profit = TRADE_AMOUNT * 0.85
                 PAPER_BALANCE += profit
@@ -168,12 +213,11 @@ def check_and_evaluate_paper_trades():
                 PAPER_BALANCE -= TRADE_AMOUNT
                 badge = f"❌ **PAPER TRADE VERLOREN** (-${TRADE_AMOUNT:.2f})"
 
-            # Resultaatbericht versturen
             msg = (
                 f"{badge}\n\n"
                 f"📍 **Pair:** {trade['symbol']} ({signal})\n"
                 f"🎯 **Type:** {trade['strat_type']}\n"
-                f"💵 **Entry Price:** `${entry_price}` ➔ **Exit Price:** `${current_price}`\n"
+                f"💵 **Entry:** `${entry_price}` ➔ **Exit:** `${current_price}`\n"
                 f"💰 **Nieuw Paper Saldo:** `${PAPER_BALANCE:.2f}`"
             )
             send_telegram_msg(msg)
@@ -188,11 +232,11 @@ def check_and_evaluate_paper_trades():
 # —————————————————————————
 
 def main():
-    print("🤖 Nobeulele's Poly Bot (Met Paper Trading Simulator) Gestart...")
+    print("🤖 Nobeulele's Poly Bot (Met Orderbook Filter & Paper Trading) Gestart...")
     send_telegram_msg(
         f"🤖 **Poly Bot Online & Paper Trading Actief!**\n"
         f"💰 Start Saldo: `${PAPER_BALANCE:.2f}` | Inzet per Trade: `${TRADE_AMOUNT:.2f}`\n"
-        f"📊 Strategie: Momentum + Pullback op 3:30-5:00M timeframes."
+        f"📊 Strategie: Momentum + Pullback + Orderbook Imbalance (3:30-5:00M timeframes)."
     )
 
     while True:
@@ -201,10 +245,10 @@ def main():
             time_in_5m_cycle = now_sec % 300
             time_remaining_sec = 300 - time_in_5m_cycle
 
-            # 1. Controleer geopende paper trades op uitslag
+            # 1. Controleer afgelopen virtuele trades op uitslag
             check_and_evaluate_paper_trades()
 
-            # 2. Scaam de markt voor nieuwe signalen
+            # 2. Scan de markt op nieuwe signalen
             for symbol in PAIRS:
                 price, pct_change, rsi = fetch_binance_data(symbol)
 
@@ -222,7 +266,6 @@ def main():
                     if trade_key not in active_signals_sent:
                         active_signals_sent[trade_key] = True
 
-                        # Open Virtuele Trade
                         expiry_time = now_sec + time_remaining_sec
                         active_paper_trades.append({
                             "symbol": symbol,
@@ -232,7 +275,6 @@ def main():
                             "expiry_time": expiry_time
                         })
 
-                        # Signaal Bericht Opbouwen
                         mins = int(time_remaining_sec // 60)
                         secs = int(time_remaining_sec % 60)
                         
@@ -255,7 +297,6 @@ def main():
                         send_telegram_msg(msg, button_url=polymarket_url)
                         print(f"🚀 Signaal + Paper Trade gestart voor {symbol}: {signal}")
 
-            # Opschonen oud geheugen
             if len(active_signals_sent) > 100:
                 active_signals_sent.clear()
 
