@@ -12,24 +12,23 @@ TELEGRAM_BOT_TOKEN = RAW_TOKEN.replace('bot', '', 1) if RAW_TOKEN.startswith('bo
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
 
 BINANCE_API_URL = "https://api.binance.com/api/v3"
-SCAN_INTERVAL_SEC = 10  # Scanningsinterval in seconden
+SCAN_INTERVAL_SEC = 10
 
-# Te scannen handelsparen
+# Scannen van alle paren met Multi-Timeframe filter
 PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ZECUSDT"]
 
-# Maximale toegestane trades per 5-minuten cyclus
 MAX_TRADES_PER_CYCLE = 2
 
 # —————————————————————————
 # PAPER TRADING INSTELLINGEN
 # —————————————————————————
-PAPER_BALANCE = 1000.0  # Startkapitaal in USD
-TRADE_AMOUNT = 25.0     # Inzet per virtuele trade in USD
+PAPER_BALANCE = 1000.0
+TRADE_AMOUNT = 25.0
 active_paper_trades = []
 active_signals_sent = {}
 
 # —————————————————————————
-# TELEGRAM BERICHTEN STUREN
+# TELEGRAM BERICHTEN
 # —————————————————————————
 
 def send_telegram_msg(message, button_url=None):
@@ -51,20 +50,14 @@ def send_telegram_msg(message, button_url=None):
         res = requests.post(url, json=payload, timeout=8).json()
         if not res.get("ok"):
             print(f"❌ Telegram API Fout: {res}")
-        else:
-            print("✅ Telegram bericht verzonden!")
     except Exception as e:
         print(f"❌ Fout bij versturen Telegram: {e}")
 
 # —————————————————————————
-# DYNAMISCHE POLYMARKET ODDS BEREKENING
+# DYNAMISCHE POLYMARKET ODDS
 # —————————————————————————
 
 def calculate_dynamic_polymarket_price(rsi, percent_change, strat_type, signal):
-    """
-    Berekent dynamisch en realistisch de Polymarket aandeelprijs (odds)
-    op basis van de markt-impact en RSI-sterkte.
-    """
     base_price = 0.50
     abs_move = abs(percent_change)
     
@@ -79,16 +72,14 @@ def calculate_dynamic_polymarket_price(rsi, percent_change, strat_type, signal):
     return round(max(0.52, min(0.88, calculated_price)), 2)
 
 # —————————————————————————
-# RSI BEREKENING LOGICA
+# RSI BEREKENING
 # —————————————————————————
 
 def calculate_rsi(prices, period=14):
     if len(prices) < period + 1:
         return 50.0
 
-    gains = []
-    losses = []
-
+    gains, losses = [], []
     for i in range(1, len(prices)):
         change = prices[i] - prices[i - 1]
         if change > 0:
@@ -112,71 +103,32 @@ def calculate_rsi(prices, period=14):
     return round(100 - (100 / (1 + rs)), 1)
 
 # —————————————————————————
-# ORDERBOOK LIQUIDITEIT & DRUK CHECK
+# 15-MINUTEN TREND CHECK (MULTI-TIMEFRAME)
 # —————————————————————————
 
-def check_orderbook_imbalance(symbol):
+def fetch_15m_trend(symbol):
     try:
-        url = f"{BINANCE_API_URL}/depth?symbol={symbol}&limit=20"
+        url = f"{BINANCE_API_URL}/klines?symbol={symbol}&interval=15m&limit=10"
         res = requests.get(url, timeout=3).json()
-
-        bid_volume = sum([float(b[1]) for b in res.get('bids', [])])
-        ask_volume = sum([float(a[1]) for a in res.get('asks', [])])
-
-        if ask_volume == 0 or bid_volume == 0:
-            return "NEUTRAL"
-
-        ratio = bid_volume / ask_volume
-
-        if ratio >= 1.8:
+        
+        close_prices = [float(k[4]) for k in res]
+        rsi_15m = calculate_rsi(close_prices)
+        
+        # Trend bepaling op basis van koersstijging en RSI op 15m
+        price_change = ((close_prices[-1] - close_prices[-3]) / close_prices[-3]) * 100
+        
+        if price_change > 0.10 and rsi_15m > 50:
             return "BULLISH"
-        elif ratio <= 0.55:
+        elif price_change < -0.10 and rsi_15m < 50:
             return "BEARISH"
-
+        
         return "NEUTRAL"
     except Exception as e:
-        print(f"Fout bij orderboek check voor {symbol}: {e}")
+        print(f"Fout bij 15m trendcheck voor {symbol}: {e}")
         return "NEUTRAL"
 
 # —————————————————————————
-# GEEVALUANCEERDE EN GEFILTERDE STRATEGIE
-# —————————————————————————
-
-def analyze_market_and_get_signal(symbol, rsi, prev_rsi, percent_change, volume_ratio, time_remaining_sec):
-    ob_status = check_orderbook_imbalance(symbol)
-
-    # -------------------------------------------------------------
-    # FASE 1: VROEG MOMENTUM (Vereist Volume Spike >= 1.3x)
-    # -------------------------------------------------------------
-    if 210 <= time_remaining_sec <= 300:
-        min_move = 0.40 if symbol in ["ZECUSDT", "DOGEUSDT"] else 0.30
-
-        if 52 <= rsi <= 68 and percent_change >= min_move and ob_status == "BULLISH" and volume_ratio >= 1.3:
-            reason = f"🚀 Fase 1: Momentum UP (+{percent_change}%, Vol {volume_ratio}x avg) + Koopmuur!"
-            return "UP", "MOMENTUM", reason
-
-        elif 32 <= rsi <= 48 and percent_change <= -min_move and ob_status == "BEARISH" and volume_ratio >= 1.3:
-            reason = f"🚀 Fase 1: Momentum DOWN ({percent_change}%, Vol {volume_ratio}x avg) + Verkoopmuur!"
-            return "DOWN", "MOMENTUM", reason
-
-    # -------------------------------------------------------------
-    # FASE 2: PULLBACK / REVERSION (Vereist Bevestigde RSI-Omslag)
-    # -------------------------------------------------------------
-    elif 60 <= time_remaining_sec <= 150:
-        # Piek was extreem, maar RSI zakt nu (rsi < prev_rsi) -> Bevestiging
-        if prev_rsi >= 78 and rsi < prev_rsi and percent_change >= 0.45:
-            reason = f"🔄 Fase 2: Piek Omslag Bevestigd (Prev RSI {prev_rsi} ➔ {rsi}) -> Trade Down!"
-            return "DOWN", "PULLBACK", reason
-
-        # Dal was extreem, maar RSI stijgt nu (rsi > prev_rsi) -> Bevestiging
-        elif prev_rsi <= 22 and rsi > prev_rsi and percent_change <= -0.45:
-            reason = f"🔄 Fase 2: Bodem Bounce Bevestigd (Prev RSI {prev_rsi} ➔ {rsi}) -> Trade Up!"
-            return "UP", "PULLBACK", reason
-
-    return None, None, "Geen geschikt signaal"
-
-# —————————————————————————
-# BINANCE DATA OPHALEN
+# BINANCE DATA OPHALEN (5M GRAFIEK)
 # —————————————————————————
 
 def fetch_binance_data(symbol):
@@ -204,7 +156,46 @@ def fetch_binance_data(symbol):
         return None, None, None, None, None
 
 # —————————————————————————
-# PAPER TRADING EVALUATIE ENGINE
+# STRATEGIE MET 15M MULTI-TIMEFRAME FILTER
+# —————————————————————————
+
+def analyze_market_and_get_signal(symbol, rsi, prev_rsi, percent_change, volume_ratio, time_remaining_sec):
+    trend_15m = fetch_15m_trend(symbol)
+
+    # -------------------------------------------------------------
+    # FASE 1: MOMENTUM (Must Align with 15M Trend!)
+    # -------------------------------------------------------------
+    if 210 <= time_remaining_sec <= 300:
+        min_move = 0.40 if symbol in ["ZECUSDT", "DOGEUSDT"] else 0.30
+
+        # Alleen UP als 15M Trend minstens Neutraal of Bullish is (geen Bearish!)
+        if 52 <= rsi <= 68 and percent_change >= min_move and volume_ratio >= 1.3:
+            if trend_15m != "BEARISH":
+                reason = f"🚀 Momentum UP (+{percent_change}%, Vol {volume_ratio}x) | 15M Trend: {trend_15m}"
+                return "UP", "MOMENTUM", reason
+
+        # Alleen DOWN als 15M Trend minstens Neutraal of Bearish is (geen Bullish!)
+        elif 32 <= rsi <= 48 and percent_change <= -min_move and volume_ratio >= 1.3:
+            if trend_15m != "BULLISH":
+                reason = f"🚀 Momentum DOWN ({percent_change}%, Vol {volume_ratio}x) | 15M Trend: {trend_15m}"
+                return "DOWN", "MOMENTUM", reason
+
+    # -------------------------------------------------------------
+    # FASE 2: PULLBACK / REVERSION (Extreme RSI Omslag)
+    # -------------------------------------------------------------
+    elif 60 <= time_remaining_sec <= 150:
+        if prev_rsi >= 78 and rsi < prev_rsi and percent_change >= 0.45:
+            reason = f"🔄 Piek Omslag Bevestigd (Prev RSI {prev_rsi} ➔ {rsi}) | 15M: {trend_15m}"
+            return "DOWN", "PULLBACK", reason
+
+        elif prev_rsi <= 22 and rsi > prev_rsi and percent_change <= -0.45:
+            reason = f"🔄 Bodem Bounce Bevestigd (Prev RSI {prev_rsi} ➔ {rsi}) | 15M: {trend_15m}"
+            return "UP", "PULLBACK", reason
+
+    return None, None, "Geen geschikt signaal"
+
+# —————————————————————————
+# PAPER TRADING EVALUATIE
 # —————————————————————————
 
 def check_and_evaluate_paper_trades():
@@ -254,25 +245,21 @@ def check_and_evaluate_paper_trades():
                 f"💰 **Nieuw Paper Saldo:** `${PAPER_BALANCE:.2f}`"
             )
             send_telegram_msg(msg)
-            print(f"Paper trade afgerond voor {trade['symbol']}: {'WIN' if is_win else 'LOSS'}")
         else:
             remaining_trades.append(trade)
 
     active_paper_trades = remaining_trades
 
 # —————————————————————————
-# MAIN BOT LOOP
+# MAIN LOOP
 # —————————————————————————
 
 def main():
-    print("🤖 Poly Bot (v4.0 - Volume & Dynamic Odds Protection) Gestart...")
+    print("🤖 Poly Bot v4.5 (15M Multi-Timeframe Active)...")
     send_telegram_msg(
-        f"🤖 **Poly Bot Online (Versie v4.0)!**\n"
+        f"🤖 **Poly Bot Online (Versie v4.5 - Multi-Timeframe)!**\n"
         f"💰 Start Saldo: `${PAPER_BALANCE:.2f}` | Inzet per Trade: `${TRADE_AMOUNT:.2f}`\n"
-        f"🛡️ **Nieuwe Filters:**\n"
-        f"• Volume Filter: Momentum vereist volume >= 1.3x gemiddelde\n"
-        f"• RSI Omslag: Pullbacks wachten op bevestiging van piek/dal\n"
-        f"• Dynamic Odds: Aandeelprijzen variëren dynamisch tussen $0.52 - $0.88"
+        f"📊 **15M + 5M Filter Actief:** Geen trades meer openen tegen de 15-minuten trend in voor álle munten!"
     )
 
     while True:
@@ -282,14 +269,12 @@ def main():
             time_remaining_sec = 300 - time_in_5m_cycle
             cycle_id = int(now_sec // 300)
 
-            # 1. Evalueer openstaande trades
             check_and_evaluate_paper_trades()
 
             current_cycle_trades_count = sum(
                 1 for key in active_signals_sent if key.startswith(f"cycle_{cycle_id}_")
             )
 
-            # 2. Scannen voor nieuwe trades
             if current_cycle_trades_count < MAX_TRADES_PER_CYCLE:
                 for symbol in PAIRS:
                     if current_cycle_trades_count >= MAX_TRADES_PER_CYCLE:
@@ -331,25 +316,24 @@ def main():
                             
                             direction_icon = "📈" if signal == "UP" else "📉"
                             target_condition = f"Hoger dan ${price}" if signal == "UP" else f"Lager dan ${price}"
-                            type_badge = "🔥 MOMENTUM SIGNAAL" if strat_type == "MOMENTUM" else "🔄 PULLBACK / REVERSION SIGNAAL"
+                            type_badge = "🔥 MOMENTUM (15M MATCH)" if strat_type == "MOMENTUM" else "🔄 PULLBACK"
 
                             msg = (
                                 f"🚨 **5M EXPIRY {type_badge}!** {direction_icon}\n\n"
                                 f"📍 **Pair:** {symbol}\n"
-                                f"🎯 **Price to Beat (Instapkoers):** `${price}`\n"
-                                f"👉 **Inzetten op Polymarket:** **{signal}** ({target_condition})\n\n"
-                                f"🏷️ **Dynamische Odds:** `${share_price:.2f}` per aandeel (`{shares_bought}` aandelen)\n"
-                                f"💵 **Mogelijke Winst bij Win:** `+${potential_profit:.2f}`\n"
-                                f"📊 **RSI:** `{rsi}` | **Volume Ratio:** `{vol_ratio}x` | **Move:** `{pct_change}%`\n"
-                                f"⏱️ **Tijd op Klok:** `~{mins}m {secs}s`\n\n"
-                                f"💡 **Strategie Advies:**\n"
+                                f"🎯 **Price to Beat:** `${price}`\n"
+                                f"👉 **Inzetten:** **{signal}** ({target_condition})\n\n"
+                                f"🏷️ **Odds:** `${share_price:.2f}` per aandeel (`{shares_bought}` aandelen)\n"
+                                f"💵 **Mogelijke Winst:** `+${potential_profit:.2f}`\n"
+                                f"📊 **RSI 5M:** `{rsi}` | **Vol Ratio:** `{vol_ratio}x` | **Move:** `{pct_change}%`\n"
+                                f"⏱️ **Resterend:** `~{mins}m {secs}s`\n\n"
+                                f"💡 **Analyse:**\n"
                                 f"• {reason}\n\n"
                                 f"📝 *[Paper Trade Geopend: Inzet ${TRADE_AMOUNT}]*"
                             )
                             
-                            polymarket_url = "https://polymarket.com"
-                            send_telegram_msg(msg, button_url=polymarket_url)
-                            print(f"🚀 Signaal gestart voor {symbol}: {signal} (Odds: ${share_price:.2f})")
+                            send_telegram_msg(msg, button_url="https://polymarket.com")
+                            print(f"🚀 Signaal gestart voor {symbol}: {signal}")
 
             if len(active_signals_sent) > 100:
                 active_signals_sent.clear()
