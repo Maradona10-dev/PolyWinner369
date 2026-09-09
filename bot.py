@@ -15,8 +15,11 @@ TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
 
 # Live Trading Instellingen
 PK = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
-LIVE_MODE = os.environ.get("LIVE_TRADING", "False").lower() == "true"
 LIVE_TRADE_AMOUNT = float(os.environ.get("LIVE_TRADE_AMOUNT", "5.0"))
+
+# Forceer LIVE_MODE op True als er een Private Key is ingevuld
+ENV_LIVE = os.environ.get("LIVE_TRADING", "False").strip().lower()
+LIVE_MODE = True if (ENV_LIVE in ["true", "1", "yes"] or (PK and len(PK) > 10)) else False
 
 BINANCE_API_URL = "https://api.binance.com/api/v3"
 SCAN_INTERVAL_SEC = 10
@@ -377,7 +380,6 @@ def main():
                             # LIVE TRADE EXECUTION VIA POLYMARKET API
                             live_order_res = None
                             if LIVE_MODE and clob_client:
-                                # Dummy Token ID referentie voor Polymarket CLOB Market Order
                                 dummy_token_id = f"TOKEN_{symbol}_{signal}"
                                 live_order_res = execute_live_polymarket_order(dummy_token_id, trade_amount)
 
