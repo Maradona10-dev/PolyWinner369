@@ -3,7 +3,7 @@ import time
 import json
 import requests
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import MarketOrderArgs, ApiCreds
+from py_clob_client.clob_types import MarketOrderArgs
 from py_clob_client.order_builder.constants import BUY
 
 # —————————————————————————
@@ -43,35 +43,34 @@ active_paper_trades = []
 active_signals_sent = {}
 
 # —————————————————————————
-# POLYMARKET LIVE CLIENT INITIALISATIE (Met L2 Auth)
+# POLYMARKET LIVE CLIENT INITIALISATIE
 # —————————————————————————
-clob_client = None
 
-if PK and LIVE_MODE:
+def init_clob_client():
+    if not PK or not LIVE_MODE:
+        return None
     try:
-        # Initialiseer client met explicit Polygon Chain (137) en Signature Type 2 (Direct EOA Wallet)
-        clob_client = ClobClient(
+        client = ClobClient(
             host="https://clob.polymarket.com",
             key=PK,
             chain_id=137,
-            signature_type=2
+            signature_type=0
         )
-        creds = clob_client.create_or_derive_api_creds()
-        clob_client.set_api_creds(creds)
+        creds = client.create_or_derive_api_creds()
+        client.set_api_creds(creds)
         print("✅ Polymarket Live Trading Client succesvol geïnitialiseerd!")
+        return client
     except Exception as e:
         print(f"❌ Fout bij opzetten Polymarket Live Client: {e}")
-        clob_client = None
+        return None
+
+clob_client = init_clob_client()
 
 # —————————————————————————
 # POLYMARKET REAL-TIME TOKEN ID OPHALEN
 # —————————————————————————
 
 def fetch_polymarket_token_id(symbol, signal):
-    """
-    Haalt het actuele, unieke blockchain token_id op via de Polymarket API
-    voor de 5-minuten crypto markten.
-    """
     coin_map = {
         "BTCUSDT": ["bitcoin", "btc"],
         "ETHUSDT": ["ethereum", "eth"],
@@ -97,7 +96,6 @@ def fetch_polymarket_token_id(symbol, signal):
             title = event.get("title", "").lower()
             slug = event.get("slug", "").lower()
             
-            # Match coin en check of het een 5M/5-minute markt betreft
             if any(kw in title or kw in slug for kw in keywords):
                 if "5m" in slug or "5m" in title or "5-minute" in title or "5 min" in title or "5min" in slug:
                     markets = event.get("markets", [])
@@ -120,6 +118,7 @@ def fetch_polymarket_token_id(symbol, signal):
 # —————————————————————————
 
 def execute_live_polymarket_order(token_id, amount_usd):
+    global clob_client
     if not clob_client or not token_id:
         print("⚠️ Live client niet actief of token_id ontbreekt. Order overgeslagen.")
         return False
@@ -140,7 +139,18 @@ def execute_live_polymarket_order(token_id, amount_usd):
             print(f"❌ ORDER WEIGERD DOOR POLYMARKET: {response}")
             return False
     except Exception as e:
-        print(f"❌ LIVE ORDER MISLUKT: {e}")
+        print(f"❌ LIVE ORDER MISLUKT ({e}). Herprobeert client her-initialisatie...")
+        try:
+            clob_client = init_clob_client()
+            if clob_client:
+                order_args = MarketOrderArgs(token_id=token_id, amount=amount_usd, side=BUY)
+                signed_order = clob_client.create_market_order(order_args)
+                response = clob_client.post_order(signed_order)
+                if response and response.get("success") == True:
+                    print(f"🚀 LIVE ORDER GEPLAATST NA RE-INIT: {response}")
+                    return True
+        except Exception as retry_e:
+            print(f"❌ HERKANSING OOK MISLUKT: {retry_e}")
         return False
 
 # —————————————————————————
@@ -162,12 +172,16 @@ def send_telegram_msg(message, button_url=None):
     if button_url:
         payload["reply_markup"] = {"inline_keyboard": [[{"text": "🌐 OPEN POLYMARKET", "url": button_url}]]}
 
-    try:
-        res = requests.post(url, json=payload, timeout=8).json()
-        if not res.get("ok"):
-            print(f"❌ Telegram API Fout: {res}")
-    except Exception as e:
-        print(f"❌ Fout bij versturen Telegram: {e}")
+    for attempt in range(2):
+        try:
+            res = requests.post(url, json=payload, timeout=5).json()
+            if res.get("ok"):
+                break
+            else:
+                print(f"❌ Telegram API Fout: {res}")
+        except Exception as e:
+            print(f"⚠️ Telegram verstuurpoging {attempt+1} mislukt: {e}")
+            time.sleep(1)
 
 # —————————————————————————
 # DYNAMISCHE POLYMARKET ODDS BEREKENING
@@ -383,9 +397,9 @@ def check_and_evaluate_paper_trades():
 def main():
     mode_str = f"🔴 **LIVE TRADING ACTIEF** (Inzet: `${LIVE_TRADE_AMOUNT:.2f}`)" if (LIVE_MODE and clob_client) else f"📝 **PAPER TRADING MODE** (Inzet: `${PAPER_TRADE_AMOUNT:.2f}`)"
     
-    print(f"🤖 Poly Bot v5.7 Gestart - Mode: {mode_str}...")
+    print(f"🤖 Poly Bot v5.8 Gestart - Mode: {mode_str}...")
     send_telegram_msg(
-        f"🤖 **Poly Bot Online (Versie v5.7)!**\n"
+        f"🤖 **Poly Bot Online (Versie v5.8)!**\n"
         f"⚙️ **Status:** {mode_str}\n"
         f"💰 Start Paper Saldo: `${PAPER_BALANCE:.2f}`\n\n"
         f"🎯 **Systeem:** Target to Beat (5M Open) + Dynamic 5M Token-ID Fetching."
