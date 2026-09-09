@@ -13,7 +13,7 @@ RAW_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
 TELEGRAM_BOT_TOKEN = RAW_TOKEN.replace('bot', '', 1) if RAW_TOKEN.startswith('bot') else RAW_TOKEN
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
 
-# Live Trading Instellingen & Grondige Opschoning Private Key
+# Live Trading Instellingen & Opschoning Private Key
 raw_pk = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
 cleaned_pk = "".join(raw_pk.split()).strip()
 
@@ -66,29 +66,45 @@ if PK and LIVE_MODE:
 def fetch_polymarket_token_id(symbol, signal):
     """
     Haalt het actuele, unieke blockchain token_id op via de Polymarket API
-    voor de actieve 5-minuten optie.
+    voor de 5-minuten crypto markten.
     """
-    coin = symbol.replace("USDT", "").lower()
+    coin_map = {
+        "BTCUSDT": ["bitcoin", "btc"],
+        "ETHUSDT": ["ethereum", "eth"],
+        "SOLUSDT": ["solana", "sol"],
+        "BNBUSDT": ["bnb", "binance"],
+        "XRPUSDT": ["xrp", "ripple"],
+        "DOGEUSDT": ["doge", "dogecoin"],
+        "ZECUSDT": ["zec", "zcash"]
+    }
+    
+    keywords = coin_map.get(symbol, [symbol.replace("USDT", "").lower()])
+
     try:
         params = {
             "closed": "false",
-            "limit": 20,
-            "tag_slug": "crypto"
+            "limit": 100,
+            "order": "startDate",
+            "ascending": "false"
         }
         res = requests.get(POLYMARKET_GAMMA_URL, params=params, timeout=5).json()
         
         for event in res:
             title = event.get("title", "").lower()
-            if coin in title and ("5m" in title or "5 min" in title or "5-minute" in title):
-                markets = event.get("markets", [])
-                for market in markets:
-                    if not market.get("closed", False):
-                        clob_token_ids = json.loads(market.get("clobTokenIds", "[]"))
-                        if len(clob_token_ids) >= 2:
-                            # Index 0 = YES / UP, Index 1 = NO / DOWN
-                            token_id = clob_token_ids[0] if signal == "UP" else clob_token_ids[1]
-                            print(f"🎯 Live Token ID gevonden voor {symbol} ({signal}): {token_id}")
-                            return token_id
+            slug = event.get("slug", "").lower()
+            
+            # Match coin en check of het een 5M/5-minute markt betreft
+            if any(kw in title or kw in slug for kw in keywords):
+                if "5m" in slug or "5m" in title or "5-minute" in title or "5 min" in title or "5min" in slug:
+                    markets = event.get("markets", [])
+                    for market in markets:
+                        if not market.get("closed", False) and market.get("active", True):
+                            clob_token_ids = json.loads(market.get("clobTokenIds", "[]"))
+                            if len(clob_token_ids) >= 2:
+                                token_id = clob_token_ids[0] if signal == "UP" else clob_token_ids[1]
+                                print(f"🎯 Live Token ID gevonden voor {symbol} ({signal}): {token_id}")
+                                return token_id
+
     except Exception as e:
         print(f"❌ Fout bij ophalen Polymarket Token ID voor {symbol}: {e}")
     
@@ -362,12 +378,12 @@ def check_and_evaluate_paper_trades():
 def main():
     mode_str = f"🔴 **LIVE TRADING ACTIEF** (Inzet: `${LIVE_TRADE_AMOUNT:.2f}`)" if (LIVE_MODE and clob_client) else f"📝 **PAPER TRADING MODE** (Inzet: `${PAPER_TRADE_AMOUNT:.2f}`)"
     
-    print(f"🤖 Poly Bot v5.3 Gestart - Mode: {mode_str}...")
+    print(f"🤖 Poly Bot v5.4 Gestart - Mode: {mode_str}...")
     send_telegram_msg(
-        f"🤖 **Poly Bot Online (Versie v5.3)!**\n"
+        f"🤖 **Poly Bot Online (Versie v5.4)!**\n"
         f"⚙️ **Status:** {mode_str}\n"
         f"💰 Start Paper Saldo: `${PAPER_BALANCE:.2f}`\n\n"
-        f"🎯 **Systeem:** Target to Beat (5M Open) + Dynamic Token-ID Fetching."
+        f"🎯 **Systeem:** Target to Beat (5M Open) + Dynamic 5M Token-ID Fetching."
     )
 
     while True:
@@ -464,7 +480,7 @@ def main():
                                 f"• {reason}"
                             )
                             
-                            send_telegram_msg(msg, button_url="https://polymarket.com")
+                            send_telegram_msg(msg, button_url="https://polymarket.com/crypto/5M")
                             print(f"🚀 Signaal verwerkt voor {symbol}: {signal} (Strike: ${window_strike_price})")
 
             if len(active_signals_sent) > 100:
