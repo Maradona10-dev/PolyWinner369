@@ -13,13 +13,17 @@ RAW_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
 TELEGRAM_BOT_TOKEN = RAW_TOKEN.replace('bot', '', 1) if RAW_TOKEN.startswith('bot') else RAW_TOKEN
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
 
-# Live Trading Instellingen
-PK = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
+# Live Trading Instellingen & Opschonen Private Key
+raw_pk = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
+# Verwijder eventuele '0x' prefix en opschonen van niet-ASCII/onzichtbare tekens
+PK = raw_pk[2:] if raw_pk.startswith("0x") else raw_pk
+PK = PK.encode('ascii', 'ignore').decode('ascii').strip()
+
 LIVE_TRADE_AMOUNT = float(os.environ.get("LIVE_TRADE_AMOUNT", "5.0"))
 
-# Forceer LIVE_MODE op True als er een Private Key is ingevuld
+# Forceer LIVE_MODE op True als er een Private Key aanwezig is
 ENV_LIVE = os.environ.get("LIVE_TRADING", "False").strip().lower()
-LIVE_MODE = True if (ENV_LIVE in ["true", "1", "yes"] or (PK and len(PK) > 10)) else False
+LIVE_MODE = True if (ENV_LIVE in ["true", "1", "yes"] or (PK and len(PK) >= 60)) else False
 
 BINANCE_API_URL = "https://api.binance.com/api/v3"
 SCAN_INTERVAL_SEC = 10
@@ -62,9 +66,6 @@ if PK and LIVE_MODE:
 # —————————————————————————
 
 def execute_live_polymarket_order(token_id, amount_usd):
-    """
-    Plaatst binnen milliseconden een marktorder rechtstreeks op de Polymarket CLOB.
-    """
     if not clob_client:
         print("⚠️ Live client is niet actief. Order overgeslagen.")
         return None
@@ -186,12 +187,10 @@ def fetch_15m_trend(symbol):
 
 def fetch_binance_data(symbol):
     try:
-        # 1. Target to Beat: Openingskoers van de huidige 5M candle op Binance
         url_5m = f"{BINANCE_API_URL}/klines?symbol={symbol}&interval=5m&limit=2"
         res_5m = requests.get(url_5m, timeout=3).json()
         window_strike_price = float(res_5m[-1][1])
 
-        # 2. 1-Minuut klines voor RSI en Volumeberekening
         url_1m = f"{BINANCE_API_URL}/klines?symbol={symbol}&interval=1m&limit=30"
         res_1m = requests.get(url_1m, timeout=4).json()
 
@@ -233,7 +232,7 @@ def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volum
         min_vol_ratio = 1.2
         pullback_delta = 0.12
 
-    # Momentum Window: 4m 15s tot 2m 00s op de klok
+    # Momentum Window
     if 120 <= time_remaining_sec <= 255:
         if 53 <= rsi <= 68 and window_delta_pct >= min_delta and volume_ratio >= min_vol_ratio:
             if trend_15m != "BEARISH":
@@ -245,7 +244,7 @@ def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volum
                 reason = f"🚀 Momentum DOWN ({window_delta_pct}% t.o.v. Strike, Vol {volume_ratio}x) | 15M: {trend_15m}"
                 return "DOWN", "MOMENTUM", reason
 
-    # Pullback Window: 1m 00s tot 2m 30s
+    # Pullback Window
     elif 60 <= time_remaining_sec <= 150:
         if prev_rsi >= 78 and rsi < prev_rsi and window_delta_pct >= pullback_delta:
             reason = f"🔄 Piek Omslag Bevestigd (Prev RSI {prev_rsi} ➔ {rsi}) | 15M: {trend_15m}"
@@ -377,7 +376,6 @@ def main():
                             shares_bought = round(trade_amount / share_price, 2)
                             potential_profit = round((shares_bought * 1.00) - trade_amount, 2)
 
-                            # LIVE TRADE EXECUTION VIA POLYMARKET API
                             live_order_res = None
                             if LIVE_MODE and clob_client:
                                 dummy_token_id = f"TOKEN_{symbol}_{signal}"
