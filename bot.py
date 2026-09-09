@@ -4,6 +4,7 @@ import json
 import requests
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import MarketOrderArgs
+from py_clob_client.order_builder.constants import BUY
 
 # —————————————————————————
 # CONFIGURATIE & ENVIRONMENT VARIABELEN
@@ -123,7 +124,8 @@ def execute_live_polymarket_order(token_id, amount_usd):
     try:
         order_args = MarketOrderArgs(
             token_id=token_id,
-            amount=amount_usd
+            amount=amount_usd,
+            side=BUY
         )
         signed_order = clob_client.create_market_order(order_args)
         response = clob_client.post_order(signed_order)
@@ -378,9 +380,9 @@ def check_and_evaluate_paper_trades():
 def main():
     mode_str = f"🔴 **LIVE TRADING ACTIEF** (Inzet: `${LIVE_TRADE_AMOUNT:.2f}`)" if (LIVE_MODE and clob_client) else f"📝 **PAPER TRADING MODE** (Inzet: `${PAPER_TRADE_AMOUNT:.2f}`)"
     
-    print(f"🤖 Poly Bot v5.4 Gestart - Mode: {mode_str}...")
+    print(f"🤖 Poly Bot v5.5 Gestart - Mode: {mode_str}...")
     send_telegram_msg(
-        f"🤖 **Poly Bot Online (Versie v5.4)!**\n"
+        f"🤖 **Poly Bot Online (Versie v5.5)!**\n"
         f"⚙️ **Status:** {mode_str}\n"
         f"💰 Start Paper Saldo: `${PAPER_BALANCE:.2f}`\n\n"
         f"🎯 **Systeem:** Target to Beat (5M Open) + Dynamic 5M Token-ID Fetching."
