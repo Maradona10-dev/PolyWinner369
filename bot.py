@@ -124,29 +124,43 @@ def execute_live_polymarket_order(token_id, amount_usd):
         return False
 
     try:
+        # Haal actuele orderboek / tick size op voor L2 compliance
+        tick_size = "0.01"
+        try:
+            tick_size = clob_client.get_tick_size(token_id)
+        except Exception:
+            pass
+
         order_args = MarketOrderArgs(
             token_id=token_id,
             amount=amount_usd,
-            side=BUY
+            side=BUY,
+            price=0.99
         )
-        signed_order = clob_client.create_market_order(order_args)
-        response = clob_client.post_order(signed_order)
         
-        if response and response.get("success") == True:
+        # Maak order via de nieuwste client methode
+        try:
+            signed_order = clob_client.create_market_order(order_args)
+            response = clob_client.post_order(signed_order)
+        except AttributeError:
+            response = clob_client.post_order(order_args)
+
+        if response and (response.get("success") == True or "orderID" in str(response)):
             print(f"🚀 LIVE ORDER GEPLAATST OP CLOB: {response}")
             return True
         else:
             print(f"❌ ORDER WEIGERD DOOR POLYMARKET: {response}")
             return False
+            
     except Exception as e:
         print(f"❌ LIVE ORDER MISLUKT ({e}). Herprobeert client her-initialisatie...")
         try:
             clob_client = init_clob_client()
             if clob_client:
-                order_args = MarketOrderArgs(token_id=token_id, amount=amount_usd, side=BUY)
+                order_args = MarketOrderArgs(token_id=token_id, amount=amount_usd, side=BUY, price=0.99)
                 signed_order = clob_client.create_market_order(order_args)
                 response = clob_client.post_order(signed_order)
-                if response and response.get("success") == True:
+                if response and (response.get("success") == True or "orderID" in str(response)):
                     print(f"🚀 LIVE ORDER GEPLAATST NA RE-INIT: {response}")
                     return True
         except Exception as retry_e:
@@ -397,9 +411,9 @@ def check_and_evaluate_paper_trades():
 def main():
     mode_str = f"🔴 **LIVE TRADING ACTIEF** (Inzet: `${LIVE_TRADE_AMOUNT:.2f}`)" if (LIVE_MODE and clob_client) else f"📝 **PAPER TRADING MODE** (Inzet: `${PAPER_TRADE_AMOUNT:.2f}`)"
     
-    print(f"🤖 Poly Bot v5.8 Gestart - Mode: {mode_str}...")
+    print(f"🤖 Poly Bot v5.9 Gestart - Mode: {mode_str}...")
     send_telegram_msg(
-        f"🤖 **Poly Bot Online (Versie v5.8)!**\n"
+        f"🤖 **Poly Bot Online (Versie v5.9)!**\n"
         f"⚙️ **Status:** {mode_str}\n"
         f"💰 Start Paper Saldo: `${PAPER_BALANCE:.2f}`\n\n"
         f"🎯 **Systeem:** Target to Beat (5M Open) + Dynamic 5M Token-ID Fetching."
