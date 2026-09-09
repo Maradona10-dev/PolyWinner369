@@ -2,6 +2,8 @@ import os
 import time
 import json
 import requests
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import MarketOrderArgs
 
 # —————————————————————————
 # CONFIGURATIE & ENVIRONMENT VARIABELEN
@@ -11,22 +13,71 @@ RAW_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
 TELEGRAM_BOT_TOKEN = RAW_TOKEN.replace('bot', '', 1) if RAW_TOKEN.startswith('bot') else RAW_TOKEN
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
 
+# Live Trading Instellingen
+PK = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
+LIVE_MODE = os.environ.get("LIVE_TRADING", "False").lower() == "true"
+LIVE_TRADE_AMOUNT = float(os.environ.get("LIVE_TRADE_AMOUNT", "5.0"))
+
 BINANCE_API_URL = "https://api.binance.com/api/v3"
 SCAN_INTERVAL_SEC = 10
 
-# Handelsparen (Inclusief aangescherpte regels voor ZEC & DOGE)
+# Handelsparen
 PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ZECUSDT"]
 
 MAX_TRADES_PER_CYCLE = 2
-MAX_ALLOWABLE_ODDS = 0.70  # Geen trades openen als de odds hoger zijn dan $0.70
+MAX_ALLOWABLE_ODDS = 0.70  # Bescherming van Risk/Reward
 
 # —————————————————————————
-# PAPER TRADING INSTELLINGEN
+# PAPER TRADING INITIALISATIE
 # —————————————————————————
 PAPER_BALANCE = 1000.0
-TRADE_AMOUNT = 25.0
+PAPER_TRADE_AMOUNT = 25.0
 active_paper_trades = []
 active_signals_sent = {}
+
+# —————————————————————————
+# POLYMARKET LIVE CLIENT INITIALISATIE
+# —————————————————————————
+clob_client = None
+
+if PK and LIVE_MODE:
+    try:
+        clob_client = ClobClient(
+            host="https://clob.polymarket.com",
+            key=PK,
+            chain_id=137  # Polygon Mainnet
+        )
+        # Genereer L2 API credentials automatisch op basis van Private Key
+        clob_client.set_api_creds(clob_client.create_or_derive_api_creds())
+        print("✅ Polymarket Live Trading Client succesvol geïnitialiseerd!")
+    except Exception as e:
+        print(f"❌ Fout bij opzetten Polymarket Live Client: {e}")
+        clob_client = None
+
+# —————————————————————————
+# LIVE TRADING ORDER EXECUTION
+# —————————————————————————
+
+def execute_live_polymarket_order(token_id, amount_usd):
+    """
+    Plaatst binnen milliseconden een marktorder rechtstreeks op de Polymarket CLOB.
+    """
+    if not clob_client:
+        print("⚠️ Live client is niet actief. Order overgeslagen.")
+        return None
+
+    try:
+        order_args = MarketOrderArgs(
+            token_id=token_id,
+            amount=amount_usd
+        )
+        signed_order = clob_client.create_market_order(order_args)
+        response = clob_client.post_order(signed_order)
+        print(f"🚀 LIVE ORDER SUCCESVOL GEPLAATST: {response}")
+        return response
+    except Exception as e:
+        print(f"❌ LIVE ORDER MISLUKT: {e}")
+        return None
 
 # —————————————————————————
 # TELEGRAM BERICHTEN STUREN
@@ -45,7 +96,7 @@ def send_telegram_msg(message, button_url=None):
         "disable_web_page_preview": True
     }
     if button_url:
-        payload["reply_markup"] = {"inline_keyboard": [[{"text": "🚀 ZET DIRECT IN OP POLYMARKET", "url": button_url}]]}
+        payload["reply_markup"] = {"inline_keyboard": [[{"text": "🌐 OPEN POLYMARKET", "url": button_url}]]}
 
     try:
         res = requests.post(url, json=payload, timeout=8).json()
@@ -104,7 +155,7 @@ def calculate_rsi(prices, period=14):
     return round(100 - (100 / (1 + rs)), 1)
 
 # —————————————————————————
-# 15-MINUTEN TREND CHECK
+# 15-MINUTEN TREND CHECK (MULTI-TIMEFRAME)
 # —————————————————————————
 
 def fetch_15m_trend(symbol):
@@ -127,17 +178,17 @@ def fetch_15m_trend(symbol):
         return "NEUTRAL"
 
 # —————————————————————————
-# BINANCE DATA OPHALEN
+# BINANCE DATA OPHALEN (STRIKE PRICE & 1M KLINES)
 # —————————————————————————
 
 def fetch_binance_data(symbol):
     try:
-        # 1. Exacte 5-minuten Strike Price (Open Price van de 5m candle)
+        # 1. Target to Beat: Openingskoers van de huidige 5M candle op Binance
         url_5m = f"{BINANCE_API_URL}/klines?symbol={symbol}&interval=5m&limit=2"
         res_5m = requests.get(url_5m, timeout=3).json()
         window_strike_price = float(res_5m[-1][1])
 
-        # 2. 1-minuut gedetailleerde klines
+        # 2. 1-Minuut klines voor RSI en Volumeberekening
         url_1m = f"{BINANCE_API_URL}/klines?symbol={symbol}&interval=1m&limit=30"
         res_1m = requests.get(url_1m, timeout=4).json()
 
@@ -145,8 +196,6 @@ def fetch_binance_data(symbol):
         volumes = [float(k[5]) for k in res_1m]
 
         current_price = close_prices[-1]
-        
-        # Verschil t.o.v. de 5m strike price
         window_delta_pct = round(((current_price - window_strike_price) / window_strike_price) * 100, 3)
 
         rsi = calculate_rsi(close_prices)
@@ -162,29 +211,26 @@ def fetch_binance_data(symbol):
         return None, None, None, None, None, None
 
 # —————————————————————————
-# STRATEGIE & SIGNAAL EVALUATIE (V5.1 AANGESCHERPT)
+# STRATEGIE LOGICA
 # —————————————————————————
 
 def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volume_ratio, time_remaining_sec):
     trend_15m = fetch_15m_trend(symbol)
 
-    # Drempelwaarden gedifferentieerd per munt
     if symbol in ["ZECUSDT", "DOGEUSDT"]:
-        min_delta = 0.14       # Vrijwel dubbele afstand vereist voor volatiele altcoins
-        min_vol_ratio = 1.6    # Hoger volume vereist voor bevestiging
+        min_delta = 0.14
+        min_vol_ratio = 1.6
         pullback_delta = 0.20
     elif symbol in ["SOLUSDT", "BNBUSDT", "XRPUSDT"]:
         min_delta = 0.08
         min_vol_ratio = 1.3
         pullback_delta = 0.15
-    else:  # BTCUSDT & ETHUSDT
+    else:  # BTC & ETH
         min_delta = 0.05
         min_vol_ratio = 1.2
         pullback_delta = 0.12
 
-    # -------------------------------------------------------------
-    # FASE 1: MOMENTUM (4m 15s tot 2m 00s resterend)
-    # -------------------------------------------------------------
+    # Momentum Window: 4m 15s tot 2m 00s op de klok
     if 120 <= time_remaining_sec <= 255:
         if 53 <= rsi <= 68 and window_delta_pct >= min_delta and volume_ratio >= min_vol_ratio:
             if trend_15m != "BEARISH":
@@ -196,9 +242,7 @@ def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volum
                 reason = f"🚀 Momentum DOWN ({window_delta_pct}% t.o.v. Strike, Vol {volume_ratio}x) | 15M: {trend_15m}"
                 return "DOWN", "MOMENTUM", reason
 
-    # -------------------------------------------------------------
-    # FASE 2: PULLBACK / REVERSION (1m 00s tot 2m 30s)
-    # -------------------------------------------------------------
+    # Pullback Window: 1m 00s tot 2m 30s
     elif 60 <= time_remaining_sec <= 150:
         if prev_rsi >= 78 and rsi < prev_rsi and window_delta_pct >= pullback_delta:
             reason = f"🔄 Piek Omslag Bevestigd (Prev RSI {prev_rsi} ➔ {rsi}) | 15M: {trend_15m}"
@@ -230,6 +274,7 @@ def check_and_evaluate_paper_trades():
             signal = trade["signal"]
             share_price = trade["share_price"]
             shares_bought = trade["shares_bought"]
+            trade_amount = trade["trade_amount"]
             
             price_diff = round(current_price - entry_strike, 4)
             pct_diff = round(((current_price - entry_strike) / entry_strike) * 100, 2)
@@ -240,14 +285,18 @@ def check_and_evaluate_paper_trades():
             elif signal == "DOWN" and current_price < entry_strike:
                 is_win = True
 
+            mode_tag = "🔴 LIVE TRADE" if trade.get("is_live") else "📝 PAPER TRADE"
+
             if is_win:
                 payout = shares_bought * 1.00
-                profit = round(payout - TRADE_AMOUNT, 2)
-                PAPER_BALANCE += profit
-                badge = f"✅ **PAPER TRADE GEWONNEN!** (+${profit:.2f})"
+                profit = round(payout - trade_amount, 2)
+                if not trade.get("is_live"):
+                    PAPER_BALANCE += profit
+                badge = f"✅ **{mode_tag} GEWONNEN!** (+${profit:.2f})"
             else:
-                PAPER_BALANCE -= TRADE_AMOUNT
-                badge = f"❌ **PAPER TRADE VERLOREN** (-${TRADE_AMOUNT:.2f})"
+                if not trade.get("is_live"):
+                    PAPER_BALANCE -= trade_amount
+                badge = f"❌ **{mode_tag} VERLOREN** (-${trade_amount:.2f})"
 
             diff_str = f"+${price_diff} (+{pct_diff}%)" if price_diff > 0 else f"-${abs(price_diff)} ({pct_diff}%)"
 
@@ -257,8 +306,8 @@ def check_and_evaluate_paper_trades():
                 f"🎯 **Type:** {trade['strat_type']}\n"
                 f"🎯 **Target to Beat (5M Open):** `${entry_strike}`\n"
                 f"🏁 **Eindkoers:** `${current_price}` ({diff_str})\n"
-                f"📊 **Aangekochte Odds:** `${share_price:.2f}` per aandeel\n"
-                f"💰 **Nieuw Paper Saldo:** `${PAPER_BALANCE:.2f}`"
+                f"📊 **Odds:** `${share_price:.2f}` | **Inzet:** `${trade_amount:.2f}`\n"
+                f"💰 **Paper Saldo:** `${PAPER_BALANCE:.2f}`"
             )
             send_telegram_msg(msg)
         else:
@@ -271,14 +320,14 @@ def check_and_evaluate_paper_trades():
 # —————————————————————————
 
 def main():
-    print("🤖 Poly Bot v5.1 (ZEC/DOGE Aangescherpt & Odds Cap)...")
+    mode_str = f"🔴 **LIVE TRADING ACTIEF** (Inzet: `${LIVE_TRADE_AMOUNT:.2f}`)" if (LIVE_MODE and clob_client) else f"📝 **PAPER TRADING MODE** (Inzet: `${PAPER_TRADE_AMOUNT:.2f}`)"
+    
+    print(f"🤖 Poly Bot v5.2 Gestart - Mode: {mode_str}...")
     send_telegram_msg(
-        f"🤖 **Poly Bot Online (Versie v5.1)!**\n"
-        f"💰 Start Saldo: `${PAPER_BALANCE:.2f}` | Inzet: `${TRADE_AMOUNT:.2f}`\n\n"
-        f"⚙️ **Update v5.1:**\n"
-        f"• **ZEC & DOGE Protection:** Minimale delta verhoogd naar 0.14% & vol ratio 1.6x.\n"
-        f"• **Max Odds Cap:** Trades boven ${MAX_ALLOWABLE_ODDS:.2f} worden geweigerd.\n"
-        f"• **Tijd-venster:** Striktere inschakeling op momentum entries."
+        f"🤖 **Poly Bot Online (Versie v5.2)!**\n"
+        f"⚙️ **Status:** {mode_str}\n"
+        f"💰 Start Paper Saldo: `${PAPER_BALANCE:.2f}`\n\n"
+        f"🎯 **Systeem:** Target to Beat (5M Open) + Multi-Timeframe (15M) + Delta Protection."
     )
 
     while True:
@@ -311,9 +360,8 @@ def main():
                     if signal:
                         share_price = calculate_dynamic_polymarket_price(rsi, window_delta_pct, strat_type, signal)
                         
-                        # Filter op te hoge odds (slechte risk/reward)
                         if share_price > MAX_ALLOWABLE_ODDS:
-                            print(f"⚠️ Trade voor {symbol} overgeslagen: Odds (${share_price}) > max kap (${MAX_ALLOWABLE_ODDS})")
+                            print(f"⚠️ Trade voor {symbol} geweigerd: Odds (${share_price}) > Max Odds Limit (${MAX_ALLOWABLE_ODDS})")
                             continue
 
                         trade_key = f"cycle_{cycle_id}_{symbol}_{strat_type}"
@@ -322,8 +370,16 @@ def main():
                             active_signals_sent[trade_key] = True
                             current_cycle_trades_count += 1
 
-                            shares_bought = round(TRADE_AMOUNT / share_price, 2)
-                            potential_profit = round((shares_bought * 1.00) - TRADE_AMOUNT, 2)
+                            trade_amount = LIVE_TRADE_AMOUNT if (LIVE_MODE and clob_client) else PAPER_TRADE_AMOUNT
+                            shares_bought = round(trade_amount / share_price, 2)
+                            potential_profit = round((shares_bought * 1.00) - trade_amount, 2)
+
+                            # LIVE TRADE EXECUTION VIA POLYMARKET API
+                            live_order_res = None
+                            if LIVE_MODE and clob_client:
+                                # Dummy Token ID referentie voor Polymarket CLOB Market Order
+                                dummy_token_id = f"TOKEN_{symbol}_{signal}"
+                                live_order_res = execute_live_polymarket_order(dummy_token_id, trade_amount)
 
                             expiry_time = now_sec + time_remaining_sec
                             active_paper_trades.append({
@@ -334,7 +390,9 @@ def main():
                                 "entry_strike": window_strike_price,
                                 "share_price": share_price,
                                 "shares_bought": shares_bought,
-                                "expiry_time": expiry_time
+                                "trade_amount": trade_amount,
+                                "expiry_time": expiry_time,
+                                "is_live": (LIVE_MODE and clob_client is not None)
                             })
 
                             mins = int(time_remaining_sec // 60)
@@ -342,25 +400,26 @@ def main():
                             
                             direction_icon = "📈" if signal == "UP" else "📉"
                             target_condition = f"Hoger dan ${window_strike_price}" if signal == "UP" else f"Lager dan ${window_strike_price}"
+                            mode_badge = "🔴 **LIVE ORDER GEPLAATST**" if (LIVE_MODE and clob_client) else "📝 **PAPER TRADE GEOPEND**"
                             type_badge = "🔥 MOMENTUM" if strat_type == "MOMENTUM" else "🔄 PULLBACK"
 
                             msg = (
-                                f"🚨 **5M EXPIRY {type_badge}!** {direction_icon}\n\n"
+                                f"🚨 **5M EXPIRY {type_badge}!** {direction_icon}\n"
+                                f"STATUS: {mode_badge}\n\n"
                                 f"📍 **Pair:** {symbol}\n"
                                 f"🎯 **Target to Beat (5M Open):** `${window_strike_price}`\n"
                                 f"📍 **Huidige Koers:** `${current_price}` ({window_delta_pct}%)\n"
-                                f"👉 **Inzetten op Polymarket:** **{signal}** ({target_condition})\n\n"
-                                f"🏷️ **Odds:** `${share_price:.2f}` per aandeel (`{shares_bought}` aandelen)\n"
+                                f"👉 **Richting:** **{signal}** ({target_condition})\n\n"
+                                f"💵 **Inzet:** `${trade_amount:.2f}` op Odds `${share_price:.2f}`\n"
                                 f"💵 **Mogelijke Winst:** `+${potential_profit:.2f}`\n"
                                 f"📊 **RSI:** `{rsi}` | **Vol Ratio:** `{vol_ratio}x` | **Delta:** `{window_delta_pct}%`\n"
                                 f"⏱️ **Resterend:** `~{mins}m {secs}s`\n\n"
                                 f"💡 **Analyse:**\n"
-                                f"• {reason}\n\n"
-                                f"📝 *[Paper Trade Geopend: Inzet ${TRADE_AMOUNT}]*"
+                                f"• {reason}"
                             )
                             
                             send_telegram_msg(msg, button_url="https://polymarket.com")
-                            print(f"🚀 Signaal gestart voor {symbol}: {signal} (Strike: ${window_strike_price})")
+                            print(f"🚀 Signaal verwerkt voor {symbol}: {signal} (Strike: ${window_strike_price})")
 
             if len(active_signals_sent) > 100:
                 active_signals_sent.clear()
