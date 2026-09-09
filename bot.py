@@ -43,7 +43,7 @@ active_paper_trades = []
 active_signals_sent = {}
 
 # —————————————————————————
-# POLYMARKET LIVE CLIENT INITIALISATIE
+# POLYMARKET LIVE CLIENT INITIALISATIE (STAP 2 UPDATE)
 # —————————————————————————
 clob_client = None
 
@@ -54,7 +54,8 @@ if PK and LIVE_MODE:
             key=PK,
             chain_id=137
         )
-        clob_client.set_api_creds(clob_client.create_or_derive_api_creds())
+        creds = clob_client.create_or_derive_api_creds()
+        clob_client.set_api_creds(creds)
         print("✅ Polymarket Live Trading Client succesvol geïnitialiseerd!")
     except Exception as e:
         print(f"❌ Fout bij opzetten Polymarket Live Client: {e}")
@@ -380,9 +381,9 @@ def check_and_evaluate_paper_trades():
 def main():
     mode_str = f"🔴 **LIVE TRADING ACTIEF** (Inzet: `${LIVE_TRADE_AMOUNT:.2f}`)" if (LIVE_MODE and clob_client) else f"📝 **PAPER TRADING MODE** (Inzet: `${PAPER_TRADE_AMOUNT:.2f}`)"
     
-    print(f"🤖 Poly Bot v5.5 Gestart - Mode: {mode_str}...")
+    print(f"🤖 Poly Bot v5.6 Gestart - Mode: {mode_str}...")
     send_telegram_msg(
-        f"🤖 **Poly Bot Online (Versie v5.5)!**\n"
+        f"🤖 **Poly Bot Online (Versie v5.6)!**\n"
         f"⚙️ **Status:** {mode_str}\n"
         f"💰 Start Paper Saldo: `${PAPER_BALANCE:.2f}`\n\n"
         f"🎯 **Systeem:** Target to Beat (5M Open) + Dynamic 5M Token-ID Fetching."
