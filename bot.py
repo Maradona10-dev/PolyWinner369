@@ -13,17 +13,24 @@ RAW_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
 TELEGRAM_BOT_TOKEN = RAW_TOKEN.replace('bot', '', 1) if RAW_TOKEN.startswith('bot') else RAW_TOKEN
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
 
-# Live Trading Instellingen & Opschonen Private Key
-raw_pk = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
-# Verwijder eventuele '0x' prefix en opschonen van niet-ASCII/onzichtbare tekens
-PK = raw_pk[2:] if raw_pk.startswith("0x") else raw_pk
-PK = PK.encode('ascii', 'ignore').decode('ascii').strip()
+# Live Trading Instellingen & Grondige Opschoning Private Key
+raw_pk = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
+
+# Verwijder alle witregels, newlines, tabs en spaties
+cleaned_pk = "".join(raw_pk.split()).strip()
+
+# Verwijder eventuele '0x' of '0X' prefix
+if cleaned_pk.lower().startswith("0x"):
+    cleaned_pk = cleaned_pk[2:]
+
+# Behoud UITSLUITEND geldige hexadecimale karakters
+PK = "".join(c for c in cleaned_pk if c in "0123456789abcdefABCDEF")
 
 LIVE_TRADE_AMOUNT = float(os.environ.get("LIVE_TRADE_AMOUNT", "5.0"))
-
-# Forceer LIVE_MODE op True als er een Private Key aanwezig is
 ENV_LIVE = os.environ.get("LIVE_TRADING", "False").strip().lower()
-LIVE_MODE = True if (ENV_LIVE in ["true", "1", "yes"] or (PK and len(PK) >= 60)) else False
+
+# Activeer LIVE_MODE automatisch zodra er exact 64 hexadecimale karakters zijn
+LIVE_MODE = True if (ENV_LIVE in ["true", "1", "yes"] or len(PK) == 64) else False
 
 BINANCE_API_URL = "https://api.binance.com/api/v3"
 SCAN_INTERVAL_SEC = 10
