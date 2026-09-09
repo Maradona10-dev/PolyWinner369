@@ -14,10 +14,11 @@ TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
 BINANCE_API_URL = "https://api.binance.com/api/v3"
 SCAN_INTERVAL_SEC = 10
 
-# Te scannen handelsparen
+# Handelsparen (Inclusief aangescherpte regels voor ZEC & DOGE)
 PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ZECUSDT"]
 
 MAX_TRADES_PER_CYCLE = 2
+MAX_ALLOWABLE_ODDS = 0.70  # Geen trades openen als de odds hoger zijn dan $0.70
 
 # —————————————————————————
 # PAPER TRADING INSTELLINGEN
@@ -103,7 +104,7 @@ def calculate_rsi(prices, period=14):
     return round(100 - (100 / (1 + rs)), 1)
 
 # —————————————————————————
-# 15-MINUTEN TREND CHECK (MULTI-TIMEFRAME)
+# 15-MINUTEN TREND CHECK
 # —————————————————————————
 
 def fetch_15m_trend(symbol):
@@ -125,17 +126,18 @@ def fetch_15m_trend(symbol):
         print(f"Fout bij 15m trendcheck voor {symbol}: {e}")
         return "NEUTRAL"
 
-# —WARNING: BINANCE DATA OPHALEN (5M WINDOW & 1M DATA)
+# —————————————————————————
+# BINANCE DATA OPHALEN
 # —————————————————————————
 
 def fetch_binance_data(symbol):
     try:
-        # 1. Exacte 5-minuten window Open Price (Target to Beat)
+        # 1. Exacte 5-minuten Strike Price (Open Price van de 5m candle)
         url_5m = f"{BINANCE_API_URL}/klines?symbol={symbol}&interval=5m&limit=2"
         res_5m = requests.get(url_5m, timeout=3).json()
-        window_strike_price = float(res_5m[-1][1])  # Open price van de lopende 5m candle
+        window_strike_price = float(res_5m[-1][1])
 
-        # 2. 1-minuut gedetailleerde klines voor indicatorberekening
+        # 2. 1-minuut gedetailleerde klines
         url_1m = f"{BINANCE_API_URL}/klines?symbol={symbol}&interval=1m&limit=30"
         res_1m = requests.get(url_1m, timeout=4).json()
 
@@ -144,7 +146,7 @@ def fetch_binance_data(symbol):
 
         current_price = close_prices[-1]
         
-        # Verschil t.o.v. de 5m openingskoers (Target to Beat)
+        # Verschil t.o.v. de 5m strike price
         window_delta_pct = round(((current_price - window_strike_price) / window_strike_price) * 100, 3)
 
         rsi = calculate_rsi(close_prices)
@@ -160,25 +162,36 @@ def fetch_binance_data(symbol):
         return None, None, None, None, None, None
 
 # —————————————————————————
-# STRATEGIE & SIGNAAL EVALUATIE
+# STRATEGIE & SIGNAAL EVALUATIE (V5.1 AANGESCHERPT)
 # —————————————————————————
 
 def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volume_ratio, time_remaining_sec):
     trend_15m = fetch_15m_trend(symbol)
 
-    # Minimale Window Delta om foute fakeouts / ruis bij de openingskoers uit te sluiten
-    min_delta = 0.08 if symbol in ["ZECUSDT", "DOGEUSDT"] else 0.05
+    # Drempelwaarden gedifferentieerd per munt
+    if symbol in ["ZECUSDT", "DOGEUSDT"]:
+        min_delta = 0.14       # Vrijwel dubbele afstand vereist voor volatiele altcoins
+        min_vol_ratio = 1.6    # Hoger volume vereist voor bevestiging
+        pullback_delta = 0.20
+    elif symbol in ["SOLUSDT", "BNBUSDT", "XRPUSDT"]:
+        min_delta = 0.08
+        min_vol_ratio = 1.3
+        pullback_delta = 0.15
+    else:  # BTCUSDT & ETHUSDT
+        min_delta = 0.05
+        min_vol_ratio = 1.2
+        pullback_delta = 0.12
 
     # -------------------------------------------------------------
-    # FASE 1: MOMENTUM (4m 30s tot 3m 00s resterend op de klok)
+    # FASE 1: MOMENTUM (4m 15s tot 2m 00s resterend)
     # -------------------------------------------------------------
-    if 180 <= time_remaining_sec <= 270:
-        if 52 <= rsi <= 68 and window_delta_pct >= min_delta and volume_ratio >= 1.3:
+    if 120 <= time_remaining_sec <= 255:
+        if 53 <= rsi <= 68 and window_delta_pct >= min_delta and volume_ratio >= min_vol_ratio:
             if trend_15m != "BEARISH":
                 reason = f"🚀 Momentum UP (+{window_delta_pct}% t.o.v. Strike, Vol {volume_ratio}x) | 15M: {trend_15m}"
                 return "UP", "MOMENTUM", reason
 
-        elif 32 <= rsi <= 48 and window_delta_pct <= -min_delta and volume_ratio >= 1.3:
+        elif 32 <= rsi <= 47 and window_delta_pct <= -min_delta and volume_ratio >= min_vol_ratio:
             if trend_15m != "BULLISH":
                 reason = f"🚀 Momentum DOWN ({window_delta_pct}% t.o.v. Strike, Vol {volume_ratio}x) | 15M: {trend_15m}"
                 return "DOWN", "MOMENTUM", reason
@@ -187,11 +200,11 @@ def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volum
     # FASE 2: PULLBACK / REVERSION (1m 00s tot 2m 30s)
     # -------------------------------------------------------------
     elif 60 <= time_remaining_sec <= 150:
-        if prev_rsi >= 78 and rsi < prev_rsi and window_delta_pct >= 0.15:
+        if prev_rsi >= 78 and rsi < prev_rsi and window_delta_pct >= pullback_delta:
             reason = f"🔄 Piek Omslag Bevestigd (Prev RSI {prev_rsi} ➔ {rsi}) | 15M: {trend_15m}"
             return "DOWN", "PULLBACK", reason
 
-        elif prev_rsi <= 22 and rsi > prev_rsi and window_delta_pct <= -0.15:
+        elif prev_rsi <= 22 and rsi > prev_rsi and window_delta_pct <= -pullback_delta:
             reason = f"🔄 Bodem Bounce Bevestigd (Prev RSI {prev_rsi} ➔ {rsi}) | 15M: {trend_15m}"
             return "UP", "PULLBACK", reason
 
@@ -258,14 +271,14 @@ def check_and_evaluate_paper_trades():
 # —————————————————————————
 
 def main():
-    print("🤖 Poly Bot v5.0 (Echte 5M Strike Price & Delta Protection)...")
+    print("🤖 Poly Bot v5.1 (ZEC/DOGE Aangescherpt & Odds Cap)...")
     send_telegram_msg(
-        f"🤖 **Poly Bot Online (Versie v5.0)!**\n"
+        f"🤖 **Poly Bot Online (Versie v5.1)!**\n"
         f"💰 Start Saldo: `${PAPER_BALANCE:.2f}` | Inzet: `${TRADE_AMOUNT:.2f}`\n\n"
-        f"🛠️ **Verbeteringen v5.0:**\n"
-        f"• **5M Strike Price:** Instapkoers is exact de openingskoers van de 5m candle.\n"
-        f"• **Delta Protection:** Vereist minimaal 0.05%-0.08% afstand tot de Strike Price.\n"
-        f"• **15M Trend Alignment:** Geen trades meer openen tegen de 15m trend in."
+        f"⚙️ **Update v5.1:**\n"
+        f"• **ZEC & DOGE Protection:** Minimale delta verhoogd naar 0.14% & vol ratio 1.6x.\n"
+        f"• **Max Odds Cap:** Trades boven ${MAX_ALLOWABLE_ODDS:.2f} worden geweigerd.\n"
+        f"• **Tijd-venster:** Striktere inschakeling op momentum entries."
     )
 
     while True:
@@ -296,13 +309,19 @@ def main():
                     )
 
                     if signal:
+                        share_price = calculate_dynamic_polymarket_price(rsi, window_delta_pct, strat_type, signal)
+                        
+                        # Filter op te hoge odds (slechte risk/reward)
+                        if share_price > MAX_ALLOWABLE_ODDS:
+                            print(f"⚠️ Trade voor {symbol} overgeslagen: Odds (${share_price}) > max kap (${MAX_ALLOWABLE_ODDS})")
+                            continue
+
                         trade_key = f"cycle_{cycle_id}_{symbol}_{strat_type}"
 
                         if trade_key not in active_signals_sent:
                             active_signals_sent[trade_key] = True
                             current_cycle_trades_count += 1
 
-                            share_price = calculate_dynamic_polymarket_price(rsi, window_delta_pct, strat_type, signal)
                             shares_bought = round(TRADE_AMOUNT / share_price, 2)
                             potential_profit = round((shares_bought * 1.00) - TRADE_AMOUNT, 2)
 
@@ -323,7 +342,7 @@ def main():
                             
                             direction_icon = "📈" if signal == "UP" else "📉"
                             target_condition = f"Hoger dan ${window_strike_price}" if signal == "UP" else f"Lager dan ${window_strike_price}"
-                            type_badge = "🔥 MOMENTUM (5M DELTA)" if strat_type == "MOMENTUM" else "🔄 PULLBACK"
+                            type_badge = "🔥 MOMENTUM" if strat_type == "MOMENTUM" else "🔄 PULLBACK"
 
                             msg = (
                                 f"🚨 **5M EXPIRY {type_badge}!** {direction_icon}\n\n"
