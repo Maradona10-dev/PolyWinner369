@@ -15,35 +15,27 @@ TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
 
 # Live Trading Instellingen & Grondige Opschoning Private Key
 raw_pk = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
-
-# Verwijder alle witregels, newlines, tabs en spaties
 cleaned_pk = "".join(raw_pk.split()).strip()
 
-# Verwijder eventuele '0x' of '0X' prefix
 if cleaned_pk.lower().startswith("0x"):
     cleaned_pk = cleaned_pk[2:]
 
-# Behoud UITSLUITEND geldige hexadecimale karakters
 PK = "".join(c for c in cleaned_pk if c in "0123456789abcdefABCDEF")
 
 LIVE_TRADE_AMOUNT = float(os.environ.get("LIVE_TRADE_AMOUNT", "5.0"))
 ENV_LIVE = os.environ.get("LIVE_TRADING", "False").strip().lower()
 
-# Activeer LIVE_MODE automatisch zodra er exact 64 hexadecimale karakters zijn
 LIVE_MODE = True if (ENV_LIVE in ["true", "1", "yes"] or len(PK) == 64) else False
 
 BINANCE_API_URL = "https://api.binance.com/api/v3"
+POLYMARKET_GAMMA_URL = "https://gamma-api.polymarket.com/events"
 SCAN_INTERVAL_SEC = 10
 
-# Handelsparen
 PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ZECUSDT"]
 
 MAX_TRADES_PER_CYCLE = 2
-MAX_ALLOWABLE_ODDS = 0.70  # Bescherming van Risk/Reward
+MAX_ALLOWABLE_ODDS = 0.70
 
-# —————————————————————————
-# PAPER TRADING INITIALISATIE
-# —————————————————————————
 PAPER_BALANCE = 1000.0
 PAPER_TRADE_AMOUNT = 25.0
 active_paper_trades = []
@@ -59,9 +51,8 @@ if PK and LIVE_MODE:
         clob_client = ClobClient(
             host="https://clob.polymarket.com",
             key=PK,
-            chain_id=137  # Polygon Mainnet
+            chain_id=137
         )
-        # Genereer L2 API credentials automatisch op basis van Private Key
         clob_client.set_api_creds(clob_client.create_or_derive_api_creds())
         print("✅ Polymarket Live Trading Client succesvol geïnitialiseerd!")
     except Exception as e:
@@ -69,13 +60,49 @@ if PK and LIVE_MODE:
         clob_client = None
 
 # —————————————————————————
+# POLYMARKET REAL-TIME TOKEN ID OPHALEN
+# —————————————————————————
+
+def fetch_polymarket_token_id(symbol, signal):
+    """
+    Haalt het actuele, unieke blockchain token_id op via de Polymarket API
+    voor de actieve 5-minuten optie.
+    """
+    coin = symbol.replace("USDT", "").lower()
+    try:
+        params = {
+            "closed": "false",
+            "limit": 20,
+            "tag_slug": "crypto"
+        }
+        res = requests.get(POLYMARKET_GAMMA_URL, params=params, timeout=5).json()
+        
+        for event in res:
+            title = event.get("title", "").lower()
+            if coin in title and ("5m" in title or "5 min" in title or "5-minute" in title):
+                markets = event.get("markets", [])
+                for market in markets:
+                    if not market.get("closed", False):
+                        clob_token_ids = json.loads(market.get("clobTokenIds", "[]"))
+                        if len(clob_token_ids) >= 2:
+                            # Index 0 = YES / UP, Index 1 = NO / DOWN
+                            token_id = clob_token_ids[0] if signal == "UP" else clob_token_ids[1]
+                            print(f"🎯 Live Token ID gevonden voor {symbol} ({signal}): {token_id}")
+                            return token_id
+    except Exception as e:
+        print(f"❌ Fout bij ophalen Polymarket Token ID voor {symbol}: {e}")
+    
+    print(f"⚠️ Geen actief Polymarket contract gevonden voor {symbol}.")
+    return None
+
+# —————————————————————————
 # LIVE TRADING ORDER EXECUTION
 # —————————————————————————
 
 def execute_live_polymarket_order(token_id, amount_usd):
-    if not clob_client:
-        print("⚠️ Live client is niet actief. Order overgeslagen.")
-        return None
+    if not clob_client or not token_id:
+        print("⚠️ Live client niet actief of token_id ontbreekt. Order overgeslagen.")
+        return False
 
     try:
         order_args = MarketOrderArgs(
@@ -84,11 +111,16 @@ def execute_live_polymarket_order(token_id, amount_usd):
         )
         signed_order = clob_client.create_market_order(order_args)
         response = clob_client.post_order(signed_order)
-        print(f"🚀 LIVE ORDER SUCCESVOL GEPLAATST: {response}")
-        return response
+        
+        if response and response.get("success") == True:
+            print(f"🚀 LIVE ORDER GEPLAATST OP CLOB: {response}")
+            return True
+        else:
+            print(f"❌ ORDER WEIGERD DOOR POLYMARKET: {response}")
+            return False
     except Exception as e:
         print(f"❌ LIVE ORDER MISLUKT: {e}")
-        return None
+        return False
 
 # —————————————————————————
 # TELEGRAM BERICHTEN STUREN
@@ -166,7 +198,7 @@ def calculate_rsi(prices, period=14):
     return round(100 - (100 / (1 + rs)), 1)
 
 # —————————————————————————
-# 15-MINUTEN TREND CHECK (MULTI-TIMEFRAME)
+# 15-MINUTEN TREND CHECK
 # —————————————————————————
 
 def fetch_15m_trend(symbol):
@@ -189,7 +221,7 @@ def fetch_15m_trend(symbol):
         return "NEUTRAL"
 
 # —————————————————————————
-# BINANCE DATA OPHALEN (STRIKE PRICE & 1M KLINES)
+# BINANCE DATA OPHALEN
 # —————————————————————————
 
 def fetch_binance_data(symbol):
@@ -234,12 +266,11 @@ def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volum
         min_delta = 0.08
         min_vol_ratio = 1.3
         pullback_delta = 0.15
-    else:  # BTC & ETH
+    else:
         min_delta = 0.05
         min_vol_ratio = 1.2
         pullback_delta = 0.12
 
-    # Momentum Window
     if 120 <= time_remaining_sec <= 255:
         if 53 <= rsi <= 68 and window_delta_pct >= min_delta and volume_ratio >= min_vol_ratio:
             if trend_15m != "BEARISH":
@@ -251,7 +282,6 @@ def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volum
                 reason = f"🚀 Momentum DOWN ({window_delta_pct}% t.o.v. Strike, Vol {volume_ratio}x) | 15M: {trend_15m}"
                 return "DOWN", "MOMENTUM", reason
 
-    # Pullback Window
     elif 60 <= time_remaining_sec <= 150:
         if prev_rsi >= 78 and rsi < prev_rsi and window_delta_pct >= pullback_delta:
             reason = f"🔄 Piek Omslag Bevestigd (Prev RSI {prev_rsi} ➔ {rsi}) | 15M: {trend_15m}"
@@ -264,7 +294,7 @@ def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volum
     return None, None, "Geen geschikt signaal"
 
 # —————————————————————————
-# PAPER TRADING EVALUATIE ENGINE
+# EVALUATIE ENGINE
 # —————————————————————————
 
 def check_and_evaluate_paper_trades():
@@ -294,16 +324,17 @@ def check_and_evaluate_paper_trades():
             elif signal == "DOWN" and current_price < entry_strike:
                 is_win = True
 
-            mode_tag = "🔴 LIVE TRADE" if trade.get("is_live") else "📝 PAPER TRADE"
+            is_live_order = trade.get("is_live_executed", False)
+            mode_tag = "🔴 LIVE TRADE" if is_live_order else "📝 PAPER TRADE"
 
             if is_win:
                 payout = shares_bought * 1.00
                 profit = round(payout - trade_amount, 2)
-                if not trade.get("is_live"):
+                if not is_live_order:
                     PAPER_BALANCE += profit
                 badge = f"✅ **{mode_tag} GEWONNEN!** (+${profit:.2f})"
             else:
-                if not trade.get("is_live"):
+                if not is_live_order:
                     PAPER_BALANCE -= trade_amount
                 badge = f"❌ **{mode_tag} VERLOREN** (-${trade_amount:.2f})"
 
@@ -331,12 +362,12 @@ def check_and_evaluate_paper_trades():
 def main():
     mode_str = f"🔴 **LIVE TRADING ACTIEF** (Inzet: `${LIVE_TRADE_AMOUNT:.2f}`)" if (LIVE_MODE and clob_client) else f"📝 **PAPER TRADING MODE** (Inzet: `${PAPER_TRADE_AMOUNT:.2f}`)"
     
-    print(f"🤖 Poly Bot v5.2 Gestart - Mode: {mode_str}...")
+    print(f"🤖 Poly Bot v5.3 Gestart - Mode: {mode_str}...")
     send_telegram_msg(
-        f"🤖 **Poly Bot Online (Versie v5.2)!**\n"
+        f"🤖 **Poly Bot Online (Versie v5.3)!**\n"
         f"⚙️ **Status:** {mode_str}\n"
         f"💰 Start Paper Saldo: `${PAPER_BALANCE:.2f}`\n\n"
-        f"🎯 **Systeem:** Target to Beat (5M Open) + Multi-Timeframe (15M) + Delta Protection."
+        f"🎯 **Systeem:** Target to Beat (5M Open) + Dynamic Token-ID Fetching."
     )
 
     while True:
@@ -383,10 +414,11 @@ def main():
                             shares_bought = round(trade_amount / share_price, 2)
                             potential_profit = round((shares_bought * 1.00) - trade_amount, 2)
 
-                            live_order_res = None
+                            is_live_success = False
                             if LIVE_MODE and clob_client:
-                                dummy_token_id = f"TOKEN_{symbol}_{signal}"
-                                live_order_res = execute_live_polymarket_order(dummy_token_id, trade_amount)
+                                real_token_id = fetch_polymarket_token_id(symbol, signal)
+                                if real_token_id:
+                                    is_live_success = execute_live_polymarket_order(real_token_id, trade_amount)
 
                             expiry_time = now_sec + time_remaining_sec
                             active_paper_trades.append({
@@ -399,7 +431,7 @@ def main():
                                 "shares_bought": shares_bought,
                                 "trade_amount": trade_amount,
                                 "expiry_time": expiry_time,
-                                "is_live": (LIVE_MODE and clob_client is not None)
+                                "is_live_executed": is_live_success
                             })
 
                             mins = int(time_remaining_sec // 60)
@@ -407,7 +439,14 @@ def main():
                             
                             direction_icon = "📈" if signal == "UP" else "📉"
                             target_condition = f"Hoger dan ${window_strike_price}" if signal == "UP" else f"Lager dan ${window_strike_price}"
-                            mode_badge = "🔴 **LIVE ORDER GEPLAATST**" if (LIVE_MODE and clob_client) else "📝 **PAPER TRADE GEOPEND**"
+                            
+                            if is_live_success:
+                                mode_badge = "🔴 **LIVE ORDER GEPLAATST OP CLOB**"
+                            elif LIVE_MODE:
+                                mode_badge = "⚠️ **LIVE ORDER MISLUKT (Paper Trade Geopend)**"
+                            else:
+                                mode_badge = "📝 **PAPER TRADE GEOPEND**"
+
                             type_badge = "🔥 MOMENTUM" if strat_type == "MOMENTUM" else "🔄 PULLBACK"
 
                             msg = (
