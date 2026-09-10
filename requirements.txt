@@ -1,2 +1,2 @@
-py-clob-client>=0.34.0
+py-clob-client==0.35.2
 requests
