@@ -48,7 +48,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 
 # ============================================================
-# POLYMARKET WALLET & VALIDATIE (UNICODE & FORMAT FIX)
+# POLYMARKET WALLET & VALIDATIE
 # ============================================================
 
 RAW_PRIVATE_KEY = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
@@ -157,7 +157,12 @@ def init_clob_client():
             kwargs["funder"] = POLYMARKET_FUNDER_ADDRESS
 
         client = ClobClient(**kwargs)
-        creds = client.create_or_derive_api_key()
+        
+        try:
+            creds = client.derive_api_key()
+        except Exception:
+            creds = client.create_api_key()
+
         client.set_api_creds(creds)
         print(f"✅ CLOB Verbonden | Wallet Adres: {client.get_address()}")
         return client
@@ -185,7 +190,7 @@ def send_telegram_msg(message: str, button_url: Optional[str] = None):
     }
     if button_url:
         payload["reply_markup"] = {
-            "inline_keyboard": [[{"text": "🌐 BEKIJK TRADES OP POLYMARKET", "url": button_url}]]
+            "inline_keyboard": [[{"text": "🚀 ZET DIRECT IN OP POLYMARKET", "url": button_url}]]
         }
 
     try:
@@ -197,7 +202,7 @@ def send_telegram_msg(message: str, button_url: Optional[str] = None):
 
 
 # ============================================================
-# BINANCE DATA & RSI BEREKENING
+# BINANCE DATA & RSI / 15M TREND BEREKENING
 # ============================================================
 
 def fetch_klines(symbol: str, interval: str, limit: int):
@@ -222,12 +227,28 @@ def calculate_rsi(prices, period: int = 14):
     return round(100 - (100 / (1 + (avg_gain / avg_loss))), 1)
 
 
+def fetch_15m_trend(symbol: str) -> str:
+    res_15m = fetch_klines(symbol, "15m", 15)
+    if not res_15m or len(res_15m) < 15:
+        return "NEUTRAL"
+    
+    closes = [float(k[4]) for k in res_15m]
+    rsi_15m = calculate_rsi(closes)
+    change = ((closes[-1] - closes[0]) / closes[0]) * 100
+
+    if rsi_15m > 60 and change > 0.15:
+        return "BULLISH"
+    elif rsi_15m < 40 and change < -0.15:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
 def fetch_binance_data(symbol: str):
     try:
         res_5m = fetch_klines(symbol, "5m", 2)
         res_1m = fetch_klines(symbol, "1m", 30)
         if not res_5m or not res_1m:
-            return None, None, None, None, None, None
+            return None, None, None, None, None, None, None
 
         window_strike_price = float(res_5m[-1][1])
         close_prices = [float(k[4]) for k in res_1m]
@@ -242,16 +263,18 @@ def fetch_binance_data(symbol: str):
         avg_volume = sum(volumes[-11:-1]) / 10 if len(volumes) >= 11 else current_volume
         volume_ratio = round(current_volume / avg_volume, 2) if avg_volume > 0 else 1.0
 
-        return current_price, window_strike_price, window_delta_pct, rsi, prev_rsi, volume_ratio
+        trend_15m = fetch_15m_trend(symbol)
+
+        return current_price, window_strike_price, window_delta_pct, rsi, prev_rsi, volume_ratio, trend_15m
     except Exception as e:
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, None
 
 
 # ============================================================
-# STRATEGIE LOGICA
+# STRATEGIE LOGICA (MOMENTUM + 15M FILTER)
 # ============================================================
 
-def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volume_ratio, time_remaining_sec):
+def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volume_ratio, trend_15m, time_remaining_sec):
     if symbol in ["ZECUSDT", "DOGEUSDT"]:
         min_delta, min_vol_ratio = 0.14, 1.6
     elif symbol in ["SOLUSDT", "BNBUSDT", "XRPUSDT"]:
@@ -261,15 +284,18 @@ def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volum
 
     if 120 <= time_remaining_sec <= 255:
         if 53 <= rsi <= 68 and window_delta_pct >= min_delta and volume_ratio >= min_vol_ratio:
-            return "UP", "MOMENTUM", f"🚀 Momentum UP (+{window_delta_pct}%, Vol {volume_ratio}x)"
+            if trend_15m != "BEARISH":
+                return "UP", "MOMENTUM", f"🚀 Momentum UP (+{window_delta_pct}% t.o.v. Strike, Vol {volume_ratio}x)"
+
         if 32 <= rsi <= 47 and window_delta_pct <= -min_delta and volume_ratio >= min_vol_ratio:
-            return "DOWN", "MOMENTUM", f"🚀 Momentum DOWN ({window_delta_pct}%, Vol {volume_ratio}x)"
+            if trend_15m != "BULLISH":
+                return "DOWN", "MOMENTUM", f"🚀 Momentum DOWN ({window_delta_pct}% t.o.v. Strike, Vol {volume_ratio}x)"
 
     return None, None, None
 
 
 # ============================================================
-# POLYMARKET ORDER EXECUTIE (VOLAUTOMATISCH)
+# POLYMARKET ORDER EXECUTIE (MET VEILIGE ORDERBOOK PARSER)
 # ============================================================
 
 def find_current_polymarket_event(symbol: str):
@@ -311,12 +337,30 @@ def get_token_info(symbol: str, signal: str):
 def execute_live_order(token_id: str, amount_usd: float, max_price: float):
     try:
         orderbook = clob_client.get_order_book(token_id)
-        if not orderbook or not orderbook.asks:
+        if not orderbook:
+            return False, 0.0, "Geen orderbook ontvangen"
+
+        # Vang zowel dict als object-structuur op uit py_clob_client
+        asks = []
+        if isinstance(orderbook, dict):
+            asks = orderbook.get("asks", [])
+        elif hasattr(orderbook, "asks"):
+            asks = orderbook.asks
+
+        if not asks:
             return False, 0.0, "Geen asks in orderbook"
 
-        best_ask = float(orderbook.asks[0].price)
+        first_ask = asks[0]
+        if isinstance(first_ask, dict):
+            best_ask = float(first_ask.get("price", 0))
+        else:
+            best_ask = float(getattr(first_ask, "price", 0))
+
+        if best_ask <= 0:
+            return False, 0.0, "Ongeldige ask prijs"
+
         if best_ask > max_price:
-            return False, best_ask, f"Prijs te hoog ({best_ask:.3f} > max {max_price:.3f})"
+            return False, best_ask, f"Prijs te hoog (${best_ask:.3f} > max ${max_price:.3f})"
 
         shares = amount_usd / best_ask
 
@@ -347,14 +391,14 @@ def execute_live_order(token_id: str, amount_usd: float, max_price: float):
 
 def main():
     print("\n" + "=" * 60)
-    print("🤖 POLYMARKET VOLAUTOMATISCHE LIVE TRADING BOT")
+    print("🤖 POLYMARKET VOLAUTOMATISCHE LIVE TRADING BOT (v5.1 Logica)")
     print("=" * 60)
     print(f"Live order bedrag: ${LIVE_TRADE_AMOUNT:.2f} USD")
     print(f"Max Ask Limiet: ${MAX_ALLOWABLE_ODDS:.2f}")
     print("=" * 60 + "\n")
 
     send_telegram_msg(
-        "⚡ **Poly Auto-Trader LIVE Gestart**\n\n"
+        "⚡ **Poly Auto-Trader LIVE Gestart (v5.1 Logica)**\n\n"
         "🚨 **Systeemstatus:** VOLAUTOMATISCH TRADEN ACTIEF\n"
         f"💵 **Inzet per trade:** `${LIVE_TRADE_AMOUNT:.2f}`\n"
         f"🛡️ **Max Ask Limiet:** `${MAX_ALLOWABLE_ODDS:.2f}`"
@@ -363,7 +407,7 @@ def main():
     while True:
         try:
             now_sec = time.time()
-            time_remaining_sec = 300 - (now_sec % 300)
+            time_remaining_sec = int(300 - (now_sec % 300))
             cycle_id = int(now_sec // 300)
 
             current_cycle_count = sum(1 for k in active_signals_sent if k.startswith(f"cycle_{cycle_id}_"))
@@ -373,12 +417,12 @@ def main():
                     if current_cycle_count >= MAX_TRADES_PER_CYCLE:
                         break
 
-                    current_price, strike, delta_pct, rsi, prev_rsi, vol_ratio = fetch_binance_data(symbol)
+                    current_price, strike, delta_pct, rsi, prev_rsi, vol_ratio, trend_15m = fetch_binance_data(symbol)
                     if current_price is None:
                         continue
 
                     signal, strat_type, reason = analyze_market_and_get_signal(
-                        symbol, rsi, prev_rsi, delta_pct, vol_ratio, time_remaining_sec
+                        symbol, rsi, prev_rsi, delta_pct, vol_ratio, trend_15m, time_remaining_sec
                     )
                     if not signal:
                         continue
@@ -401,20 +445,26 @@ def main():
                     active_signals_sent[trade_key] = True
                     current_cycle_count += 1
 
+                    mins, secs = divmod(time_remaining_sec, 60)
+                    time_str = f"~{mins}m {secs}s"
+
                     if success:
                         shares = round(LIVE_TRADE_AMOUNT / filled_price, 2)
                         msg = (
-                            f"🟢 **LIVE ORDER SUCCESVOL GEPLAATST!**\n\n"
+                            f"🚨 **5M EXPIRY 📈 MOMENTUM!**\n\n"
                             f"📍 **Pair:** {symbol} ({signal})\n"
-                            f"🎯 **Binance Open:** `${strike}`\n"
-                            f"📊 **Uitvoeringsprijs:** `${filled_price:.3f}`\n"
-                            f"💵 **Inzet:** `${LIVE_TRADE_AMOUNT:.2f}` ({shares} shares)\n"
-                            f"🆔 **Order ID:** `{info}`\n\n"
-                            f"💡 **Motivatie:** {reason}"
+                            f"🎯 **Target to Beat (5M Open):** `${strike}`\n"
+                            f"📌 **Huidige Koers:** `${current_price}` ({delta_pct}%)\n"
+                            f"📊 **Uitvoeringsprijs:** `${filled_price:.3f}` ({shares} aandelen)\n"
+                            f"💵 **Inzetten op Polymarket:** `${LIVE_TRADE_AMOUNT:.2f}` ({signal})\n\n"
+                            f"📊 **RSI:** {rsi} | **Vol Ratio:** {vol_ratio}x | **Delta:** {delta_pct}%\n"
+                            f"⏳ **Resterend:** `{time_str}`\n\n"
+                            f"💡 **Analyse:** 🚀 Momentum {signal} ({delta_pct}% t.o.v. Strike, Vol {vol_ratio}x) | **15M:** {trend_15m}\n\n"
+                            f"🟢 **LIVE ORDER GEPLAATST** | Order ID: `{info}`"
                         )
                     else:
                         msg = (
-                            f"🔴 **LIVE ORDER GEWEIGERD / MISLUKT**\n\n"
+                            f"🚨 **LIVE ORDER GEWEIGERD / MISLUKT**\n\n"
                             f"📍 **Pair:** {symbol} ({signal})\n"
                             f"⚠️ **Reden:** {info}"
                         )
