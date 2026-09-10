@@ -47,7 +47,6 @@ active_signals_sent = {}
 # POLYMARKET LIVE CLIENT INITIALISATIE
 # —————————————————————————
 
-# Determine signature type: 2 voor Proxy/Deposit Wallet, 0 voor standaard EOA
 SIG_TYPE = 2 if POLYMARKET_FUNDER_ADDRESS else 0
 
 def init_clob_client():
@@ -152,6 +151,7 @@ def execute_live_polymarket_order(token_id, amount_usd):
         return False
 
     try:
+        # Constructie volgens V2 API specificaties
         order_args = MarketOrderArgsV2(
             token_id=token_id,
             amount=round(amount_usd, 2),
@@ -159,16 +159,7 @@ def execute_live_polymarket_order(token_id, amount_usd):
             price=0.99
         )
 
-        # Forceer funder_address en signature_type bij ordergeneratie
-        if POLYMARKET_FUNDER_ADDRESS:
-            signed_order = clob_client.create_market_order(
-                order_args,
-                funder_address=POLYMARKET_FUNDER_ADDRESS,
-                signature_type=SIG_TYPE
-            )
-        else:
-            signed_order = clob_client.create_market_order(order_args)
-
+        signed_order = clob_client.create_market_order(order_args)
         response = clob_client.post_order(signed_order, order_type=OrderType.FAK)
 
         if response and (response.get("success") == True or "orderID" in str(response)):
