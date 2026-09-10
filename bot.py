@@ -42,7 +42,7 @@ active_paper_trades = []
 active_signals_sent = {}
 
 # —————————————————————————
-# POLYMARKET LIVE CLIENT INITIALISATIE (v0.34+)
+# POLYMARKET LIVE CLIENT INITIALISATIE (v0.35.2+)
 # —————————————————————————
 
 def init_clob_client():
@@ -66,7 +66,7 @@ def init_clob_client():
             except Exception:
                 pass
 
-        print("✅ Polymarket Live Client (SDK v0.34+) succesvol geïnitialiseerd!")
+        print("✅ Polymarket Live Client (py-clob-client v0.35.2) succesvol geïnitialiseerd!")
         return client
     except Exception as e:
         print(f"❌ Fout bij opzetten Polymarket Live Client: {e}")
@@ -75,7 +75,7 @@ def init_clob_client():
 clob_client = init_clob_client()
 
 # —————————————————————————
-# TOKEN ID OPHALEN
+# REAL-TIME TOKEN ID OPHALEN
 # —————————————————————————
 
 def fetch_polymarket_token_id(symbol, signal):
@@ -120,7 +120,7 @@ def fetch_polymarket_token_id(symbol, signal):
                         except json.JSONDecodeError:
                             continue
         
-        print(f"❌ Geen geschikte Token ID voor {symbol} ({signal})")
+        print(f"❌ Geen geschikte Token ID gevonden voor {symbol} ({signal})")
         return None
         
     except Exception as e:
@@ -128,7 +128,7 @@ def fetch_polymarket_token_id(symbol, signal):
         return None
 
 # —————————————————————————
-# LIVE ORDER EXECUTION
+# LIVE ORDER EXECUTION (MET OrderType.FOK VLAG)
 # —————————————————————————
 
 def execute_live_polymarket_order(token_id, amount_usd):
@@ -146,6 +146,8 @@ def execute_live_polymarket_order(token_id, amount_usd):
         )
 
         signed_order = clob_client.create_market_order(order_args)
+        
+        # OrderType.FOK is verplicht op de nieuwste Polymarket API om v2/v3 te forceren
         response = clob_client.post_order(signed_order, OrderType.FOK)
 
         if response and (response.get("success") == True or "orderID" in str(response)):
@@ -403,10 +405,10 @@ def main():
     
     print(f"🤖 Poly Bot Gestart - Mode: {mode_str}...")
     send_telegram_msg(
-        f"🤖 **Poly Bot Online (SDK v0.34+)!**\n"
+        f"🤖 **Poly Bot Online (v0.35.2 Fix)!**\n"
         f"⚙️ **Status:** {mode_str}\n"
         f"💰 Start Paper Saldo: `${PAPER_BALANCE:.2f}`\n\n"
-        f"🎯 **Systeem:** Target to Beat + SDK Upgraded."
+        f"🎯 **Systeem:** OrderType.FOK Geactiveerd."
     )
 
     while True:
