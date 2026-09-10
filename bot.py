@@ -37,6 +37,9 @@ MAX_TRADES_PER_CYCLE = int(os.environ.get("MAX_TRADES_PER_CYCLE", "2"))
 MAX_ALLOWABLE_ODDS = float(os.environ.get("MAX_ALLOWABLE_ODDS", "0.70"))
 LIVE_TRADE_AMOUNT = float(os.environ.get("LIVE_TRADE_AMOUNT", "5.0"))
 
+# Maximaal toegestaan verschil tussen orderbook-prijs en get_price()-prijs
+MAX_PRICE_DISCREPANCY = float(os.environ.get("MAX_PRICE_DISCREPANCY", "0.05"))
+
 
 # ============================================================
 # TELEGRAM CONFIGURATIE
@@ -109,7 +112,7 @@ POLY_SYMBOL_MAP = {
 
 active_signals_sent = {}
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyAutoTrader/3.2"})
+session.headers.update({"User-Agent": "PolyAutoTrader/3.4"})
 
 
 # ============================================================
@@ -157,7 +160,7 @@ def init_clob_client():
             kwargs["funder"] = POLYMARKET_FUNDER_ADDRESS
 
         client = ClobClient(**kwargs)
-        
+
         try:
             creds = client.derive_api_key()
         except Exception:
@@ -231,7 +234,7 @@ def fetch_15m_trend(symbol: str) -> str:
     res_15m = fetch_klines(symbol, "15m", 15)
     if not res_15m or len(res_15m) < 15:
         return "NEUTRAL"
-    
+
     closes = [float(k[4]) for k in res_15m]
     rsi_15m = calculate_rsi(closes)
     change = ((closes[-1] - closes[0]) / closes[0]) * 100
@@ -304,7 +307,6 @@ def find_current_polymarket_event(symbol: str):
     if not prefix:
         return None
 
-    # Dynamisch zoeken naar actieve, niet-gesloten markt op Gamma API
     url = f"{POLYMARKET_GAMMA_URL}/events?limit=10&active=true&closed=false&q={prefix}-updown-5m"
     data = request_json("GET", url, timeout=5)
 
@@ -357,19 +359,41 @@ def execute_live_order(token_id: str, amount_usd: float, max_price: float):
         if not asks:
             return False, 0.0, "Geen asks in orderbook"
 
-        first_ask = asks[0]
-        if isinstance(first_ask, dict):
-            best_ask = float(first_ask.get("price", 0))
+        # Beste (laagste) ask is de laatste entry in de lijst
+        best_ask_entry = asks[-1]
+        if isinstance(best_ask_entry, dict):
+            orderbook_ask = float(best_ask_entry.get("price", 0))
         else:
-            best_ask = float(getattr(first_ask, "price", 0))
+            orderbook_ask = float(getattr(best_ask_entry, "price", 0))
 
-        if best_ask <= 0:
-            return False, 0.0, "Ongeldige ask prijs"
+        if orderbook_ask <= 0:
+            return False, 0.0, "Ongeldige ask prijs (orderbook)"
+
+        # Kruiscontrole via get_price()
+        live_ask = None
+        try:
+            live_price = clob_client.get_price(token_id, side="SELL")
+            live_ask = float(live_price) if live_price is not None else None
+        except Exception as e:
+            print(f"⚠️ get_price() kruiscontrole mislukt: {e}")
+
+        if live_ask is not None:
+            price_diff = abs(orderbook_ask - live_ask)
+            if price_diff > MAX_PRICE_DISCREPANCY:
+                return False, orderbook_ask, (
+                    f"Prijs-mismatch gedetecteerd: orderbook=${orderbook_ask:.3f} "
+                    f"vs live_price=${live_ask:.3f} (verschil {price_diff:.3f}) "
+                    f"-- order geweigerd uit voorzorg"
+                )
+            best_ask = live_ask
+        else:
+            best_ask = orderbook_ask
 
         if best_ask > max_price:
             return False, best_ask, f"Prijs te hoog (${best_ask:.3f} > max ${max_price:.3f})"
 
-        shares = amount_usd / best_ask
+        # Aantal shares expliciet afronden op 2 decimalen
+        shares = round(amount_usd / best_ask, 2)
 
         order_args = OrderArgs(
             price=best_ask,
@@ -403,6 +427,7 @@ def main():
     print(f"Live order bedrag: ${LIVE_TRADE_AMOUNT:.2f} USD")
     print(f"Max Ask Limiet: ${MAX_ALLOWABLE_ODDS:.2f}")
     print(f"Scan Interval: {SCAN_INTERVAL_SEC}s")
+    print(f"Max prijs-discrepantie (orderbook vs live): ${MAX_PRICE_DISCREPANCY:.2f}")
     print("=" * 60 + "\n")
 
     send_telegram_msg(
@@ -410,7 +435,8 @@ def main():
         "🚨 **Systeemstatus:** VOLAUTOMATISCH TRADEN ACTIEF\n"
         f"💵 **Inzet per trade:** `${LIVE_TRADE_AMOUNT:.2f}`\n"
         f"🛡️ **Max Ask Limiet:** `${MAX_ALLOWABLE_ODDS:.2f}`\n"
-        f"⏱️ **Scan Frequentie:** `{SCAN_INTERVAL_SEC}s`"
+        f"⏱️ **Scan Frequentie:** `{SCAN_INTERVAL_SEC}s`\n"
+        f"🔍 **Prijs-kruiscontrole:** actief (max verschil ${MAX_PRICE_DISCREPANCY:.2f})"
     )
 
     while True:
@@ -446,8 +472,8 @@ def main():
 
                     print(f"⚡ Automatische live order starten voor {symbol} ({signal})...")
                     success, filled_price, info = execute_live_order(
-                        token_info["token_id"], 
-                        LIVE_TRADE_AMOUNT, 
+                        token_info["token_id"],
+                        LIVE_TRADE_AMOUNT,
                         MAX_ALLOWABLE_ODDS
                     )
 
