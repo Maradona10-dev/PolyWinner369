@@ -23,7 +23,7 @@ except ImportError:
 
 
 # ============================================================
-# CONFIGURATIE (PAPER TRADE INSTELLINGEN)
+# CONFIGURATIE (PAPER TRADE INSTELLINGEN + PULLBACK)
 # ============================================================
 
 CLOB_HOST = "https://clob.polymarket.com"
@@ -112,7 +112,7 @@ POLY_SYMBOL_MAP = {
 
 active_signals_sent = {}
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyAutoTrader/3.6"})
+session.headers.update({"User-Agent": "PolyAutoTrader/3.7"})
 
 
 # ============================================================
@@ -274,7 +274,7 @@ def fetch_binance_data(symbol: str):
 
 
 # ============================================================
-# STRATEGIE LOGICA (PAPER TRADE OORSPRONKELIJK)
+# STRATEGIE LOGICA (5M MOMENTUM, 15M TREND & 5M PULLBACK)
 # ============================================================
 
 def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volume_ratio, trend_15m, rsi_15m, time_remaining_sec):
@@ -288,7 +288,7 @@ def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volum
     now_sec = time.time()
     time_remaining_15m = int(900 - (now_sec % 900))
 
-    # STRATEGIE 1: 5M Expiry Momentum (Eerste 1 minuut van 5m candle)
+    # STRATEGIE 1: 5M Expiry Momentum (Eerste minuut van de candle)
     if 220 <= time_remaining_sec <= 280:
         if 53 <= rsi <= 68 and window_delta_pct >= min_delta and volume_ratio >= min_vol_ratio:
             if trend_15m != "BEARISH":
@@ -298,13 +298,25 @@ def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volum
             if trend_15m != "BULLISH":
                 return "DOWN", "5M_MOMENTUM", f"🚀 5M Momentum DOWN ({window_delta_pct}% t.o.v. Strike, Vol {volume_ratio}x)"
 
-    # STRATEGIE 2: 15M Expiry Trend (Laatste 15m candle fase)
+    # STRATEGIE 2: 15M Expiry Trend
     if time_remaining_15m <= 300 and time_remaining_sec <= 270:
         if trend_15m == "BULLISH" and rsi >= 50 and window_delta_pct > 0:
             return "UP", "15M_TREND", f"🌊 15M Trend Follow UP (15M RSI {rsi_15m:.1f}, 5M Delta +{window_delta_pct}%)"
 
         if trend_15m == "BEARISH" and rsi <= 50 and window_delta_pct < 0:
             return "DOWN", "15M_TREND", f"🌊 15M Trend Follow DOWN (15M RSI {rsi_15m:.1f}, 5M Delta {window_delta_pct}%)"
+
+    # STRATEGIE 3: 5M Pullback / Reentry (Midden-tot-eind van de candle)
+    if 30 <= time_remaining_sec <= 220:
+        # Bullish Pullback: RSI veert op uit oversold (prev_rsi < 45, rsi > prev_rsi) én prijs staat boven strike
+        if prev_rsi < 45 and rsi > prev_rsi and window_delta_pct > 0.01:
+            if trend_15m != "BEARISH":
+                return "UP", "5M_PULLBACK", f"🔄 5M Pullback Reentry UP (RSI {prev_rsi:.1f} ➔ {rsi:.1f}, Delta +{window_delta_pct}%)"
+
+        # Bearish Pullback: RSI koelt af uit overbought (prev_rsi > 55, rsi < prev_rsi) én prijs staat onder strike
+        if prev_rsi > 55 and rsi < prev_rsi and window_delta_pct < -0.01:
+            if trend_15m != "BULLISH":
+                return "DOWN", "5M_PULLBACK", f"🔄 5M Pullback Reentry DOWN (RSI {prev_rsi:.1f} ➔ {rsi:.1f}, Delta {window_delta_pct}%)"
 
     return None, None, None
 
@@ -433,7 +445,7 @@ def execute_live_order(token_id: str, amount_usd: float, max_price: float):
 
 def main():
     print("\n" + "=" * 60)
-    print("🤖 POLYMARKET LIVE TRADING BOT (PAPER TRADE STRAT: 5M + 15M)")
+    print("🤖 POLYMARKET LIVE TRADING BOT (5M MOMENTUM, 15M TREND & PULLBACK)")
     print("=" * 60)
     print(f"Live order bedrag: ${LIVE_TRADE_AMOUNT:.2f} USD")
     print(f"Max Ask Limiet: ${MAX_ALLOWABLE_ODDS:.2f}")
@@ -442,12 +454,12 @@ def main():
     print("=" * 60 + "\n")
 
     send_telegram_msg(
-        "⚡ **Poly Auto-Trader LIVE Gestart (Originele Paper-Trade Instellingen)**\n\n"
+        "⚡ **Poly Auto-Trader LIVE Gestart (Inclusief Pullback Strategie)**\n\n"
         "🚨 **Systeemstatus:** VOLAUTOMATISCH TRADEN ACTIEF\n"
         f"💵 **Inzet per trade:** `${LIVE_TRADE_AMOUNT:.2f}`\n"
         f"🛡️ **Max Ask Limiet:** `${MAX_ALLOWABLE_ODDS:.2f}`\n"
         f"⏱️ **Scan Frequentie:** `{SCAN_INTERVAL_SEC}s`\n"
-        "🎯 **Strategieën:** 5M Momentum + 15M Trend Follow"
+        "🎯 **Strategieën:** 5M Momentum + 15M Trend + 5M Pullback Reentry"
     )
 
     while True:
