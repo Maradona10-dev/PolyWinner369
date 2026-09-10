@@ -47,6 +47,9 @@ active_signals_sent = {}
 # POLYMARKET LIVE CLIENT INITIALISATIE
 # —————————————————————————
 
+# Bepaal signature type: 2 voor Proxy/Deposit Wallet, 0 voor standaard EOA
+SIG_TYPE = 2 if POLYMARKET_FUNDER_ADDRESS else 0
+
 def init_clob_client():
     if not PK or not LIVE_MODE:
         return None
@@ -56,7 +59,7 @@ def init_clob_client():
                 host="https://clob.polymarket.com",
                 key=PK,
                 chain_id=137,
-                signature_type=2,  # 2 staat voor POLY_1271 / Gnosis Safe Deposit Wallet
+                signature_type=SIG_TYPE,
                 funder=POLYMARKET_FUNDER_ADDRESS
             )
         else:
@@ -156,7 +159,9 @@ def execute_live_polymarket_order(token_id, amount_usd):
             price=0.99
         )
 
-        response = clob_client.create_and_post_market_order(order_args, order_type=OrderType.FAK)
+        # Gebruik expliciet create_market_order en post_order met correcte signature_type
+        signed_order = clob_client.create_market_order(order_args)
+        response = clob_client.post_order(signed_order, order_type=OrderType.FAK)
 
         if response and (response.get("success") == True or "orderID" in str(response)):
             print(f"🚀 LIVE ORDER GEPLAATST OP CLOB V2: {response}")
