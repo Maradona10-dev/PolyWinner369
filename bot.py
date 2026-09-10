@@ -37,10 +37,7 @@ MAX_TRADES_PER_CYCLE = int(os.environ.get("MAX_TRADES_PER_CYCLE", "2"))
 MAX_ALLOWABLE_ODDS = float(os.environ.get("MAX_ALLOWABLE_ODDS", "0.70"))
 LIVE_TRADE_AMOUNT = float(os.environ.get("LIVE_TRADE_AMOUNT", "5.0"))
 
-# Maximaal toegestaan verschil tussen orderbook-prijs en get_price()-prijs
 MAX_PRICE_DISCREPANCY = float(os.environ.get("MAX_PRICE_DISCREPANCY", "0.05"))
-
-# Log-frequentie voor status-updates als er geen signaal is (in seconden)
 VERBOSE_LOG_INTERVAL_SEC = 15
 
 
@@ -116,7 +113,7 @@ POLY_SYMBOL_MAP = {
 active_signals_sent = {}
 last_verbose_log_time = 0
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyAutoTrader/3.8"})
+session.headers.update({"User-Agent": "PolyAutoTrader/3.9"})
 
 
 # ============================================================
@@ -274,7 +271,6 @@ def fetch_binance_data(symbol: str):
 
         return current_price, window_strike_price, window_delta_pct, rsi, prev_rsi, volume_ratio, trend_15m, rsi_15m
     except Exception as e:
-        # VERBETERING 1: Print expliciete exception
         print(f"⚠️ fetch_binance_data fout voor {symbol}: {e}")
         return None, None, None, None, None, None, None, None
 
@@ -326,7 +322,7 @@ def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volum
 
 
 # ============================================================
-# POLYMARKET DYNAMISCHE EVENT-ZOEKER (MET LOGGING)
+# POLYMARKET EVENT MATCHING (PUNT 1 GEFIXED: BREDE ZOEKOPDRACHT + LOKALE FILTER)
 # ============================================================
 
 def find_current_polymarket_event(symbol: str):
@@ -334,18 +330,22 @@ def find_current_polymarket_event(symbol: str):
     if not prefix:
         return None
 
-    url = f"{POLYMARKET_GAMMA_URL}/events?limit=10&active=true&closed=false&q={prefix}-updown-5m"
+    # Haal actieve events op zonder te strakke q= filter om zoekfouten in Gamma API te omzeilen
+    url = f"{POLYMARKET_GAMMA_URL}/events?limit=30&active=true&closed=false"
     data = request_json("GET", url, timeout=5)
 
-    # VERBETERING 2: Logging van Gamma API response
     if not data:
         print(f"⚠️ Geen response van Gamma API voor {symbol}")
         return None
 
     if isinstance(data, list):
         for event in data:
-            slug = event.get("slug", "")
-            if f"{prefix}-updown-5m-" in slug and not event.get("closed", False):
+            slug = event.get("slug", "").lower()
+            title = event.get("title", "").lower()
+
+            # Controleer op slug óf titel (bijv: "btc-updown-5m-" of "will btc go up in next 5m")
+            target_pattern = f"{prefix}-updown-5m"
+            if (target_pattern in slug or target_pattern in title) and not event.get("closed", False):
                 return event
 
     print(f"⚠️ Geen matchend actief event gevonden voor {symbol} (prefix={prefix})")
@@ -377,6 +377,10 @@ def get_token_info(symbol: str, signal: str):
     return None
 
 
+# ============================================================
+# ORDER EXECUTIE (PUNT 2 GEFIXED: EXPLICIETE SORTERING LAAGSTE ASK)
+# ============================================================
+
 def execute_live_order(token_id: str, amount_usd: float, max_price: float):
     try:
         orderbook = clob_client.get_order_book(token_id)
@@ -392,15 +396,21 @@ def execute_live_order(token_id: str, amount_usd: float, max_price: float):
         if not asks:
             return False, 0.0, "Geen asks in orderbook"
 
-        best_ask_entry = asks[-1]
-        if isinstance(best_ask_entry, dict):
-            orderbook_ask = float(best_ask_entry.get("price", 0))
-        else:
-            orderbook_ask = float(getattr(best_ask_entry, "price", 0))
+        # PUNT 2 FIX: Sorteer de asks altijd expliciet op prijs (van laag naar hoog)
+        def get_ask_price(entry):
+            if isinstance(entry, dict):
+                return float(entry.get("price", 0))
+            return float(getattr(entry, "price", 0))
+
+        sorted_asks = sorted(asks, key=get_ask_price)
+        best_ask_entry = sorted_asks[0]  # Neem de ALLERLAAGSTE (goedkoopste) ask
+        
+        orderbook_ask = get_ask_price(best_ask_entry)
 
         if orderbook_ask <= 0:
             return False, 0.0, "Ongeldige ask prijs (orderbook)"
 
+        # Kruiscontrole via get_price()
         live_ask = None
         try:
             live_price = clob_client.get_price(token_id, side="SELL")
@@ -453,7 +463,7 @@ def main():
     global last_verbose_log_time
 
     print("\n" + "=" * 60)
-    print("🤖 POLYMARKET LIVE TRADING BOT (INCLUSIEF UITGEBREIDE LOGGING)")
+    print("🤖 POLYMARKET LIVE TRADING BOT (INCLUSIEF FIXES VOOR API & ASKS)")
     print("=" * 60)
     print(f"Live order bedrag: ${LIVE_TRADE_AMOUNT:.2f} USD")
     print(f"Max Ask Limiet: ${MAX_ALLOWABLE_ODDS:.2f}")
@@ -461,7 +471,7 @@ def main():
     print("=" * 60 + "\n")
 
     send_telegram_msg(
-        "⚡ **Poly Auto-Trader LIVE Gestart (Met Verbeterde Logging)**\n\n"
+        "⚡ **Poly Auto-Trader LIVE Gestart (Met Orderbook & Matching Fixes)**\n\n"
         "🚨 **Systeemstatus:** VOLAUTOMATISCH TRADEN ACTIEF\n"
         f"💵 **Inzet per trade:** `${LIVE_TRADE_AMOUNT:.2f}`\n"
         f"🛡️ **Max Ask Limiet:** `${MAX_ALLOWABLE_ODDS:.2f}`"
@@ -473,7 +483,6 @@ def main():
             time_remaining_sec = int(300 - (now_sec % 300))
             cycle_id = int(now_sec // 300)
 
-            # Bepaal of we deze scan-ronde een status-log in de terminal willen tonen
             should_log_status = (now_sec - last_verbose_log_time) >= VERBOSE_LOG_INTERVAL_SEC
             if should_log_status:
                 last_verbose_log_time = now_sec
@@ -495,7 +504,6 @@ def main():
                         symbol, rsi, prev_rsi, delta_pct, vol_ratio, trend_15m, rsi_15m, time_remaining_sec
                     )
 
-                    # VERBETERING 3: Gedoseerde statuslog als er geen signaal is
                     if not signal:
                         if should_log_status:
                             print(f"🔍 {symbol}: geen signaal | RSI={rsi} | delta={delta_pct}% | vol={vol_ratio}x | 15m={trend_15m} | t_rem={time_remaining_sec}s")
