@@ -3,7 +3,7 @@ import time
 import json
 import requests
 from py_clob_client_v2.client import ClobClient
-from py_clob_client_v2.clob_types import MarketOrderArgsV2, OrderType
+from py_clob_client_v2.clob_types import MarketOrderArgsV2, OrderType, SignatureTypeV2
 from py_clob_client_v2.order_builder.constants import BUY
 
 # —————————————————————————
@@ -21,6 +21,8 @@ if cleaned_pk.lower().startswith("0x"):
     cleaned_pk = cleaned_pk[2:]
 
 PK = "".join(c for c in cleaned_pk if c in "0123456789abcdefABCDEF")
+
+POLYMARKET_FUNDER_ADDRESS = os.environ.get("POLYMARKET_FUNDER_ADDRESS", "").strip()
 
 LIVE_TRADE_AMOUNT = float(os.environ.get("LIVE_TRADE_AMOUNT", "5.0"))
 ENV_LIVE = os.environ.get("LIVE_TRADING", "False").strip().lower()
@@ -42,19 +44,29 @@ active_paper_trades = []
 active_signals_sent = {}
 
 # —————————————————————————
-# POLYMARKET LIVE CLIENT INITIALISATIE (CLOB V2)
+# POLYMARKET LIVE CLIENT INITIALISATIE (CLOB V2 & DEPOSIT WALLET)
 # —————————————————————————
 
 def init_clob_client():
     if not PK or not LIVE_MODE:
         return None
     try:
-        client = ClobClient(
-            host="https://clob.polymarket.com",
-            key=PK,
-            chain_id=137,
-            signature_type=0
-        )
+        # Als funder address (Deposit Wallet) is opgegeven, sturen we orders via de Polymarket Proxy Wallet flow
+        if POLYMARKET_FUNDER_ADDRESS:
+            client = ClobClient(
+                host="https://clob.polymarket.com",
+                key=PK,
+                chain_id=137,
+                signature_type=SignatureTypeV2.POLY_1271,
+                funder=POLYMARKET_FUNDER_ADDRESS
+            )
+        else:
+            client = ClobClient(
+                host="https://clob.polymarket.com",
+                key=PK,
+                chain_id=137,
+                signature_type=0
+            )
         
         try:
             creds = client.derive_api_key()
@@ -66,7 +78,7 @@ def init_clob_client():
             except Exception:
                 pass
 
-        print("✅ Polymarket Live Client (CLOB V2) succesvol geïnitialiseerd!")
+        print("✅ Polymarket Live Client (CLOB V2 + Deposit Wallet) geactiveerd!")
         return client
     except Exception as e:
         print(f"❌ Fout bij opzetten Polymarket Live Client: {e}")
@@ -138,7 +150,7 @@ def execute_live_polymarket_order(token_id, amount_usd):
         return False
 
     try:
-        # Gebruik van MarketOrderArgsV2 voor het nieuwe CLOB V2 orderformaat
+        # V2 Marktorder vereist MarketOrderArgsV2 en OrderType.FAK
         order_args = MarketOrderArgsV2(
             token_id=token_id,
             amount=round(amount_usd, 2),
@@ -394,14 +406,16 @@ def check_and_evaluate_paper_trades():
 
     active_paper_trades = remaining_trades
 
-# —WARNING: MAIN LOOP—
+# —————————————————————————
+# MAIN LOOP
+# —————————————————————————
 
 def main():
     mode_str = f"🔴 **LIVE TRADING ACTIEF** (Inzet: `${LIVE_TRADE_AMOUNT:.2f}`)" if (LIVE_MODE and clob_client) else f"📝 **PAPER TRADING MODE** (Inzet: `${PAPER_TRADE_AMOUNT:.2f}`)"
     
     print(f"🤖 Poly Bot Gestart - Mode: {mode_str}...")
     send_telegram_msg(
-        f"🤖 **Poly Bot Online (CLOB V2)**\n"
+        f"🤖 **Poly Bot Online (CLOB V2 + Deposit Wallet)**\n"
         f"⚙️ **Status:** {mode_str}\n"
         f"💰 Start Paper Saldo: `${PAPER_BALANCE:.2f}`"
     )
