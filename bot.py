@@ -2,9 +2,9 @@ import os
 import time
 import json
 import requests
-from py_clob_client_v2.client import ClobClient
-from py_clob_client_v2.clob_types import MarketOrderArgs, OrderType
-from py_clob_client_v2.order_builder.constants import BUY
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import MarketOrderArgs
+from py_clob_client.order_builder.constants import BUY
 
 # —————————————————————————
 # CONFIGURATIE & ENVIRONMENT VARIABELEN
@@ -43,27 +43,36 @@ active_paper_trades = []
 active_signals_sent = {}
 
 # —————————————————————————
-# POLYMARKET LIVE CLIENT INITIALISATIE (V2 SDK)
+# POLYMARKET LIVE CLIENT INITIALISATIE (SDK v0.34+)
 # —————————————————————————
 
 def init_clob_client():
     if not PK or not LIVE_MODE:
         return None
     try:
-        # Signature type 0 = EOA wallet (MetaMask/Private key direct)
-        # Gebruik signature_type=3 als je een Polymarket Email/Magic Deposit wallet gebruikt!
+        # Base instelling voor Polygon Mainnet (Chain ID 137)
         client = ClobClient(
             host="https://clob.polymarket.com",
             key=PK,
             chain_id=137,
             signature_type=0
         )
-        creds = client.create_or_derive_api_creds()
-        client.set_api_creds(creds)
-        print("✅ Polymarket Live Trading Client (CLOB V2) succesvol geïnitialiseerd!")
+        
+        # API Creds ophalen via de nieuwste SDK methodes
+        try:
+            creds = client.derive_api_key()
+            client.set_api_creds(creds)
+        except AttributeError:
+            try:
+                creds = client.create_or_derive_api_creds()
+                client.set_api_creds(creds)
+            except Exception:
+                pass # Bij signature_type=0 maakt de nieuwste SDK intern autologin aan
+
+        print("✅ Polymarket Live Trading Client v7.2 succesvol geïnitialiseerd!")
         return client
     except Exception as e:
-        print(f"❌ Fout bij opzetten Polymarket V2 Live Client: {e}")
+        print(f"❌ Fout bij opzetten Polymarket Live Client: {e}")
         return None
 
 clob_client = init_clob_client()
@@ -116,7 +125,7 @@ def fetch_polymarket_token_id(symbol, signal):
     return None
 
 # —————————————————————————
-# LIVE TRADING ORDER EXECUTION (V2 FAK MARKET ORDER)
+# LIVE TRADING ORDER EXECUTION
 # —————————————————————————
 
 def execute_live_polymarket_order(token_id, amount_usd):
@@ -126,7 +135,6 @@ def execute_live_polymarket_order(token_id, amount_usd):
         return False
 
     try:
-        # v2 Market Order Args (bedrag afgerond op 2 decimalen)
         order_args = MarketOrderArgs(
             token_id=token_id,
             amount=round(amount_usd, 2),
@@ -134,12 +142,11 @@ def execute_live_polymarket_order(token_id, amount_usd):
             price=0.99
         )
 
-        # Nieuwe Polymarket CLOB v2 FAK (Fill-and-Kill) order call
         signed_order = clob_client.create_market_order(order_args)
-        response = clob_client.post_order(signed_order, OrderType.FAK)
+        response = clob_client.post_order(signed_order)
 
         if response and (response.get("success") == True or "orderID" in str(response)):
-            print(f"🚀 LIVE ORDER GEPLAATST OP CLOB V2: {response}")
+            print(f"🚀 LIVE ORDER GEPLAATST OP CLOB: {response}")
             return True
         else:
             print(f"❌ ORDER WEIGERD DOOR POLYMARKET: {response}")
@@ -152,7 +159,7 @@ def execute_live_polymarket_order(token_id, amount_usd):
             if clob_client:
                 order_args = MarketOrderArgs(token_id=token_id, amount=round(amount_usd, 2), side=BUY, price=0.99)
                 signed_order = clob_client.create_market_order(order_args)
-                response = clob_client.post_order(signed_order, OrderType.FAK)
+                response = clob_client.post_order(signed_order)
                 if response and (response.get("success") == True or "orderID" in str(response)):
                     print(f"🚀 LIVE ORDER GEPLAATST NA RE-INIT: {response}")
                     return True
@@ -400,14 +407,14 @@ def check_and_evaluate_paper_trades():
 # —————————————————————————
 
 def main():
-    mode_str = f"🔴 **LIVE TRADING ACTIEF (V2 API)** (Inzet: `${LIVE_TRADE_AMOUNT:.2f}`)" if (LIVE_MODE and clob_client) else f"📝 **PAPER TRADING MODE** (Inzet: `${PAPER_TRADE_AMOUNT:.2f}`)"
+    mode_str = f"🔴 **LIVE TRADING ACTIEF** (Inzet: `${LIVE_TRADE_AMOUNT:.2f}`)" if (LIVE_MODE and clob_client) else f"📝 **PAPER TRADING MODE** (Inzet: `${PAPER_TRADE_AMOUNT:.2f}`)"
     
-    print(f"🤖 Poly Bot v7.0 Gestart - Mode: {mode_str}...")
+    print(f"🤖 Poly Bot v7.2 Gestart - Mode: {mode_str}...")
     send_telegram_msg(
-        f"🤖 **Poly Bot Online (Versie v7.0 CLOB V2)!**\n"
+        f"🤖 **Poly Bot Online (Versie v7.2)!**\n"
         f"⚙️ **Status:** {mode_str}\n"
         f"💰 Start Paper Saldo: `${PAPER_BALANCE:.2f}`\n\n"
-        f"🎯 **Systeem:** Target to Beat (5M Open) + CLOB v2 FAK Orders."
+        f"🎯 **Systeem:** Target to Beat (5M Open) + Live CLOB Trading."
     )
 
     while True:
@@ -481,7 +488,7 @@ def main():
                             target_condition = f"Hoger dan ${window_strike_price}" if signal == "UP" else f"Lager dan ${window_strike_price}"
                             
                             if is_live_success:
-                                mode_badge = "🔴 **LIVE ORDER GEPLAATST OP CLOB V2**"
+                                mode_badge = "🔴 **LIVE ORDER GEPLAATST OP CLOB**"
                             elif LIVE_MODE:
                                 mode_badge = "⚠️ **LIVE ORDER MISLUKT (Paper Trade Geopend)**"
                             else:
