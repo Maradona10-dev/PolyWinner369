@@ -3,7 +3,7 @@ import time
 import json
 import requests
 from py_clob_client_v2.client import ClobClient
-from py_clob_client_v2.clob_types import MarketOrderArgsV2, OrderType, SignatureTypeV2
+from py_clob_client_v2.clob_types import MarketOrderArgsV2, OrderType, SignatureType
 from py_clob_client_v2.order_builder.constants import BUY
 
 # —————————————————————————
@@ -44,20 +44,19 @@ active_paper_trades = []
 active_signals_sent = {}
 
 # —————————————————————————
-# POLYMARKET LIVE CLIENT INITIALISATIE (CLOB V2 & DEPOSIT WALLET)
+# POLYMARKET LIVE CLIENT INITIALISATIE
 # —————————————————————————
 
 def init_clob_client():
     if not PK or not LIVE_MODE:
         return None
     try:
-        # Als funder address (Deposit Wallet) is opgegeven, sturen we orders via de Polymarket Proxy Wallet flow
         if POLYMARKET_FUNDER_ADDRESS:
             client = ClobClient(
                 host="https://clob.polymarket.com",
                 key=PK,
                 chain_id=137,
-                signature_type=SignatureTypeV2.POLY_1271,
+                signature_type=SignatureType.POLY_1271,
                 funder=POLYMARKET_FUNDER_ADDRESS
             )
         else:
@@ -140,7 +139,7 @@ def fetch_polymarket_token_id(symbol, signal):
         return None
 
 # —————————————————————————
-# LIVE ORDER EXECUTION (CLOB V2 MARKT ORDER)
+# LIVE ORDER EXECUTION
 # —————————————————————————
 
 def execute_live_polymarket_order(token_id, amount_usd):
@@ -150,7 +149,6 @@ def execute_live_polymarket_order(token_id, amount_usd):
         return False
 
     try:
-        # V2 Marktorder vereist MarketOrderArgsV2 en OrderType.FAK
         order_args = MarketOrderArgsV2(
             token_id=token_id,
             amount=round(amount_usd, 2),
