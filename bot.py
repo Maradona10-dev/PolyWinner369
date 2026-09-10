@@ -23,7 +23,7 @@ except ImportError:
 
 
 # ============================================================
-# CONFIGURATIE
+# CONFIGURATIE (PAPER TRADE INSTELLINGEN)
 # ============================================================
 
 CLOB_HOST = "https://clob.polymarket.com"
@@ -112,7 +112,7 @@ POLY_SYMBOL_MAP = {
 
 active_signals_sent = {}
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyAutoTrader/3.5"})
+session.headers.update({"User-Agent": "PolyAutoTrader/3.6"})
 
 
 # ============================================================
@@ -230,20 +230,20 @@ def calculate_rsi(prices, period: int = 14):
     return round(100 - (100 / (1 + (avg_gain / avg_loss))), 1)
 
 
-def fetch_15m_trend(symbol: str) -> str:
+def fetch_15m_trend(symbol: str) -> Tuple[str, float]:
     res_15m = fetch_klines(symbol, "15m", 15)
     if not res_15m or len(res_15m) < 15:
-        return "NEUTRAL"
+        return "NEUTRAL", 0.0
 
     closes = [float(k[4]) for k in res_15m]
     rsi_15m = calculate_rsi(closes)
     change = ((closes[-1] - closes[0]) / closes[0]) * 100
 
-    if rsi_15m > 60 and change > 0.15:
-        return "BULLISH"
-    elif rsi_15m < 40 and change < -0.15:
-        return "BEARISH"
-    return "NEUTRAL"
+    if rsi_15m > 58 and change > 0.12:
+        return "BULLISH", rsi_15m
+    elif rsi_15m < 42 and change < -0.12:
+        return "BEARISH", rsi_15m
+    return "NEUTRAL", rsi_15m
 
 
 def fetch_binance_data(symbol: str):
@@ -251,7 +251,7 @@ def fetch_binance_data(symbol: str):
         res_5m = fetch_klines(symbol, "5m", 2)
         res_1m = fetch_klines(symbol, "1m", 30)
         if not res_5m or not res_1m:
-            return None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, None
 
         window_strike_price = float(res_5m[-1][1])
         close_prices = [float(k[4]) for k in res_1m]
@@ -266,18 +266,18 @@ def fetch_binance_data(symbol: str):
         avg_volume = sum(volumes[-11:-1]) / 10 if len(volumes) >= 11 else current_volume
         volume_ratio = round(current_volume / avg_volume, 2) if avg_volume > 0 else 1.0
 
-        trend_15m = fetch_15m_trend(symbol)
+        trend_15m, rsi_15m = fetch_15m_trend(symbol)
 
-        return current_price, window_strike_price, window_delta_pct, rsi, prev_rsi, volume_ratio, trend_15m
+        return current_price, window_strike_price, window_delta_pct, rsi, prev_rsi, volume_ratio, trend_15m, rsi_15m
     except Exception as e:
-        return None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None
 
 
 # ============================================================
-# STRATEGIE LOGICA (RUIMER VENSTER: EERSTE 2M 20S)
+# STRATEGIE LOGICA (PAPER TRADE OORSPRONKELIJK)
 # ============================================================
 
-def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volume_ratio, trend_15m, time_remaining_sec):
+def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volume_ratio, trend_15m, rsi_15m, time_remaining_sec):
     if symbol in ["ZECUSDT", "DOGEUSDT"]:
         min_delta, min_vol_ratio = 0.08, 1.2
     elif symbol in ["SOLUSDT", "BNBUSDT", "XRPUSDT"]:
@@ -285,21 +285,32 @@ def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volum
     else:
         min_delta, min_vol_ratio = 0.02, 1.05
 
-    # VERTRAGINGSVENSTER: Eerste 2m 20s van de 5m candle (resterend: 160s tot 285s)
-    if 160 <= time_remaining_sec <= 285:
-        if 51 <= rsi <= 68 and window_delta_pct >= min_delta and volume_ratio >= min_vol_ratio:
-            if trend_15m != "BEARISH":
-                return "UP", "MOMENTUM", f"🚀 Momentum UP (+{window_delta_pct}% t.o.v. Strike, Vol {volume_ratio}x)"
+    now_sec = time.time()
+    time_remaining_15m = int(900 - (now_sec % 900))
 
-        if 32 <= rsi <= 49 and window_delta_pct <= -min_delta and volume_ratio >= min_vol_ratio:
+    # STRATEGIE 1: 5M Expiry Momentum (Eerste 1 minuut van 5m candle)
+    if 220 <= time_remaining_sec <= 280:
+        if 53 <= rsi <= 68 and window_delta_pct >= min_delta and volume_ratio >= min_vol_ratio:
+            if trend_15m != "BEARISH":
+                return "UP", "5M_MOMENTUM", f"🚀 5M Momentum UP (+{window_delta_pct}% t.o.v. Strike, Vol {volume_ratio}x)"
+
+        if 32 <= rsi <= 47 and window_delta_pct <= -min_delta and volume_ratio >= min_vol_ratio:
             if trend_15m != "BULLISH":
-                return "DOWN", "MOMENTUM", f"🚀 Momentum DOWN ({window_delta_pct}% t.o.v. Strike, Vol {volume_ratio}x)"
+                return "DOWN", "5M_MOMENTUM", f"🚀 5M Momentum DOWN ({window_delta_pct}% t.o.v. Strike, Vol {volume_ratio}x)"
+
+    # STRATEGIE 2: 15M Expiry Trend (Laatste 15m candle fase)
+    if time_remaining_15m <= 300 and time_remaining_sec <= 270:
+        if trend_15m == "BULLISH" and rsi >= 50 and window_delta_pct > 0:
+            return "UP", "15M_TREND", f"🌊 15M Trend Follow UP (15M RSI {rsi_15m:.1f}, 5M Delta +{window_delta_pct}%)"
+
+        if trend_15m == "BEARISH" and rsi <= 50 and window_delta_pct < 0:
+            return "DOWN", "15M_TREND", f"🌊 15M Trend Follow DOWN (15M RSI {rsi_15m:.1f}, 5M Delta {window_delta_pct}%)"
 
     return None, None, None
 
 
 # ============================================================
-# POLYMARKET DYNAMISCHE EVENT-ZOEKER (ALTIJD DE ACTIEVE MARKT)
+# POLYMARKET DYNAMISCHE EVENT-ZOEKER
 # ============================================================
 
 def find_current_polymarket_event(symbol: str):
@@ -422,7 +433,7 @@ def execute_live_order(token_id: str, amount_usd: float, max_price: float):
 
 def main():
     print("\n" + "=" * 60)
-    print("🤖 POLYMARKET LIVE TRADING BOT (VENSTER: 0M15S - 2M20S)")
+    print("🤖 POLYMARKET LIVE TRADING BOT (PAPER TRADE STRAT: 5M + 15M)")
     print("=" * 60)
     print(f"Live order bedrag: ${LIVE_TRADE_AMOUNT:.2f} USD")
     print(f"Max Ask Limiet: ${MAX_ALLOWABLE_ODDS:.2f}")
@@ -431,12 +442,12 @@ def main():
     print("=" * 60 + "\n")
 
     send_telegram_msg(
-        "⚡ **Poly Auto-Trader LIVE Gestart (Venster: Eerste 2m20s)**\n\n"
+        "⚡ **Poly Auto-Trader LIVE Gestart (Originele Paper-Trade Instellingen)**\n\n"
         "🚨 **Systeemstatus:** VOLAUTOMATISCH TRADEN ACTIEF\n"
         f"💵 **Inzet per trade:** `${LIVE_TRADE_AMOUNT:.2f}`\n"
         f"🛡️ **Max Ask Limiet:** `${MAX_ALLOWABLE_ODDS:.2f}`\n"
         f"⏱️ **Scan Frequentie:** `{SCAN_INTERVAL_SEC}s`\n"
-        f"🔍 **Prijs-kruiscontrole:** actief (max verschil ${MAX_PRICE_DISCREPANCY:.2f})"
+        "🎯 **Strategieën:** 5M Momentum + 15M Trend Follow"
     )
 
     while True:
@@ -452,12 +463,12 @@ def main():
                     if current_cycle_count >= MAX_TRADES_PER_CYCLE:
                         break
 
-                    current_price, strike, delta_pct, rsi, prev_rsi, vol_ratio, trend_15m = fetch_binance_data(symbol)
+                    current_price, strike, delta_pct, rsi, prev_rsi, vol_ratio, trend_15m, rsi_15m = fetch_binance_data(symbol)
                     if current_price is None:
                         continue
 
                     signal, strat_type, reason = analyze_market_and_get_signal(
-                        symbol, rsi, prev_rsi, delta_pct, vol_ratio, trend_15m, time_remaining_sec
+                        symbol, rsi, prev_rsi, delta_pct, vol_ratio, trend_15m, rsi_15m, time_remaining_sec
                     )
                     if not signal:
                         continue
@@ -470,7 +481,7 @@ def main():
                     if not token_info:
                         continue
 
-                    print(f"⚡ Automatische live order starten voor {symbol} ({signal})...")
+                    print(f"⚡ Automatische live order starten voor {symbol} ({signal} - {strat_type})...")
                     success, filled_price, info = execute_live_order(
                         token_info["token_id"],
                         LIVE_TRADE_AMOUNT,
@@ -486,15 +497,15 @@ def main():
                     if success:
                         shares = round(LIVE_TRADE_AMOUNT / filled_price, 2)
                         msg = (
-                            f"🚨 **5M EXPIRY 📈 MOMENTUM!**\n\n"
+                            f"🚨 **SIGNALIERING: {strat_type}!**\n\n"
                             f"📍 **Pair:** {symbol} ({signal})\n"
                             f"🎯 **Target to Beat (5M Open):** `${strike}`\n"
                             f"📌 **Huidige Koers:** `${current_price}` ({delta_pct}%)\n"
                             f"📊 **Uitvoeringsprijs:** `${filled_price:.3f}` ({shares} aandelen)\n"
                             f"💵 **Inzetten op Polymarket:** `${LIVE_TRADE_AMOUNT:.2f}` ({signal})\n\n"
-                            f"📊 **RSI:** {rsi} | **Vol Ratio:** {vol_ratio}x | **Delta:** {delta_pct}%\n"
+                            f"📊 **RSI:** {rsi} | **15M RSI:** {rsi_15m:.1f} | **Vol Ratio:** {vol_ratio}x\n"
                             f"⏳ **Resterend:** `{time_str}`\n\n"
-                            f"💡 **Analyse:** 🚀 Momentum {signal} ({delta_pct}% t.o.v. Strike, Vol {vol_ratio}x) | **15M:** {trend_15m}\n\n"
+                            f"💡 **Analyse:** {reason}\n\n"
                             f"🟢 **LIVE ORDER GEPLAATST** | Order ID: `{info}`"
                         )
                     else:
