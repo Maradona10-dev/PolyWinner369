@@ -3,7 +3,7 @@ import time
 import json
 import requests
 from py_clob_client_v2.client import ClobClient
-from py_clob_client_v2.clob_types import MarketOrderArgsV2, OrderType, SignatureType
+from py_clob_client_v2.clob_types import MarketOrderArgsV2, OrderType
 from py_clob_client_v2.order_builder.constants import BUY
 
 # —————————————————————————
@@ -56,7 +56,7 @@ def init_clob_client():
                 host="https://clob.polymarket.com",
                 key=PK,
                 chain_id=137,
-                signature_type=SignatureType.POLY_1271,
+                signature_type=2,  # 2 staat voor POLY_1271 / Gnosis Safe Deposit Wallet
                 funder=POLYMARKET_FUNDER_ADDRESS
             )
         else:
