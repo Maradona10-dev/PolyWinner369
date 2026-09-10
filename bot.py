@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import re
 from typing import Optional, Dict, Any, Tuple
 
 import requests
@@ -47,7 +48,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 
 # ============================================================
-# POLYMARKET WALLET & VALIDATIE (HERSTELD NAAR OUDE WERKENDE LOGICA)
+# POLYMARKET WALLET & VALIDATIE (UNICODE & FORMAT FIX)
 # ============================================================
 
 RAW_PRIVATE_KEY = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
@@ -58,10 +59,10 @@ SIGNATURE_TYPE_ENV = os.environ.get("POLYMARKET_SIGNATURE_TYPE", "").strip()
 def clean_private_key(value: str) -> str:
     if not value:
         return ""
-    value = "".join(value.split())
     if value.lower().startswith("0x"):
         value = value[2:]
-    return value
+    cleaned = "".join(re.findall(r"[0-9a-fA-F]", value))
+    return cleaned
 
 
 PK = clean_private_key(RAW_PRIVATE_KEY)
@@ -142,7 +143,7 @@ def request_json(method: str, url: str, *, timeout: int = 10, **kwargs):
 
 def init_clob_client():
     if not PK:
-        raise SystemExit("❌ FOUT: Geen POLYMARKET_PRIVATE_KEY gevonden in Railway variabelen.")
+        raise SystemExit("❌ FOUT: Geen geldige POLYMARKET_PRIVATE_KEY gevonden.")
 
     try:
         kwargs = {
