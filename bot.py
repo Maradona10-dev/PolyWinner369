@@ -112,7 +112,7 @@ POLY_SYMBOL_MAP = {
 
 active_signals_sent = {}
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyAutoTrader/3.4"})
+session.headers.update({"User-Agent": "PolyAutoTrader/3.5"})
 
 
 # ============================================================
@@ -274,7 +274,7 @@ def fetch_binance_data(symbol: str):
 
 
 # ============================================================
-# STRATEGIE LOGICA (ULTRA-VROEG VENSTER)
+# STRATEGIE LOGICA (RUIMER VENSTER: EERSTE 2M 20S)
 # ============================================================
 
 def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volume_ratio, trend_15m, time_remaining_sec):
@@ -285,15 +285,15 @@ def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volum
     else:
         min_delta, min_vol_ratio = 0.02, 1.05
 
-    # ULTRA-VROEG VENSTER: Eerste 90s van de 5m candle (resterend: 210s tot 285s)
-    if 210 <= time_remaining_sec <= 285:
+    # VERTRAGINGSVENSTER: Eerste 2m 20s van de 5m candle (resterend: 160s tot 285s)
+    if 160 <= time_remaining_sec <= 285:
         if 51 <= rsi <= 68 and window_delta_pct >= min_delta and volume_ratio >= min_vol_ratio:
             if trend_15m != "BEARISH":
-                return "UP", "MOMENTUM", f"🚀 Ultra-Vroege Momentum UP (+{window_delta_pct}% t.o.v. Strike, Vol {volume_ratio}x)"
+                return "UP", "MOMENTUM", f"🚀 Momentum UP (+{window_delta_pct}% t.o.v. Strike, Vol {volume_ratio}x)"
 
         if 32 <= rsi <= 49 and window_delta_pct <= -min_delta and volume_ratio >= min_vol_ratio:
             if trend_15m != "BULLISH":
-                return "DOWN", "MOMENTUM", f"🚀 Ultra-Vroege Momentum DOWN ({window_delta_pct}% t.o.v. Strike, Vol {volume_ratio}x)"
+                return "DOWN", "MOMENTUM", f"🚀 Momentum DOWN ({window_delta_pct}% t.o.v. Strike, Vol {volume_ratio}x)"
 
     return None, None, None
 
@@ -422,7 +422,7 @@ def execute_live_order(token_id: str, amount_usd: float, max_price: float):
 
 def main():
     print("\n" + "=" * 60)
-    print("🤖 POLYMARKET ULTRA-FAST LIVE TRADING BOT (ULTRA-VROEGE INSTAP)")
+    print("🤖 POLYMARKET LIVE TRADING BOT (VENSTER: 0M15S - 2M20S)")
     print("=" * 60)
     print(f"Live order bedrag: ${LIVE_TRADE_AMOUNT:.2f} USD")
     print(f"Max Ask Limiet: ${MAX_ALLOWABLE_ODDS:.2f}")
@@ -431,7 +431,7 @@ def main():
     print("=" * 60 + "\n")
 
     send_telegram_msg(
-        "⚡ **Poly Auto-Trader LIVE Gestart (Ultra-Vroege Instap)**\n\n"
+        "⚡ **Poly Auto-Trader LIVE Gestart (Venster: Eerste 2m20s)**\n\n"
         "🚨 **Systeemstatus:** VOLAUTOMATISCH TRADEN ACTIEF\n"
         f"💵 **Inzet per trade:** `${LIVE_TRADE_AMOUNT:.2f}`\n"
         f"🛡️ **Max Ask Limiet:** `${MAX_ALLOWABLE_ODDS:.2f}`\n"
@@ -494,7 +494,7 @@ def main():
                             f"💵 **Inzetten op Polymarket:** `${LIVE_TRADE_AMOUNT:.2f}` ({signal})\n\n"
                             f"📊 **RSI:** {rsi} | **Vol Ratio:** {vol_ratio}x | **Delta:** {delta_pct}%\n"
                             f"⏳ **Resterend:** `{time_str}`\n\n"
-                            f"💡 **Analyse:** 🚀 Ultra-Vroege Momentum {signal} ({delta_pct}% t.o.v. Strike, Vol {vol_ratio}x) | **15M:** {trend_15m}\n\n"
+                            f"💡 **Analyse:** 🚀 Momentum {signal} ({delta_pct}% t.o.v. Strike, Vol {vol_ratio}x) | **15M:** {trend_15m}\n\n"
                             f"🟢 **LIVE ORDER GEPLAATST** | Order ID: `{info}`"
                         )
                     else:
