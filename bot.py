@@ -1,7 +1,6 @@
 import os
 import time
 import json
-import re
 from typing import Optional, Dict, Any, Tuple
 
 import requests
@@ -17,7 +16,7 @@ try:
 except ImportError:
     raise SystemExit(
         "\n❌ py-clob-client-v2 ontbreekt.\n"
-        "Installeer eerst via requirements.txt:\n"
+        "Installeer via requirements.txt:\n"
         "py-clob-client-v2\nrequests\n"
     )
 
@@ -48,7 +47,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 
 # ============================================================
-# POLYMARKET WALLET & VALIDATIE
+# POLYMARKET WALLET & VALIDATIE (HERSTELD NAAR OUDE WERKENDE LOGICA)
 # ============================================================
 
 RAW_PRIVATE_KEY = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
@@ -62,8 +61,6 @@ def clean_private_key(value: str) -> str:
     value = "".join(value.split())
     if value.lower().startswith("0x"):
         value = value[2:]
-    if len(value) != 64 or not re.fullmatch(r"[0-9a-fA-F]{64}", value):
-        return ""
     return value
 
 
@@ -140,13 +137,12 @@ def request_json(method: str, url: str, *, timeout: int = 10, **kwargs):
 
 
 # ============================================================
-# CLOB CLIENT INITIALISATIE (VERBETERD)
+# CLOB CLIENT INITIALISATIE
 # ============================================================
 
 def init_clob_client():
     if not PK:
-        print("❌ FOUT: POLYMARKET_PRIVATE_KEY ontbreekt of is ongeldig in Railway Variables!")
-        raise SystemExit("Geen private key aanwezig.")
+        raise SystemExit("❌ FOUT: Geen POLYMARKET_PRIVATE_KEY gevonden in Railway variabelen.")
 
     try:
         kwargs = {
@@ -165,8 +161,7 @@ def init_clob_client():
         print(f"✅ CLOB Verbonden | Wallet Adres: {client.get_address()}")
         return client
     except Exception as e:
-        print(f"❌ CLOB Initialisatie mislukt: {e}")
-        raise SystemExit(e)
+        raise SystemExit(f"❌ CLOB Initialisatie mislukt: {e}")
 
 
 clob_client = init_clob_client()
