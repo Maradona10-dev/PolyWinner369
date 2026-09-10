@@ -116,7 +116,7 @@ POLY_SYMBOL_MAP = {
 active_signals_sent = {}
 last_verbose_log_time = 0
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyAutoTrader/4.0"})
+session.headers.update({"User-Agent": "PolyAutoTrader/4.1"})
 
 
 # ============================================================
@@ -274,7 +274,6 @@ def fetch_binance_data(symbol: str):
 
         return current_price, window_strike_price, window_delta_pct, rsi, prev_rsi, volume_ratio, trend_15m, rsi_15m
     except Exception as e:
-        # VERBETERING: Explicite logging van fout in fetch_binance_data
         print(f"⚠️ fetch_binance_data fout voor {symbol}: {e}")
         return None, None, None, None, None, None, None, None
 
@@ -326,7 +325,7 @@ def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volum
 
 
 # ============================================================
-# POLYMARKET EVENT MATCHING (ROBUUSTE FILTERING)
+# POLYMARKET EVENT MATCHING (ROBUUSTE DIEPE ZOEKOPDRACHT)
 # ============================================================
 
 def find_current_polymarket_event(symbol: str):
@@ -334,22 +333,37 @@ def find_current_polymarket_event(symbol: str):
     if not prefix:
         return None
 
-    # Vraag actieve events op zonder q= parameter om onbetrouwbare Gamma-zoekresultaten te omzeilen
-    url = f"{POLYMARKET_GAMMA_URL}/events?limit=30&active=true&closed=false"
+    # Zoek gericht op q={prefix} met hogere limiet van 100 items
+    url = f"{POLYMARKET_GAMMA_URL}/events?limit=100&active=true&closed=false&q={prefix}"
     data = request_json("GET", url, timeout=5)
 
-    if not data:
+    # Fallback: als de q-query niks oplevert, haal de 100 meest recente actieve events op
+    if not data or not isinstance(data, list) or len(data) == 0:
+        url_fallback = f"{POLYMARKET_GAMMA_URL}/events?limit=100&active=true&closed=false"
+        data = request_json("GET", url_fallback, timeout=5)
+
+    if not data or not isinstance(data, list):
         print(f"⚠️ Geen response van Gamma API voor {symbol}")
         return None
 
-    if isinstance(data, list):
-        target_pattern = f"{prefix}-updown-5m"
-        for event in data:
-            slug = event.get("slug", "").lower()
-            title = event.get("title", "").lower()
+    # Mogelijke slug- en titel-patronen voor 5-minuten opties
+    search_patterns = [
+        f"{prefix}-updown-5m",
+        f"{prefix}-5m",
+        f"{prefix}-price-5m",
+        f"{prefix} 5m"
+    ]
 
-            # Matchen op slug én title
-            if (target_pattern in slug or target_pattern in title) and not event.get("closed", False):
+    for event in data:
+        slug = event.get("slug", "").lower()
+        title = event.get("title", "").lower()
+
+        if event.get("closed", False):
+            continue
+
+        for pattern in search_patterns:
+            if pattern in slug or pattern in title:
+                print(f"✅ Event gevonden voor {symbol}: {event.get('slug')}")
                 return event
 
     print(f"⚠️ Geen matchend actief event gevonden voor {symbol} (prefix={prefix})")
@@ -405,7 +419,7 @@ def execute_live_order(token_id: str, amount_usd: float, max_price: float):
                 return float(entry.get("price", 0))
             return float(getattr(entry, "price", 0))
 
-        # GARANTIE: Sorteer asks van laag naar hoog om altijd de beste (goedkoopste) prijs te pakken
+        # Sorteer asks altijd expliciet van laag naar hoog
         sorted_asks = sorted(asks, key=extract_price)
         best_ask_entry = sorted_asks[0]
         orderbook_ask = extract_price(best_ask_entry)
@@ -413,7 +427,6 @@ def execute_live_order(token_id: str, amount_usd: float, max_price: float):
         if orderbook_ask <= 0:
             return False, 0.0, "Ongeldige ask prijs (orderbook)"
 
-        # Kruiscontrole via get_price()
         live_ask = None
         try:
             live_price = clob_client.get_price(token_id, side="SELL")
@@ -466,7 +479,7 @@ def main():
     global last_verbose_log_time
 
     print("\n" + "=" * 60)
-    print("🤖 POLYMARKET LIVE TRADING BOT (GEOPTIMALISEERD)")
+    print("🤖 POLYMARKET LIVE TRADING BOT")
     print("=" * 60)
     print(f"Live order bedrag: ${LIVE_TRADE_AMOUNT:.2f} USD")
     print(f"Max Ask Limiet: ${MAX_ALLOWABLE_ODDS:.2f}")
@@ -474,7 +487,7 @@ def main():
     print("=" * 60 + "\n")
 
     send_telegram_msg(
-        "⚡ **Poly Auto-Trader LIVE Gestart (Inclusief Orderbook & Search Fixes)**\n\n"
+        "⚡ **Poly Auto-Trader LIVE Gestart (Met Gamma Event Matching Fix)**\n\n"
         "🚨 **Systeemstatus:** VOLAUTOMATISCH TRADEN ACTIEF\n"
         f"💵 **Inzet per trade:** `${LIVE_TRADE_AMOUNT:.2f}`\n"
         f"🛡️ **Max Ask Limiet:** `${MAX_ALLOWABLE_ODDS:.2f}`"
