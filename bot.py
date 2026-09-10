@@ -40,6 +40,9 @@ LIVE_TRADE_AMOUNT = float(os.environ.get("LIVE_TRADE_AMOUNT", "5.0"))
 # Maximaal toegestaan verschil tussen orderbook-prijs en get_price()-prijs
 MAX_PRICE_DISCREPANCY = float(os.environ.get("MAX_PRICE_DISCREPANCY", "0.05"))
 
+# Log-frequentie voor status-updates als er geen signaal is (in seconden)
+VERBOSE_LOG_INTERVAL_SEC = 15
+
 
 # ============================================================
 # TELEGRAM CONFIGURATIE
@@ -111,8 +114,9 @@ POLY_SYMBOL_MAP = {
 }
 
 active_signals_sent = {}
+last_verbose_log_time = 0
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyAutoTrader/3.7"})
+session.headers.update({"User-Agent": "PolyAutoTrader/3.8"})
 
 
 # ============================================================
@@ -270,11 +274,13 @@ def fetch_binance_data(symbol: str):
 
         return current_price, window_strike_price, window_delta_pct, rsi, prev_rsi, volume_ratio, trend_15m, rsi_15m
     except Exception as e:
+        # VERBETERING 1: Print expliciete exception
+        print(f"⚠️ fetch_binance_data fout voor {symbol}: {e}")
         return None, None, None, None, None, None, None, None
 
 
 # ============================================================
-# STRATEGIE LOGICA (5M MOMENTUM, 15M TREND & 5M PULLBACK)
+# STRATEGIE LOGICA
 # ============================================================
 
 def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volume_ratio, trend_15m, rsi_15m, time_remaining_sec):
@@ -288,7 +294,7 @@ def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volum
     now_sec = time.time()
     time_remaining_15m = int(900 - (now_sec % 900))
 
-    # STRATEGIE 1: 5M Expiry Momentum (Eerste minuut van de candle)
+    # STRATEGIE 1: 5M Expiry Momentum
     if 220 <= time_remaining_sec <= 280:
         if 53 <= rsi <= 68 and window_delta_pct >= min_delta and volume_ratio >= min_vol_ratio:
             if trend_15m != "BEARISH":
@@ -306,14 +312,12 @@ def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volum
         if trend_15m == "BEARISH" and rsi <= 50 and window_delta_pct < 0:
             return "DOWN", "15M_TREND", f"🌊 15M Trend Follow DOWN (15M RSI {rsi_15m:.1f}, 5M Delta {window_delta_pct}%)"
 
-    # STRATEGIE 3: 5M Pullback / Reentry (Midden-tot-eind van de candle)
+    # STRATEGIE 3: 5M Pullback / Reentry
     if 30 <= time_remaining_sec <= 220:
-        # Bullish Pullback: RSI veert op uit oversold (prev_rsi < 45, rsi > prev_rsi) én prijs staat boven strike
         if prev_rsi < 45 and rsi > prev_rsi and window_delta_pct > 0.01:
             if trend_15m != "BEARISH":
                 return "UP", "5M_PULLBACK", f"🔄 5M Pullback Reentry UP (RSI {prev_rsi:.1f} ➔ {rsi:.1f}, Delta +{window_delta_pct}%)"
 
-        # Bearish Pullback: RSI koelt af uit overbought (prev_rsi > 55, rsi < prev_rsi) én prijs staat onder strike
         if prev_rsi > 55 and rsi < prev_rsi and window_delta_pct < -0.01:
             if trend_15m != "BULLISH":
                 return "DOWN", "5M_PULLBACK", f"🔄 5M Pullback Reentry DOWN (RSI {prev_rsi:.1f} ➔ {rsi:.1f}, Delta {window_delta_pct}%)"
@@ -322,7 +326,7 @@ def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volum
 
 
 # ============================================================
-# POLYMARKET DYNAMISCHE EVENT-ZOEKER
+# POLYMARKET DYNAMISCHE EVENT-ZOEKER (MET LOGGING)
 # ============================================================
 
 def find_current_polymarket_event(symbol: str):
@@ -333,12 +337,18 @@ def find_current_polymarket_event(symbol: str):
     url = f"{POLYMARKET_GAMMA_URL}/events?limit=10&active=true&closed=false&q={prefix}-updown-5m"
     data = request_json("GET", url, timeout=5)
 
-    if isinstance(data, list) and len(data) > 0:
+    # VERBETERING 2: Logging van Gamma API response
+    if not data:
+        print(f"⚠️ Geen response van Gamma API voor {symbol}")
+        return None
+
+    if isinstance(data, list):
         for event in data:
             slug = event.get("slug", "")
             if f"{prefix}-updown-5m-" in slug and not event.get("closed", False):
                 return event
 
+    print(f"⚠️ Geen matchend actief event gevonden voor {symbol} (prefix={prefix})")
     return None
 
 
@@ -382,7 +392,6 @@ def execute_live_order(token_id: str, amount_usd: float, max_price: float):
         if not asks:
             return False, 0.0, "Geen asks in orderbook"
 
-        # Beste (laagste) ask is de laatste entry in de lijst
         best_ask_entry = asks[-1]
         if isinstance(best_ask_entry, dict):
             orderbook_ask = float(best_ask_entry.get("price", 0))
@@ -392,7 +401,6 @@ def execute_live_order(token_id: str, amount_usd: float, max_price: float):
         if orderbook_ask <= 0:
             return False, 0.0, "Ongeldige ask prijs (orderbook)"
 
-        # Kruiscontrole via get_price()
         live_ask = None
         try:
             live_price = clob_client.get_price(token_id, side="SELL")
@@ -404,9 +412,8 @@ def execute_live_order(token_id: str, amount_usd: float, max_price: float):
             price_diff = abs(orderbook_ask - live_ask)
             if price_diff > MAX_PRICE_DISCREPANCY:
                 return False, orderbook_ask, (
-                    f"Prijs-mismatch gedetecteerd: orderbook=${orderbook_ask:.3f} "
-                    f"vs live_price=${live_ask:.3f} (verschil {price_diff:.3f}) "
-                    f"-- order geweigerd uit voorzorg"
+                    f"Prijs-mismatch: orderbook=${orderbook_ask:.3f} "
+                    f"vs live_price=${live_ask:.3f} (verschil {price_diff:.3f})"
                 )
             best_ask = live_ask
         else:
@@ -415,7 +422,6 @@ def execute_live_order(token_id: str, amount_usd: float, max_price: float):
         if best_ask > max_price:
             return False, best_ask, f"Prijs te hoog (${best_ask:.3f} > max ${max_price:.3f})"
 
-        # Aantal shares expliciet afronden op 2 decimalen
         shares = round(amount_usd / best_ask, 2)
 
         order_args = OrderArgs(
@@ -444,22 +450,21 @@ def execute_live_order(token_id: str, amount_usd: float, max_price: float):
 # ============================================================
 
 def main():
+    global last_verbose_log_time
+
     print("\n" + "=" * 60)
-    print("🤖 POLYMARKET LIVE TRADING BOT (5M MOMENTUM, 15M TREND & PULLBACK)")
+    print("🤖 POLYMARKET LIVE TRADING BOT (INCLUSIEF UITGEBREIDE LOGGING)")
     print("=" * 60)
     print(f"Live order bedrag: ${LIVE_TRADE_AMOUNT:.2f} USD")
     print(f"Max Ask Limiet: ${MAX_ALLOWABLE_ODDS:.2f}")
     print(f"Scan Interval: {SCAN_INTERVAL_SEC}s")
-    print(f"Max prijs-discrepantie (orderbook vs live): ${MAX_PRICE_DISCREPANCY:.2f}")
     print("=" * 60 + "\n")
 
     send_telegram_msg(
-        "⚡ **Poly Auto-Trader LIVE Gestart (Inclusief Pullback Strategie)**\n\n"
+        "⚡ **Poly Auto-Trader LIVE Gestart (Met Verbeterde Logging)**\n\n"
         "🚨 **Systeemstatus:** VOLAUTOMATISCH TRADEN ACTIEF\n"
         f"💵 **Inzet per trade:** `${LIVE_TRADE_AMOUNT:.2f}`\n"
-        f"🛡️ **Max Ask Limiet:** `${MAX_ALLOWABLE_ODDS:.2f}`\n"
-        f"⏱️ **Scan Frequentie:** `{SCAN_INTERVAL_SEC}s`\n"
-        "🎯 **Strategieën:** 5M Momentum + 15M Trend + 5M Pullback Reentry"
+        f"🛡️ **Max Ask Limiet:** `${MAX_ALLOWABLE_ODDS:.2f}`"
     )
 
     while True:
@@ -467,6 +472,11 @@ def main():
             now_sec = time.time()
             time_remaining_sec = int(300 - (now_sec % 300))
             cycle_id = int(now_sec // 300)
+
+            # Bepaal of we deze scan-ronde een status-log in de terminal willen tonen
+            should_log_status = (now_sec - last_verbose_log_time) >= VERBOSE_LOG_INTERVAL_SEC
+            if should_log_status:
+                last_verbose_log_time = now_sec
 
             current_cycle_count = sum(1 for k in active_signals_sent if k.startswith(f"cycle_{cycle_id}_"))
 
@@ -476,13 +486,19 @@ def main():
                         break
 
                     current_price, strike, delta_pct, rsi, prev_rsi, vol_ratio, trend_15m, rsi_15m = fetch_binance_data(symbol)
+                    
                     if current_price is None:
+                        print(f"⏭️ {symbol}: geen Binance data beschikbaar")
                         continue
 
                     signal, strat_type, reason = analyze_market_and_get_signal(
                         symbol, rsi, prev_rsi, delta_pct, vol_ratio, trend_15m, rsi_15m, time_remaining_sec
                     )
+
+                    # VERBETERING 3: Gedoseerde statuslog als er geen signaal is
                     if not signal:
+                        if should_log_status:
+                            print(f"🔍 {symbol}: geen signaal | RSI={rsi} | delta={delta_pct}% | vol={vol_ratio}x | 15m={trend_15m} | t_rem={time_remaining_sec}s")
                         continue
 
                     trade_key = f"cycle_{cycle_id}_{symbol}_{strat_type}"
@@ -491,6 +507,7 @@ def main():
 
                     token_info = get_token_info(symbol, signal)
                     if not token_info:
+                        print(f"⚠️ {symbol}: Signaal {signal} aanwezig, maar geen bruikbaar token/market-id gevonden op Polymarket")
                         continue
 
                     print(f"⚡ Automatische live order starten voor {symbol} ({signal} - {strat_type})...")
