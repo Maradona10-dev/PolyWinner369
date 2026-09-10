@@ -47,7 +47,8 @@ active_signals_sent = {}
 # POLYMARKET LIVE CLIENT INITIALISATIE
 # —————————————————————————
 
-SIG_TYPE = 2 if POLYMARKET_FUNDER_ADDRESS else 0
+# signature_type = 1 (POLY_PROXY) voor e-mail/Google accounts, 2 voor Web3 Gnosis Safe
+SIG_TYPE = 1 if POLYMARKET_FUNDER_ADDRESS else 0
 
 def init_clob_client():
     if not PK or not LIVE_MODE:
@@ -79,7 +80,7 @@ def init_clob_client():
             except Exception:
                 pass
 
-        print("✅ Polymarket Live Client (CLOB V2 + Deposit Wallet) geactiveerd!")
+        print(f"✅ Polymarket Live Client geactiveerd! (Funder: {POLYMARKET_FUNDER_ADDRESS[:6]}... SigType: {SIG_TYPE})")
         return client
     except Exception as e:
         print(f"❌ Fout bij opzetten Polymarket Live Client: {e}")
@@ -150,28 +151,31 @@ def execute_live_polymarket_order(token_id, amount_usd):
         print("⚠️ Live client niet actief of token_id ontbreekt.")
         return False
 
-    try:
-        # Constructie volgens V2 API specificaties
-        order_args = MarketOrderArgsV2(
-            token_id=token_id,
-            amount=round(amount_usd, 2),
-            side=BUY,
-            price=0.99
-        )
-
-        signed_order = clob_client.create_market_order(order_args)
-        response = clob_client.post_order(signed_order, order_type=OrderType.FAK)
-
-        if response and (response.get("success") == True or "orderID" in str(response)):
-            print(f"🚀 LIVE ORDER GEPLAATST OP CLOB V2: {response}")
-            return True
-        else:
-            print(f"❌ ORDER WEIGERD DOOR POLYMARKET: {response}")
-            return False
+    # Probeer order execution met ingestelde signature_type, zo nodig met fallback naar type 2
+    for try_sig_type in ([SIG_TYPE, 2] if SIG_TYPE != 0 else [0]):
+        try:
+            clob_client.signature_type = try_sig_type
             
-    except Exception as e:
-        print(f"❌ LIVE ORDER MISLUKT ({e})")
-        return False
+            order_args = MarketOrderArgsV2(
+                token_id=token_id,
+                amount=round(amount_usd, 2),
+                side=BUY,
+                price=0.99
+            )
+
+            signed_order = clob_client.create_market_order(order_args)
+            response = clob_client.post_order(signed_order, order_type=OrderType.FAK)
+
+            if response and (response.get("success") == True or "orderID" in str(response)):
+                print(f"🚀 LIVE ORDER GEPLAATST OP CLOB V2 (SigType {try_sig_type}): {response}")
+                return True
+            else:
+                print(f"⚠️ Poging met SigType {try_sig_type} geweigerd: {response}")
+        except Exception as e:
+            print(f"⚠️ Fout bij order met SigType {try_sig_type}: {e}")
+
+    print("❌ LIVE ORDER DEFINITIEF MISLUKT op alle signature types.")
+    return False
 
 # —————————————————————————
 # TELEGRAM BERICHTEN STUREN
