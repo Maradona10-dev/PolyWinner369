@@ -3,7 +3,7 @@ import time
 import json
 import requests
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import MarketOrderArgs
+from py_clob_client.clob_types import MarketOrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY
 
 # —————————————————————————
@@ -58,7 +58,6 @@ def init_clob_client():
             signature_type=0
         )
         
-        # API Creds ophalen via de nieuwste SDK methodes
         try:
             creds = client.derive_api_key()
             client.set_api_creds(creds)
@@ -67,9 +66,9 @@ def init_clob_client():
                 creds = client.create_or_derive_api_creds()
                 client.set_api_creds(creds)
             except Exception:
-                pass # Bij signature_type=0 maakt de nieuwste SDK intern autologin aan
+                pass
 
-        print("✅ Polymarket Live Trading Client v7.2 succesvol geïnitialiseerd!")
+        print("✅ Polymarket Live Trading Client v7.3 succesvol geïnitialiseerd!")
         return client
     except Exception as e:
         print(f"❌ Fout bij opzetten Polymarket Live Client: {e}")
@@ -135,6 +134,7 @@ def execute_live_polymarket_order(token_id, amount_usd):
         return False
 
     try:
+        # Exploratieve marktorder-aanroep met FOK (Fill-Or-Kill) op v2 API-standaard
         order_args = MarketOrderArgs(
             token_id=token_id,
             amount=round(amount_usd, 2),
@@ -142,8 +142,11 @@ def execute_live_polymarket_order(token_id, amount_usd):
             price=0.99
         )
 
-        signed_order = clob_client.create_market_order(order_args)
-        response = clob_client.post_order(signed_order)
+        # Nieuwe universele marktorder post-call
+        response = clob_client.post_order(
+            clob_client.create_market_order(order_args),
+            OrderType.FOK
+        )
 
         if response and (response.get("success") == True or "orderID" in str(response)):
             print(f"🚀 LIVE ORDER GEPLAATST OP CLOB: {response}")
@@ -153,19 +156,25 @@ def execute_live_polymarket_order(token_id, amount_usd):
             return False
             
     except Exception as e:
-        print(f"❌ LIVE ORDER MISLUKT ({e}). Herprobeert client her-initialisatie...")
+        print(f"❌ LIVE ORDER MISLUKT ({e}). Proberen met standaard order type...")
         try:
-            clob_client = init_clob_client()
-            if clob_client:
-                order_args = MarketOrderArgs(token_id=token_id, amount=round(amount_usd, 2), side=BUY, price=0.99)
-                signed_order = clob_client.create_market_order(order_args)
-                response = clob_client.post_order(signed_order)
-                if response and (response.get("success") == True or "orderID" in str(response)):
-                    print(f"🚀 LIVE ORDER GEPLAATST NA RE-INIT: {response}")
-                    return True
+            order_args = MarketOrderArgs(
+                token_id=token_id,
+                amount=round(amount_usd, 2),
+                side=BUY,
+                price=0.99
+            )
+            signed_order = clob_client.create_market_order(order_args)
+            response = clob_client.post_order(signed_order)
+            if response and (response.get("success") == True or "orderID" in str(response)):
+                print(f"🚀 LIVE ORDER GEPLAATST OP CLOB: {response}")
+                return True
+            else:
+                print(f"❌ POGING 2 WEIGERD: {response}")
+                return False
         except Exception as retry_e:
             print(f"❌ HERKANSING OOK MISLUKT: {retry_e}")
-        return False
+            return False
 
 # —————————————————————————
 # TELEGRAM BERICHTEN STUREN
@@ -409,12 +418,12 @@ def check_and_evaluate_paper_trades():
 def main():
     mode_str = f"🔴 **LIVE TRADING ACTIEF** (Inzet: `${LIVE_TRADE_AMOUNT:.2f}`)" if (LIVE_MODE and clob_client) else f"📝 **PAPER TRADING MODE** (Inzet: `${PAPER_TRADE_AMOUNT:.2f}`)"
     
-    print(f"🤖 Poly Bot v7.2 Gestart - Mode: {mode_str}...")
+    print(f"🤖 Poly Bot v7.3 Gestart - Mode: {mode_str}...")
     send_telegram_msg(
-        f"🤖 **Poly Bot Online (Versie v7.2)!**\n"
+        f"🤖 **Poly Bot Online (Versie v7.3)!**\n"
         f"⚙️ **Status:** {mode_str}\n"
         f"💰 Start Paper Saldo: `${PAPER_BALANCE:.2f}`\n\n"
-        f"🎯 **Systeem:** Target to Beat (5M Open) + Live CLOB Trading."
+        f"🎯 **Systeem:** Target to Beat (5M Open) + Fixed Order Version API."
     )
 
     while True:
