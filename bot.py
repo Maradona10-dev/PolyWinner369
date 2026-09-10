@@ -109,7 +109,7 @@ POLY_SYMBOL_MAP = {
 
 active_signals_sent = {}
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyAutoTrader/3.1"})
+session.headers.update({"User-Agent": "PolyAutoTrader/3.2"})
 
 
 # ============================================================
@@ -296,17 +296,24 @@ def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volum
 
 
 # ============================================================
-# POLYMARKET ORDER EXECUTIE
+# POLYMARKET DYNAMISCHE EVENT-ZOEKER (ALTIJD DE ACTIEVE MARKT)
 # ============================================================
 
 def find_current_polymarket_event(symbol: str):
     prefix = POLY_SYMBOL_MAP.get(symbol)
-    cycle_start = int(time.time() // 300) * 300
-    slug = f"{prefix}-updown-5m-{cycle_start}"
+    if not prefix:
+        return None
 
-    event = request_json("GET", f"{POLYMARKET_GAMMA_URL}/events/slug/{slug}", timeout=5)
-    if isinstance(event, dict) and event.get("markets"):
-        return event
+    # Dynamisch zoeken naar actieve, niet-gesloten markt op Gamma API
+    url = f"{POLYMARKET_GAMMA_URL}/events?limit=10&active=true&closed=false&q={prefix}-updown-5m"
+    data = request_json("GET", url, timeout=5)
+
+    if isinstance(data, list) and len(data) > 0:
+        for event in data:
+            slug = event.get("slug", "")
+            if f"{prefix}-updown-5m-" in slug and not event.get("closed", False):
+                return event
+
     return None
 
 
