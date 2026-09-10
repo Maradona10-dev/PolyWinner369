@@ -14,7 +14,6 @@ RAW_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
 TELEGRAM_BOT_TOKEN = RAW_TOKEN.replace('bot', '', 1) if RAW_TOKEN.startswith('bot') else RAW_TOKEN
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
 
-# Live Trading Instellingen & Private Key opschonen
 raw_pk = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
 cleaned_pk = "".join(raw_pk.split()).strip()
 
@@ -43,14 +42,13 @@ active_paper_trades = []
 active_signals_sent = {}
 
 # —————————————————————————
-# POLYMARKET LIVE CLIENT INITIALISATIE (SDK v0.34+)
+# POLYMARKET LIVE CLIENT INITIALISATIE (v0.34+)
 # —————————————————————————
 
 def init_clob_client():
     if not PK or not LIVE_MODE:
         return None
     try:
-        # Base instelling voor Polygon Mainnet (Chain ID 137)
         client = ClobClient(
             host="https://clob.polymarket.com",
             key=PK,
@@ -61,14 +59,14 @@ def init_clob_client():
         try:
             creds = client.derive_api_key()
             client.set_api_creds(creds)
-        except AttributeError:
+        except Exception:
             try:
                 creds = client.create_or_derive_api_creds()
                 client.set_api_creds(creds)
             except Exception:
                 pass
 
-        print("✅ Polymarket Live Trading Client v7.3 succesvol geïnitialiseerd!")
+        print("✅ Polymarket Live Client (SDK v0.34+) succesvol geïnitialiseerd!")
         return client
     except Exception as e:
         print(f"❌ Fout bij opzetten Polymarket Live Client: {e}")
@@ -77,7 +75,7 @@ def init_clob_client():
 clob_client = init_clob_client()
 
 # —————————————————————————
-# POLYMARKET REAL-TIME TOKEN ID OPHALEN
+# TOKEN ID OPHALEN
 # —————————————————————————
 
 def fetch_polymarket_token_id(symbol, signal):
@@ -100,31 +98,37 @@ def fetch_polymarket_token_id(symbol, signal):
             "order": "startDate",
             "ascending": "false"
         }
-        res = requests.get(POLYMARKET_GAMMA_URL, params=params, timeout=5).json()
+        res = requests.get(POLYMARKET_GAMMA_URL, params=params, timeout=10).json()
         
         for event in res:
             title = event.get("title", "").lower()
             slug = event.get("slug", "").lower()
             
-            if any(kw in title or kw in slug for kw in keywords):
-                if "5m" in slug or "5m" in title or "5-minute" in title or "5 min" in title or "5min" in slug:
-                    markets = event.get("markets", [])
-                    for market in markets:
-                        if not market.get("closed", False) and market.get("active", True):
+            is_relevant_coin = any(kw in title or kw in slug for kw in keywords)
+            is_5min_event = any(term in title or term in slug for term in ["5m", "5-minute", "5 min", "5min"])
+
+            if is_relevant_coin and is_5min_event:
+                markets = event.get("markets", [])
+                for market in markets:
+                    if not market.get("closed", False) and market.get("active", True):
+                        try:
                             clob_token_ids = json.loads(market.get("clobTokenIds", "[]"))
                             if len(clob_token_ids) >= 2:
                                 token_id = clob_token_ids[0] if signal == "UP" else clob_token_ids[1]
-                                print(f"🎯 Live Token ID gevonden voor {symbol} ({signal}): {token_id}")
+                                print(f"🎯 Live Token ID voor {symbol} ({signal}): {token_id}")
                                 return token_id
-
+                        except json.JSONDecodeError:
+                            continue
+        
+        print(f"❌ Geen geschikte Token ID voor {symbol} ({signal})")
+        return None
+        
     except Exception as e:
-        print(f"❌ Fout bij ophalen Polymarket Token ID voor {symbol}: {e}")
-    
-    print(f"⚠️ Geen actief Polymarket contract gevonden voor {symbol}.")
-    return None
+        print(f"❌ Fout bij ophalen Polymarket token ID: {e}")
+        return None
 
 # —————————————————————————
-# LIVE TRADING ORDER EXECUTION
+# LIVE ORDER EXECUTION
 # —————————————————————————
 
 def execute_live_polymarket_order(token_id, amount_usd):
@@ -134,7 +138,6 @@ def execute_live_polymarket_order(token_id, amount_usd):
         return False
 
     try:
-        # Exploratieve marktorder-aanroep met FOK (Fill-Or-Kill) op v2 API-standaard
         order_args = MarketOrderArgs(
             token_id=token_id,
             amount=round(amount_usd, 2),
@@ -142,11 +145,8 @@ def execute_live_polymarket_order(token_id, amount_usd):
             price=0.99
         )
 
-        # Nieuwe universele marktorder post-call
-        response = clob_client.post_order(
-            clob_client.create_market_order(order_args),
-            OrderType.FOK
-        )
+        signed_order = clob_client.create_market_order(order_args)
+        response = clob_client.post_order(signed_order, OrderType.FOK)
 
         if response and (response.get("success") == True or "orderID" in str(response)):
             print(f"🚀 LIVE ORDER GEPLAATST OP CLOB: {response}")
@@ -156,25 +156,8 @@ def execute_live_polymarket_order(token_id, amount_usd):
             return False
             
     except Exception as e:
-        print(f"❌ LIVE ORDER MISLUKT ({e}). Proberen met standaard order type...")
-        try:
-            order_args = MarketOrderArgs(
-                token_id=token_id,
-                amount=round(amount_usd, 2),
-                side=BUY,
-                price=0.99
-            )
-            signed_order = clob_client.create_market_order(order_args)
-            response = clob_client.post_order(signed_order)
-            if response and (response.get("success") == True or "orderID" in str(response)):
-                print(f"🚀 LIVE ORDER GEPLAATST OP CLOB: {response}")
-                return True
-            else:
-                print(f"❌ POGING 2 WEIGERD: {response}")
-                return False
-        except Exception as retry_e:
-            print(f"❌ HERKANSING OOK MISLUKT: {retry_e}")
-            return False
+        print(f"❌ LIVE ORDER MISLUKT ({e})")
+        return False
 
 # —————————————————————————
 # TELEGRAM BERICHTEN STUREN
@@ -205,7 +188,7 @@ def send_telegram_msg(message, button_url=None):
             time.sleep(1)
 
 # —————————————————————————
-# DYNAMISCHE POLYMARKET ODDS BEREKENING
+# DYNAMISCHE ODDS BEREKENING
 # —————————————————————————
 
 def calculate_dynamic_polymarket_price(rsi, window_delta_pct, strat_type, signal):
@@ -418,12 +401,12 @@ def check_and_evaluate_paper_trades():
 def main():
     mode_str = f"🔴 **LIVE TRADING ACTIEF** (Inzet: `${LIVE_TRADE_AMOUNT:.2f}`)" if (LIVE_MODE and clob_client) else f"📝 **PAPER TRADING MODE** (Inzet: `${PAPER_TRADE_AMOUNT:.2f}`)"
     
-    print(f"🤖 Poly Bot v7.3 Gestart - Mode: {mode_str}...")
+    print(f"🤖 Poly Bot Gestart - Mode: {mode_str}...")
     send_telegram_msg(
-        f"🤖 **Poly Bot Online (Versie v7.3)!**\n"
+        f"🤖 **Poly Bot Online (SDK v0.34+)!**\n"
         f"⚙️ **Status:** {mode_str}\n"
         f"💰 Start Paper Saldo: `${PAPER_BALANCE:.2f}`\n\n"
-        f"🎯 **Systeem:** Target to Beat (5M Open) + Fixed Order Version API."
+        f"🎯 **Systeem:** Target to Beat + SDK Upgraded."
     )
 
     while True:
