@@ -104,12 +104,16 @@ POLY_SYMBOL_ALIASES = {
     "ZECUSDT": ["zcash", "zec"],
 }
 
-EXCLUDED_KEYWORDS = ["ipo", "election", "presidential", "tweet", "approval", "sec", "court", "fed", "rate", "lawsuit"]
+# Verstrengde uitsluitingslijst om verkeerde IPO / nieuws-markten te blokkeren
+EXCLUDED_KEYWORDS = [
+    "ipo", "kraken", "election", "presidential", "tweet", "approval", 
+    "sec", "court", "fed", "rate", "lawsuit", "trump", "biden", "musk"
+]
 
 active_signals_sent = {}
 last_verbose_log_time = 0
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyAutoTrader/5.6"})
+session.headers.update({"User-Agent": "PolyAutoTrader/5.7"})
 
 # ============================================================
 # HELPERS & HTTP WRAPPERS
@@ -143,10 +147,8 @@ def init_clob_client():
         raise SystemExit("❌ FOUT: Geen geldige POLYMARKET_PRIVATE_KEY gevonden.")
 
     try:
-        host_url = "https://clob.polymarket.com"
-        
         kwargs = {
-            "host": host_url,
+            "host": CLOB_HOST,
             "key": PK,
             "chain_id": CHAIN_ID,
             "signature_type": SIG_TYPE,
@@ -277,6 +279,7 @@ def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volum
     now_sec = time.time()
     time_remaining_15m = int(900 - (now_sec % 900))
 
+    # STRATEGIE 1: 5M Expiry Momentum
     if 180 <= time_remaining_sec <= 285:
         if rsi >= 51 and window_delta_pct >= min_delta and volume_ratio >= min_vol_ratio:
             if trend_15m != "BEARISH":
@@ -286,6 +289,7 @@ def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volum
             if trend_15m != "BULLISH":
                 return "DOWN", "5M_MOMENTUM", f"🚀 5M Momentum DOWN ({window_delta_pct}% t.o.v. Strike, Vol {volume_ratio}x)"
 
+    # STRATEGIE 2: 15M Expiry Trend
     if time_remaining_15m <= 360 and time_remaining_sec <= 270:
         if trend_15m == "BULLISH" and rsi >= 48 and window_delta_pct >= 0:
             return "UP", "15M_TREND", f"🌊 15M Trend Follow UP (15M RSI {rsi_15m:.1f}, 5M Delta +{window_delta_pct}%)"
@@ -293,6 +297,7 @@ def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volum
         if trend_15m == "BEARISH" and rsi <= 52 and window_delta_pct <= 0:
             return "DOWN", "15M_TREND", f"🌊 15M Trend Follow DOWN (15M RSI {rsi_15m:.1f}, 5M Delta {window_delta_pct}%)"
 
+    # STRATEGIE 3: 5M Pullback Reentry
     if 30 <= time_remaining_sec <= 240:
         if rsi > prev_rsi and window_delta_pct >= 0.005:
             if trend_15m != "BEARISH":
@@ -305,7 +310,7 @@ def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volum
     return None, None, None
 
 # ============================================================
-# GEVERIFIEERDE MARKTMATCHING
+# GEVERIFIEERDE MARKTMATCHING (GEEFILTERD TEGEN ONGEWENSTE MARKTEN)
 # ============================================================
 
 def get_token_info(symbol: str, signal: str):
@@ -323,7 +328,12 @@ def get_token_info(symbol: str, signal: str):
             slug = str(event.get("slug", "")).lower()
             title = str(event.get("title", "")).lower()
 
+            # Negeer niet-prijsgerelateerde markten (zoals IPO, verkiezingen, etc.)
             if any(ex in slug or ex in title for ex in EXCLUDED_KEYWORDS):
+                continue
+
+            # Zorg dat de naam daadwerkelijk de coin alias bevat
+            if not any(a in slug or a in title for a in aliases):
                 continue
 
             markets = event.get("markets", [])
@@ -383,7 +393,7 @@ def execute_live_order(token_id: str, amount_usd: float, max_price: float):
             return False, 0.0, "Ongeldige ask prijs"
 
         if best_ask > max_price:
-            return False, best_ask, f"Prijs te hoog (${best_ask:.3f} > max${max_price:.3f})"
+            return False, best_ask, f"Prijs te hoog (${best_ask:.3f} > max ${max_price:.3f})"
 
         shares = round(amount_usd / best_ask, 2)
 
@@ -415,7 +425,7 @@ def main():
     global last_verbose_log_time
 
     print("\n" + "=" * 60)
-    print("🤖 POLYMARKET LIVE TRADING BOT V5.6")
+    print("🤖 POLYMARKET LIVE TRADING BOT V5.7")
     print("=" * 60)
     print(f"Live order bedrag: ${LIVE_TRADE_AMOUNT:.2f} USD")
     print(f"Max Ask Limiet: ${MAX_ALLOWABLE_ODDS:.2f}")
@@ -424,7 +434,7 @@ def main():
     print("=" * 60 + "\n")
 
     send_telegram_msg(
-        "⚡ **Poly Auto-Trader LIVE Gestart (v5.6)**\n\n"
+        "⚡ **Poly Auto-Trader LIVE Gestart (v5.7)**\n\n"
         "🚨 **Systeemstatus:** VOLAUTOMATISCH TRADEN ACTIEF\n"
         f"💵 **Inzet per trade:** `${LIVE_TRADE_AMOUNT:.2f}`\n"
         f"🛡️ **Max Ask Limiet:** `${MAX_ALLOWABLE_ODDS:.2f}`"
@@ -458,4 +468,60 @@ def main():
 
                     if not signal:
                         if should_log_status:
-                            print(f"🔍 {symbol}: geen signaal | RSI={rsi} | delta={delta_pct}% | vol={vol_ratio}
+                            print(f"🔍 {symbol}: geen signaal | RSI={rsi} | delta={delta_pct}% | vol={vol_ratio}x | t_rem={time_remaining_sec}s")
+                        continue
+
+                    trade_key = f"cycle_{cycle_id}_{symbol}_{strat_type}"
+                    if trade_key in active_signals_sent:
+                        continue
+
+                    token_info = get_token_info(symbol, signal)
+                    if not token_info:
+                        continue
+
+                    print(f"⚡ Automatische live order starten voor {symbol} ({signal} - {strat_type})...")
+                    success, filled_price, info = execute_live_order(
+                        token_info["token_id"],
+                        LIVE_TRADE_AMOUNT,
+                        MAX_ALLOWABLE_ODDS
+                    )
+
+                    active_signals_sent[trade_key] = True
+                    current_cycle_count += 1
+
+                    mins, secs = divmod(time_remaining_sec, 60)
+                    time_str = f"~{mins}m {secs}s"
+
+                    if success:
+                        shares = round(LIVE_TRADE_AMOUNT / filled_price, 2)
+                        msg = (
+                            f"🚨 **SIGNALIERING: {strat_type}!**\n\n"
+                            f"📍 **Pair:** {symbol} ({signal})\n"
+                            f"🎯 **Target to Beat (5M Open):** `${strike}`\n"
+                            f"📌 **Huidige Koers:** `${current_price}` ({delta_pct}%)\n"
+                            f"📊 **Uitvoeringsprijs:** `${filled_price:.3f}` ({shares} aandelen)\n"
+                            f"💵 **Inzetten op Polymarket:** `${LIVE_TRADE_AMOUNT:.2f}` ({signal})\n\n"
+                            f"📊 **RSI:** {rsi} | **15M RSI:** {rsi_15m:.1f} | **Vol Ratio:** {vol_ratio}x\n"
+                            f"⏳ **Resterend:** `{time_str}`\n\n"
+                            f"💡 **Analyse:** {reason}\n\n"
+                            f"🟢 **LIVE ORDER GEPLAATST** | Order ID: `{info}`"
+                        )
+                    else:
+                        msg = (
+                            f"🚨 **LIVE ORDER GEWEIGERD / MISLUKT**\n\n"
+                            f"📍 **Pair:** {symbol} ({signal})\n"
+                            f"⚠️ **Reden:** {info}"
+                        )
+
+                    send_telegram_msg(msg, token_info["url"])
+
+        except KeyboardInterrupt:
+            print("\n🛑 Bot handmatig gestopt.")
+            break
+        except Exception as e:
+            print(f"\n❌ Fout in hoofdloop: {e}")
+
+        time.sleep(SCAN_INTERVAL_SEC)
+
+if __name__ == "__main__":
+    main()
