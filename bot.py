@@ -116,7 +116,7 @@ POLY_SYMBOL_MAP = {
 active_signals_sent = {}
 last_verbose_log_time = 0
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyAutoTrader/4.3"})
+session.headers.update({"User-Agent": "PolyAutoTrader/4.4"})
 
 
 # ============================================================
@@ -279,7 +279,7 @@ def fetch_binance_data(symbol: str):
 
 
 # ============================================================
-# STRATEGIE LOGICA (VERSOEPELD VOOR HOGERE TRADE FREQUENTIE)
+# STRATEGIE LOGICA
 # ============================================================
 
 def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volume_ratio, trend_15m, rsi_15m, time_remaining_sec):
@@ -325,7 +325,7 @@ def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volum
 
 
 # ============================================================
-# POLYMARKET EVENT MATCHING (DIRECTE EVENT EVALUATIE)
+# POLYMARKET EVENT MATCHING (SLIMME MULTI-QUERY MATCHING)
 # ============================================================
 
 def find_current_polymarket_event(symbol: str):
@@ -333,23 +333,36 @@ def find_current_polymarket_event(symbol: str):
     if not prefix:
         return None
 
-    url = f"{POLYMARKET_GAMMA_URL}/events?limit=50&active=true&closed=false"
-    data = request_json("GET", url, timeout=5)
+    # Probeer gericht te zoeken met specifieke queries op Gamma API
+    queries = [
+        f"{POLYMARKET_GAMMA_URL}/events?limit=20&active=true&closed=false&q={prefix}",
+        f"{POLYMARKET_GAMMA_URL}/events?limit=50&active=true&closed=false",
+        f"{POLYMARKET_GAMMA_URL}/markets?limit=30&active=true&closed=false&q={prefix}"
+    ]
 
-    if not data or not isinstance(data, list):
-        return None
+    for url in queries:
+        data = request_json("GET", url, timeout=5)
+        if not data or not isinstance(data, list):
+            continue
 
-    for event in data:
-        slug = event.get("slug", "").lower()
-        title = event.get("title", "").lower()
+        for item in data:
+            # Check of het een Event-object is of een los Market-object
+            slug = item.get("slug", "").lower()
+            title = item.get("title", "").lower()
+            question = item.get("question", "").lower()
 
-        if prefix in slug or prefix in title:
-            if "5m" in slug or "5m" in title or "updown" in slug or "updown" in title:
-                markets = event.get("markets", [])
-                for market in markets:
-                    if not market.get("closed", False):
-                        print(f"✅ Event gevonden voor {symbol}: {event.get('slug')}")
-                        return event
+            full_text = f"{slug} {title} {question}"
+
+            # Controleer of het symbool erin zit
+            if prefix in full_text:
+                # Controleer of het om een kortlopende/5m/updown markt gaat
+                if any(k in full_text for k in ["5m", "updown", "price", "5-min", "above"]):
+                    markets = item.get("markets", [item]) if "markets" in item else [item]
+                    for market in markets:
+                        if not market.get("closed", False) and market.get("active", True):
+                            event_obj = item if "markets" in item else {"slug": slug, "markets": [item]}
+                            print(f"✅ Event/Markt gevonden voor {symbol}: {slug}")
+                            return event_obj
 
     print(f"⚠️ Geen matchend actief event gevonden voor {symbol} (prefix={prefix})")
     return None
@@ -361,27 +374,35 @@ def get_token_info(symbol: str, signal: str):
         return None
 
     wanted = signal.lower()
-    for market in event.get("markets", []):
+    markets = event.get("markets", [])
+
+    for market in markets:
         if market.get("closed", False) or not market.get("active", True):
             continue
 
         outcomes = safe_json_load(market.get("outcomes"))
         token_ids = safe_json_load(market.get("clobTokenIds"))
 
+        if not outcomes or not token_ids:
+            continue
+
         for idx, outcome in enumerate(outcomes):
             norm = str(outcome).strip().lower()
             if (wanted == "up" and norm in {"up", "yes"}) or (wanted == "down" and norm in {"down", "no"}):
-                return {
-                    "token_id": str(token_ids[idx]),
-                    "outcome": str(outcome),
-                    "event_slug": event.get("slug", ""),
-                    "url": f"https://polymarket.com/event/{event.get('slug', '')}?outcomeIndex={idx}"
-                }
+                token_id = str(token_ids[idx]) if idx < len(token_ids) else None
+                if token_id:
+                    slug = event.get("slug", market.get("slug", ""))
+                    return {
+                        "token_id": token_id,
+                        "outcome": str(outcome),
+                        "event_slug": slug,
+                        "url": f"https://polymarket.com/event/{slug}?outcomeIndex={idx}"
+                    }
     return None
 
 
 # ============================================================
-# ORDER EXECUTIE (MET GEGARANDEERDE SORTERING LAAGSTE ASK)
+# ORDER EXECUTIE
 # ============================================================
 
 def execute_live_order(token_id: str, amount_usd: float, max_price: float):
@@ -463,7 +484,7 @@ def main():
     global last_verbose_log_time
 
     print("\n" + "=" * 60)
-    print("🤖 POLYMARKET LIVE TRADING BOT (MET GAMMA MATCH FIX)")
+    print("🤖 POLYMARKET LIVE TRADING BOT (MULTI-QUERY MATCHING)")
     print("=" * 60)
     print(f"Live order bedrag: ${LIVE_TRADE_AMOUNT:.2f} USD")
     print(f"Max Ask Limiet: ${MAX_ALLOWABLE_ODDS:.2f}")
@@ -471,7 +492,7 @@ def main():
     print("=" * 60 + "\n")
 
     send_telegram_msg(
-        "⚡ **Poly Auto-Trader LIVE Gestart (Directe Gamma Matching Actief)**\n\n"
+        "⚡ **Poly Auto-Trader LIVE Gestart (Multi-Query Matching Actief)**\n\n"
         "🚨 **Systeemstatus:** VOLAUTOMATISCH TRADEN ACTIEF\n"
         f"💵 **Inzet per trade:** `${LIVE_TRADE_AMOUNT:.2f}`\n"
         f"🛡️ **Max Ask Limiet:** `${MAX_ALLOWABLE_ODDS:.2f}`"
