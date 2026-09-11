@@ -116,7 +116,7 @@ POLY_SYMBOL_MAP = {
 active_signals_sent = {}
 last_verbose_log_time = 0
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyAutoTrader/4.2"})
+session.headers.update({"User-Agent": "PolyAutoTrader/4.3"})
 
 
 # ============================================================
@@ -325,7 +325,7 @@ def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volum
 
 
 # ============================================================
-# POLYMARKET EVENT MATCHING (ROBUUSTE DIEPE ZOEKOPDRACHT)
+# POLYMARKET EVENT MATCHING (DIRECTE EVENT EVALUATIE)
 # ============================================================
 
 def find_current_polymarket_event(symbol: str):
@@ -333,35 +333,23 @@ def find_current_polymarket_event(symbol: str):
     if not prefix:
         return None
 
-    url = f"{POLYMARKET_GAMMA_URL}/events?limit=100&active=true&closed=false&q={prefix}"
+    url = f"{POLYMARKET_GAMMA_URL}/events?limit=50&active=true&closed=false"
     data = request_json("GET", url, timeout=5)
 
-    if not data or not isinstance(data, list) or len(data) == 0:
-        url_fallback = f"{POLYMARKET_GAMMA_URL}/events?limit=100&active=true&closed=false"
-        data = request_json("GET", url_fallback, timeout=5)
-
     if not data or not isinstance(data, list):
-        print(f"⚠️ Geen response van Gamma API voor {symbol}")
         return None
-
-    search_patterns = [
-        f"{prefix}-updown-5m",
-        f"{prefix}-5m",
-        f"{prefix}-price-5m",
-        f"{prefix} 5m"
-    ]
 
     for event in data:
         slug = event.get("slug", "").lower()
         title = event.get("title", "").lower()
 
-        if event.get("closed", False):
-            continue
-
-        for pattern in search_patterns:
-            if pattern in slug or pattern in title:
-                print(f"✅ Event gevonden voor {symbol}: {event.get('slug')}")
-                return event
+        if prefix in slug or prefix in title:
+            if "5m" in slug or "5m" in title or "updown" in slug or "updown" in title:
+                markets = event.get("markets", [])
+                for market in markets:
+                    if not market.get("closed", False):
+                        print(f"✅ Event gevonden voor {symbol}: {event.get('slug')}")
+                        return event
 
     print(f"⚠️ Geen matchend actief event gevonden voor {symbol} (prefix={prefix})")
     return None
@@ -475,7 +463,7 @@ def main():
     global last_verbose_log_time
 
     print("\n" + "=" * 60)
-    print("🤖 POLYMARKET LIVE TRADING BOT (GEOPTIMALISEERD)")
+    print("🤖 POLYMARKET LIVE TRADING BOT (MET GAMMA MATCH FIX)")
     print("=" * 60)
     print(f"Live order bedrag: ${LIVE_TRADE_AMOUNT:.2f} USD")
     print(f"Max Ask Limiet: ${MAX_ALLOWABLE_ODDS:.2f}")
@@ -483,7 +471,7 @@ def main():
     print("=" * 60 + "\n")
 
     send_telegram_msg(
-        "⚡ **Poly Auto-Trader LIVE Gestart (Inclusief Versoepelde Strategieregels)**\n\n"
+        "⚡ **Poly Auto-Trader LIVE Gestart (Directe Gamma Matching Actief)**\n\n"
         "🚨 **Systeemstatus:** VOLAUTOMATISCH TRADEN ACTIEF\n"
         f"💵 **Inzet per trade:** `${LIVE_TRADE_AMOUNT:.2f}`\n"
         f"🛡️ **Max Ask Limiet:** `${MAX_ALLOWABLE_ODDS:.2f}`"
