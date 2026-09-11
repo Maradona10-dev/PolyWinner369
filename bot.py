@@ -103,7 +103,6 @@ SIG_TYPE = get_signature_type()
 
 PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ZECUSDT"]
 
-# Mappings voor zowel afkorting als volledige namen om match-garantie te verhogen
 POLY_SYMBOL_ALIASES = {
     "BTCUSDT": ["btc", "bitcoin"],
     "ETHUSDT": ["eth", "ethereum"],
@@ -117,7 +116,7 @@ POLY_SYMBOL_ALIASES = {
 active_signals_sent = {}
 last_verbose_log_time = 0
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyAutoTrader/5.0"})
+session.headers.update({"User-Agent": "PolyAutoTrader/5.1"})
 
 
 # ============================================================
@@ -326,106 +325,85 @@ def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volum
 
 
 # ============================================================
-# ROBUUSTE DYNAMISCHE POLYMARKET MATCHING
+# ROBUUSTE DYNAMISCHE POLYMARKET MATCHING (CLOB + GAMMA API)
 # ============================================================
 
-def find_current_polymarket_event(symbol: str):
-    aliases = POLY_SYMBOL_ALIASES.get(symbol, [])
-
-    # Step 1: Query Gamma API op zoek naar actieve markten
-    for alias in aliases:
-        endpoints = [
-            f"{POLYMARKET_GAMMA_URL}/events?limit=30&active=true&closed=false&q={alias}",
-            f"{POLYMARKET_GAMMA_URL}/markets?limit=30&active=true&closed=false&q={alias}"
-        ]
-
-        for url in endpoints:
-            data = request_json("GET", url, timeout=5)
-            if not data or not isinstance(data, list):
-                continue
-
-            for item in data:
-                slug = item.get("slug", "").lower()
-                title = item.get("title", "").lower()
-                question = item.get("question", "").lower()
-                text_block = f"{slug} {title} {question}"
-
-                # Controleer of ten minste één alias voorkomt
-                if any(a in text_block for a in aliases):
-                    # Zorg ervoor dat het een actieve/open markt betreft
-                    markets = item.get("markets", [item]) if "markets" in item else [item]
-                    for market in markets:
-                        if not market.get("closed", False) and market.get("active", True):
-                            clob_ids = safe_json_load(market.get("clobTokenIds"))
-                            if clob_ids and len(clob_ids) >= 2:
-                                print(f"✅ Gamma Match voor {symbol}: {slug}")
-                                return {
-                                    "slug": slug,
-                                    "markets": [market]
-                                }
-
-    # Step 2: Algemene scan van de laatste 100 actieve Gamma markten zonder 'q' filter (Fallback)
-    fallback_url = f"{POLYMARKET_GAMMA_URL}/markets?limit=100&active=true&closed=false"
-    data = request_json("GET", fallback_url, timeout=5)
-
-    if data and isinstance(data, list):
-        for market in data:
-            if market.get("closed", False) or not market.get("active", True):
-                continue
-
-            slug = market.get("slug", "").lower()
-            question = market.get("question", "").lower()
-            text_block = f"{slug} {question}"
-
-            if any(alias in text_block for alias in aliases):
-                clob_ids = safe_json_load(market.get("clobTokenIds"))
-                if clob_ids and len(clob_ids) >= 2:
-                    print(f"✅ Fallback Gamma Match voor {symbol}: {slug}")
-                    return {
-                        "slug": slug,
-                        "markets": [market]
-                    }
-
-    print(f"⚠️ Geen matchend actief event gevonden voor {symbol}")
-    return None
-
-
 def get_token_info(symbol: str, signal: str):
-    event = find_current_polymarket_event(symbol)
-    if not event:
-        return None
-
+    """
+    Zoekt het actieve token op Polymarket voor een gegeven crypto symbol (bijv. SOLUSDT)
+    en een signaal ('UP' of 'DOWN').
+    """
+    aliases = POLY_SYMBOL_ALIASES.get(symbol, [])
     wanted = signal.lower()
-    markets = event.get("markets", [])
 
-    for market in markets:
-        if market.get("closed", False) or not market.get("active", True):
+    # 1. Probeer de CLOB Sampling Markets API (Direct voor actieve crypto markten)
+    clob_url = f"{CLOB_HOST}/sampling-markets"
+    clob_data = request_json("GET", clob_url, timeout=5)
+
+    if clob_data and isinstance(clob_data, list):
+        for m in clob_data:
+            question = str(m.get("question", "")).lower()
+            description = str(m.get("description", "")).lower()
+            text_block = f"{question} {description}"
+
+            if any(alias in text_block for alias in aliases) and not m.get("closed", False):
+                tokens = m.get("tokens", [])
+                for token in tokens:
+                    outcome = str(token.get("outcome", "")).lower()
+                    token_id = str(token.get("token_id", ""))
+
+                    is_up = (wanted == "up" and outcome in {"up", "yes", "above"})
+                    is_down = (wanted == "down" and outcome in {"down", "no", "below"})
+
+                    if (is_up or is_down) and token_id:
+                        condition_id = m.get("condition_id", "")
+                        print(f"✅ CLOB Match voor {symbol} ({signal}): {token_id[:10]}...")
+                        return {
+                            "token_id": token_id,
+                            "outcome": token.get("outcome"),
+                            "event_slug": condition_id,
+                            "url": f"https://polymarket.com/market/{condition_id}"
+                        }
+
+    # 2. Fallback: Gamma API via Direct Query op actieve events
+    for alias in aliases:
+        gamma_url = f"{POLYMARKET_GAMMA_URL}/events?limit=30&active=true&closed=false&q={alias}"
+        gamma_data = request_json("GET", gamma_url, timeout=5)
+
+        if not gamma_data or not isinstance(gamma_data, list):
             continue
 
-        outcomes = safe_json_load(market.get("outcomes"))
-        token_ids = safe_json_load(market.get("clobTokenIds"))
+        for event in gamma_data:
+            markets = event.get("markets", [])
+            for market in markets:
+                if market.get("closed", False) or not market.get("active", True):
+                    continue
 
-        if not outcomes or not token_ids:
-            continue
+                outcomes = safe_json_load(market.get("outcomes"))
+                token_ids = safe_json_load(market.get("clobTokenIds"))
 
-        for idx, outcome in enumerate(outcomes):
-            norm = str(outcome).strip().lower()
+                if not outcomes or not token_ids:
+                    continue
 
-            # flexibele matching van Yes/No en Up/Down
-            is_up = (wanted == "up" and norm in {"up", "yes", "above"})
-            is_down = (wanted == "down" and norm in {"down", "no", "below"})
+                for idx, outcome in enumerate(outcomes):
+                    norm = str(outcome).strip().lower()
 
-            if is_up or is_down:
-                if idx < len(token_ids):
-                    token_id = str(token_ids[idx])
-                    slug = event.get("slug", market.get("slug", ""))
-                    return {
-                        "token_id": token_id,
-                        "outcome": str(outcome),
-                        "event_slug": slug,
-                        "url": f"https://polymarket.com/event/{slug}?outcomeIndex={idx}"
-                    }
+                    is_up = (wanted == "up" and norm in {"up", "yes", "above"})
+                    is_down = (wanted == "down" and norm in {"down", "no", "below"})
 
+                    if is_up or is_down:
+                        if idx < len(token_ids):
+                            token_id = str(token_ids[idx])
+                            slug = event.get("slug", market.get("slug", ""))
+                            print(f"✅ Gamma Match voor {symbol} ({signal}): {slug}")
+                            return {
+                                "token_id": token_id,
+                                "outcome": str(outcome),
+                                "event_slug": slug,
+                                "url": f"https://polymarket.com/event/{slug}?outcomeIndex={idx}"
+                            }
+
+    print(f"⚠️ Geen matchend actief token gevonden op Polymarket voor {symbol} ({signal})")
     return None
 
 
@@ -512,7 +490,7 @@ def main():
     global last_verbose_log_time
 
     print("\n" + "=" * 60)
-    print("🤖 POLYMARKET LIVE TRADING BOT (V5.0 WATERDICHT)")
+    print("🤖 POLYMARKET LIVE TRADING BOT (V5.1 DIRECT MATCHING)")
     print("=" * 60)
     print(f"Live order bedrag: ${LIVE_TRADE_AMOUNT:.2f} USD")
     print(f"Max Ask Limiet: ${MAX_ALLOWABLE_ODDS:.2f}")
@@ -520,7 +498,7 @@ def main():
     print("=" * 60 + "\n")
 
     send_telegram_msg(
-        "⚡ **Poly Auto-Trader LIVE Gestart (v5.0 Waterdicht Matching System)**\n\n"
+        "⚡ **Poly Auto-Trader LIVE Gestart (v5.1 Direct Matching)**\n\n"
         "🚨 **Systeemstatus:** VOLAUTOMATISCH TRADEN ACTIEF\n"
         f"💵 **Inzet per trade:** `${LIVE_TRADE_AMOUNT:.2f}`\n"
         f"🛡️ **Max Ask Limiet:** `${MAX_ALLOWABLE_ODDS:.2f}`"
