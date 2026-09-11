@@ -26,7 +26,7 @@ except ImportError:
         raise SystemExit(
             "\n❌ py-clob-client ontbreekt.\n"
             "Installeer via requirements.txt:\n"
-            "py-clob-client\nrequests\n"
+            "py-clob-client-v2\nrequests\n"
         )
 
 # ============================================================
@@ -50,7 +50,7 @@ MAX_PRICE_DISCREPANCY = float(os.environ.get("MAX_PRICE_DISCREPANCY", "0.05"))
 # Log-frequentie voor status-updates als er geen signaal is (in seconden)
 VERBOSE_LOG_INTERVAL_SEC = 15
 
-# DEBUG_TOKEN_MATCHING
+# NIEUW: zet op "1" in env vars om uitgebreide token-matching debug te zien
 DEBUG_TOKEN_MATCHING = os.environ.get("DEBUG_TOKEN_MATCHING", "1").strip() == "1"
 
 # ============================================================
@@ -142,7 +142,7 @@ def request_json(method: str, url: str, *, timeout: int = 5, **kwargs):
         return response.json()
     except Exception as e:
         print(f"⚠️ Netwerkfout ({url}): {e}")
-        return None
+    return None
 
 # ============================================================
 # CLOB CLIENT INITIALISATIE
@@ -219,4 +219,412 @@ def calculate_rsi(prices, period: int = 14):
     losses = [max(0.0, prices[i - 1] - prices[i]) for i in range(1, len(prices))]
 
     avg_gain = sum(gains[:period]) / period
-    avg_loss =
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+    return round(100 - (100 / (1 + (avg_gain / avg_loss))), 1)
+
+def fetch_15m_trend(symbol: str) -> Tuple[str, float]:
+    res_15m = fetch_klines(symbol, "15m", 15)
+    if not res_15m or len(res_15m) < 15:
+        return "NEUTRAL", 0.0
+
+    closes = [float(k[4]) for k in res_15m]
+    rsi_15m = calculate_rsi(closes)
+    change = ((closes[-1] - closes[0]) / closes[0]) * 100
+
+    if rsi_15m > 58 and change > 0.12:
+        return "BULLISH", rsi_15m
+    elif rsi_15m < 42 and change < -0.12:
+        return "BEARISH", rsi_15m
+    return "NEUTRAL", rsi_15m
+
+def fetch_binance_data(symbol: str):
+    try:
+        res_5m = fetch_klines(symbol, "5m", 2)
+        res_1m = fetch_klines(symbol, "1m", 30)
+        if not res_5m or not res_1m:
+            return None, None, None, None, None, None, None, None
+
+        window_strike_price = float(res_5m[-1][1])
+        close_prices = [float(k[4]) for k in res_1m]
+        volumes = [float(k[5]) for k in res_1m]
+
+        current_price = close_prices[-1]
+        window_delta_pct = round(((current_price - window_strike_price) / window_strike_price) * 100, 3)
+        rsi = calculate_rsi(close_prices)
+        prev_rsi = calculate_rsi(close_prices[:-1])
+
+        current_volume = volumes[-1]
+        avg_volume = sum(volumes[-11:-1]) / 10 if len(volumes) >= 11 else current_volume
+        volume_ratio = round(current_volume / avg_volume, 2) if avg_volume > 0 else 1.0
+
+        trend_15m, rsi_15m = fetch_15m_trend(symbol)
+
+        return current_price, window_strike_price, window_delta_pct, rsi, prev_rsi, volume_ratio, trend_15m, rsi_15m
+    except Exception as e:
+        print(f"⚠️ fetch_binance_data fout voor {symbol}: {e}")
+        return None, None, None, None, None, None, None, None
+
+# ============================================================
+# STRATEGIE LOGICA
+# ============================================================
+
+def analyze_market_and_get_signal(symbol, rsi, prev_rsi, window_delta_pct, volume_ratio, trend_15m, rsi_15m, time_remaining_sec):
+    if symbol in ["ZECUSDT", "DOGEUSDT"]:
+        min_delta, min_vol_ratio = 0.04, 1.05
+    elif symbol in ["SOLUSDT", "BNBUSDT", "XRPUSDT"]:
+        min_delta, min_vol_ratio = 0.02, 1.02
+    else:
+        min_delta, min_vol_ratio = 0.01, 1.00
+
+    now_sec = time.time()
+    time_remaining_15m = int(900 - (now_sec % 900))
+
+    # STRATEGIE 1: 5M Expiry Momentum
+    if 180 <= time_remaining_sec <= 285:
+        if rsi >= 51 and window_delta_pct >= min_delta and volume_ratio >= min_vol_ratio:
+            if trend_15m != "BEARISH":
+                return "UP", "5M_MOMENTUM", f"🚀 5M Momentum UP (+{window_delta_pct}% t.o.v. Strike, Vol {volume_ratio}x)"
+
+        if rsi <= 49 and window_delta_pct <= -min_delta and volume_ratio >= min_vol_ratio:
+            if trend_15m != "BULLISH":
+                return "DOWN", "5M_MOMENTUM", f"🚀 5M Momentum DOWN ({window_delta_pct}% t.o.v. Strike, Vol {volume_ratio}x)"
+
+    # STRATEGIE 2: 15M Expiry Trend
+    if time_remaining_15m <= 360 and time_remaining_sec <= 270:
+        if trend_15m == "BULLISH" and rsi >= 48 and window_delta_pct >= 0:
+            return "UP", "15M_TREND", f"🌊 15M Trend Follow UP (15M RSI {rsi_15m:.1f}, 5M Delta +{window_delta_pct}%)"
+
+        if trend_15m == "BEARISH" and rsi <= 52 and window_delta_pct <= 0:
+            return "DOWN", "15M_TREND", f"🌊 15M Trend Follow DOWN (15M RSI {rsi_15m:.1f}, 5M Delta {window_delta_pct}%)"
+
+    # STRATEGIE 3: 5M Pullback / Reentry
+    if 30 <= time_remaining_sec <= 240:
+        if rsi > prev_rsi and window_delta_pct >= 0.005:
+            if trend_15m != "BEARISH":
+                return "UP", "5M_PULLBACK", f"🔄 5M Pullback Reentry UP (RSI {prev_rsi:.1f} ➔ {rsi:.1f}, Delta +{window_delta_pct}%)"
+
+        if rsi < prev_rsi and window_delta_pct <= -0.005:
+            if trend_15m != "BULLISH":
+                return "DOWN", "5M_PULLBACK", f"🔄 5M Pullback Reentry DOWN (RSI {prev_rsi:.1f} ➔ {rsi:.1f}, Delta {window_delta_pct}%)"
+
+    return None, None, None
+
+# ============================================================
+# ROBUUSTE DYNAMISCHE POLYMARKET MATCHING (EXACTE SLUG LINK)
+# ============================================================
+
+def get_token_info(symbol: str, signal: str):
+    """
+    Zoekt het actieve token op Polymarket voor een gegeven crypto symbol (bijv. SOLUSDT)
+    en bouwt de exacte URL naar het juiste event.
+    """
+    aliases = POLY_SYMBOL_ALIASES.get(symbol, [])
+    wanted = signal.lower()
+
+    # 1. CLOB sampling-markets pad
+    clob_url = f"{CLOB_HOST}/sampling-markets"
+    clob_data = request_json("GET", clob_url, timeout=5)
+
+    if DEBUG_TOKEN_MATCHING:
+        n = len(clob_data) if isinstance(clob_data, list) else 0
+        print(f"🔎[{symbol}] CLOB sampling-markets response: {n} markten ontvangen")
+
+    matched_text_but_no_token = 0
+
+    if clob_data and isinstance(clob_data, list):
+        for m in clob_data:
+            question = str(m.get("question", "")).lower()
+            description = str(m.get("description", "")).lower()
+            text_block = f"{question} {description}"
+
+            text_matches = any(alias in text_block for alias in aliases)
+            if not text_matches:
+                continue
+            if m.get("closed", False):
+                continue
+
+            tokens = m.get("tokens", [])
+            if DEBUG_TOKEN_MATCHING:
+                outcomes_seen = [str(t.get("outcome", "")) for t in tokens]
+                print(f"🔎[{symbol}] CLOB match op tekst | question='{question[:60]}' | outcomes={outcomes_seen} | wanted={wanted}")
+
+            found_this_market = False
+            for idx, token in enumerate(tokens):
+                outcome = str(token.get("outcome", "")).lower()
+                token_id = str(token.get("token_id", ""))
+
+                is_up = (wanted == "up" and outcome in {"up", "yes", "above"})
+                is_down = (wanted == "down" and outcome in {"down", "no", "below"})
+
+                if (is_up or is_down) and token_id:
+                    found_this_market = True
+                    condition_id = m.get("condition_id", "")
+
+                    event_url = "[https://polymarket.com](https://polymarket.com)"
+                    if condition_id:
+                        gamma_market = request_json("GET", f"{POLYMARKET_GAMMA_URL}/markets?condition_id={condition_id}", timeout=3)
+                        if gamma_market and isinstance(gamma_market, list) and len(gamma_market) > 0:
+                            slug = gamma_market[0].get("slug") or (gamma_market[0].get("events", [{}])[0].get("slug") if gamma_market[0].get("events") else None)
+                            if slug:
+                                event_url = f"[https://polymarket.com/event/](https://polymarket.com/event/){slug}"
+
+                    print(f"✅ CLOB Match voor {symbol} ({signal}): {token_id[:10]}...")
+                    return {
+                        "token_id": token_id,
+                        "outcome": token.get("outcome"),
+                        "event_slug": condition_id,
+                        "url": event_url
+                    }
+
+            if not found_this_market:
+                matched_text_but_no_token += 1
+
+    if DEBUG_TOKEN_MATCHING and matched_text_but_no_token:
+        print(f"🔎[{symbol}] {matched_text_but_no_token} CLOB markt(en) matchten op tekst, maar geen outcome matchte wanted='{wanted}'")
+
+    # 2. Fallback: Gamma API per alias
+    for alias in aliases:
+        gamma_url = f"{POLYMARKET_GAMMA_URL}/events?limit=10&active=true&closed=false&q={alias}"
+        gamma_data = request_json("GET", gamma_url, timeout=5)
+
+        if DEBUG_TOKEN_MATCHING:
+            n = len(gamma_data) if isinstance(gamma_data, list) else 0
+            print(f"🔎[{symbol}] Gamma fallback alias='{alias}': {n} events ontvangen")
+
+        if not gamma_data or not isinstance(gamma_data, list):
+            continue
+
+        for event in gamma_data:
+            title = str(event.get("title", "")).lower()
+            slug = event.get("slug", "")
+
+            if not any(a in title or a in slug for a in aliases):
+                continue
+
+            markets = event.get("markets", [])
+            for market in markets:
+                if market.get("closed", False) or not market.get("active", True):
+                    continue
+
+                outcomes = safe_json_load(market.get("outcomes"))
+                token_ids = safe_json_load(market.get("clobTokenIds"))
+
+                if DEBUG_TOKEN_MATCHING:
+                    print(f"🔎[{symbol}] Gamma event slug='{slug}' | outcomes={outcomes} | token_ids_count={len(token_ids)} | wanted={wanted}")
+
+                if not outcomes or not token_ids:
+                    if DEBUG_TOKEN_MATCHING:
+                        print(f"🔎[{symbol}] -> overgeslagen: outcomes of token_ids is leeg (mogelijk parse-probleem)")
+                    continue
+
+                for idx, outcome in enumerate(outcomes):
+                    norm = str(outcome).strip().lower()
+
+                    is_up = (wanted == "up" and norm in {"up", "yes", "above"})
+                    is_down = (wanted == "down" and norm in {"down", "no", "below"})
+
+                    if is_up or is_down:
+                        if idx < len(token_ids):
+                            token_id = str(token_ids[idx])
+                            print(f"✅ Gamma Match voor {symbol} ({signal}): {slug}")
+                            return {
+                                "token_id": token_id,
+                                "outcome": str(outcome),
+                                "event_slug": slug,
+                                "url": f"[https://polymarket.com/event/](https://polymarket.com/event/){slug}"
+                            }
+
+    print(f"⚠️ Geen matchend actief token gevonden op Polymarket voor {symbol} ({signal})")
+    return None
+
+# ============================================================
+# ORDER EXECUTIE
+# ============================================================
+
+def execute_live_order(token_id: str, amount_usd: float, max_price: float):
+    try:
+        orderbook = clob_client.get_order_book(token_id)
+        if not orderbook:
+            return False, 0.0, "Geen orderbook ontvangen"
+
+        asks = []
+        if isinstance(orderbook, dict):
+            asks = orderbook.get("asks", [])
+        elif hasattr(orderbook, "asks"):
+            asks = orderbook.asks
+
+        if not asks:
+            return False, 0.0, "Geen asks in orderbook"
+
+        def extract_price(entry):
+            if isinstance(entry, dict):
+                return float(entry.get("price", 0))
+            return float(getattr(entry, "price", 0))
+
+        sorted_asks = sorted(asks, key=extract_price)
+        best_ask_entry = sorted_asks[0]
+        orderbook_ask = extract_price(best_ask_entry)
+
+        if orderbook_ask <= 0:
+            return False, 0.0, "Ongeldige ask prijs (orderbook)"
+
+        live_ask = None
+        try:
+            live_price = clob_client.get_price(token_id, side="SELL")
+            live_ask = float(live_price) if live_price is not None else None
+        except Exception as e:
+            print(f"⚠️ get_price() kruiscontrole mislukt: {e}")
+
+        if live_ask is not None:
+            price_diff = abs(orderbook_ask - live_ask)
+            if price_diff > MAX_PRICE_DISCREPANCY:
+                return False, orderbook_ask, (
+                    f"Prijs-mismatch: orderbook=${orderbook_ask:.3f} "
+                    f"vs live_price=${live_ask:.3f} (verschil {price_diff:.3f})"
+                )
+            best_ask = live_ask
+        else:
+            best_ask = orderbook_ask
+
+        if best_ask > max_price:
+            return False, best_ask, f"Prijs te hoog (${best_ask:.3f} > max ${max_price:.3f})"
+
+        shares = round(amount_usd / best_ask, 2)
+
+        order_args = OrderArgs(
+            price=best_ask,
+            size=shares,
+            side="BUY",
+            token_id=token_id,
+        )
+
+        signed_order = clob_client.create_order(order_args)
+        resp = clob_client.post_order(signed_order, OrderType.FOK)
+
+        if resp and resp.get("success"):
+            order_id = resp.get("orderID", "N/A")
+            return True, best_ask, order_id
+        else:
+            error_msg = resp.get("errorMsg", "Order afgewezen door CLOB")
+            return False, best_ask, error_msg
+
+    except Exception as e:
+        return False, 0.0, str(e)
+
+# ============================================================
+# MAIN BOT LOOP
+# ============================================================
+
+def main():
+    global last_verbose_log_time
+
+    print("\n" + "=" * 60)
+    print("🤖 POLYMARKET LIVE TRADING BOT (V5.3 MET TOKEN-MATCHING DEBUG)")
+    print("=" * 60)
+    print(f"Live order bedrag: ${LIVE_TRADE_AMOUNT:.2f} USD")
+    print(f"Max Ask Limiet: ${MAX_ALLOWABLE_ODDS:.2f}")
+    print(f"Scan Interval: {SCAN_INTERVAL_SEC}s")
+    print(f"Debug token matching: {DEBUG_TOKEN_MATCHING}")
+    print("=" * 60 + "\n")
+
+    send_telegram_msg(
+        "⚡ **Poly Auto-Trader LIVE Gestart (v5.3 Debug Matching)**\n\n"
+        "🚨 **Systeemstatus:** VOLAUTOMATISCH TRADEN ACTIEF\n"
+        f"💵 **Inzet per trade:** `${LIVE_TRADE_AMOUNT:.2f}`\n"
+        f"🛡️ **Max Ask Limiet:** `${MAX_ALLOWABLE_ODDS:.2f}`"
+    )
+
+    while True:
+        try:
+            now_sec = time.time()
+            time_remaining_sec = int(300 - (now_sec % 300))
+            cycle_id = int(now_sec // 300)
+
+            should_log_status = (now_sec - last_verbose_log_time) >= VERBOSE_LOG_INTERVAL_SEC
+            if should_log_status:
+                last_verbose_log_time = now_sec
+
+            current_cycle_count = sum(1 for k in active_signals_sent if k.startswith(f"cycle_{cycle_id}_"))
+
+            if current_cycle_count < MAX_TRADES_PER_CYCLE:
+                for symbol in PAIRS:
+                    if current_cycle_count >= MAX_TRADES_PER_CYCLE:
+                        break
+
+                    current_price, strike, delta_pct, rsi, prev_rsi, vol_ratio, trend_15m, rsi_15m = fetch_binance_data(symbol)
+
+                    if current_price is None:
+                        print(f"⏭️ {symbol}: geen Binance data beschikbaar")
+                        continue
+
+                    signal, strat_type, reason = analyze_market_and_get_signal(
+                        symbol, rsi, prev_rsi, delta_pct, vol_ratio, trend_15m, rsi_15m, time_remaining_sec
+                    )
+
+                    if not signal:
+                        if should_log_status:
+                            print(f"🔍 {symbol}: geen signaal | RSI={rsi} | delta={delta_pct}% | vol={vol_ratio}x | 15m={trend_15m} | t_rem={time_remaining_sec}s")
+                        continue
+
+                    trade_key = f"cycle_{cycle_id}_{symbol}_{strat_type}"
+                    if trade_key in active_signals_sent:
+                        continue
+
+                    token_info = get_token_info(symbol, signal)
+                    if not token_info:
+                        print(f"⚠️ {symbol}: Signaal {signal} aanwezig, maar geen bruikbaar token/market-id gevonden op Polymarket")
+                        continue
+
+                    print(f"⚡ Automatische live order starten voor {symbol} ({signal} - {strat_type})...")
+                    success, filled_price, info = execute_live_order(
+                        token_info["token_id"],
+                        LIVE_TRADE_AMOUNT,
+                        MAX_ALLOWABLE_ODDS
+                    )
+
+                    active_signals_sent[trade_key] = True
+                    current_cycle_count += 1
+
+                    mins, secs = divmod(time_remaining_sec, 60)
+                    time_str = f"~{mins}m {secs}s"
+
+                    if success:
+                        shares = round(LIVE_TRADE_AMOUNT / filled_price, 2)
+                        msg = (
+                            f"🚨 **SIGNALIERING: {strat_type}!**\n\n"
+                            f"📍 **Pair:** {symbol} ({signal})\n"
+                            f"🎯 **Target to Beat (5M Open):** `${strike}`\n"
+                            f"📌 **Huidige Koers:** `${current_price}` ({delta_pct}%)\n"
+                            f"📊 **Uitvoeringsprijs:** `${filled_price:.3f}` ({shares} aandelen)\n"
+                            f"💵 **Inzetten op Polymarket:** `${LIVE_TRADE_AMOUNT:.2f}` ({signal})\n\n"
+                            f"📊 **RSI:** {rsi} | **15M RSI:** {rsi_15m:.1f} | **Vol Ratio:** {vol_ratio}x\n"
+                            f"⏳ **Resterend:** `{time_str}`\n\n"
+                            f"💡 **Analyse:** {reason}\n\n"
+                            f"🟢 **LIVE ORDER GEPLAATST** | Order ID: `{info}`"
+                        )
+                    else:
+                        msg = (
+                            f"🚨 **LIVE ORDER GEWEIGERD / MISLUKT**\n\n"
+                            f"📍 **Pair:** {symbol} ({signal})\n"
+                            f"⚠️ **Reden:** {info}"
+                        )
+
+                    send_telegram_msg(msg, token_info["url"])
+
+        except KeyboardInterrupt:
+            print("\n🛑 Bot handmatig gestopt.")
+            break
+        except Exception as e:
+            print(f"\n❌ Fout in hoofdloop: {e}")
+
+        time.sleep(SCAN_INTERVAL_SEC)
+
+if __name__ == "__main__":
+    main()
