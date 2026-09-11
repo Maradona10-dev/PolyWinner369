@@ -6,19 +6,35 @@ from typing import Optional, Dict, Any, Tuple
 
 import requests
 
+# ============================================================
+# FLEXIBELE CLOB CLIENT IMPORTS
+# ============================================================
+
+ClobClient = None
+OrderArgs = None
+OrderType = None
+
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
-    from py_clob_client.order_builder.constants import SignatureType
-except ImportError:
+    from py_clob_client.clob_types import OrderArgs, OrderType
+except Exception:
+    try:
+        from py_clob_client import ClobClient, OrderArgs, OrderType
+    except Exception:
+        try:
+            from py_clob_client_v2 import ClobClient, OrderArgs, OrderType
+        except Exception:
+            pass
+
+if ClobClient is None:
     raise SystemExit(
-        "\n❌ py-clob-client ontbreekt.\n"
-        "Installeer via requirements.txt:\n"
+        "\n❌ py-clob-client ontbreekt of kon niet geïmporteerd worden.\n"
+        "Zorg dat 'requirements.txt' in je GitHub repo staat met daarin:\n"
         "py-clob-client\nrequests\n"
     )
 
 # ============================================================
-# CONFIGURATIE & INSTELINGEN
+# CONFIGURATIE & INSTELLINGEN
 # ============================================================
 
 CLOB_HOST = "https://clob.polymarket.com"
@@ -93,7 +109,7 @@ POLY_SYMBOL_ALIASES = {
 active_signals_sent = {}
 last_verbose_log_time = 0
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyAutoTrader/5.4"})
+session.headers.update({"User-Agent": "PolyAutoTrader/5.5"})
 
 # ============================================================
 # HELPERS & HTTP WRAPPERS
@@ -129,13 +145,16 @@ def init_clob_client():
     try:
         host_url = "https://clob.polymarket.com"
         
-        client = ClobClient(
-            host=host_url,
-            key=PK,
-            chain_id=CHAIN_ID,
-            signature_type=SIG_TYPE,
-            funder=POLYMARKET_FUNDER_ADDRESS if POLYMARKET_FUNDER_ADDRESS else None
-        )
+        kwargs = {
+            "host": host_url,
+            "key": PK,
+            "chain_id": CHAIN_ID,
+            "signature_type": SIG_TYPE,
+        }
+        if POLYMARKET_FUNDER_ADDRESS:
+            kwargs["funder"] = POLYMARKET_FUNDER_ADDRESS
+
+        client = ClobClient(**kwargs)
 
         try:
             creds = client.derive_api_key()
@@ -302,7 +321,6 @@ def get_token_info(symbol: str, signal: str):
 
         for event in gamma_data:
             slug = event.get("slug", "")
-            title = str(event.get("title", "")).lower()
 
             markets = event.get("markets", [])
             for market in markets:
@@ -393,7 +411,7 @@ def main():
     global last_verbose_log_time
 
     print("\n" + "=" * 60)
-    print("🤖 POLYMARKET LIVE TRADING BOT V5.4")
+    print("🤖 POLYMARKET LIVE TRADING BOT V5.5")
     print("=" * 60)
     print(f"Live order bedrag: ${LIVE_TRADE_AMOUNT:.2f} USD")
     print(f"Max Ask Limiet: ${MAX_ALLOWABLE_ODDS:.2f}")
@@ -401,7 +419,7 @@ def main():
     print("=" * 60 + "\n")
 
     send_telegram_msg(
-        "⚡ **Poly Auto-Trader LIVE Gestart (v5.4)**\n\n"
+        "⚡ **Poly Auto-Trader LIVE Gestart (v5.5)**\n\n"
         "🚨 **Systeemstatus:** VOLAUTOMATISCH TRADEN ACTIEF\n"
         f"💵 **Inzet per trade:** `${LIVE_TRADE_AMOUNT:.2f}`\n"
         f"🛡️ **Max Ask Limiet:** `${MAX_ALLOWABLE_ODDS:.2f}`"
