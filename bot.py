@@ -5,15 +5,23 @@ from typing import Optional, Dict, Any, List
 import requests
 
 # ============================================================
-# CLOB CLIENT V2 IMPORTS
+# CLOB CLIENT IMPORTS
 # ============================================================
+ClobClient = None
+OrderArgs = None
+OrderType = None
+
 try:
-    from py_clob_client_v2 import ClobClient, OrderArgs, OrderType, Side
-except ImportError:
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import OrderArgs, OrderType
+except Exception:
     try:
-        from py_clob_client import ClobClient, OrderArgs, OrderType, Side
-    except ImportError:
-        raise SystemExit("\n❌ py-clob-client-v2 ontbreekt in requirements.txt.\n")
+        from py_clob_client_v2 import ClobClient, OrderArgs, OrderType
+    except Exception:
+        pass
+
+if ClobClient is None:
+    raise SystemExit("\n❌ py-clob-client ontbreekt in requirements.txt.\n")
 
 # ============================================================
 # CONFIGURATIE & INSTELLINGEN (PRE-CLOSE MAKER)
@@ -41,7 +49,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 # WALLET CONFIGURATIE
 RAW_PRIVATE_KEY = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
 POLYMARKET_FUNDER_ADDRESS = os.environ.get("POLYMARKET_FUNDER_ADDRESS", "").strip()
-SIGNATURE_TYPE_ENV = os.environ.get("POLYMARKET_SIGNATURE_TYPE", "1").strip()
+SIGNATURE_TYPE_ENV = os.environ.get("POLYMARKET_SIGNATURE_TYPE", "0").strip()
 
 def clean_private_key(value: str) -> str:
     if not value: return ""
@@ -52,7 +60,7 @@ PK = clean_private_key(RAW_PRIVATE_KEY)
 
 def get_signature_type() -> int:
     try: return int(SIGNATURE_TYPE_ENV)
-    except ValueError: return 1
+    except ValueError: return 0
 
 SIG_TYPE = get_signature_type()
 
@@ -70,7 +78,7 @@ POLY_SYMBOL_ALIASES = {
 active_signals = {}
 open_orders_tracker = {}
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyMakerBot/18.0"})
+session.headers.update({"User-Agent": "PolyMakerBot/19.0"})
 
 def request_json(method: str, url: str, *, timeout: int = 2, **kwargs):
     try:
@@ -98,22 +106,18 @@ def send_telegram_msg(message: str, button_url: Optional[str] = None):
         print(f"⚠️ Telegram Verbindingsfout: {e}")
         return False
 
-def init_clob_client():
+def init_clob_client(sig_type_override: Optional[int] = None):
     if not PK: raise SystemExit("❌ FOUT: Geen POLYMARKET_PRIVATE_KEY ingesteld.")
+    stype = sig_type_override if sig_type_override is not None else SIG_TYPE
     try:
-        kwargs = {"host": CLOB_HOST, "key": PK, "chain_id": CHAIN_ID, "signature_type": SIG_TYPE}
+        kwargs = {"host": CLOB_HOST, "key": PK, "chain_id": CHAIN_ID, "signature_type": stype}
         if POLYMARKET_FUNDER_ADDRESS: kwargs["funder"] = POLYMARKET_FUNDER_ADDRESS
         
-        # Stap 1: derive API creds via L1 auth
-        temp_client = ClobClient(**kwargs)
-        try:
-            creds = temp_client.derive_api_key()
-        except Exception:
-            creds = temp_client.create_api_key()
-
-        kwargs["creds"] = creds
         client = ClobClient(**kwargs)
-        print(f"✅ CLOB V2 Verbonden | Wallet: {client.get_address()}")
+        try: creds = client.derive_api_key()
+        except Exception: creds = client.create_api_key()
+        client.set_api_creds(creds)
+        print(f"✅ CLOB Verbonden | SigType: {stype} | Wallet: {client.get_address()}")
         return client
     except Exception as e:
         raise SystemExit(f"❌ CLOB Initialisatie mislukt: {e}")
@@ -181,15 +185,14 @@ def get_token_info(symbol: str, signal: str):
     return None
 
 # ============================================================
-# PRE-CLOSE MAKER EXECUTION (CLOB V2 COMPATIBEL)
+# PRE-CLOSE MAKER EXECUTION
 # ============================================================
 def execute_maker_limit_order(token_id: str, amount_usd: float) -> tuple[bool, float, str]:
-    """ Plaatst een Limit order compatibel met het CLOB V2 netwerk """
+    global clob_client
     try:
         best_ask = None
         best_bid = None
 
-        # 1. Haal orderboek informatie op
         try:
             mid_res = clob_client.get_midpoint(token_id)
             if isinstance(mid_res, dict) and "mid" in mid_res:
@@ -220,7 +223,6 @@ def execute_maker_limit_order(token_id: str, amount_usd: float) -> tuple[bool, f
         if best_bid is None or best_bid < 0.10: best_bid = 0.50
         if best_ask is None or best_ask <= best_bid: best_ask = round(best_bid + 0.02, 3)
 
-        # 2. Bepaal maker limit prijs
         maker_price = round(min(best_bid + 0.01, TARGET_MAKER_PRICE), 3)
         if maker_price >= best_ask: maker_price = round(best_ask - 0.01, 3)
 
@@ -231,27 +233,32 @@ def execute_maker_limit_order(token_id: str, amount_usd: float) -> tuple[bool, f
 
         shares = round(amount_usd / maker_price, 2)
 
-        # 3. Bouw en post de V2 order
-        side_val = Side.BUY if 'Side' in globals() else "BUY"
-        
         order_args = OrderArgs(
             price=maker_price,
             size=shares,
-            side=side_val,
+            side="BUY",
             token_id=token_id
         )
 
-        if hasattr(clob_client, "create_and_post_order"):
-            resp = clob_client.create_and_post_order(order_args, order_type=OrderType.GTC)
-        else:
-            signed_order = clob_client.create_order(order_args)
-            resp = clob_client.post_order(signed_order)
+        signed_order = clob_client.create_order(order_args)
+        resp = clob_client.post_order(signed_order)
 
         if resp and isinstance(resp, dict) and resp.get("success"):
             order_id = resp.get("orderID", resp.get("id", "N/A"))
             return True, maker_price, order_id
         else:
-            return False, maker_price, str(resp)
+            err_msg = str(resp)
+            # Automatische fallback als de maker address / signature mismatch voorkomt
+            if "maker address not allowed" in err_msg:
+                alt_sig = 0 if SIG_TYPE == 1 else 1
+                print(f"🔄 Proberen opnieuw met alternatief SignatureType ({alt_sig})...")
+                clob_client = init_clob_client(sig_type_override=alt_sig)
+                signed_order = clob_client.create_order(order_args)
+                resp = clob_client.post_order(signed_order)
+                if resp and isinstance(resp, dict) and resp.get("success"):
+                    return True, maker_price, resp.get("orderID", "N/A")
+
+            return False, maker_price, err_msg
 
     except Exception as e:
         return False, 0.0, str(e)
@@ -276,10 +283,10 @@ def auto_cancel_stale_orders():
 # ============================================================
 def main():
     print("\n" + "=" * 60)
-    print("🤖 POLYMARKET PRE-CLOSE MAKER BOT V18.0 (V2 API)")
+    print("🤖 POLYMARKET PRE-CLOSE MAKER BOT V19.0")
     print("=" * 60)
 
-    send_telegram_msg("🚀 **Bot succesvol gestart op CLOB V2!**\nActief en aan het scannen voor 5-minuten kaarswissels.")
+    send_telegram_msg("🚀 **Bot succesvol gestart!**\nActief met automatische signature-detectie.")
 
     last_logged_minute = -1
 
