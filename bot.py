@@ -1,27 +1,11 @@
 import os
 import time
 import re
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 import requests
 
-# ============================================================
-# CLOB CLIENT IMPORTS (CLOB V2 COMPATIBEL)
-# ============================================================
-ClobClient = None
-OrderArgs = None
-OrderType = None
-
-try:
-    from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs, OrderType
-except Exception:
-    try:
-        from py_clob_client_v2 import ClobClient, OrderArgs, OrderType
-    except Exception:
-        pass
-
-if ClobClient is None:
-    raise SystemExit("\n❌ py-clob-client ontbreekt in requirements.txt.\n")
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import OrderArgs
 
 # ============================================================
 # CONFIGURATIE & INSTELLINGEN
@@ -41,15 +25,16 @@ LIVE_TRADE_AMOUNT = float(os.environ.get("LIVE_TRADE_AMOUNT", "5.0"))
 MIN_BREAKOUT_PCT = float(os.environ.get("MIN_BREAKOUT_PCT", "0.05"))
 ORDER_TIMEOUT_SEC = int(os.environ.get("ORDER_TIMEOUT_SEC", "15"))
 
-# TELEGRAM CONFIGURATIE
+# TELEGRAM
 RAW_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_BOT_TOKEN = RAW_TOKEN[3:] if RAW_TOKEN.startswith("bot") else RAW_TOKEN
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# WALLET CONFIGURATIE
+# WALLET CONFIGURATIE (MAGIC WALLET / POLY_PROXY SETUP)
 RAW_PRIVATE_KEY = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
 POLYMARKET_FUNDER_ADDRESS = os.environ.get("POLYMARKET_FUNDER_ADDRESS", "").strip()
-SIGNATURE_TYPE_ENV = os.environ.get("POLYMARKET_SIGNATURE_TYPE", "3").strip()
+# Forceer SignatureType 1 als Magic Wallet wordt gebruikt
+SIGNATURE_TYPE_ENV = os.environ.get("POLYMARKET_SIGNATURE_TYPE", "1").strip()
 
 def clean_private_key(value: str) -> str:
     if not value: return ""
@@ -60,7 +45,7 @@ PK = clean_private_key(RAW_PRIVATE_KEY)
 
 def get_signature_type() -> int:
     try: return int(SIGNATURE_TYPE_ENV)
-    except ValueError: return 3
+    except ValueError: return 1
 
 SIG_TYPE = get_signature_type()
 
@@ -78,7 +63,7 @@ POLY_SYMBOL_ALIASES = {
 active_signals = {}
 open_orders_tracker = {}
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyMakerBot/21.0"})
+session.headers.update({"User-Agent": "PolyMakerBot/23.0"})
 
 def request_json(method: str, url: str, *, timeout: int = 2, **kwargs):
     try:
@@ -90,58 +75,49 @@ def request_json(method: str, url: str, *, timeout: int = 2, **kwargs):
     return None
 
 def send_telegram_msg(message: str, button_url: Optional[str] = None):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ Telegram-token of Chat ID niet ingesteld.")
-        return False
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown", "disable_web_page_preview": True}
     if button_url:
         payload["reply_markup"] = {"inline_keyboard": [[{"text": "🚀 BEKIJK MAKER ORDER OP POLYMARKET", "url": button_url}]]}
     try:
         r = session.post(url, json=payload, timeout=2)
-        if not r.ok:
-            print(f"⚠️ Telegram API Fout: {r.text}")
         return r.ok
     except Exception as e:
-        print(f"⚠️ Telegram Verbindingsfout: {e}")
         return False
 
+# ============================================================
+# MAGIC WALLET (POLY_PROXY) INITIALISATIE
+# ============================================================
 def init_clob_client():
     if not PK: raise SystemExit("❌ FOUT: Geen POLYMARKET_PRIVATE_KEY ingesteld.")
+    if not POLYMARKET_FUNDER_ADDRESS:
+        raise SystemExit("❌ FOUT: POLYMARKET_FUNDER_ADDRESS is verplicht bij Magic Wallet (POLY_PROXY). Vul je Proxy-adres in Railway in.")
+
+    client_args = {
+        "host": CLOB_HOST,
+        "key": PK,
+        "chain_id": CHAIN_ID,
+        "signature_type": SIG_TYPE,
+        "funder": POLYMARKET_FUNDER_ADDRESS
+    }
+
     try:
-        kwargs = {
-            "host": CLOB_HOST,
-            "key": PK,
-            "chain_id": CHAIN_ID,
-            "signature_type": SIG_TYPE
-        }
-        if POLYMARKET_FUNDER_ADDRESS:
-            kwargs["funder"] = POLYMARKET_FUNDER_ADDRESS
-
-        # Stap 1: Maak L1 client aan MET funder en signature_type gebonden
-        l1_client = ClobClient(**kwargs)
+        # Stap 1: Initialiseer L1 Auth Client met Proxy/Funder context
+        auth_client = ClobClient(**client_args)
         
-        # Stap 2: Derive/Create API credentials behorende bij deze specifieke proxy/funder
+        # Stap 2: Maak direct een geldige L2 API Credential aan gekoppeld aan de Proxy
         try:
-            creds = l1_client.create_or_derive_api_creds()
+            creds = auth_client.create_or_derive_api_creds()
         except Exception:
-            try:
-                creds = l1_client.derive_api_key()
-            except Exception:
-                creds = l1_client.create_api_key()
+            creds = auth_client.derive_api_key()
 
-        # Stap 3: Initialiseer de L2 trading client
-        kwargs["creds"] = creds
-        client = ClobClient(**kwargs)
-        
-        # Stap 4: Update CLOB server-side balance cache
-        try:
-            if hasattr(client, "update_balance_allowance"):
-                client.update_balance_allowance()
-        except Exception as e:
-            print(f"⚠️ Balance allowance sync: {e}")
-
-        print(f"✅ CLOB V2 Verbonden | SigType: {SIG_TYPE} | Funder: {POLYMARKET_FUNDER_ADDRESS or 'None'}")
+        # Stap 3: Initialiseer de uiteindelijke trading client
+        client = ClobClient(**client_args, creds=creds)
+        print(f"✅ Magic Wallet Client Verbonden!")
+        print(f"🔹 SigType: {SIG_TYPE} (POLY_PROXY)")
+        print(f"🔹 Proxy Funder: {POLYMARKET_FUNDER_ADDRESS}")
+        print(f"🔹 Signer Address: {client.get_address()}")
         return client
     except Exception as e:
         raise SystemExit(f"❌ CLOB Initialisatie mislukt: {e}")
@@ -149,7 +125,7 @@ def init_clob_client():
 clob_client = init_clob_client()
 
 # ============================================================
-# MOMENTUM & TOKEN SEARCH
+# MOMENTUM & EXECUTION LOGICA
 # ============================================================
 def analyze_binance_momentum(symbol: str) -> Optional[str]:
     url = f"{BINANCE_API_URL}/klines"
@@ -208,13 +184,10 @@ def get_token_info(symbol: str, signal: str):
                         }
     return None
 
-# ============================================================
-# PRE-CLOSE MAKER EXECUTION
-# ============================================================
 def execute_maker_limit_order(token_id: str, amount_usd: float) -> tuple[bool, float, str]:
     try:
-        best_ask = None
-        best_bid = None
+        best_bid = 0.50
+        best_ask = 0.52
 
         try:
             mid_res = clob_client.get_midpoint(token_id)
@@ -226,33 +199,11 @@ def execute_maker_limit_order(token_id: str, amount_usd: float) -> tuple[bool, f
         except Exception:
             pass
 
-        if best_bid is None or best_ask is None:
-            try:
-                orderbook = clob_client.get_order_book(token_id)
-                bids = getattr(orderbook, "bids", []) or (orderbook.get("bids", []) if isinstance(orderbook, dict) else [])
-                asks = getattr(orderbook, "asks", []) or (orderbook.get("asks", []) if isinstance(orderbook, dict) else [])
-
-                def get_p(entry):
-                    return float(entry.get("price", 0)) if isinstance(entry, dict) else float(getattr(entry, "price", 0))
-
-                valid_bids = [get_p(b) for b in bids if get_p(b) > 0.05]
-                valid_asks = [get_p(a) for a in asks if get_p(a) > 0.05]
-
-                if valid_bids and best_bid is None: best_bid = max(valid_bids)
-                if valid_asks and best_ask is None: best_ask = min(valid_asks)
-            except Exception:
-                pass
-
-        if best_bid is None or best_bid < 0.10: best_bid = 0.50
-        if best_ask is None or best_ask <= best_bid: best_ask = round(best_bid + 0.02, 3)
-
         maker_price = round(min(best_bid + 0.01, TARGET_MAKER_PRICE), 3)
         if maker_price >= best_ask: maker_price = round(best_ask - 0.01, 3)
 
-        if maker_price > MAX_MAKER_PRICE:
-            return False, maker_price, f"Maker prijs (${maker_price:.3f}) > Max ingesteld (${MAX_MAKER_PRICE:.3f})"
-        if maker_price < 0.10:
-            return False, maker_price, f"Berekende maker prijs te laag (${maker_price:.3f})"
+        if maker_price > MAX_MAKER_PRICE or maker_price < 0.10:
+            return False, maker_price, f"Prijs buiten bereik (${maker_price:.3f})"
 
         shares = round(amount_usd / maker_price, 2)
 
@@ -263,12 +214,8 @@ def execute_maker_limit_order(token_id: str, amount_usd: float) -> tuple[bool, f
             token_id=token_id
         )
 
-        # Order bouwen en verzenden
-        if hasattr(clob_client, "create_and_post_order"):
-            resp = clob_client.create_and_post_order(order_args)
-        else:
-            signed_order = clob_client.create_order(order_args)
-            resp = clob_client.post_order(signed_order)
+        signed_order = clob_client.create_order(order_args)
+        resp = clob_client.post_order(signed_order)
 
         if resp and isinstance(resp, dict) and resp.get("success"):
             order_id = resp.get("orderID", resp.get("id", "N/A"))
@@ -286,36 +233,22 @@ def auto_cancel_stale_orders():
         if now - created_at > ORDER_TIMEOUT_SEC:
             try:
                 clob_client.cancel_order(order_id)
-                print(f"🧹 Limit Order Gecanceld: {order_id}")
-            except Exception as e:
-                print(f"⚠️ Kon order {order_id} niet cancelen: {e}")
+            except Exception:
+                pass
             to_delete.append(order_id)
 
     for oid in to_delete:
         del open_orders_tracker[oid]
 
-# ============================================================
-# HOOFDLOOP
-# ============================================================
 def main():
-    print("\n" + "=" * 60)
-    print("🤖 POLYMARKET PRE-CLOSE MAKER BOT V21.0")
-    print("=" * 60)
-
-    send_telegram_msg("🚀 **Bot gestart met SignatureType 3 (POLY_1271)!**")
-
-    last_logged_minute = -1
+    print("🤖 BOT ACTIEF (MAGIC WALLET MODE)")
+    send_telegram_msg("🚀 **Bot gestart met Magic Wallet configuration (SigType 1)!**")
 
     while True:
         try:
             now_sec = time.time()
             time_elapsed = int(now_sec % 300)
             cycle_id = int(now_sec // 300)
-
-            current_minute = int(now_sec // 60)
-            if current_minute != last_logged_minute:
-                last_logged_minute = current_minute
-                print(f"⏱️ Actief. Huidige positie in 5m cyclus: {time_elapsed}s / 300s")
 
             if PRE_CLOSE_WINDOW_START <= time_elapsed <= PRE_CLOSE_WINDOW_END:
                 for symbol in PAIRS:
@@ -328,8 +261,6 @@ def main():
                     token_info = get_token_info(symbol, signal)
                     if not token_info: continue
 
-                    print(f"🎯 [{symbol}] PRE-CLOSE MOMENTUM GEVONDEN ({signal}) op T-{300-time_elapsed}s!")
-
                     success, price, info = execute_maker_limit_order(token_info["token_id"], LIVE_TRADE_AMOUNT)
                     active_signals[trade_key] = True
 
@@ -338,7 +269,7 @@ def main():
                         msg = (
                             f"🔷 **PRE-CLOSE MAKER ORDER GEPLAATST**\n"
                             f"Asset: `{symbol}` ({signal})\n"
-                            f"Limit Prijs: `${price:.3f}` (Passief / 0% Fee)\n"
+                            f"Limit Prijs: `${price:.3f}`\n"
                             f"Order ID: `{info}`"
                         )
                         send_telegram_msg(msg, token_info["url"])
@@ -356,7 +287,7 @@ def main():
         except KeyboardInterrupt:
             break
         except Exception as e:
-            print(f"❌ Fout in hoofdloop: {e}")
+            print(f"❌ Fout: {e}")
 
         time.sleep(SCAN_INTERVAL_SEC)
 
