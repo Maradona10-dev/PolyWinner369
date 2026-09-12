@@ -32,13 +32,15 @@ if ClobClient is None:
 CLOB_HOST = "https://clob.polymarket.com"
 POLYMARKET_GAMMA_URL = "https://gamma-api.polymarket.com"
 BINANCE_API_URL = "https://api.binance.com/api/v3"
-CHAIN_ID = 137  # Polygon Mainnet
+CHAIN_ID = 137
 
-SCAN_INTERVAL_SEC = float(os.environ.get("SCAN_INTERVAL_SEC", "0.5"))             # Hoge frequentie voor instant entry
-MAX_ENTRY_WINDOW_SECONDS = int(os.environ.get("MAX_ENTRY_WINDOW_SECONDS", "10"))  # Alleen eerste 10 sec van de nieuwe candle
-MAX_ALLOWABLE_ODDS = float(os.environ.get("MAX_ALLOWABLE_ODDS", "0.75"))         # Alleen gunstige instapprijzen (< $0.75)
+SCAN_INTERVAL_SEC = float(os.environ.get("SCAN_INTERVAL_SEC", "1.0"))
+# We kijken alleen in de eerste 40 seconden van de HUIDIGE candle
+MAX_ENTRY_WINDOW_SECONDS = int(os.environ.get("MAX_ENTRY_WINDOW_SECONDS", "40"))  
+MAX_ALLOWABLE_ODDS = float(os.environ.get("MAX_ALLOWABLE_ODDS", "0.75"))         
 LIVE_TRADE_AMOUNT = float(os.environ.get("LIVE_TRADE_AMOUNT", "5.0"))
-MIN_CANDLE_CHANGE_PCT = float(os.environ.get("MIN_CANDLE_CHANGE_PCT", "0.08"))     # Minimaal 0.08% beweging op vorige 5m
+# Snelle drempel: 0.05% beweging in de eerste seconden van de candle
+MIN_BREAKOUT_PCT = float(os.environ.get("MIN_BREAKOUT_PCT", "0.05"))     
 
 # ============================================================
 # TELEGRAM CONFIGURATIE
@@ -55,19 +57,15 @@ POLYMARKET_FUNDER_ADDRESS = os.environ.get("POLYMARKET_FUNDER_ADDRESS", "").stri
 SIGNATURE_TYPE_ENV = os.environ.get("POLYMARKET_SIGNATURE_TYPE", "1").strip()
 
 def clean_private_key(value: str) -> str:
-    if not value:
-        return ""
-    if value.lower().startswith("0x"):
-        value = value[2:]
+    if not value: return ""
+    if value.lower().startswith("0x"): value = value[2:]
     return "".join(re.findall(r"[0-9a-fA-F]", value))
 
 PK = clean_private_key(RAW_PRIVATE_KEY)
 
 def get_signature_type() -> int:
-    try:
-        return int(SIGNATURE_TYPE_ENV)
-    except ValueError:
-        return 1
+    try: return int(SIGNATURE_TYPE_ENV)
+    except ValueError: return 1
 
 SIG_TYPE = get_signature_type()
 
@@ -83,9 +81,8 @@ POLY_SYMBOL_ALIASES = {
 }
 
 active_signals_sent = {}
-market_cache = {}  # Cache voor het vooraf opslaan van markten
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyAutoTrader/8.0"})
+session.headers.update({"User-Agent": "PolyAutoTrader/9.0"})
 
 def request_json(method: str, url: str, *, timeout: int = 3, **kwargs):
     try:
@@ -97,26 +94,15 @@ def request_json(method: str, url: str, *, timeout: int = 3, **kwargs):
     return None
 
 def init_clob_client():
-    if not PK:
-        raise SystemExit("❌ FOUT: Geen geldige POLYMARKET_PRIVATE_KEY gevonden.")
+    if not PK: raise SystemExit("❌ FOUT: Geen geldige POLYMARKET_PRIVATE_KEY gevonden.")
     try:
-        kwargs = {
-            "host": CLOB_HOST,
-            "key": PK,
-            "chain_id": CHAIN_ID,
-            "signature_type": SIG_TYPE,
-        }
-        if POLYMARKET_FUNDER_ADDRESS:
-            kwargs["funder"] = POLYMARKET_FUNDER_ADDRESS
-
+        kwargs = {"host": CLOB_HOST, "key": PK, "chain_id": CHAIN_ID, "signature_type": SIG_TYPE}
+        if POLYMARKET_FUNDER_ADDRESS: kwargs["funder"] = POLYMARKET_FUNDER_ADDRESS
         client = ClobClient(**kwargs)
-        try:
-            creds = client.derive_api_key()
-        except Exception:
-            creds = client.create_api_key()
-
+        try: creds = client.derive_api_key()
+        except Exception: creds = client.create_api_key()
         client.set_api_creds(creds)
-        print(f"✅ CLOB Verbonden | Wallet: {client.get_address()} | SigType: {SIG_TYPE}")
+        print(f"✅ CLOB Verbonden | Wallet: {client.get_address()}")
         return client
     except Exception as e:
         raise SystemExit(f"❌ CLOB Initialisatie mislukt: {e}")
@@ -124,19 +110,11 @@ def init_clob_client():
 clob_client = init_clob_client()
 
 def send_telegram_msg(message: str, button_url: Optional[str] = None):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True,
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown", "disable_web_page_preview": True}
     if button_url:
-        payload["reply_markup"] = {
-            "inline_keyboard": [[{"text": "🚀 ZET DIRECT IN OP POLYMARKET", "url": button_url}]]
-        }
+        payload["reply_markup"] = {"inline_keyboard": [[{"text": "🚀 ZET DIRECT IN OP POLYMARKET", "url": button_url}]]}
     try:
         session.post(url, json=payload, timeout=3)
         return True
@@ -145,36 +123,35 @@ def send_telegram_msg(message: str, button_url: Optional[str] = None):
         return False
 
 # ============================================================
-# 5M VORIGE CANDLE MOMENTUM STRATEGIE
+# HUIDIGE CANDLE BREAKOUT LOGICA
 # ============================================================
-def get_previous_5m_momentum(symbol: str) -> Optional[str]:
+def get_current_candle_breakout(symbol: str) -> Optional[str]:
+    """
+    Analyseert de HUIDIGE (nog lopende) 5-minuten candle op Binance.
+    Als de prijs in de eerste seconden snel uitslaat, geeft hij een signaal.
+    """
     url = f"{BINANCE_API_URL}/klines"
-    params = {"symbol": symbol, "interval": "5m", "limit": 2}
+    params = {"symbol": symbol, "interval": "5m", "limit": 1}
     klines = request_json("GET", url, params=params)
 
-    if not klines or len(klines) < 2:
+    if not klines or len(klines) < 1:
         return None
 
-    # Index 0 is de vorige, volledig afgesloten 5-minuten candle
-    prev_candle = klines[0]
-    open_price = float(prev_candle[1])
-    close_price = float(prev_candle[4])
+    current_candle = klines[0]
+    open_price = float(current_candle[1])
+    current_price = float(current_candle[4]) # Huidige prijs
 
-    if open_price == 0:
-        return None
+    if open_price == 0: return None
 
-    change_pct = ((close_price - open_price) / open_price) * 100
+    change_pct = ((current_price - open_price) / open_price) * 100
 
-    if change_pct >= MIN_CANDLE_CHANGE_PCT:
+    if change_pct >= MIN_BREAKOUT_PCT:
         return "UP"
-    elif change_pct <= -MIN_CANDLE_CHANGE_PCT:
+    elif change_pct <= -MIN_BREAKOUT_PCT:
         return "DOWN"
 
     return None
 
-# ============================================================
-# MARKT MATCHING & PRE-FETCHING LOGICA
-# ============================================================
 def get_token_info(symbol: str, signal: str):
     aliases = POLY_SYMBOL_ALIASES.get(symbol, [])
     wanted = signal.lower()
@@ -182,15 +159,13 @@ def get_token_info(symbol: str, signal: str):
     for alias in aliases:
         gamma_url = f"{POLYMARKET_GAMMA_URL}/events?limit=30&active=true&closed=false&q={alias}"
         gamma_data = request_json("GET", gamma_url, timeout=3)
-        if not gamma_data or not isinstance(gamma_data, list):
-            continue
+        if not gamma_data or not isinstance(gamma_data, list): continue
 
         for event in gamma_data:
             slug = str(event.get("slug", "")).lower()
             markets = event.get("markets", [])
             for market in markets:
-                if market.get("closed", False) or not market.get("active", True):
-                    continue
+                if market.get("closed", False) or not market.get("active", True): continue
 
                 outcomes = market.get("outcomes", [])
                 token_ids = market.get("clobTokenIds", [])
@@ -203,8 +178,7 @@ def get_token_info(symbol: str, signal: str):
                     try: token_ids = json.loads(token_ids)
                     except: pass
 
-                if not outcomes or not token_ids:
-                    continue
+                if not outcomes or not token_ids: continue
 
                 for idx, outcome in enumerate(outcomes):
                     norm = str(outcome).strip().lower()
@@ -218,21 +192,11 @@ def get_token_info(symbol: str, signal: str):
                         }
     return None
 
-def update_market_cache():
-    """Haalt voor de start van het nieuwe interval de token IDs op."""
-    global market_cache
-    for symbol in PAIRS:
-        for sig in ["UP", "DOWN"]:
-            info = get_token_info(symbol, sig)
-            if info:
-                market_cache[f"{symbol}_{sig}"] = info
-
 def execute_live_order(token_id: str, amount_usd: float, max_price: float):
     try:
         orderbook = clob_client.get_order_book(token_id)
         asks = getattr(orderbook, "asks", []) or (orderbook.get("asks", []) if isinstance(orderbook, dict) else [])
-        if not asks:
-            return False, 0.0, "Geen verkopers in het orderboek"
+        if not asks: return False, 0.0, "Geen verkopers in het orderboek"
 
         def extract_price(entry):
             if isinstance(entry, dict): return float(entry.get("price", 0))
@@ -245,12 +209,7 @@ def execute_live_order(token_id: str, amount_usd: float, max_price: float):
             return False, best_ask, f"Prijs te hoog (${best_ask:.3f} > max ${max_price:.3f})"
 
         shares = round(amount_usd / best_ask, 2)
-        order_args = OrderArgs(
-            price=best_ask,
-            size=shares,
-            side="BUY",
-            token_id=token_id,
-        )
+        order_args = OrderArgs(price=best_ask, size=shares, side="BUY", token_id=token_id)
         signed_order = clob_client.create_order(order_args)
         resp = clob_client.post_order(signed_order, OrderType.FOK)
 
@@ -267,10 +226,8 @@ def execute_live_order(token_id: str, amount_usd: float, max_price: float):
 # ============================================================
 def main():
     print("\n" + "=" * 60)
-    print("🤖 POLYMARKET ULTRA-FAST PRE-FETCH BOT V8.0")
+    print("🤖 POLYMARKET EARLY BREAKOUT BOT V9.0")
     print("=" * 60)
-
-    last_prefetched_cycle = -1
 
     while True:
         try:
@@ -278,30 +235,23 @@ def main():
             time_elapsed = int(now_sec % 300)
             cycle_id = int(now_sec // 300)
 
-            # 1. PRE-FETCHING: Sla 15 sec voor einde candle de markten alvast op in geheugen
-            if time_elapsed >= 285 and cycle_id != last_prefetched_cycle:
-                print("🔄 [Pre-fetch] Markten vooraf ophalen en opslaan in geheugen...")
-                update_market_cache()
-                last_prefetched_cycle = cycle_id
-
-            # 2. INSTANT ENTRY: Binnen de eerste X seconden direct schieten vanuit geheugen
+            # Pak de eerste 40 seconden van de HUIDIGE candle
             if time_elapsed <= MAX_ENTRY_WINDOW_SECONDS:
                 for symbol in PAIRS:
                     trade_key = f"cycle_{cycle_id}_{symbol}"
                     if trade_key in active_signals_sent:
                         continue
 
-                    signal = get_previous_5m_momentum(symbol)
+                    # Kijkt naar de snelle beweging in de openingsseconden
+                    signal = get_current_candle_breakout(symbol)
                     if not signal:
                         continue
 
-                    cache_key = f"{symbol}_{signal}"
-                    token_info = market_cache.get(cache_key) or get_token_info(symbol, signal)
-
+                    token_info = get_token_info(symbol, signal)
                     if not token_info:
                         continue
 
-                    print(f"⚡ [{symbol}] INSTANT EXECUTION op seconde {time_elapsed}s ({signal})...")
+                    print(f"⚡ [{symbol}] VROEGE INTIATIE op seconde {time_elapsed}s ({signal})...")
 
                     success, filled_price, info = execute_live_order(
                         token_info["token_id"],
