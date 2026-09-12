@@ -31,9 +31,16 @@ RAW_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_BOT_TOKEN = RAW_TOKEN[3:] if RAW_TOKEN.startswith("bot") else RAW_TOKEN
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# WALLET CONFIGURATIE (METAMASK / EOA SETUP)
+# WALLET CONFIGURATIE (AUTOMATISCHE SAFE DETECTIE VOOR METAMASK)
 RAW_PRIVATE_KEY = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
-SIG_TYPE = 0  # Direct EOA Signature voor MetaMask
+FUNDER_ADDRESS = os.environ.get("POLYMARKET_FUNDER_ADDRESS", "").strip()
+
+# Forceer automatisch SigType 2 als er een funder-adres is ingesteld
+if FUNDER_ADDRESS:
+    SIG_TYPE = 2
+    print(f"🔒 Funder adres gedetecteerd! Signature Type wordt automatisch geforceerd op 2 (POLY_GNOSIS_SAFE).")
+else:
+    SIG_TYPE = int(os.environ.get("POLYMARKET_SIGNATURE_TYPE", "0"))
 
 def clean_private_key(value: str) -> str:
     if not value: return ""
@@ -56,7 +63,7 @@ POLY_SYMBOL_ALIASES = {
 active_signals = {}
 open_orders_tracker = {}
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyMakerBot/27.0"})
+session.headers.update({"User-Agent": "PolyMakerBot/30.0"})
 
 def request_json(method: str, url: str, *, timeout: int = 2, **kwargs):
     try:
@@ -80,7 +87,7 @@ def send_telegram_msg(message: str, button_url: Optional[str] = None):
         return False
 
 # ============================================================
-# METAMASK (EOA) INITIALISATIE
+# INITIALISATIE CLOB CLIENT (METAMASK / SAFE)
 # ============================================================
 def init_clob_client():
     if not PK: 
@@ -90,24 +97,30 @@ def init_clob_client():
         "host": CLOB_HOST,
         "key": PK,
         "chain_id": CHAIN_ID,
-        "signature_type": SIG_TYPE
+        "signature_type": SIG_TYPE,
     }
+    
+    if FUNDER_ADDRESS:
+        client_args["funder"] = FUNDER_ADDRESS
 
     try:
         auth_client = ClobClient(**client_args)
 
         try:
-            creds = auth_client.create_api_key()
-            print("🔑 Nieuwe L2 API Key succesvol geregistreerd voor MetaMask EOA!")
+            creds = auth_client.create_or_derive_api_key()
+            print("🔑 API Key succesvol geregistreerd.")
         except Exception:
             creds = auth_client.derive_api_key()
             print("🔑 Bestaande L2 API Key opgehaald.")
 
-        client = ClobClient(**client_args, creds=creds)
+        client_args["creds"] = creds
+        client = ClobClient(**client_args)
 
-        print(f"✅ MetaMask Client Verbonden!")
-        print(f"🔹 SigType: {SIG_TYPE} (EOA Direct)")
-        print(f"🔹 Wallet Adres: {client.get_address()}")
+        print(f"✅ MetaMask / Safe Client Verbonden!")
+        print(f"🔹 SigType: {SIG_TYPE} (POLY_GNOSIS_SAFE)")
+        print(f"🔹 Signer Wallet Adres: {client.get_address()}")
+        if FUNDER_ADDRESS:
+            print(f"🔹 Funder (Safe) Adres: {FUNDER_ADDRESS}")
         return client
     except Exception as e:
         raise SystemExit(f"❌ CLOB Initialisatie mislukt: {e}")
@@ -195,7 +208,6 @@ def execute_maker_limit_order(token_id: str, amount_usd: float):
 
         shares = round(amount_usd / maker_price, 2)
 
-        # Nieuwe v2 order-structuur
         order_args = OrderArgs(
             price=float(maker_price),
             size=float(shares),
@@ -231,8 +243,8 @@ def auto_cancel_stale_orders():
         del open_orders_tracker[oid]
 
 def main():
-    print("🤖 BOT ACTIEF (METAMASK EOA MODE)")
-    send_telegram_msg("🚀 **Bot gestart met CLOB v2 SDK!**")
+    print("🤖 BOT ACTIEF (METAMARK / SAFE MODE)")
+    send_telegram_msg("🚀 **Bot gestart in MetaMask / Gnosis Safe Mode!**")
 
     while True:
         try:
