@@ -34,9 +34,9 @@ POLYMARKET_GAMMA_URL = "https://gamma-api.polymarket.com"
 BINANCE_API_URL = "https://api.binance.com/api/v3"
 CHAIN_ID = 137  # Polygon Mainnet
 
-SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", "2"))
-MAX_ENTRY_WINDOW_SECONDS = int(os.environ.get("MAX_ENTRY_WINDOW_SECONDS", "20"))  # Strikt eerste 20 sec van nieuwe candle
-MAX_ALLOWABLE_ODDS = float(os.environ.get("MAX_ALLOWABLE_ODDS", "0.75"))         # Alleen scherpe instapprijzen (< $0.75)
+SCAN_INTERVAL_SEC = float(os.environ.get("SCAN_INTERVAL_SEC", "0.5"))             # Hoge frequentie voor instant entry
+MAX_ENTRY_WINDOW_SECONDS = int(os.environ.get("MAX_ENTRY_WINDOW_SECONDS", "10"))  # Alleen eerste 10 sec van de nieuwe candle
+MAX_ALLOWABLE_ODDS = float(os.environ.get("MAX_ALLOWABLE_ODDS", "0.75"))         # Alleen gunstige instapprijzen (< $0.75)
 LIVE_TRADE_AMOUNT = float(os.environ.get("LIVE_TRADE_AMOUNT", "5.0"))
 MIN_CANDLE_CHANGE_PCT = float(os.environ.get("MIN_CANDLE_CHANGE_PCT", "0.08"))     # Minimaal 0.08% beweging op vorige 5m
 
@@ -83,10 +83,11 @@ POLY_SYMBOL_ALIASES = {
 }
 
 active_signals_sent = {}
+market_cache = {}  # Cache voor het vooraf opslaan van markten
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyAutoTrader/7.0"})
+session.headers.update({"User-Agent": "PolyAutoTrader/8.0"})
 
-def request_json(method: str, url: str, *, timeout: int = 4, **kwargs):
+def request_json(method: str, url: str, *, timeout: int = 3, **kwargs):
     try:
         response = session.request(method, url, timeout=timeout, **kwargs)
         response.raise_for_status()
@@ -137,7 +138,7 @@ def send_telegram_msg(message: str, button_url: Optional[str] = None):
             "inline_keyboard": [[{"text": "🚀 ZET DIRECT IN OP POLYMARKET", "url": button_url}]]
         }
     try:
-        session.post(url, json=payload, timeout=4)
+        session.post(url, json=payload, timeout=3)
         return True
     except Exception as e:
         print(f"⚠️ Telegram Fout: {e}")
@@ -147,9 +148,6 @@ def send_telegram_msg(message: str, button_url: Optional[str] = None):
 # 5M VORIGE CANDLE MOMENTUM STRATEGIE
 # ============================================================
 def get_previous_5m_momentum(symbol: str) -> Optional[str]:
-    """
-    Analyseert de zojuist afgesloten 5-minuten candle op Binance.
-    """
     url = f"{BINANCE_API_URL}/klines"
     params = {"symbol": symbol, "interval": "5m", "limit": 2}
     klines = request_json("GET", url, params=params)
@@ -175,7 +173,7 @@ def get_previous_5m_momentum(symbol: str) -> Optional[str]:
     return None
 
 # ============================================================
-# MARKT MATCHING & ORDER EXECUTIE
+# MARKT MATCHING & PRE-FETCHING LOGICA
 # ============================================================
 def get_token_info(symbol: str, signal: str):
     aliases = POLY_SYMBOL_ALIASES.get(symbol, [])
@@ -183,7 +181,7 @@ def get_token_info(symbol: str, signal: str):
 
     for alias in aliases:
         gamma_url = f"{POLYMARKET_GAMMA_URL}/events?limit=30&active=true&closed=false&q={alias}"
-        gamma_data = request_json("GET", gamma_url, timeout=4)
+        gamma_data = request_json("GET", gamma_url, timeout=3)
         if not gamma_data or not isinstance(gamma_data, list):
             continue
 
@@ -219,6 +217,15 @@ def get_token_info(symbol: str, signal: str):
                             "url": f"https://polymarket.com/event/{slug}" if slug else "https://polymarket.com"
                         }
     return None
+
+def update_market_cache():
+    """Haalt voor de start van het nieuwe interval de token IDs op."""
+    global market_cache
+    for symbol in PAIRS:
+        for sig in ["UP", "DOWN"]:
+            info = get_token_info(symbol, sig)
+            if info:
+                market_cache[f"{symbol}_{sig}"] = info
 
 def execute_live_order(token_id: str, amount_usd: float, max_price: float):
     try:
@@ -260,32 +267,41 @@ def execute_live_order(token_id: str, amount_usd: float, max_price: float):
 # ============================================================
 def main():
     print("\n" + "=" * 60)
-    print("🤖 POLYMARKET 5M PREVIOUS-CANDLE BOT V7.0")
+    print("🤖 POLYMARKET ULTRA-FAST PRE-FETCH BOT V8.0")
     print("=" * 60)
+
+    last_prefetched_cycle = -1
 
     while True:
         try:
             now_sec = time.time()
-            time_elapsed_in_window = int(now_sec % 300)  # Verstreken seconden in de nieuwe 5m candle
+            time_elapsed = int(now_sec % 300)
             cycle_id = int(now_sec // 300)
 
-            # --- REGEL 1: INSTAPPEN ALLEEN IN DE EERSTE X SECONDEN VAN HET NIEUWE INTERVAL ---
-            if time_elapsed_in_window <= MAX_ENTRY_WINDOW_SECONDS:
+            # 1. PRE-FETCHING: Sla 15 sec voor einde candle de markten alvast op in geheugen
+            if time_elapsed >= 285 and cycle_id != last_prefetched_cycle:
+                print("🔄 [Pre-fetch] Markten vooraf ophalen en opslaan in geheugen...")
+                update_market_cache()
+                last_prefetched_cycle = cycle_id
+
+            # 2. INSTANT ENTRY: Binnen de eerste X seconden direct schieten vanuit geheugen
+            if time_elapsed <= MAX_ENTRY_WINDOW_SECONDS:
                 for symbol in PAIRS:
                     trade_key = f"cycle_{cycle_id}_{symbol}"
                     if trade_key in active_signals_sent:
                         continue
 
-                    # --- REGEL 2: BEKIJK CONTINU DE MOMENTUM RICHTING VAN DE VORIGE 5M CANDLE ---
                     signal = get_previous_5m_momentum(symbol)
                     if not signal:
                         continue
 
-                    token_info = get_token_info(symbol, signal)
+                    cache_key = f"{symbol}_{signal}"
+                    token_info = market_cache.get(cache_key) or get_token_info(symbol, signal)
+
                     if not token_info:
                         continue
 
-                    print(f"🎯 [{symbol}] Vorige 5m candle momentum is {signal}. Instappen op seconde {time_elapsed_in_window}s...")
+                    print(f"⚡ [{symbol}] INSTANT EXECUTION op seconde {time_elapsed}s ({signal})...")
 
                     success, filled_price, info = execute_live_order(
                         token_info["token_id"],
