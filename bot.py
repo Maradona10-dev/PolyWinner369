@@ -1,11 +1,12 @@
 import os
 import time
 import re
+import json
 from typing import Optional, Dict, Any
 import requests
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs
+from py_clob_client.clob_types import OrderArgs, ApiCreds
 
 # ============================================================
 # CONFIGURATIE & INSTELLINGEN
@@ -33,7 +34,6 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 # WALLET CONFIGURATIE (MAGIC WALLET / POLY_PROXY SETUP)
 RAW_PRIVATE_KEY = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
 POLYMARKET_FUNDER_ADDRESS = os.environ.get("POLYMARKET_FUNDER_ADDRESS", "").strip()
-# Forceer SignatureType 1 als Magic Wallet wordt gebruikt
 SIGNATURE_TYPE_ENV = os.environ.get("POLYMARKET_SIGNATURE_TYPE", "1").strip()
 
 def clean_private_key(value: str) -> str:
@@ -63,7 +63,7 @@ POLY_SYMBOL_ALIASES = {
 active_signals = {}
 open_orders_tracker = {}
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyMakerBot/23.0"})
+session.headers.update({"User-Agent": "PolyMakerBot/24.0"})
 
 def request_json(method: str, url: str, *, timeout: int = 2, **kwargs):
     try:
@@ -83,14 +83,15 @@ def send_telegram_msg(message: str, button_url: Optional[str] = None):
     try:
         r = session.post(url, json=payload, timeout=2)
         return r.ok
-    except Exception as e:
+    except Exception:
         return False
 
 # ============================================================
-# MAGIC WALLET (POLY_PROXY) INITIALISATIE
+# MAGIC WALLET INITIALISATIE MET CORRECTE API-KEY SYNC
 # ============================================================
 def init_clob_client():
-    if not PK: raise SystemExit("❌ FOUT: Geen POLYMARKET_PRIVATE_KEY ingesteld.")
+    if not PK: 
+        raise SystemExit("❌ FOUT: Geen POLYMARKET_PRIVATE_KEY ingesteld in Railway.")
     if not POLYMARKET_FUNDER_ADDRESS:
         raise SystemExit("❌ FOUT: POLYMARKET_FUNDER_ADDRESS is verplicht bij Magic Wallet (POLY_PROXY). Vul je Proxy-adres in Railway in.")
 
@@ -103,17 +104,27 @@ def init_clob_client():
     }
 
     try:
-        # Stap 1: Initialiseer L1 Auth Client met Proxy/Funder context
+        # Stap 1: Initialiseer de tijdelijke client voor L1 authenticatie
         auth_client = ClobClient(**client_args)
-        
-        # Stap 2: Maak direct een geldige L2 API Credential aan gekoppeld aan de Proxy
+
+        # Stap 2: Genereer of haal de L2 API Credentials op die gebonden zijn aan deze specifieke funder
         try:
-            creds = auth_client.create_or_derive_api_creds()
+            creds = auth_client.create_api_key()
+            print("🔑 Nieuwe L2 API Key succesvol geregistreerd voor Magic Proxy!")
         except Exception:
             creds = auth_client.derive_api_key()
+            print("🔑 Bestaande L2 API Key opgehaald.")
 
-        # Stap 3: Initialiseer de uiteindelijke trading client
+        # Stap 3: Initialiseer de definitieve trading client
         client = ClobClient(**client_args, creds=creds)
+        
+        # Update server-side allowances voor de Proxy
+        try:
+            if hasattr(client, "update_balance_allowance"):
+                client.update_balance_allowance()
+        except Exception as e:
+            print(f"⚠️ Balance sync melding: {e}")
+
         print(f"✅ Magic Wallet Client Verbonden!")
         print(f"🔹 SigType: {SIG_TYPE} (POLY_PROXY)")
         print(f"🔹 Proxy Funder: {POLYMARKET_FUNDER_ADDRESS}")
@@ -162,13 +173,11 @@ def get_token_info(symbol: str, signal: str):
                 outcomes = market.get("outcomes", [])
                 token_ids = market.get("clobTokenIds", [])
                 if isinstance(outcomes, str):
-                    import json
                     try: outcomes = json.loads(outcomes)
-                    except: pass
+                    except Exception: pass
                 if isinstance(token_ids, str):
-                    import json
                     try: token_ids = json.loads(token_ids)
-                    except: pass
+                    except Exception: pass
 
                 if not outcomes or not token_ids: continue
 
@@ -184,7 +193,7 @@ def get_token_info(symbol: str, signal: str):
                         }
     return None
 
-def execute_maker_limit_order(token_id: str, amount_usd: float) -> tuple[bool, float, str]:
+def execute_maker_limit_order(token_id: str, amount_usd: float):
     try:
         best_bid = 0.50
         best_ask = 0.52
@@ -208,10 +217,10 @@ def execute_maker_limit_order(token_id: str, amount_usd: float) -> tuple[bool, f
         shares = round(amount_usd / maker_price, 2)
 
         order_args = OrderArgs(
-            price=maker_price,
-            size=shares,
+            price=float(maker_price),
+            size=float(shares),
             side="BUY",
-            token_id=token_id
+            token_id=str(token_id)
         )
 
         signed_order = clob_client.create_order(order_args)
@@ -233,6 +242,7 @@ def auto_cancel_stale_orders():
         if now - created_at > ORDER_TIMEOUT_SEC:
             try:
                 clob_client.cancel_order(order_id)
+                print(f"🧹 Order gecanceld: {order_id}")
             except Exception:
                 pass
             to_delete.append(order_id)
