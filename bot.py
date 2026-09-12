@@ -5,8 +5,8 @@ import json
 from typing import Optional, Dict, Any
 import requests
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client_v2 import ClobClient
+from py_clob_client_v2.clob_types import OrderArgs, OrderType
 
 # ============================================================
 # CONFIGURATIE & INSTELLINGEN
@@ -195,7 +195,7 @@ def execute_maker_limit_order(token_id: str, amount_usd: float):
 
         shares = round(amount_usd / maker_price, 2)
 
-        # Nieuwe universele order-structuur
+        # Nieuwe v2 order-structuur
         order_args = OrderArgs(
             price=float(maker_price),
             size=float(shares),
@@ -232,7 +232,7 @@ def auto_cancel_stale_orders():
 
 def main():
     print("🤖 BOT ACTIEF (METAMASK EOA MODE)")
-    send_telegram_msg("🚀 **Bot gestart met bijgewerkte CLOB-client!**")
+    send_telegram_msg("🚀 **Bot gestart met CLOB v2 SDK!**")
 
     while True:
         try:
