@@ -82,7 +82,7 @@ POLY_SYMBOL_ALIASES = {
 active_signals = {}
 open_orders_tracker = {}
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyMakerBot/16.0"})
+session.headers.update({"User-Agent": "PolyMakerBot/17.0"})
 
 def request_json(method: str, url: str, *, timeout: int = 2, **kwargs):
     try:
@@ -188,11 +188,11 @@ def get_token_info(symbol: str, signal: str):
     return None
 
 # ============================================================
-# PRE-CLOSE MAKER EXECUTION (GEOPTIMALISEERDE PRIJSBEPALING)
+# PRE-CLOSE MAKER EXECUTION (LATEST CLOB API FIX)
 # ============================================================
 def execute_maker_limit_order(token_id: str, amount_usd: float) -> tuple[bool, float, str]:
     """
-    Plaatst een PASSIEVE LIMIT ORDER om Maker te blijven (0% fee + Maker Rebates).
+    Plaatst een PASSIEVE LIMIT ORDER compatibel met de nieuwste CLOB API signature format.
     """
     try:
         best_ask = None
@@ -231,7 +231,7 @@ def execute_maker_limit_order(token_id: str, amount_usd: float) -> tuple[bool, f
             except Exception:
                 pass
 
-        # 2. Fallback naar Orderbook als direct endpoints geen liquide prijzen geven
+        # 2. Fallback naar Orderbook
         if best_ask is None or best_bid is None:
             try:
                 orderbook = clob_client.get_order_book(token_id)
@@ -251,13 +251,13 @@ def execute_maker_limit_order(token_id: str, amount_usd: float) -> tuple[bool, f
             except Exception:
                 pass
 
-        # Realistische ondergrenzen hanteren voor nieuwe/dunne 5m-markten
+        # Handhaaf realistische ondergrenzen voor nieuwe markten
         if best_bid is None or best_bid < 0.10:
             best_bid = 0.50
         if best_ask is None or best_ask <= best_bid:
             best_ask = round(best_bid + 0.02, 3)
 
-        # 3. Bereken passieve Maker-prijs (1 cent boven best_bid, maar onder target en ask)
+        # 3. Bereken passieve Maker-prijs
         maker_price = round(min(best_bid + 0.01, TARGET_MAKER_PRICE), 3)
 
         if maker_price >= best_ask:
@@ -271,7 +271,7 @@ def execute_maker_limit_order(token_id: str, amount_usd: float) -> tuple[bool, f
 
         shares = round(amount_usd / maker_price, 2)
 
-        # 4. Order argumenten en signing
+        # 4. AANMAAK EN ONDERTEKENING VAN BESTELLING MET VOLLEDIGE COMPATIBILITEIT
         order_args = OrderArgs(
             price=maker_price,
             size=shares,
@@ -279,15 +279,19 @@ def execute_maker_limit_order(token_id: str, amount_usd: float) -> tuple[bool, f
             token_id=token_id
         )
 
-        try:
-            signed_order = clob_client.create_order(order_args, order_type=OrderType.GTC)
-        except TypeError:
-            signed_order = clob_client.create_order(order_args)
-
-        resp = clob_client.post_order(signed_order, OrderType.GTC)
+        # Gebruik create_order_and_post of create_order afhankelijk van de nieuwste SDK methodes
+        if hasattr(clob_client, "create_and_post_order"):
+            resp = clob_client.create_and_post_order(order_args)
+        else:
+            try:
+                signed_order = clob_client.create_order(order_args)
+            except Exception:
+                signed_order = clob_client.create_order(order_args, order_type=OrderType.GTC)
+            
+            resp = clob_client.post_order(signed_order)
 
         if resp and isinstance(resp, dict) and resp.get("success"):
-            order_id = resp.get("orderID", "N/A")
+            order_id = resp.get("orderID", resp.get("id", "N/A"))
             return True, maker_price, order_id
         else:
             return False, maker_price, str(resp)
@@ -316,7 +320,7 @@ def auto_cancel_stale_orders():
 # ============================================================
 def main():
     print("\n" + "=" * 60)
-    print("🤖 POLYMARKET PRE-CLOSE MAKER BOT V16.0")
+    print("🤖 POLYMARKET PRE-CLOSE MAKER BOT V17.0")
     print("=" * 60)
 
     send_telegram_msg("🚀 **Bot succesvol gestart!**\nActief en aan het scannen voor 5-minuten kaarswissels.")
