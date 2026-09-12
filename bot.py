@@ -27,7 +27,7 @@ if ClobClient is None:
     raise SystemExit("\n❌ py-clob-client ontbreekt in requirements.txt.\n")
 
 # ============================================================
-# CONFIGURATIE & INSTELLINGEN (MAKER SNIPER)
+# CONFIGURATIE & INSTELLINGEN (PRE-CLOSE MAKER)
 # ============================================================
 CLOB_HOST = "https://clob.polymarket.com"
 POLYMARKET_GAMMA_URL = "https://gamma-api.polymarket.com"
@@ -82,7 +82,7 @@ POLY_SYMBOL_ALIASES = {
 active_signals = {}
 open_orders_tracker = {}
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyMakerBot/11.0"})
+session.headers.update({"User-Agent": "PolyMakerBot/14.0"})
 
 def request_json(method: str, url: str, *, timeout: int = 2, **kwargs):
     try:
@@ -184,43 +184,82 @@ def get_token_info(symbol: str, signal: str):
     return None
 
 # ============================================================
-# PRE-CLOSE MAKER ORDER EXECUTION
+# PRE-CLOSE MAKER EXECUTION
 # ============================================================
 def execute_maker_limit_order(token_id: str, amount_usd: float) -> tuple[bool, float, str]:
     """
     Plaatst een PASSIEVE LIMIT ORDER om Maker te blijven (0% fee + Maker Rebates).
-    Order wordt gecalculeerd net boven best_bid maar onder best_ask.
     """
     try:
-        orderbook = clob_client.get_order_book(token_id)
-        bids = getattr(orderbook, "bids", []) or (orderbook.get("bids", []) if isinstance(orderbook, dict) else [])
-        asks = getattr(orderbook, "asks", []) or (orderbook.get("asks", []) if isinstance(orderbook, dict) else [])
+        best_ask = None
+        best_bid = None
 
-        def get_p(entry):
-            return float(entry.get("price", 0)) if isinstance(entry, dict) else float(getattr(entry, "price", 0))
+        # 1. Probeer actuele prijzen via direct endpoint te halen
+        try:
+            ask_res = clob_client.get_price(token_id, side="BUY")
+            if isinstance(ask_res, dict) and "price" in ask_res:
+                best_ask = float(ask_res["price"])
+            elif isinstance(ask_res, (float, int, str)):
+                best_ask = float(ask_res)
+        except Exception:
+            pass
 
-        best_bid = get_p(sorted(bids, key=get_p, reverse=True)[0]) if bids else 0.50
-        best_ask = get_p(sorted(asks, key=get_p)[0]) if asks else 0.99
+        try:
+            bid_res = clob_client.get_price(token_id, side="SELL")
+            if isinstance(bid_res, dict) and "price" in bid_res:
+                best_bid = float(bid_res["price"])
+            elif isinstance(bid_res, (float, int, str)):
+                best_bid = float(bid_res)
+        except Exception:
+            pass
 
-        # We plaatsen onze Limit Buy net 1 cent boven de best_bid (passief)
+        # 2. Fallback naar Orderbook
+        if best_ask is None or best_bid is None:
+            orderbook = clob_client.get_order_book(token_id)
+            bids = getattr(orderbook, "bids", []) or (orderbook.get("bids", []) if isinstance(orderbook, dict) else [])
+            asks = getattr(orderbook, "asks", []) or (orderbook.get("asks", []) if isinstance(orderbook, dict) else [])
+
+            def get_p(entry):
+                return float(entry.get("price", 0)) if isinstance(entry, dict) else float(getattr(entry, "price", 0))
+
+            if bids and best_bid is None:
+                best_bid = get_p(sorted(bids, key=get_p, reverse=True)[0])
+            if asks and best_ask is None:
+                best_ask = get_p(sorted(asks, key=get_p)[0])
+
+        # Defaults als book leeg is
+        if best_bid is None or best_bid <= 0.01:
+            best_bid = 0.50
+        if best_ask is None or best_ask <= 0.01:
+            best_ask = 0.99
+
+        # 3. Bereken Maker-prijs
         maker_price = round(min(best_bid + 0.01, TARGET_MAKER_PRICE), 3)
 
-        # Zorg dat we NIET de ask crossen (voorkomt direct Taker execution)
         if maker_price >= best_ask:
             maker_price = round(best_ask - 0.01, 3)
 
-        # Cap op maximale instapprijs
         if maker_price > MAX_MAKER_PRICE:
             return False, maker_price, f"Maker prijs (${maker_price:.3f}) > Max ingesteld (${MAX_MAKER_PRICE:.3f})"
 
-        if maker_price <= 0.05:
-            return False, maker_price, "Geen geldige bid/ask diepte gevonden"
+        if maker_price < 0.10:
+            return False, maker_price, f"Berekende maker prijs te laag (${maker_price:.3f})"
 
         shares = round(amount_usd / maker_price, 2)
 
-        # PLAATSEN VAN GTL (Good-Till-Cancelled) LIMIT MAKER ORDER
-        order_args = OrderArgs(price=maker_price, size=shares, side="BUY", token_id=token_id)
-        signed_order = clob_client.create_order(order_args)
+        # 4. Order argumenten en signing
+        order_args = OrderArgs(
+            price=maker_price,
+            size=shares,
+            side="BUY",
+            token_id=token_id
+        )
+
+        try:
+            signed_order = clob_client.create_order(order_args, order_type=OrderType.GTC)
+        except TypeError:
+            signed_order = clob_client.create_order(order_args)
+
         resp = clob_client.post_order(signed_order, OrderType.GTC)
 
         if resp and isinstance(resp, dict) and resp.get("success"):
@@ -249,11 +288,11 @@ def auto_cancel_stale_orders():
         del open_orders_tracker[oid]
 
 # ============================================================
-# MAIN LUS
+# HOOFDLOOP
 # ============================================================
 def main():
     print("\n" + "=" * 60)
-    print("🤖 POLYMARKET PRE-CLOSE MAKER / SOFT SNIPER BOT V11.0")
+    print("🤖 POLYMARKET PRE-CLOSE MAKER BOT V14.0")
     print("=" * 60)
 
     while True:
@@ -301,7 +340,7 @@ def main():
                         )
                         send_telegram_msg(msg, token_info["url"])
 
-            # STAP 2: VERWIJDER OVERDUMPED / STALE ORDERS
+            # STAP 2: CLEANUP VAN NIET-GEVULDE ORDERS
             auto_cancel_stale_orders()
 
         except KeyboardInterrupt:
