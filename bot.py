@@ -6,7 +6,7 @@ from typing import Optional, Dict, Any
 import requests
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs
+from py_clob_client.clob_types import OrderArgs, OrderType
 
 # ============================================================
 # CONFIGURATIE & INSTELLINGEN
@@ -56,7 +56,7 @@ POLY_SYMBOL_ALIASES = {
 active_signals = {}
 open_orders_tracker = {}
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyMakerBot/26.0"})
+session.headers.update({"User-Agent": "PolyMakerBot/27.0"})
 
 def request_json(method: str, url: str, *, timeout: int = 2, **kwargs):
     try:
@@ -195,6 +195,7 @@ def execute_maker_limit_order(token_id: str, amount_usd: float):
 
         shares = round(amount_usd / maker_price, 2)
 
+        # Nieuwe universele order-structuur
         order_args = OrderArgs(
             price=float(maker_price),
             size=float(shares),
@@ -203,7 +204,7 @@ def execute_maker_limit_order(token_id: str, amount_usd: float):
         )
 
         signed_order = clob_client.create_order(order_args)
-        resp = clob_client.post_order(signed_order)
+        resp = clob_client.post_order(signed_order, OrderType.GTC)
 
         if resp and isinstance(resp, dict) and resp.get("success"):
             order_id = resp.get("orderID", resp.get("id", "N/A"))
@@ -231,7 +232,7 @@ def auto_cancel_stale_orders():
 
 def main():
     print("🤖 BOT ACTIEF (METAMASK EOA MODE)")
-    send_telegram_msg("🚀 **Bot gestart met MetaMask (EOA) Wallet!**")
+    send_telegram_msg("🚀 **Bot gestart met bijgewerkte CLOB-client!**")
 
     while True:
         try:
