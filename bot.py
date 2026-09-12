@@ -1,7 +1,7 @@
 import os
 import time
 import re
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any
 import requests
 
 # ============================================================
@@ -34,10 +34,11 @@ POLYMARKET_GAMMA_URL = "https://gamma-api.polymarket.com"
 BINANCE_API_URL = "https://api.binance.com/api/v3"
 CHAIN_ID = 137  # Polygon Mainnet
 
-SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", "3"))
-MAX_ENTRY_WINDOW_SECONDS = int(os.environ.get("MAX_ENTRY_WINDOW_SECONDS", "80"))
-MAX_ALLOWABLE_ODDS = float(os.environ.get("MAX_ALLOWABLE_ODDS", "0.93"))
+SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", "2"))
+MAX_ENTRY_WINDOW_SECONDS = int(os.environ.get("MAX_ENTRY_WINDOW_SECONDS", "20"))  # Strikt eerste 20 sec van nieuwe candle
+MAX_ALLOWABLE_ODDS = float(os.environ.get("MAX_ALLOWABLE_ODDS", "0.75"))         # Alleen scherpe instapprijzen (< $0.75)
 LIVE_TRADE_AMOUNT = float(os.environ.get("LIVE_TRADE_AMOUNT", "5.0"))
+MIN_CANDLE_CHANGE_PCT = float(os.environ.get("MIN_CANDLE_CHANGE_PCT", "0.08"))     # Minimaal 0.08% beweging op vorige 5m
 
 # ============================================================
 # TELEGRAM CONFIGURATIE
@@ -83,9 +84,9 @@ POLY_SYMBOL_ALIASES = {
 
 active_signals_sent = {}
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyAutoTrader/6.0"})
+session.headers.update({"User-Agent": "PolyAutoTrader/7.0"})
 
-def request_json(method: str, url: str, *, timeout: int = 5, **kwargs):
+def request_json(method: str, url: str, *, timeout: int = 4, **kwargs):
     try:
         response = session.request(method, url, timeout=timeout, **kwargs)
         response.raise_for_status()
@@ -136,75 +137,39 @@ def send_telegram_msg(message: str, button_url: Optional[str] = None):
             "inline_keyboard": [[{"text": "🚀 ZET DIRECT IN OP POLYMARKET", "url": button_url}]]
         }
     try:
-        session.post(url, json=payload, timeout=5)
+        session.post(url, json=payload, timeout=4)
         return True
     except Exception as e:
         print(f"⚠️ Telegram Fout: {e}")
         return False
 
 # ============================================================
-# 1-MINUUT INDICATOR BEREKENINGEN (EMA, RSI, MACD)
+# 5M VORIGE CANDLE MOMENTUM STRATEGIE
 # ============================================================
-def calculate_ema(prices, period):
-    k = 2 / (period + 1)
-    ema = prices[0]
-    for price in prices[1:]:
-        ema = (price * k) + (ema * (1 - k))
-    return ema
-
-def calculate_rsi(prices, period=14):
-    if len(prices) < period + 1:
-        return 50.0
-    gains = [max(0.0, prices[i] - prices[i - 1]) for i in range(1, len(prices))]
-    losses = [max(0.0, prices[i - 1] - prices[i]) for i in range(1, len(prices))]
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-
-    if avg_loss == 0:
-        return 100.0 if avg_gain > 0 else 50.0
-    return round(100 - (100 / (1 + (avg_gain / avg_loss))), 1)
-
-def calculate_macd(prices):
-    ema12 = calculate_ema(prices, 12)
-    ema26 = calculate_ema(prices, 26)
-    macd_line = ema12 - ema26
-    # Eenvoudige benadering van de signaallijn over de laatste kaarsen
-    macd_signal = macd_line * 0.9 
-    return macd_line, macd_signal
-
-def get_1m_strategy_signal(symbol: str):
+def get_previous_5m_momentum(symbol: str) -> Optional[str]:
     """
-    1-minuut strategie met 3 indicatoren:
-    1. EMA 20
-    2. RSI 14
-    3. MACD
+    Analyseert de zojuist afgesloten 5-minuten candle op Binance.
     """
-    klines = request_json("GET", f"{BINANCE_API_URL}/klines", params={"symbol": symbol, "interval": "1m", "limit": 40})
-    if not klines or len(klines) < 35:
+    url = f"{BINANCE_API_URL}/klines"
+    params = {"symbol": symbol, "interval": "5m", "limit": 2}
+    klines = request_json("GET", url, params=params)
+
+    if not klines or len(klines) < 2:
         return None
 
-    close_prices = [float(k[4]) for k in klines]
-    current_price = close_prices[-1]
+    # Index 0 is de vorige, volledig afgesloten 5-minuten candle
+    prev_candle = klines[0]
+    open_price = float(prev_candle[1])
+    close_price = float(prev_candle[4])
 
-    ema_20 = calculate_ema(close_prices, 20)
-    rsi = calculate_rsi(close_prices, 14)
-    macd_line, macd_signal = calculate_macd(close_prices)
+    if open_price == 0:
+        return None
 
-    ema_up = current_price > ema_20
-    rsi_up = rsi > 52
-    macd_up = macd_line > macd_signal
+    change_pct = ((close_price - open_price) / open_price) * 100
 
-    ema_down = current_price < ema_20
-    rsi_down = rsi < 48
-    macd_down = macd_line < macd_signal
-
-    if ema_up and rsi_up and macd_up:
+    if change_pct >= MIN_CANDLE_CHANGE_PCT:
         return "UP"
-    elif ema_down and rsi_down and macd_down:
+    elif change_pct <= -MIN_CANDLE_CHANGE_PCT:
         return "DOWN"
 
     return None
@@ -218,7 +183,7 @@ def get_token_info(symbol: str, signal: str):
 
     for alias in aliases:
         gamma_url = f"{POLYMARKET_GAMMA_URL}/events?limit=30&active=true&closed=false&q={alias}"
-        gamma_data = request_json("GET", gamma_url, timeout=5)
+        gamma_data = request_json("GET", gamma_url, timeout=4)
         if not gamma_data or not isinstance(gamma_data, list):
             continue
 
@@ -295,48 +260,45 @@ def execute_live_order(token_id: str, amount_usd: float, max_price: float):
 # ============================================================
 def main():
     print("\n" + "=" * 60)
-    print("🤖 POLYMARKET 1M STRATEGIE BOT V6.0")
+    print("🤖 POLYMARKET 5M PREVIOUS-CANDLE BOT V7.0")
     print("=" * 60)
 
     while True:
         try:
             now_sec = time.time()
-            time_elapsed_in_window = int(now_sec % 300) # Verstreken seconden in de 5m interval
+            time_elapsed_in_window = int(now_sec % 300)  # Verstreken seconden in de nieuwe 5m candle
             cycle_id = int(now_sec // 300)
 
-            # --- REGEL 1: STRICHTE ENTRY BINNEN DE EERSTE 80 SECONDEN ---
-            if time_elapsed_in_window > MAX_ENTRY_WINDOW_SECONDS:
-                time.sleep(SCAN_INTERVAL_SEC)
-                continue
+            # --- REGEL 1: INSTAPPEN ALLEEN IN DE EERSTE X SECONDEN VAN HET NIEUWE INTERVAL ---
+            if time_elapsed_in_window <= MAX_ENTRY_WINDOW_SECONDS:
+                for symbol in PAIRS:
+                    trade_key = f"cycle_{cycle_id}_{symbol}"
+                    if trade_key in active_signals_sent:
+                        continue
 
-            for symbol in PAIRS:
-                trade_key = f"cycle_{cycle_id}_{symbol}"
-                if trade_key in active_signals_sent:
-                    continue
+                    # --- REGEL 2: BEKIJK CONTINU DE MOMENTUM RICHTING VAN DE VORIGE 5M CANDLE ---
+                    signal = get_previous_5m_momentum(symbol)
+                    if not signal:
+                        continue
 
-                # --- REGEL 2: 1-MINUUT MULTI-INDICATOR CONVERGENTIE ---
-                signal = get_1m_strategy_signal(symbol)
-                if not signal:
-                    continue
+                    token_info = get_token_info(symbol, signal)
+                    if not token_info:
+                        continue
 
-                token_info = get_token_info(symbol, signal)
-                if not token_info:
-                    continue
+                    print(f"🎯 [{symbol}] Vorige 5m candle momentum is {signal}. Instappen op seconde {time_elapsed_in_window}s...")
 
-                print(f"🚀 [{symbol}] Sterk {signal}-signaal in eerste {time_elapsed_in_window}s. Order uitvoeren...")
+                    success, filled_price, info = execute_live_order(
+                        token_info["token_id"],
+                        LIVE_TRADE_AMOUNT,
+                        MAX_ALLOWABLE_ODDS
+                    )
 
-                success, filled_price, info = execute_live_order(
-                    token_info["token_id"],
-                    LIVE_TRADE_AMOUNT,
-                    MAX_ALLOWABLE_ODDS
-                )
+                    active_signals_sent[trade_key] = True
 
-                active_signals_sent[trade_key] = True
-
-                if success:
-                    send_telegram_msg(f"✅ **LIVE ORDER GEPLAATST:** {symbol} ({signal})\nPrijs: `${filled_price:.3f}`\nOrder ID: `{info}`", token_info["url"])
-                else:
-                    send_telegram_msg(f"🚨 **ORDER GEWEIGERD:** {symbol} ({signal})\nReden: `{info}`", token_info["url"])
+                    if success:
+                        send_telegram_msg(f"✅ **LIVE ORDER GEPLAATST:** {symbol} ({signal})\nPrijs: `${filled_price:.3f}`\nOrder ID: `{info}`", token_info["url"])
+                    else:
+                        send_telegram_msg(f"🚨 **ORDER GEWEIGERD:** {symbol} ({signal})\nReden: `{info}`", token_info["url"])
 
         except KeyboardInterrupt:
             break
