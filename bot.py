@@ -5,7 +5,7 @@ from typing import Optional, Dict, Any, List
 import requests
 
 # ============================================================
-# CLOB CLIENT IMPORTS
+# CLOB CLIENT IMPORTS (CLOB V2 COMPATIBEL)
 # ============================================================
 ClobClient = None
 OrderArgs = None
@@ -49,7 +49,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 # WALLET CONFIGURATIE
 RAW_PRIVATE_KEY = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
 POLYMARKET_FUNDER_ADDRESS = os.environ.get("POLYMARKET_FUNDER_ADDRESS", "").strip()
-SIGNATURE_TYPE_ENV = os.environ.get("POLYMARKET_SIGNATURE_TYPE", "1").strip()
+SIGNATURE_TYPE_ENV = os.environ.get("POLYMARKET_SIGNATURE_TYPE", "3").strip()
 
 def clean_private_key(value: str) -> str:
     if not value: return ""
@@ -60,7 +60,7 @@ PK = clean_private_key(RAW_PRIVATE_KEY)
 
 def get_signature_type() -> int:
     try: return int(SIGNATURE_TYPE_ENV)
-    except ValueError: return 1
+    except ValueError: return 3
 
 SIG_TYPE = get_signature_type()
 
@@ -78,7 +78,7 @@ POLY_SYMBOL_ALIASES = {
 active_signals = {}
 open_orders_tracker = {}
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyMakerBot/20.0"})
+session.headers.update({"User-Agent": "PolyMakerBot/21.0"})
 
 def request_json(method: str, url: str, *, timeout: int = 2, **kwargs):
     try:
@@ -118,13 +118,30 @@ def init_clob_client():
         if POLYMARKET_FUNDER_ADDRESS:
             kwargs["funder"] = POLYMARKET_FUNDER_ADDRESS
 
-        client = ClobClient(**kwargs)
+        # Stap 1: Maak L1 client aan MET funder en signature_type gebonden
+        l1_client = ClobClient(**kwargs)
+        
+        # Stap 2: Derive/Create API credentials behorende bij deze specifieke proxy/funder
         try:
-            creds = client.derive_api_key()
+            creds = l1_client.create_or_derive_api_creds()
         except Exception:
-            creds = client.create_api_key()
-        client.set_api_creds(creds)
-        print(f"✅ CLOB Verbonden | SigType: {SIG_TYPE} | Funder: {POLYMARKET_FUNDER_ADDRESS or 'None'}")
+            try:
+                creds = l1_client.derive_api_key()
+            except Exception:
+                creds = l1_client.create_api_key()
+
+        # Stap 3: Initialiseer de L2 trading client
+        kwargs["creds"] = creds
+        client = ClobClient(**kwargs)
+        
+        # Stap 4: Update CLOB server-side balance cache
+        try:
+            if hasattr(client, "update_balance_allowance"):
+                client.update_balance_allowance()
+        except Exception as e:
+            print(f"⚠️ Balance allowance sync: {e}")
+
+        print(f"✅ CLOB V2 Verbonden | SigType: {SIG_TYPE} | Funder: {POLYMARKET_FUNDER_ADDRESS or 'None'}")
         return client
     except Exception as e:
         raise SystemExit(f"❌ CLOB Initialisatie mislukt: {e}")
@@ -246,9 +263,12 @@ def execute_maker_limit_order(token_id: str, amount_usd: float) -> tuple[bool, f
             token_id=token_id
         )
 
-        # Maak order aan en verstuur via CLOB
-        signed_order = clob_client.create_order(order_args)
-        resp = clob_client.post_order(signed_order)
+        # Order bouwen en verzenden
+        if hasattr(clob_client, "create_and_post_order"):
+            resp = clob_client.create_and_post_order(order_args)
+        else:
+            signed_order = clob_client.create_order(order_args)
+            resp = clob_client.post_order(signed_order)
 
         if resp and isinstance(resp, dict) and resp.get("success"):
             order_id = resp.get("orderID", resp.get("id", "N/A"))
@@ -279,10 +299,10 @@ def auto_cancel_stale_orders():
 # ============================================================
 def main():
     print("\n" + "=" * 60)
-    print("🤖 POLYMARKET PRE-CLOSE MAKER BOT V20.0")
+    print("🤖 POLYMARKET PRE-CLOSE MAKER BOT V21.0")
     print("=" * 60)
 
-    send_telegram_msg("🚀 **Bot gestart!**\nControleer Railway variabelen op Funder Address & Sig Type.")
+    send_telegram_msg("🚀 **Bot gestart met SignatureType 3 (POLY_1271)!**")
 
     last_logged_minute = -1
 
