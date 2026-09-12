@@ -31,10 +31,9 @@ RAW_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_BOT_TOKEN = RAW_TOKEN[3:] if RAW_TOKEN.startswith("bot") else RAW_TOKEN
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# WALLET CONFIGURATIE (MAGIC WALLET / POLY_PROXY SETUP)
+# WALLET CONFIGURATIE (METAMASK / EOA SETUP)
 RAW_PRIVATE_KEY = os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip()
-POLYMARKET_FUNDER_ADDRESS = os.environ.get("POLYMARKET_FUNDER_ADDRESS", "").strip()
-SIGNATURE_TYPE_ENV = os.environ.get("POLYMARKET_SIGNATURE_TYPE", "1").strip()
+SIG_TYPE = 0  # Direct EOA Signature voor MetaMask
 
 def clean_private_key(value: str) -> str:
     if not value: return ""
@@ -42,12 +41,6 @@ def clean_private_key(value: str) -> str:
     return "".join(re.findall(r"[0-9a-fA-F]", value))
 
 PK = clean_private_key(RAW_PRIVATE_KEY)
-
-def get_signature_type() -> int:
-    try: return int(SIGNATURE_TYPE_ENV)
-    except ValueError: return 1
-
-SIG_TYPE = get_signature_type()
 
 PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ZECUSDT"]
 POLY_SYMBOL_ALIASES = {
@@ -63,7 +56,7 @@ POLY_SYMBOL_ALIASES = {
 active_signals = {}
 open_orders_tracker = {}
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyMakerBot/25.0"})
+session.headers.update({"User-Agent": "PolyMakerBot/26.0"})
 
 def request_json(method: str, url: str, *, timeout: int = 2, **kwargs):
     try:
@@ -87,13 +80,11 @@ def send_telegram_msg(message: str, button_url: Optional[str] = None):
         return False
 
 # ============================================================
-# INITIALISATIE
+# METAMASK (EOA) INITIALISATIE
 # ============================================================
 def init_clob_client():
     if not PK: 
         raise SystemExit("❌ FOUT: Geen POLYMARKET_PRIVATE_KEY ingesteld.")
-    if not POLYMARKET_FUNDER_ADDRESS and SIG_TYPE != 0:
-        raise SystemExit("❌ FOUT: POLYMARKET_FUNDER_ADDRESS is verplicht voor Proxy/Magic wallets.")
 
     client_args = {
         "host": CLOB_HOST,
@@ -102,27 +93,21 @@ def init_clob_client():
         "signature_type": SIG_TYPE
     }
 
-    if POLYMARKET_FUNDER_ADDRESS and SIG_TYPE != 0:
-        client_args["funder"] = POLYMARKET_FUNDER_ADDRESS
-
     try:
         auth_client = ClobClient(**client_args)
 
         try:
             creds = auth_client.create_api_key()
-            print("🔑 Nieuwe L2 API Key succesvol geregistreerd!")
+            print("🔑 Nieuwe L2 API Key succesvol geregistreerd voor MetaMask EOA!")
         except Exception:
             creds = auth_client.derive_api_key()
             print("🔑 Bestaande L2 API Key opgehaald.")
 
         client = ClobClient(**client_args, creds=creds)
-        
-        sig_name = "POLY_PROXY (Magic Wallet)" if SIG_TYPE == 1 else ("POLY_1271 (Browser Wallet)" if SIG_TYPE == 3 else "EOA")
 
-        print(f"✅ Client Verbonden!")
-        print(f"🔹 SigType: {SIG_TYPE} ({sig_name})")
-        print(f"🔹 Funder: {POLYMARKET_FUNDER_ADDRESS or 'Geen'}")
-        print(f"🔹 Signer Address: {client.get_address()}")
+        print(f"✅ MetaMask Client Verbonden!")
+        print(f"🔹 SigType: {SIG_TYPE} (EOA Direct)")
+        print(f"🔹 Wallet Adres: {client.get_address()}")
         return client
     except Exception as e:
         raise SystemExit(f"❌ CLOB Initialisatie mislukt: {e}")
@@ -245,8 +230,8 @@ def auto_cancel_stale_orders():
         del open_orders_tracker[oid]
 
 def main():
-    print("🤖 BOT ACTIEF EN OPERATIONEEL")
-    send_telegram_msg("🚀 **Bot gestart en verbonden!**")
+    print("🤖 BOT ACTIEF (METAMASK EOA MODE)")
+    send_telegram_msg("🚀 **Bot gestart met MetaMask (EOA) Wallet!**")
 
     while True:
         try:
