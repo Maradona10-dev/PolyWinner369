@@ -82,7 +82,7 @@ POLY_SYMBOL_ALIASES = {
 active_signals = {}
 open_orders_tracker = {}
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyMakerBot/14.0"})
+session.headers.update({"User-Agent": "PolyMakerBot/16.0"})
 
 def request_json(method: str, url: str, *, timeout: int = 2, **kwargs):
     try:
@@ -92,6 +92,23 @@ def request_json(method: str, url: str, *, timeout: int = 2, **kwargs):
     except Exception as e:
         print(f"⚠️ Netwerkfout ({url}): {e}")
     return None
+
+def send_telegram_msg(message: str, button_url: Optional[str] = None):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ Telegram-token of Chat ID niet ingesteld.")
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown", "disable_web_page_preview": True}
+    if button_url:
+        payload["reply_markup"] = {"inline_keyboard": [[{"text": "🚀 BEKIJK MAKER ORDER OP POLYMARKET", "url": button_url}]]}
+    try:
+        r = session.post(url, json=payload, timeout=2)
+        if not r.ok:
+            print(f"⚠️ Telegram API Fout: {r.text}")
+        return r.ok
+    except Exception as e:
+        print(f"⚠️ Telegram Verbindingsfout: {e}")
+        return False
 
 def init_clob_client():
     if not PK: raise SystemExit("❌ FOUT: Geen POLYMARKET_PRIVATE_KEY ingesteld.")
@@ -108,19 +125,6 @@ def init_clob_client():
         raise SystemExit(f"❌ CLOB Initialisatie mislukt: {e}")
 
 clob_client = init_clob_client()
-
-def send_telegram_msg(message: str, button_url: Optional[str] = None):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown", "disable_web_page_preview": True}
-    if button_url:
-        payload["reply_markup"] = {"inline_keyboard": [[{"text": "🚀 BEKIJK MAKER ORDER OP POLYMARKET", "url": button_url}]]}
-    try:
-        session.post(url, json=payload, timeout=2)
-        return True
-    except Exception as e:
-        print(f"⚠️ Telegram Fout: {e}")
-        return False
 
 # ============================================================
 # MOMENTUM & TOKEN SEARCH
@@ -184,7 +188,7 @@ def get_token_info(symbol: str, signal: str):
     return None
 
 # ============================================================
-# PRE-CLOSE MAKER EXECUTION
+# PRE-CLOSE MAKER EXECUTION (GEOPTIMALISEERDE PRIJSBEPALING)
 # ============================================================
 def execute_maker_limit_order(token_id: str, amount_usd: float) -> tuple[bool, float, str]:
     """
@@ -194,46 +198,66 @@ def execute_maker_limit_order(token_id: str, amount_usd: float) -> tuple[bool, f
         best_ask = None
         best_bid = None
 
-        # 1. Probeer actuele prijzen via direct endpoint te halen
+        # 1. Probeer Midpoint of Direct Prices via CLOB te halen
         try:
-            ask_res = clob_client.get_price(token_id, side="BUY")
-            if isinstance(ask_res, dict) and "price" in ask_res:
-                best_ask = float(ask_res["price"])
-            elif isinstance(ask_res, (float, int, str)):
-                best_ask = float(ask_res)
+            mid_res = clob_client.get_midpoint(token_id)
+            if isinstance(mid_res, dict) and "mid" in mid_res:
+                mid = float(mid_res["mid"])
+                if mid > 0.05:
+                    best_bid = round(mid - 0.01, 3)
+                    best_ask = round(mid + 0.01, 3)
         except Exception:
             pass
 
-        try:
-            bid_res = clob_client.get_price(token_id, side="SELL")
-            if isinstance(bid_res, dict) and "price" in bid_res:
-                best_bid = float(bid_res["price"])
-            elif isinstance(bid_res, (float, int, str)):
-                best_bid = float(bid_res)
-        except Exception:
-            pass
+        if best_bid is None:
+            try:
+                bid_res = clob_client.get_price(token_id, side="SELL")
+                if isinstance(bid_res, dict) and "price" in bid_res:
+                    p = float(bid_res["price"])
+                    if p > 0.05: best_bid = p
+                elif isinstance(bid_res, (float, int, str)) and float(bid_res) > 0.05:
+                    best_bid = float(bid_res)
+            except Exception:
+                pass
 
-        # 2. Fallback naar Orderbook
+        if best_ask is None:
+            try:
+                ask_res = clob_client.get_price(token_id, side="BUY")
+                if isinstance(ask_res, dict) and "price" in ask_res:
+                    p = float(ask_res["price"])
+                    if p > 0.05: best_ask = p
+                elif isinstance(ask_res, (float, int, str)) and float(ask_res) > 0.05:
+                    best_ask = float(ask_res)
+            except Exception:
+                pass
+
+        # 2. Fallback naar Orderbook als direct endpoints geen liquide prijzen geven
         if best_ask is None or best_bid is None:
-            orderbook = clob_client.get_order_book(token_id)
-            bids = getattr(orderbook, "bids", []) or (orderbook.get("bids", []) if isinstance(orderbook, dict) else [])
-            asks = getattr(orderbook, "asks", []) or (orderbook.get("asks", []) if isinstance(orderbook, dict) else [])
+            try:
+                orderbook = clob_client.get_order_book(token_id)
+                bids = getattr(orderbook, "bids", []) or (orderbook.get("bids", []) if isinstance(orderbook, dict) else [])
+                asks = getattr(orderbook, "asks", []) or (orderbook.get("asks", []) if isinstance(orderbook, dict) else [])
 
-            def get_p(entry):
-                return float(entry.get("price", 0)) if isinstance(entry, dict) else float(getattr(entry, "price", 0))
+                def get_p(entry):
+                    return float(entry.get("price", 0)) if isinstance(entry, dict) else float(getattr(entry, "price", 0))
 
-            if bids and best_bid is None:
-                best_bid = get_p(sorted(bids, key=get_p, reverse=True)[0])
-            if asks and best_ask is None:
-                best_ask = get_p(sorted(asks, key=get_p)[0])
+                valid_bids = [get_p(b) for b in bids if get_p(b) > 0.05]
+                valid_asks = [get_p(a) for a in asks if get_p(a) > 0.05]
 
-        # Defaults als book leeg is
-        if best_bid is None or best_bid <= 0.01:
+                if valid_bids and best_bid is None:
+                    best_bid = max(valid_bids)
+                if valid_asks and best_ask is None:
+                    best_ask = min(valid_asks)
+            except Exception:
+                pass
+
+        # Realistische ondergrenzen hanteren voor nieuwe/dunne 5m-markten
+        if best_bid is None or best_bid < 0.10:
             best_bid = 0.50
-        if best_ask is None or best_ask <= 0.01:
-            best_ask = 0.99
+        if best_ask is None or best_ask <= best_bid:
+            best_ask = round(best_bid + 0.02, 3)
 
-        # 3. Bereken Maker-prijs
+        # 3. Bereken passieve Maker-prijs (1 cent boven best_bid, maar onder target en ask)
         maker_price = round(min(best_bid + 0.01, TARGET_MAKER_PRICE), 3)
 
         if maker_price >= best_ask:
@@ -292,14 +316,23 @@ def auto_cancel_stale_orders():
 # ============================================================
 def main():
     print("\n" + "=" * 60)
-    print("🤖 POLYMARKET PRE-CLOSE MAKER BOT V14.0")
+    print("🤖 POLYMARKET PRE-CLOSE MAKER BOT V16.0")
     print("=" * 60)
+
+    send_telegram_msg("🚀 **Bot succesvol gestart!**\nActief en aan het scannen voor 5-minuten kaarswissels.")
+
+    last_logged_minute = -1
 
     while True:
         try:
             now_sec = time.time()
             time_elapsed = int(now_sec % 300)
             cycle_id = int(now_sec // 300)
+
+            current_minute = int(now_sec // 60)
+            if current_minute != last_logged_minute:
+                last_logged_minute = current_minute
+                print(f"⏱️ Actief. Huidige positie in 5m cyclus: {time_elapsed}s / 300s")
 
             # STAP 1: PRE-CLOSE VENSTER (T-10s TOT T-2s VÓÓR CANDLE CLOSE)
             if PRE_CLOSE_WINDOW_START <= time_elapsed <= PRE_CLOSE_WINDOW_END:
