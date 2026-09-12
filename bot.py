@@ -6,7 +6,7 @@ from typing import Optional, Dict, Any
 import requests
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, ApiCreds
+from py_clob_client.clob_types import OrderArgs
 
 # ============================================================
 # CONFIGURATIE & INSTELLINGEN
@@ -63,7 +63,7 @@ POLY_SYMBOL_ALIASES = {
 active_signals = {}
 open_orders_tracker = {}
 session = requests.Session()
-session.headers.update({"User-Agent": "PolyMakerBot/24.0"})
+session.headers.update({"User-Agent": "PolyMakerBot/25.0"})
 
 def request_json(method: str, url: str, *, timeout: int = 2, **kwargs):
     try:
@@ -87,47 +87,41 @@ def send_telegram_msg(message: str, button_url: Optional[str] = None):
         return False
 
 # ============================================================
-# MAGIC WALLET INITIALISATIE MET CORRECTE API-KEY SYNC
+# INITIALISATIE
 # ============================================================
 def init_clob_client():
     if not PK: 
-        raise SystemExit("❌ FOUT: Geen POLYMARKET_PRIVATE_KEY ingesteld in Railway.")
-    if not POLYMARKET_FUNDER_ADDRESS:
-        raise SystemExit("❌ FOUT: POLYMARKET_FUNDER_ADDRESS is verplicht bij Magic Wallet (POLY_PROXY). Vul je Proxy-adres in Railway in.")
+        raise SystemExit("❌ FOUT: Geen POLYMARKET_PRIVATE_KEY ingesteld.")
+    if not POLYMARKET_FUNDER_ADDRESS and SIG_TYPE != 0:
+        raise SystemExit("❌ FOUT: POLYMARKET_FUNDER_ADDRESS is verplicht voor Proxy/Magic wallets.")
 
     client_args = {
         "host": CLOB_HOST,
         "key": PK,
         "chain_id": CHAIN_ID,
-        "signature_type": SIG_TYPE,
-        "funder": POLYMARKET_FUNDER_ADDRESS
+        "signature_type": SIG_TYPE
     }
 
+    if POLYMARKET_FUNDER_ADDRESS and SIG_TYPE != 0:
+        client_args["funder"] = POLYMARKET_FUNDER_ADDRESS
+
     try:
-        # Stap 1: Initialiseer de tijdelijke client voor L1 authenticatie
         auth_client = ClobClient(**client_args)
 
-        # Stap 2: Genereer of haal de L2 API Credentials op die gebonden zijn aan deze specifieke funder
         try:
             creds = auth_client.create_api_key()
-            print("🔑 Nieuwe L2 API Key succesvol geregistreerd voor Magic Proxy!")
+            print("🔑 Nieuwe L2 API Key succesvol geregistreerd!")
         except Exception:
             creds = auth_client.derive_api_key()
             print("🔑 Bestaande L2 API Key opgehaald.")
 
-        # Stap 3: Initialiseer de definitieve trading client
         client = ClobClient(**client_args, creds=creds)
         
-        # Update server-side allowances voor de Proxy
-        try:
-            if hasattr(client, "update_balance_allowance"):
-                client.update_balance_allowance()
-        except Exception as e:
-            print(f"⚠️ Balance sync melding: {e}")
+        sig_name = "POLY_PROXY (Magic Wallet)" if SIG_TYPE == 1 else ("POLY_1271 (Browser Wallet)" if SIG_TYPE == 3 else "EOA")
 
-        print(f"✅ Magic Wallet Client Verbonden!")
-        print(f"🔹 SigType: {SIG_TYPE} (POLY_PROXY)")
-        print(f"🔹 Proxy Funder: {POLYMARKET_FUNDER_ADDRESS}")
+        print(f"✅ Client Verbonden!")
+        print(f"🔹 SigType: {SIG_TYPE} ({sig_name})")
+        print(f"🔹 Funder: {POLYMARKET_FUNDER_ADDRESS or 'Geen'}")
         print(f"🔹 Signer Address: {client.get_address()}")
         return client
     except Exception as e:
@@ -251,8 +245,8 @@ def auto_cancel_stale_orders():
         del open_orders_tracker[oid]
 
 def main():
-    print("🤖 BOT ACTIEF (MAGIC WALLET MODE)")
-    send_telegram_msg("🚀 **Bot gestart met Magic Wallet configuration (SigType 1)!**")
+    print("🤖 BOT ACTIEF EN OPERATIONEEL")
+    send_telegram_msg("🚀 **Bot gestart en verbonden!**")
 
     while True:
         try:
