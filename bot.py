@@ -30,7 +30,7 @@ def set_leverage_for_symbol(symbol):
         pass
 
 def run_momentum_bot():
-    for symbol in SYMBOL:
+    for symbol in SYMBOLS:  # Hier stond per ongeluk SYMBOL (enkelvoud)
         try:
             # Hefboom controleren/instellen voor deze munt
             set_leverage_for_symbol(symbol)
