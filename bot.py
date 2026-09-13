@@ -2,8 +2,8 @@ import ccxt
 import time
 import os
 
-# Verbinding maken met Bybit Spot via CCXT
-exchange = ccxt.bybit({
+# Verbinding maken met Margex via CCXT
+exchange = ccxt.margex({
     'apiKey': os.environ.get('EXCHANGE_API_KEY', ''),
     'secret': os.environ.get('EXCHANGE_SECRET', ''),
     'enableRateLimit': True,
@@ -34,12 +34,12 @@ def run_momentum_bot():
         quantity = round(TRADE_AMOUNT_USD / current_price, 6)
 
         if pct_change >= MIN_BREAKOUT_PCT:
-            print(f"🚀 Bullish momentum ({pct_change:.2f}%). Spot BTC kopen...")
+            print(f"🚀 Bullish momentum ({pct_change:.2f}%). Kopen op Margex...")
             order = exchange.create_market_buy_order(SYMBOL, quantity)
             print(f"Order succesvol geplaatst! ID: {order.get('id')}")
             
         elif pct_change <= -MIN_BREAKOUT_PCT:
-            print(f"🔻 Bearish momentum ({pct_change:.2f}%). Spot BTC verkopen...")
+            print(f"🔻 Bearish momentum ({pct_change:.2f}%). Verkopen op Margex...")
             order = exchange.create_market_sell_order(SYMBOL, quantity)
             print(f"Order succesvol geplaatst! ID: {order.get('id')}")
         else:
@@ -49,7 +49,7 @@ def run_momentum_bot():
         print(f"⚠️ Fout in bot cyclus: {e}")
 
 if __name__ == "__main__":
-    print("🤖 Crypto Spot Momentum Bot gestart (Bybit EU Mode)")
+    print("🤖 Crypto Momentum Bot gestart (Margex Mode)")
     exchange.load_markets()
     
     while True:
