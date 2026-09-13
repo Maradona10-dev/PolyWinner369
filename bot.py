@@ -6,13 +6,14 @@ import os
 exchange = ccxt.blofin({
     'apiKey': os.environ.get('EXCHANGE_API_KEY', ''),
     'secret': os.environ.get('EXCHANGE_SECRET', ''),
-    'password': os.environ.get('EXCHANGE_PASSWORD', ''),  # BloFin API passphrase
+    'password': os.environ.get('EXCHANGE_PASSWORD', ''),
     'enableRateLimit': True,
 })
 
-SYMBOL = 'BTC/USDT'
+# BloFin futures/perpetual symbool notatie in CCXT
+SYMBOL = 'BTC/USDT:USDT'
 TIMEFRAME = '5m'
-TRADE_AMOUNT_USD = 5.0  # Ingesteld op 5 USDT per trade
+TRADE_AMOUNT_USD = 5.0  
 MIN_BREAKOUT_PCT = 0.05
 
 def run_momentum_bot():
