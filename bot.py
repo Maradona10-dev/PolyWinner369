@@ -2,10 +2,11 @@ import ccxt
 import time
 import os
 
-# Verbinding maken met Margex via CCXT
-exchange = ccxt.margex({
+# Verbinding maken met BloFin via CCXT
+exchange = ccxt.blofin({
     'apiKey': os.environ.get('EXCHANGE_API_KEY', ''),
     'secret': os.environ.get('EXCHANGE_SECRET', ''),
+    'password': os.environ.get('EXCHANGE_PASSWORD', ''),  # BloFin API passphrase
     'enableRateLimit': True,
 })
 
@@ -34,12 +35,12 @@ def run_momentum_bot():
         quantity = round(TRADE_AMOUNT_USD / current_price, 6)
 
         if pct_change >= MIN_BREAKOUT_PCT:
-            print(f"🚀 Bullish momentum ({pct_change:.2f}%). Kopen op Margex...")
+            print(f"🚀 Bullish momentum ({pct_change:.2f}%). Kopen op BloFin...")
             order = exchange.create_market_buy_order(SYMBOL, quantity)
             print(f"Order succesvol geplaatst! ID: {order.get('id')}")
             
         elif pct_change <= -MIN_BREAKOUT_PCT:
-            print(f"🔻 Bearish momentum ({pct_change:.2f}%). Verkopen op Margex...")
+            print(f"🔻 Bearish momentum ({pct_change:.2f}%). Verkopen op BloFin...")
             order = exchange.create_market_sell_order(SYMBOL, quantity)
             print(f"Order succesvol geplaatst! ID: {order.get('id')}")
         else:
@@ -49,7 +50,7 @@ def run_momentum_bot():
         print(f"⚠️ Fout in bot cyclus: {e}")
 
 if __name__ == "__main__":
-    print("🤖 Crypto Momentum Bot gestart (Margex Mode)")
+    print("🤖 Crypto Momentum Bot gestart (BloFin Mode)")
     exchange.load_markets()
     
     while True:
