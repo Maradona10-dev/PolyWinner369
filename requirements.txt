@@ -1,2 +1,2 @@
-py-clob-client-v2
+ccxt
 requests
