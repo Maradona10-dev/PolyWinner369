@@ -38,11 +38,11 @@ SYMBOLS = [
 LEVERAGE = 12           
 MIN_VOLUME_RATIO = 1.3  
 
-# ATR & Risk Management parameters (Punt 1, 2 & 3 opgelost)
+# ATR & Risk Management parameters
 ATR_PERIOD = 14
-ATR_SL_MULTIPLIER = 1.5   # Stop-loss afstand in ATRv
-ATR_TP_MULTIPLIER = 3.0   # Take-profit afstand in ATR
-BASE_RISK_USD = 5.0       # Basis risico-bedrag
+ATR_SL_MULTIPLIER = 1.5   
+ATR_TP_MULTIPLIER = 3.0   
+BASE_RISK_USD = 5.0       
 
 # Fee drag administratie
 TAKER_FEE_PCT = 0.06  
@@ -51,7 +51,6 @@ FEE_DRAG_PCT = round(2 * TAKER_FEE_PCT * LEVERAGE, 3)
 last_trade_time = {}
 COOLDOWN_SECONDS = 900  # 15 minuten rust per munt
 
-# Houd bij of partial TP al is uitgevoerd per positie om te voorkomen dat het dubbel gebeurt
 partial_tp_done = {}
 
 def calculate_rsi(closes, period=14):
@@ -103,10 +102,6 @@ def enforce_leverage_and_margin(symbol):
         pass
 
 def manage_open_positions_with_smart_exits():
-    """
-    Beheert open posities met echte dynamische ATR-drempels, 
-    Partial Take-Profit (50% sluiten bij 1.5x ATR winst) en Breakeven protection.
-    """
     try:
         positions = exchange.fetch_positions()
         for pos in positions:
@@ -135,8 +130,7 @@ def manage_open_positions_with_smart_exits():
                 pnl_pct = ((entry_price - current_price) / entry_price) * 100 * LEVERAGE
                 price_gain_pct = ((entry_price - current_price) / entry_price) * 100
 
-            # --- PARTIAL TAKE-PROFIT & BREAKEVEN (Punt 2 & 4) ---
-            # Als de koers 1.5% stijgt (zonder hefboom), nemen we de helft winst en zetten we de rest veilig
+            # Partial Take-Profit (50% sluiten bij 1.5% koerswinst)
             if price_gain_pct >= 1.5 and not partial_tp_done[symbol]:
                 half_contracts = contracts / 2
                 market = exchange.market(symbol)
@@ -147,17 +141,17 @@ def manage_open_positions_with_smart_exits():
                     if side == 'long':
                         exchange.create_market_sell_order(symbol, precision_contracts, {'reduceOnly': True})
                     else:
-                        exchange.create_market_buy_order(symbol, precision_contracts, {'reduceOnly': True}}
+                        exchange.create_market_buy_order(symbol, precision_contracts, {'reduceOnly': True})  # Syntax hersteld!
                     
                     partial_tp_done[symbol] = True
                     msg = f"🛡️ *Partial TP (50%) bereikt op {symbol}!*\n• Breakeven lock-in geactiveerd.\n• Bruto PnL: `+{pnl_pct:.2f}%`"
                     print(msg)
                     send_telegram_message(msg)
 
-            # --- VOLLEDIGE TAKE-PROFIT / STOP-LOSS ---
+            # Volledige Take-Profit / Stop-Loss
             if pnl_pct >= 4.0:
                 close_full_position(symbol, side, contracts, f"🎯 *Volledige Take-Profit op {symbol}!*\n• Bruto PnL: `+{pnl_pct:.2f}%` | Netto: `~+{pnl_pct - FEE_DRAG_PCT:.2f}%`")
-            elif pnl_pct <= -2.5: # ATR-gebaseerde stop-loss limiet
+            elif pnl_pct <= -2.5: 
                 close_full_position(symbol, side, contracts, f"🛑 *Stop-Loss ingegrepen op {symbol}!*\n• Bruto PnL: `{pnl_pct:.2f}%` | Netto: `~{pnl_pct - FEE_DRAG_PCT:.2f}%`")
 
     except Exception as e:
@@ -193,7 +187,6 @@ def run_elite_bot():
             if has_position:
                 continue
 
-            # Multi-Timeframe ophalen (1h voor grote context, 15m voor trend, 5m voor timing)
             ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=30)
             ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=30)
             ohlcv_5m = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=30)
@@ -201,7 +194,6 @@ def run_elite_bot():
             if len(ohlcv_1h) < 20 or len(ohlcv_15m) < 20 or len(ohlcv_5m) < 20:
                 continue
             
-            # --- 1H & 15M Trend Filters (Punt 6) ---
             closes_1h = [x[4] for x in ohlcv_1h]
             ema_1h = calculate_ema(closes_1h, period=21)
             trend_1h_bullish = closes_1h[-1] > ema_1h
@@ -210,7 +202,6 @@ def run_elite_bot():
             ema_15m = calculate_ema(closes_15m, period=21)
             trend_15m_bullish = closes_15m[-1] > ema_15m
 
-            # --- 5M Indicatoren, ATR & Volatiliteit-gebaseerde Sizing (Punt 3 & 5) ---
             closes_5m = [x[4] for x in ohlcv_5m]
             volumes_5m = [x[5] for x in ohlcv_5m]
             
@@ -229,8 +220,6 @@ def run_elite_bot():
             ticker = exchange.fetch_ticker(symbol)
             current_price = ticker['last']
             
-            # Volatility-Adjusted Position Sizing (Punt 3):
-            # Bij hoge ATR schalen we de positie subtiel terug om het risico per trade stabiel te houden.
             atr_percentage = (current_atr / current_price) * 100 if current_price > 0 else 1.0
             dynamic_multiplier = max(0.5, min(2.0, 1.0 / (atr_percentage if atr_percentage > 0 else 1.0)))
             adjusted_notional = BASE_RISK_USD * LEVERAGE * dynamic_multiplier
@@ -242,8 +231,6 @@ def run_elite_bot():
                 raw_quantity = min_amount
             quantity = exchange.amount_to_precision(symbol, raw_quantity)
 
-            # --- ENTRY LOGICA: PULLBACK / CONFIRMATION (Punt 5) ---
-            # We kopen niet meer op de blinde uitbraak, maar wachten op bevestiging in een sterke multi-TF trend
             is_bullish_confluence = trend_1h_bullish and trend_15m_bullish
             is_bearish_confluence = not trend_1h_bullish and not trend_15m_bullish
 
@@ -266,7 +253,7 @@ def run_elite_bot():
 
 if __name__ == "__main__":
     exchange.load_markets()
-    start_msg = "🚀 *Elite Trading Bot v3 gestart*\n(ATR-gebaseerd risicomanagement + Partial TP + Multi-TF 1h/15m/5m)"
+    start_msg = "🚀 *Elite Trading Bot v3.1 gestart*\n(Syntax opgelost + ATR-risicomanagement + Partial TP)"
     print(start_msg)
     send_telegram_message(start_msg)
     
