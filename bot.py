@@ -163,13 +163,13 @@ def manage_positions():
                     else:
                         exchange.create_market_buy_order(symbol, prec_contracts, {'reduceOnly': True})
                     info['partial_done'] = True
-                    send_telegram_message(f"🛡️ *Partial TP (50%) bereikt op {symbol}* | PnL: `+{pnl_pct:.2f}%`")
+                    send_telegram_message(f"🛡️ *Inverted Partial TP (50%) bereikt op {symbol}* | PnL: `+{pnl_pct:.2f}%`")
 
             # Full TP or SL
             if hit_tp:
-                close_position(symbol, info['side'], contracts, f"🎯 *Take-Profit bereikt op {symbol}* | PnL: `+{pnl_pct:.2f}%`")
+                close_position(symbol, info['side'], contracts, f"🎯 *Inverted Take-Profit bereikt op {symbol}* | PnL: `+{pnl_pct:.2f}%`")
             elif hit_sl:
-                close_position(symbol, info['side'], contracts, f"🛑 *Stop-Loss bereikt op {symbol}* | PnL: `{pnl_pct:.2f}%`")
+                close_position(symbol, info['side'], contracts, f"🛑 *Inverted Stop-Loss bereikt op {symbol}* | PnL: `{pnl_pct:.2f}%`")
 
         # Cleanup closed positions from state
         for s in list(trade_info.keys()):
@@ -271,18 +271,21 @@ def run_bot():
                 raw_qty = min_amt
             qty = exchange.amount_to_precision(symbol, raw_qty)
 
+            # --- OPGEDRAAIDE LOGICA (INVERTEREN) ---
+            # Als de markt score aangeeft voor LONG, gaan we nu SHORT
             if bullish_score >= MIN_SCORE:
-                order = exchange.create_market_buy_order(symbol, qty)
-                entry = float(order.get('average', current_price) or current_price)
-                trade_info[symbol] = {'side': 'long', 'entry': entry, 'atr': current_atr, 'partial_done': False}
-                send_telegram_message(f"🚀 *Score Long [{bullish_score}/{MIN_SCORE}] op {symbol}* | Entry: `{entry}`")
-                last_trade_time[symbol] = time.time()
-
-            elif bearish_score >= MIN_SCORE:
                 order = exchange.create_market_sell_order(symbol, qty)
                 entry = float(order.get('average', current_price) or current_price)
                 trade_info[symbol] = {'side': 'short', 'entry': entry, 'atr': current_atr, 'partial_done': False}
-                send_telegram_message(f"🚀 *Score Short [{bearish_score}/{MIN_SCORE}] op {symbol}* | Entry: `{entry}`")
+                send_telegram_message(f"🔄 *Inverted Short [{bullish_score}/{MIN_SCORE}] op {symbol}* | Entry: `{entry}`")
+                last_trade_time[symbol] = time.time()
+
+            # Als de markt score aangeeft voor SHORT, gaan we nu LONG
+            elif bearish_score >= MIN_SCORE:
+                order = exchange.create_market_buy_order(symbol, qty)
+                entry = float(order.get('average', current_price) or current_price)
+                trade_info[symbol] = {'side': 'long', 'entry': entry, 'atr': current_atr, 'partial_done': False}
+                send_telegram_message(f"🔄 *Inverted Long [{bearish_score}/{MIN_SCORE}] op {symbol}* | Entry: `{entry}`")
                 last_trade_time[symbol] = time.time()
 
         except Exception as e:
@@ -291,7 +294,7 @@ def run_bot():
 
 if __name__ == "__main__":
     exchange.load_markets()
-    send_telegram_message("🤖 *Trading Bot gestart met Score-Systeem en Max Posities*")
+    send_telegram_message("🤖 *Inverted Trading Bot gestart (Longs/Shorts omgedraaid)*")
     while True:
         run_bot()
         time.sleep(60)
