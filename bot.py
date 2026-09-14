@@ -28,11 +28,13 @@ def send_telegram_message(message):
         except Exception as e:
             print(f"⚠️ Fout bij versturen Telegram bericht: {e}")
 
-# Uitgebreide lijst met populaire munten voor meer kansen
+# Uitgebreide lijst inclusief je nieuwe favorieten
 SYMBOLS = [
     'BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'BNB/USDT:USDT',
     'XRP/USDT:USDT', 'ADA/USDT:USDT', 'DOGE/USDT:USDT', 'AVAX/USDT:USDT',
-    'LINK/USDT:USDT', 'SUI/USDT:USDT', 'NEAR/USDT:USDT', 'PEPE/USDT:USDT'
+    'LINK/USDT:USDT', 'SUI/USDT:USDT', 'NEAR/USDT:USDT', 'PEPE/USDT:USDT',
+    'TRX/USDT:USDT', 'HYPE/USDT:USDT', 'ZEC/USDT:USDT', 'HBAR/USDT:USDT',
+    'SHIB/USDT:USDT', 'THETA/USDT:USDT', 'LTC/USDT:USDT', 'ZALM/USDT:USDT'
 ]
 
 TIMEFRAME = '5m'
@@ -169,7 +171,7 @@ def run_momentum_bot():
 
 if __name__ == "__main__":
     exchange.load_markets()
-    start_msg = "🤖 *Multi-Coin Trend Bot gestart*\n(12 munten actief + Multi-candle filter + 15m Cooldown + Auto TP/SL)"
+    start_msg = "🤖 *Uitgebreide Trend Bot gestart*\n(20 munten actief + Multi-candle filter + 15m Cooldown + Auto TP/SL)"
     print(start_msg)
     send_telegram_message(start_msg)
     
