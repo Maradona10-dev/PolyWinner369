@@ -60,7 +60,7 @@ def calculate_rsi(closes, period=14):
     if down == 0:
         return 100.0
     rs = up / down
-    rsi = 100.data = 100.0 - (100.0 / (1.0 + rs))
+    rsi = 100.0 - (100.0 / (1.0 + rs))
     
     # Eenvoudige Wilder's smoothing voor de rest
     for i in range(period, len(deltas)):
@@ -147,7 +147,6 @@ def run_momentum_bot():
             if has_position:
                 continue
 
-            # Haal voldoende candles op voor RSI (14 periodes + marge) en volume-analyse
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=30)
             if len(ohlcv) < 20:
                 continue
@@ -156,7 +155,7 @@ def run_momentum_bot():
             volumes = np.array([x[5] for x in ohlcv])
             
             current_rsi = calculate_rsi(closes, period=14)
-            avg_volume = np.mean(volumes[-10:-1]) # Gemiddelde van recente volume
+            avg_volume = np.mean(volumes[-10:-1])
             current_volume = volumes[-1]
             
             vol_ratio = current_volume / avg_volume if avg_volume > 0 else 1.0
@@ -177,16 +176,13 @@ def run_momentum_bot():
                 raw_quantity = min_amount
             quantity = exchange.amount_to_precision(symbol, raw_quantity)
 
-            # STRENGE VOORWAARDEN: Momentum + Volume Spike + RSI buiten de extreme gevarenzone
-            is_volume_valid = vol_ratio >= MIN_VOLUME_RATIO
-
-            if pct_change >= MIN_BREAKOUT_PCT and is_volume_valid and current_rsi < 70 and current_rsi > 40:
+            if pct_change >= MIN_BREAKOUT_PCT and vol_ratio >= MIN_VOLUME_RATIO and 40 < current_rsi < 70:
                 exchange.create_market_buy_order(symbol, quantity)
                 msg = f"🔥 *Gefilterde Long Order op {symbol}!*\n• Momentum: `+{pct_change:.2f}%`\n• RSI: `{current_rsi:.1f}`\n• Vol Ratio: `{vol_ratio:.1f}x` (12x)"
                 print(msg)
                 send_telegram_message(msg)
                 
-            elif pct_change <= -MIN_BREAKOUT_PCT and is_volume_valid and current_rsi > 30 and current_rsi < 60:
+            elif pct_change <= -MIN_BREAKOUT_PCT and vol_ratio >= MIN_VOLUME_RATIO and 30 < current_rsi < 60:
                 exchange.create_market_sell_order(symbol, quantity)
                 msg = f"🔥 *Gefilterde Short Order op {symbol}!*\n• Momentum: `{pct_change:.2f}%`\n• RSI: `{current_rsi:.1f}`\n• Vol Ratio: `{vol_ratio:.1f}x` (12x)"
                 print(msg)
