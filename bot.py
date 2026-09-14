@@ -2,7 +2,6 @@ import ccxt
 import time
 import os
 import requests
-import numpy as np
 
 # Verbinding maken met BloFin via CCXT
 exchange = ccxt.blofin({
@@ -53,32 +52,23 @@ last_trade_time = {}
 COOLDOWN_SECONDS = 900  # 15 minuten rust
 
 def calculate_rsi(closes, period=14):
-    deltas = np.diff(closes)
-    seed = deltas[:period]
-    up = seed[seed >= 0].sum() / period
-    down = -seed[seed < 0].sum() / period
-    if down == 0:
-        return 100.0
-    rs = up / down
-    rsi = 100.0 - (100.0 / (1.0 + rs))
+    if len(closes) < period + 1:
+        return 50.0
+    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    gains = [d if d > 0 else 0.0 for d in deltas]
+    losses = [-d if d < 0 else 0.0 for d in deltas]
     
-    # Eenvoudige Wilder's smoothing voor de rest
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    
     for i in range(period, len(deltas)):
-        delta = deltas[i]
-        if delta > 0:
-            upval = delta
-            downval = 0.0
-        else:
-            upval = 0.0
-            downval = -delta
-        up = (up * (period - 1) + upval) / period
-        down = (down * (period - 1) + downval) / period
-        if down == 0:
-            rsi = 100.0
-        else:
-            rs = up / down
-            rsi = 100.0 - (100.0 / (1.0 + rs))
-    return rsi
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
 
 def enforce_leverage_and_margin(symbol):
     try:
@@ -151,11 +141,11 @@ def run_momentum_bot():
             if len(ohlcv) < 20:
                 continue
             
-            closes = np.array([x[4] for x in ohlcv])
-            volumes = np.array([x[5] for x in ohlcv])
+            closes = [x[4] for x in ohlcv]
+            volumes = [x[5] for x in ohlcv]
             
             current_rsi = calculate_rsi(closes, period=14)
-            avg_volume = np.mean(volumes[-10:-1])
+            avg_volume = sum(volumes[-10:-1]) / 9 if len(volumes) >= 10 else 1.0
             current_volume = volumes[-1]
             
             vol_ratio = current_volume / avg_volume if avg_volume > 0 else 1.0
