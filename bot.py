@@ -39,7 +39,7 @@ TIMEFRAME = '5m'
 TRADE_AMOUNT_USD = 5.0  
 LEVERAGE = 12           
 MIN_BREAKOUT_PCT = 0.25 
-MIN_VOLUME_RATIO = 1.5  # Volume moet minstens 1.5x het gemiddelde zijn
+MIN_VOLUME_RATIO = 1.3  # Volume eis
 
 # Fee-gecorrigeerde TP/SL
 TAKER_FEE_PCT = 0.06  
@@ -147,7 +147,6 @@ def run_momentum_bot():
             current_rsi = calculate_rsi(closes, period=14)
             avg_volume = sum(volumes[-10:-1]) / 9 if len(volumes) >= 10 else 1.0
             current_volume = volumes[-1]
-            
             vol_ratio = current_volume / avg_volume if avg_volume > 0 else 1.0
 
             candle = ohlcv[-1]
@@ -166,15 +165,35 @@ def run_momentum_bot():
                 raw_quantity = min_amount
             quantity = exchange.amount_to_precision(symbol, raw_quantity)
 
+            # --- STRATEGIE 1: PULLBACK / REVERSION (Extreme RSI Piek -> Tegen de piek in) ---
+            if current_rsi >= 78 and pct_change >= 0.2:
+                # Extreme piek omhoog -> Trade Short (Down)
+                exchange.create_market_sell_order(symbol, quantity)
+                msg = f"🔄 *Pullback Short op {symbol}!*\n• RSI: `{current_rsi:.1f}` (Extreme Piek)\n• Move: `+{pct_change:.2f}%` (12x)"
+                print(msg)
+                send_telegram_message(msg)
+                last_trade_time[symbol] = time.time()
+                continue
+                
+            elif current_rsi <= 22 and pct_change <= -0.2:
+                # Extreme dip omlaag -> Trade Long (Up)
+                exchange.create_market_buy_order(symbol, quantity)
+                msg = f"🔄 *Pullback Long op {symbol}!*\n• RSI: `{current_rsi:.1f}` (Extreme Dip)\n• Move: `{pct_change:.2f}%` (12x)"
+                print(msg)
+                send_telegram_message(msg)
+                last_trade_time[symbol] = time.time()
+                continue
+
+            # --- STRATEGIE 2: TREND MOMENTUM (Gefilterd met Volume en normale RSI) ---
             if pct_change >= MIN_BREAKOUT_PCT and vol_ratio >= MIN_VOLUME_RATIO and 40 < current_rsi < 70:
                 exchange.create_market_buy_order(symbol, quantity)
-                msg = f"🔥 *Gefilterde Long Order op {symbol}!*\n• Momentum: `+{pct_change:.2f}%`\n• RSI: `{current_rsi:.1f}`\n• Vol Ratio: `{vol_ratio:.1f}x` (12x)"
+                msg = f"🔥 *Trend Long op {symbol}!*\n• Momentum: `+{pct_change:.2f}%`\n• RSI: `{current_rsi:.1f}` | Vol: `{vol_ratio:.1f}x` (12x)"
                 print(msg)
                 send_telegram_message(msg)
                 
             elif pct_change <= -MIN_BREAKOUT_PCT and vol_ratio >= MIN_VOLUME_RATIO and 30 < current_rsi < 60:
                 exchange.create_market_sell_order(symbol, quantity)
-                msg = f"🔥 *Gefilterde Short Order op {symbol}!*\n• Momentum: `{pct_change:.2f}%`\n• RSI: `{current_rsi:.1f}`\n• Vol Ratio: `{vol_ratio:.1f}x` (12x)"
+                msg = f"🔥 *Trend Short op {symbol}!*\n• Momentum: `{pct_change:.2f}%`\n• RSI: `{current_rsi:.1f}` | Vol: `{vol_ratio:.1f}x` (12x)"
                 print(msg)
                 send_telegram_message(msg)
 
@@ -183,7 +202,7 @@ def run_momentum_bot():
 
 if __name__ == "__main__":
     exchange.load_markets()
-    start_msg = "🤖 *Slimme Indicator-Bot gestart*\n(RSI + Volume Ratio + Fee-gecorrigeerde TP/SL)"
+    start_msg = "🤖 *Gecombineerde Bot gestart*\n(Trend Momentum + Pullback Reversion + Fee-gecorrigeerde TP/SL)"
     print(start_msg)
     send_telegram_message(start_msg)
     
