@@ -28,7 +28,7 @@ def send_telegram_message(message):
         except Exception as e:
             print(f"⚠️ Fout bij versturen Telegram bericht: {e}")
 
-# Uitgebreide lijst inclusief je nieuwe favorieten
+# Uitgebreide lijst met 20 actieve munten
 SYMBOLS = [
     'BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'BNB/USDT:USDT',
     'XRP/USDT:USDT', 'ADA/USDT:USDT', 'DOGE/USDT:USDT', 'AVAX/USDT:USDT',
@@ -42,9 +42,14 @@ TRADE_AMOUNT_USD = 5.0
 LEVERAGE = 12           
 MIN_BREAKOUT_PCT = 0.25 
 
-# Winst en verlies doelen
-TAKE_PROFIT_PCT = 0.8   
-STOP_LOSS_PCT = 0.5     
+# ============================================================
+# FEE-GECORRIGEERDE TP/SL INSTELLINGEN
+# ============================================================
+TAKER_FEE_PCT = 0.06  # BloFin standaard taker fee per kant, in %
+FEE_DRAG_PCT = round(2 * TAKER_FEE_PCT * LEVERAGE, 3)  # round-trip fee-drag op PnL%-schaal (1.44%)
+
+TAKE_PROFIT_PCT = 3.0   # Netto na fees: ~+1.56%
+STOP_LOSS_PCT = 2.0     # Netto na fees: ~-3.44%
 
 # Cooldown bijhouden per munt
 last_trade_time = {}
@@ -85,11 +90,11 @@ def manage_open_positions():
                 pnl_pct = ((entry_price - current_price) / entry_price) * 100 * LEVERAGE
                 
             if pnl_pct >= TAKE_PROFIT_PCT:
-                close_position(symbol, side, contracts, f"🎯 *Take-Profit bereikt op {symbol}!*\nPnL: `+{pnl_pct:.2f}%`\nInstap: `{entry_price}` | Uitstap: `{current_price}`")
+                close_position(symbol, side, contracts, f"🎯 *Take-Profit bereikt op {symbol}!*\nPnL (bruto): `+{pnl_pct:.2f}%` | Netto na fees: `~+{pnl_pct - FEE_DRAG_PCT:.2f}%`\nInstap: `{entry_price}` | Uitstap: `{current_price}`")
                 last_trade_time[symbol] = time.time()
                 
             elif pnl_pct <= -STOP_LOSS_PCT:
-                close_position(symbol, side, contracts, f"🛑 *Stop-Loss ingegrepen op {symbol}!*\nPnL: `{pnl_pct:.2f}%`\nInstap: `{entry_price}` | Uitstap: `{current_price}`")
+                close_position(symbol, side, contracts, f"🛑 *Stop-Loss ingegrepen op {symbol}!*\nPnL (bruto): `{pnl_pct:.2f}%` | Netto na fees: `~{pnl_pct - FEE_DRAG_PCT:.2f}%`\nInstap: `{entry_price}` | Uitstap: `{current_price}`")
                 last_trade_time[symbol] = time.time()
                 
     except Exception as e:
@@ -156,13 +161,13 @@ def run_momentum_bot():
 
             if (c2_bullish and c3_bullish) and pct_change >= MIN_BREAKOUT_PCT:
                 exchange.create_market_buy_order(symbol, quantity)
-                success_msg = f"✅ *Trend Long Order op {symbol}!*\nMomentum: `+{pct_change:.2f}%` (3-candle trend) | Prijs: `{current_price}` (12x)"
+                success_msg = f"✅ *Trend Long Order op {symbol}!*\nMomentum: `+{pct_change:.2f}%` (3-candle trend) | Prijs: `{current_price}` ({LEVERAGE}x)\nTP: `{TAKE_PROFIT_PCT}%` (netto ~+{TAKE_PROFIT_PCT - FEE_DRAG_PCT:.2f}%) | SL: `{STOP_LOSS_PCT}%`"
                 print(success_msg)
                 send_telegram_message(success_msg)
                 
             elif (c2_bearish and c3_bearish) and pct_change <= -MIN_BREAKOUT_PCT:
                 exchange.create_market_sell_order(symbol, quantity)
-                success_msg = f"✅ *Trend Short Order op {symbol}!*\nMomentum: `{pct_change:.2f}%` (3-candle trend) | Prijs: `{current_price}` (12x)"
+                success_msg = f"✅ *Trend Short Order op {symbol}!*\nMomentum: `{pct_change:.2f}%` (3-candle trend) | Prijs: `{current_price}` ({LEVERAGE}x)\nTP: `{TAKE_PROFIT_PCT}%` (netto ~+{TAKE_PROFIT_PCT - FEE_DRAG_PCT:.2f}%) | SL: `{STOP_LOSS_PCT}%`"
                 print(success_msg)
                 send_telegram_message(success_msg)
 
@@ -171,7 +176,15 @@ def run_momentum_bot():
 
 if __name__ == "__main__":
     exchange.load_markets()
-    start_msg = "🤖 *Uitgebreide Trend Bot gestart*\n(20 munten actief + Multi-candle filter + 15m Cooldown + Auto TP/SL)"
+    breakeven_wr = round(100 * (STOP_LOSS_PCT + FEE_DRAG_PCT) / ((STOP_LOSS_PCT + FEE_DRAG_PCT) + (TAKE_PROFIT_PCT - FEE_DRAG_PCT)), 1)
+    start_msg = (
+        f"🤖 *Uitgebreide Trend Bot gestart (fee-gecorrigeerd)*\n"
+        f"(20 munten actief + Multi-candle filter + 15m Cooldown + Auto TP/SL)\n\n"
+        f"📐 Fee-drag per trade: `{FEE_DRAG_PCT:.2f}%`\n"
+        f"🎯 TP: `{TAKE_PROFIT_PCT}%` bruto → netto ~`+{TAKE_PROFIT_PCT - FEE_DRAG_PCT:.2f}%`\n"
+        f"🛑 SL: `{STOP_LOSS_PCT}%` bruto → netto ~`-{STOP_LOSS_PCT + FEE_DRAG_PCT:.2f}%`\n"
+        f"⚖ Benodigde breakeven win rate: `~{breakeven_wr}%`"
+    )
     print(start_msg)
     send_telegram_message(start_msg)
     
