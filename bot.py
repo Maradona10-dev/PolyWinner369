@@ -28,8 +28,13 @@ def send_telegram_message(message):
         except Exception as e:
             print(f"⚠️ Fout bij versturen Telegram bericht: {e}")
 
-# Strategie instellingen met Trend-filter voor de 5m chart
-SYMBOLS = ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'BNB/USDT:USDT']
+# Uitgebreide lijst met populaire munten voor meer kansen
+SYMBOLS = [
+    'BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'BNB/USDT:USDT',
+    'XRP/USDT:USDT', 'ADA/USDT:USDT', 'DOGE/USDT:USDT', 'AVAX/USDT:USDT',
+    'LINK/USDT:USDT', 'SUI/USDT:USDT', 'NEAR/USDT:USDT', 'PEPE/USDT:USDT'
+]
+
 TIMEFRAME = '5m'
 TRADE_AMOUNT_USD = 5.0  
 LEVERAGE = 12           
@@ -116,13 +121,10 @@ def run_momentum_bot():
             if has_position:
                 continue
 
-            # Haal meerdere candles op om de trend te controleren (laatste 4 candles)
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=4)
             if len(ohlcv) < 4:
                 continue
             
-            # Trend-filter: controleer of de laatste 3 afgesloten candles dezelfde richting op bewegen
-            # Dit voorkomt dat we handelen op een enkele valse uitbraak (whipsaw)
             c1, c2, c3 = ohlcv[-3], ohlcv[-2], ohlcv[-1]
             
             c1_bullish = c1[4] > c1[1]
@@ -150,14 +152,12 @@ def run_momentum_bot():
 
             quantity = exchange.amount_to_precision(symbol, raw_quantity)
 
-            # Alleen long gaan als de laatste candles consistent meetrekken én de drempel haalt
             if (c2_bullish and c3_bullish) and pct_change >= MIN_BREAKOUT_PCT:
                 exchange.create_market_buy_order(symbol, quantity)
                 success_msg = f"✅ *Trend Long Order op {symbol}!*\nMomentum: `+{pct_change:.2f}%` (3-candle trend) | Prijs: `{current_price}` (12x)"
                 print(success_msg)
                 send_telegram_message(success_msg)
                 
-            # Alleen short gaan bij consistente neerwaartse trend candles
             elif (c2_bearish and c3_bearish) and pct_change <= -MIN_BREAKOUT_PCT:
                 exchange.create_market_sell_order(symbol, quantity)
                 success_msg = f"✅ *Trend Short Order op {symbol}!*\nMomentum: `{pct_change:.2f}%` (3-candle trend) | Prijs: `{current_price}` (12x)"
@@ -169,7 +169,7 @@ def run_momentum_bot():
 
 if __name__ == "__main__":
     exchange.load_markets()
-    start_msg = "🤖 *Trend-gebaseerde Momentum Bot gestart*\n(Multi-candle filter + 15m Cooldown + Auto TP/SL)"
+    start_msg = "🤖 *Multi-Coin Trend Bot gestart*\n(12 munten actief + Multi-candle filter + 15m Cooldown + Auto TP/SL)"
     print(start_msg)
     send_telegram_message(start_msg)
     
