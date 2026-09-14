@@ -28,29 +28,31 @@ def send_telegram_message(message):
         except Exception as e:
             print(f"⚠️ Fout bij versturen Telegram bericht: {e}")
 
-# Instellingen voor de bot
+# Slimme instellingen om overtrading tegen te gaan
 SYMBOLS = ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'BNB/USDT:USDT']
 TIMEFRAME = '5m'
 TRADE_AMOUNT_USD = 5.0  # Inzet per trade
 LEVERAGE = 12           # Hefboom van 12x
-MIN_BREAKOUT_PCT = 0.05 # Momentum drempelwaarde
+MIN_BREAKOUT_PCT = 0.25 # Pas handelen bij een koerssprong van minstens 0.25%
 
-# Doelstellingen voor automatische winst en verlies (in percentages)
-TAKE_PROFIT_PCT = 0.4   # Winstdoel: 0.4%
-STOP_LOSS_PCT = 0.3     # Verlieslimiet: 0.3%
+# Winst en verlies doelen (in % rendement)
+TAKE_PROFIT_PCT = 0.8   # Winstdoel
+STOP_LOSS_PCT = 0.5     # Verlieslimiet
+
+# Cooldown bijhouden per munt (zodat hij niet direct weer instapt)
+last_trade_time = {}
+COOLDOWN_SECONDS = 900  # 15 minuten rust na sluiten van een trade
 
 def enforce_leverage_and_margin(symbol):
     try:
-        # Forceer Isolated margin en 12x hefboom
         exchange.set_margin_mode('isolated', symbol)
         exchange.set_leverage(LEVERAGE, symbol)
     except Exception as e:
-        print(f"⚠️ Kon margin/hefboom niet instellen voor {symbol}: {e}")
+        pass
 
 def manage_open_positions():
     """Controleert open posities en sluit ze automatisch bij bereiken van TP of SL"""
     try:
-        balance = exchange.fetch_balance()
         positions = exchange.fetch_positions()
         
         for pos in positions:
@@ -71,20 +73,20 @@ def manage_open_positions():
             ticker = exchange.fetch_ticker(symbol)
             current_price = ticker['last']
             
-            # Bereken percentage winst/verlies inclusief hefboom
+            # Bereken rendement inclusief hefboom
             if side == 'long':
                 pnl_pct = ((current_price - entry_price) / entry_price) * 100 * LEVERAGE
-            else:  # short
+            else:  
                 pnl_pct = ((entry_price - current_price) / entry_price) * 100 * LEVERAGE
                 
-            # Actie ondernemen bij behalen van TP of SL
+            # Actie bij behalen doel
             if pnl_pct >= TAKE_PROFIT_PCT:
-                print(f"🎯 Take-Profit geraakt voor {symbol} ({pnl_pct:.2f}%). Positie sluiten...")
                 close_position(symbol, side, contracts, f"🎯 *Take-Profit bereikt op {symbol}!*\nPnL: `+{pnl_pct:.2f}%`\nInstap: `{entry_price}` | Uitstap: `{current_price}`")
+                last_trade_time[symbol] = time.time()
                 
             elif pnl_pct <= -STOP_LOSS_PCT:
-                print(f"🛑 Stop-Loss geraakt voor {symbol} ({pnl_pct:.2f}%). Positie sluiten...")
                 close_position(symbol, side, contracts, f"🛑 *Stop-Loss ingegrepen op {symbol}!*\nPnL: `{pnl_pct:.2f}%`\nInstap: `{entry_price}` | Uitstap: `{current_price}`")
+                last_trade_time[symbol] = time.time()
                 
     except Exception as e:
         print(f"⚠️ Fout bij beheren open posities: {e}")
@@ -102,15 +104,20 @@ def close_position(symbol, side, contracts, telegram_msg):
         print(f"⚠️ Fout bij sluiten positie {symbol}: {e}")
 
 def run_momentum_bot():
-    # Stap 1: Beheer eerst de actieve posities (TP/SL checks)
+    # Stap 1: Beheer actieve posities
     manage_open_positions()
 
-    # Stap 2: Scan op nieuwe momentums
+    # Stap 2: Zoek naar nieuwe kansen met strengere filters
     for symbol in SYMBOLS:
         try:
+            # Check of de munt in cooldown zit
+            if symbol in last_trade_time:
+                if time.time() - last_trade_time[symbol] < COOLDOWN_SECONDS:
+                    continue
+
             enforce_leverage_and_margin(symbol)
 
-            # Kijk of we al een open positie hebben voor deze munt; zo ja, open geen nieuwe
+            # Heeft deze munt al een open positie? Sla dan over.
             positions = exchange.fetch_positions([symbol])
             has_position = any(float(p.get('contracts', 0)) > 0 for p in positions)
             if has_position:
@@ -144,20 +151,14 @@ def run_momentum_bot():
             quantity = exchange.amount_to_precision(symbol, raw_quantity)
 
             if pct_change >= MIN_BREAKOUT_PCT:
-                msg = f"🚀 *[{symbol}]* Bullish momentum ({pct_change:.2f}%).\nLong openen met {LEVERAGE}x hefboom..."
-                print(msg)
-                
                 exchange.create_market_buy_order(symbol, quantity)
-                success_msg = f"✅ *Long Order geplaatst op {symbol}!*\nHoeveelheid: `{quantity}` | Prijs: `{current_price}` (12x Isolated)"
+                success_msg = f"✅ *Sterke Long Order op {symbol}!*\nMomentum: `+{pct_change:.2f}%` | Prijs: `{current_price}` (12x Isolated)"
                 print(success_msg)
                 send_telegram_message(success_msg)
                 
             elif pct_change <= -MIN_BREAKOUT_PCT:
-                msg = f"🔻 *[{symbol}]* Bearish momentum ({pct_change:.2f}%).\nShort openen met {LEVERAGE}x hefboom..."
-                print(msg)
-                
                 exchange.create_market_sell_order(symbol, quantity)
-                success_msg = f"✅ *Short Order geplaatst op {symbol}!*\nHoeveelheid: `{quantity}` | Prijs: `{current_price}` (12x Isolated)"
+                success_msg = f"✅ *Sterke Short Order op {symbol}!*\nMomentum: `{pct_change:.2f}%` | Prijs: `{current_price}` (12x Isolated)"
                 print(success_msg)
                 send_telegram_message(success_msg)
 
@@ -166,10 +167,10 @@ def run_momentum_bot():
 
 if __name__ == "__main__":
     exchange.load_markets()
-    start_msg = "🤖 *Slimme Momentum Bot gestart*\n(12x Isolated Hefboom + Auto TP/SL + Telegram Meldingen)"
+    start_msg = "🤖 *Geoptimaliseerde Momentum Bot gestart*\n(Filter: 0.25% breuk + 15m Cooldown + Auto TP/SL)"
     print(start_msg)
     send_telegram_message(start_msg)
     
     while True:
         run_momentum_bot()
-        time.sleep(60)  # Controleert nu elke minuut de posities en markten
+        time.sleep(60)
