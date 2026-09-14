@@ -38,10 +38,11 @@ SYMBOLS = [
 LEVERAGE = 12           
 MIN_VOLUME_RATIO = 1.3  
 
-# ATR & Risk Management parameters
+# ATR & Risk Management parameters (Elite v4)
 ATR_PERIOD = 14
-ATR_SL_MULTIPLIER = 1.5   
-ATR_TP_MULTIPLIER = 3.0   
+ATR_SL_MULTIPLIER = 1.5   # Stop-loss op 1.5x ATR
+ATR_TP_MULTIPLIER = 3.0   # Take-profit op 3.0x ATR
+PARTIAL_TP_R = 1.4        # Partial TP op 1.4R
 BASE_RISK_USD = 5.0       
 
 # Fee drag administratie
@@ -51,7 +52,8 @@ FEE_DRAG_PCT = round(2 * TAKER_FEE_PCT * LEVERAGE, 3)
 last_trade_time = {}
 COOLDOWN_SECONDS = 900  # 15 minuten rust per munt
 
-partial_tp_done = {}
+# State tracking per actieve trade (bevat entry price, entry ATR, side, partial status)
+trade_states = {}
 
 def calculate_rsi(closes, period=14):
     if len(closes) < period + 1:
@@ -101,9 +103,15 @@ def enforce_leverage_and_margin(symbol):
     except Exception as e:
         pass
 
-def manage_open_positions_with_smart_exits():
+def manage_open_positions_elite_v4():
+    """
+    Beheert open posities op basis van opgeslagen entry-states, 
+    echte ATR-afstanden, R-multiples, automatische breakeven en schone state-cleanup.
+    """
     try:
         positions = exchange.fetch_positions()
+        active_exchange_symbols = []
+
         for pos in positions:
             contracts = float(pos.get('contracts', 0))
             if contracts == 0:
@@ -111,51 +119,89 @@ def manage_open_positions_with_smart_exits():
             symbol = pos.get('symbol')
             if symbol not in SYMBOLS:
                 continue
-                
+            
+            active_exchange_symbols.append(symbol)
             entry_price = float(pos.get('entryPrice', 0))
             side = pos.get('side')
             if entry_price == 0:
                 continue
-                
+
+            # Als de trade nog niet in onze state staat (bijv. na bot restart), initialiseer veilig
+            if symbol not in trade_states:
+                # Vraag snelle ATR op als fallback
+                ohlcv = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=20)
+                fallback_atr = calculate_atr(ohlcv, ATR_PERIOD) if len(ohlcv) >= 20 else (entry_price * 0.01)
+                trade_states[symbol] = {
+                    'entry_price': entry_price,
+                    'entry_atr': fallback_atr,
+                    'side': side,
+                    'partial_done': False,
+                    'breakeven_active': False
+                }
+
+            state = trade_states[symbol]
             ticker = exchange.fetch_ticker(symbol)
             current_price = ticker['last']
-            
-            if symbol not in partial_tp_done:
-                partial_tp_done[symbol] = False
 
-            if side == 'long':
+            # Bereken risico-afstand (R) op basis van de ATR bij entry
+            r_distance = state['entry_atr'] * ATR_SL_MULTIPLIER
+            tp_distance = state['entry_atr'] * ATR_TP_MULTIPLIER
+
+            if state['side'] == 'long':
                 pnl_pct = ((current_price - entry_price) / entry_price) * 100 * LEVERAGE
-                price_gain_pct = ((current_price - entry_price) / entry_price) * 100
-            else:  
-                pnl_pct = ((entry_price - current_price) / entry_price) * 100 * LEVERAGE
-                price_gain_pct = ((entry_price - current_price) / entry_price) * 100
+                price_move = current_price - entry_price
+                current_r = price_move / r_distance if r_distance > 0 else 0
+                
+                stop_loss_price = entry_price if state['breakeven_active'] else (entry_price - r_distance)
+                take_profit_price = entry_price + tp_distance
+                
+                hit_sl = current_price <= stop_loss_price
+                hit_tp = current_price >= take_profit_price
 
-            # Partial Take-Profit (50% sluiten bij 1.5% koerswinst)
-            if price_gain_pct >= 1.5 and not partial_tp_done[symbol]:
+            else: # short
+                pnl_pct = ((entry_price - current_price) / entry_price) * 100 * LEVERAGE
+                price_move = entry_price - current_price
+                current_r = price_move / r_distance if r_distance > 0 else 0
+                
+                stop_loss_price = entry_price if state['breakeven_active'] else (entry_price + r_distance)
+                take_profit_price = entry_price - tp_distance
+                
+                hit_sl = current_price >= stop_loss_price
+                hit_tp = current_price <= take_profit_price
+
+            # 1. Partial TP op 1.4R (50% sluiten + Breakeven activeren)
+            if current_r >= PARTIAL_TP_R and not state['partial_done']:
                 half_contracts = contracts / 2
                 market = exchange.market(symbol)
                 min_amount = market['limits']['amount']['min']
                 
                 if half_contracts >= min_amount:
                     precision_contracts = exchange.amount_to_precision(symbol, half_contracts)
-                    if side == 'long':
+                    if state['side'] == 'long':
                         exchange.create_market_sell_order(symbol, precision_contracts, {'reduceOnly': True})
                     else:
-                        exchange.create_market_buy_order(symbol, precision_contracts, {'reduceOnly': True})  # Syntax hersteld!
+                        exchange.create_market_buy_order(symbol, precision_contracts, {'reduceOnly': True})
                     
-                    partial_tp_done[symbol] = True
-                    msg = f"🛡️ *Partial TP (50%) bereikt op {symbol}!*\n• Breakeven lock-in geactiveerd.\n• Bruto PnL: `+{pnl_pct:.2f}%`"
+                    state['partial_done'] = True
+                    state['breakeven_active'] = True
+                    msg = f"🛡️ *Partial TP (50%) op {symbol} bereikt ({current_r:.2f}R)*\n• Stop-loss verplaatst naar Breakeven."
                     print(msg)
                     send_telegram_message(msg)
 
-            # Volledige Take-Profit / Stop-Loss
-            if pnl_pct >= 4.0:
-                close_full_position(symbol, side, contracts, f"🎯 *Volledige Take-Profit op {symbol}!*\n• Bruto PnL: `+{pnl_pct:.2f}%` | Netto: `~+{pnl_pct - FEE_DRAG_PCT:.2f}%`")
-            elif pnl_pct <= -2.5: 
-                close_full_position(symbol, side, contracts, f"🛑 *Stop-Loss ingegrepen op {symbol}!*\n• Bruto PnL: `{pnl_pct:.2f}%` | Netto: `~{pnl_pct - FEE_DRAG_PCT:.2f}%`")
+            # 2. Volledige Take-Profit of Stop-Loss bereikt
+            if hit_tp:
+                close_full_position(symbol, state['side'], contracts, f"🎯 *ATR Take-Profit bereikt op {symbol}!*\n• Bruto PnL: `+{pnl_pct:.2f}%` | Netto: `~+{pnl_pct - FEE_DRAG_PCT:.2f}%`")
+            elif hit_sl:
+                sl_type = "Breakeven" if state['breakeven_active'] else "ATR Stop-Loss"
+                close_full_position(symbol, state['side'], contracts, f"🛑 *{sl_type} getriggerd op {symbol}!*\n• Bruto PnL: `{pnl_pct:.2f}%` | Netto: `~{pnl_pct - FEE_DRAG_PCT:.2f}%`")
+
+        # Ruim state op als posities extern/handmatig zijn gesloten op de exchange
+        closed_symbols = [s for s in trade_states if s not in active_exchange_symbols]
+        for s in closed_symbols:
+            del trade_states[s]
 
     except Exception as e:
-        print(f"⚠️ Fout bij beheren open posities: {e}")
+        print(f"⚠️ Fout bij beheren open posities (v4): {e}")
 
 def close_full_position(symbol, side, contracts, telegram_msg):
     try:
@@ -166,13 +212,13 @@ def close_full_position(symbol, side, contracts, telegram_msg):
         print(telegram_msg)
         send_telegram_message(telegram_msg)
         last_trade_time[symbol] = time.time()
-        if symbol in partial_tp_done:
-            del partial_tp_done[symbol]
+        if symbol in trade_states:
+            del trade_states[symbol]
     except Exception as e:
         print(f"⚠️ Fout bij sluiten positie {symbol}: {e}")
 
-def run_elite_bot():
-    manage_open_positions_with_smart_exits()
+def run_elite_v4_bot():
+    manage_open_positions_elite_v4()
 
     for symbol in SYMBOLS:
         try:
@@ -182,16 +228,15 @@ def run_elite_bot():
 
             enforce_leverage_and_margin(symbol)
 
-            positions = exchange.fetch_positions([symbol])
-            has_position = any(float(p.get('contracts', 0)) > 0 for p in positions)
-            if has_position:
+            if symbol in trade_states:
                 continue
 
+            # Data ophalen: 1h, 15m, 5m voor robuuste multi-timeframe context
             ohlcv_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=30)
             ohlcv_15m = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=30)
             ohlcv_5m = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=30)
             
-            if len(ohlcv_1h) < 20 or len(ohlcv_15m) < 20 or len(ohlcv_5m) < 20:
+            if len(ohlcv_1h) < 20 or len(ohlcv_15m) < 20 or len(ohlcv_20 := ohlcv_5m) < 20:
                 continue
             
             closes_1h = [x[4] for x in ohlcv_1h]
@@ -212,14 +257,18 @@ def run_elite_bot():
             current_volume = volumes_5m[-1]
             vol_ratio = current_volume / avg_volume if avg_volume > 0 else 1.0
 
-            candle = ohlcv_5m[-1]
-            open_price = float(candle[1])
-            close_price = float(candle[4])
-            pct_change = ((close_price - open_price) / open_price) * 100
+            # Lichte pullback / stabiliteitsfilter in plaats van blinde breakout chase
+            prev_candle_close = ohlcv_5m[-2][4]
+            prev_candle_open = ohlcv_5m[-2][1]
+            current_candle_open = ohlcv_5m[-1][1]
+            current_candle_close = ohlcv_5m[-1][4]
+            
+            pct_change = ((current_candle_close - current_candle_open) / current_candle_open) * 100
             
             ticker = exchange.fetch_ticker(symbol)
             current_price = ticker['last']
             
+            # Volatility-Adjusted Sizing
             atr_percentage = (current_atr / current_price) * 100 if current_price > 0 else 1.0
             dynamic_multiplier = max(0.5, min(2.0, 1.0 / (atr_percentage if atr_percentage > 0 else 1.0)))
             adjusted_notional = BASE_RISK_USD * LEVERAGE * dynamic_multiplier
@@ -234,16 +283,37 @@ def run_elite_bot():
             is_bullish_confluence = trend_1h_bullish and trend_15m_bullish
             is_bearish_confluence = not trend_1h_bullish and not trend_15m_bullish
 
-            if is_bullish_confluence and vol_ratio >= MIN_VOLUME_RATIO and 45 < current_rsi < 65 and pct_change > 0.1:
-                exchange.create_market_buy_order(symbol, quantity)
-                msg = f"💎 *Elite Multi-TF Long op {symbol}!*\n• Trend (1h+15m): `Bullish`\n• ATR: `{current_atr:.4f}` | Vol: `{vol_ratio:.1f}x`"
+            # Entry met bevestiging (geen extreme uitschieters die al weg zijn, maar sterke trend + volume)
+            if is_bullish_confluence and vol_ratio >= MIN_VOLUME_RATIO and 45 < current_rsi < 62 and -0.2 < pct_change < 0.8:
+                order = exchange.create_market_buy_order(symbol, quantity)
+                actual_entry = float(order.get('average', current_price) or current_price)
+                
+                trade_states[symbol] = {
+                    'entry_price': actual_entry,
+                    'entry_atr': current_atr,
+                    'side': 'long',
+                    'partial_done': False,
+                    'breakeven_active': False
+                }
+                
+                msg = f"💎 *Elite v4 Long op {symbol}!*\n• Entry: `{actual_entry}`\n• ATR: `{current_atr:.4f}` | Vol: `{vol_ratio:.1f}x`"
                 print(msg)
                 send_telegram_message(msg)
                 last_trade_time[symbol] = time.time()
                 
-            elif is_bearish_confluence and vol_ratio >= MIN_VOLUME_RATIO and 35 < current_rsi < 55 and pct_change < -0.1:
-                exchange.create_market_sell_order(symbol, quantity)
-                msg = f"💎 *Elite Multi-TF Short op {symbol}!*\n• Trend (1h+15m): `Bearish`\n• ATR: `{current_atr:.4f}` | Vol: `{vol_ratio:.1f}x`"
+            elif is_bearish_confluence and vol_ratio >= MIN_VOLUME_RATIO and 38 < current_rsi < 55 and -0.8 < pct_change < 0.2:
+                order = exchange.create_market_sell_order(symbol, quantity)
+                actual_entry = float(order.get('average', current_price) or current_price)
+                
+                trade_states[symbol] = {
+                    'entry_price': actual_entry,
+                    'entry_atr': current_atr,
+                    'side': 'short',
+                    'partial_done': False,
+                    'breakeven_active': False
+                }
+                
+                msg = f"💎 *Elite v4 Short op {symbol}!*\n• Entry: `{actual_entry}`\n• ATR: `{current_atr:.4f}` | Vol: `{vol_ratio:.1f}x`"
                 print(msg)
                 send_telegram_message(msg)
                 last_trade_time[symbol] = time.time()
@@ -253,10 +323,10 @@ def run_elite_bot():
 
 if __name__ == "__main__":
     exchange.load_markets()
-    start_msg = "🚀 *Elite Trading Bot v3.1 gestart*\n(Syntax opgelost + ATR-risicomanagement + Partial TP)"
+    start_msg = "🚀 *Elite Trading Bot v4 gestart*\n(Echte ATR-state tracking + 1.4R Partial TP + Breakeven + Stricter filters)"
     print(start_msg)
     send_telegram_message(start_msg)
     
     while True:
-        run_elite_bot()
+        run_elite_v4_bot()
         time.sleep(60)
