@@ -20,14 +20,26 @@ PAPER_TRADING = os.environ.get("PAPER_TRADING", "True").lower() == "true"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+# Juiste symbolen voor BloFin perpetual futures
 SYMBOLS = [
-    "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT",
-    "XRP/USDT", "ADA/USDT", "DOGE/USDT", "AVAX/USDT",
-    "ZEC/USDT", "XLM/USDT", "HBAR/USDT", "XMR/USDT",
-    "TRX/USDT", "THETA/USDT", "LTC/USDT"
+    "BTC/USDT:USDT",
+    "ETH/USDT:USDT",
+    "SOL/USDT:USDT",
+    "BNB/USDT:USDT",
+    "XRP/USDT:USDT",
+    "ADA/USDT:USDT",
+    "DOGE/USDT:USDT",
+    "AVAX/USDT:USDT",
+    "ZEC/USDT:USDT",
+    "XLM/USDT:USDT",
+    "HBAR/USDT:USDT",
+    "XMR/USDT:USDT",
+    "TRX/USDT:USDT",
+    "THETA/USDT:USDT",
+    "LTC/USDT:USDT"
 ]
 
-# Timeframes & Strategie Parameters
+# Strategie parameters
 TIMEFRAME_ENTRY = "1m"
 TIMEFRAME_FILTER = "5m"
 
@@ -35,7 +47,7 @@ LOOKBACK = 50
 ZONE_ATR_MULT = 0.6
 MIN_BREAK_ATR = 1.4
 RR_RATIO = 2.0
-RISK_PER_TRADE = 0.005
+RISK_PER_TRADE = 0.005          # 0.5% risico per trade
 ATR_LENGTH = 14
 EMA_FILTER_LENGTH = 20
 SCAN_INTERVAL = 12
@@ -77,16 +89,15 @@ class BreakRetestBot:
             "secret": API_SECRET,
             "password": API_PASSWORD,
             "enableRateLimit": True,
-            "options": {"defaultType": "future"}
+            "options": {"defaultType": "swap"}  # Cruciaal voor BloFin swaps/perpetuals
         })
 
-        # Belangrijk: Markets inladen voor BloFin zodat symbolen herkend worden
-        logger.info("Bezig met inladen van exchange markten (load_markets)...")
+        # Markets laden
         try:
             self.exchange.load_markets()
-            logger.info("Markten succesvol ingeladen!")
+            logger.info(f"Markets geladen. Aantal beschikbare markten: {len(self.exchange.markets)}")
         except Exception as e:
-            logger.error(f"Fout bij load_markets: {e}")
+            logger.error(f"Kon markets niet laden: {e}")
 
         self.state: Dict[str, dict] = {}
         for symbol in SYMBOLS:
@@ -94,7 +105,7 @@ class BreakRetestBot:
                 "direction": None,          # "long" of "short"
                 "broke_out": False,
                 "zone": None,               # (bottom, top)
-                "level": None,              # originele break level
+                "level": None,
                 "break_time": None,
                 "in_position": False
             }
@@ -112,9 +123,7 @@ class BreakRetestBot:
             return None
 
     def get_higher_tf_bias(self, symbol: str) -> Optional[str]:
-        """
-        Geeft terug: "bullish", "bearish" of None
-        """
+        """Geeft 'bullish', 'bearish' of None terug"""
         df = self.fetch_ohlcv(symbol, TIMEFRAME_FILTER, limit=50)
         if df is None or len(df) < EMA_FILTER_LENGTH + 5:
             return None
@@ -149,15 +158,13 @@ class BreakRetestBot:
 
         resistance = None
         for i in range(len(df) - 8, 8, -1):
-            window = highs[i-7:i+8]
-            if highs[i] == max(window) and highs[i] > highs[i-3] and highs[i] > highs[i+3]:
+            if highs[i] == max(highs[i-7:i+8]) and highs[i] > highs[i-3] and highs[i] > highs[i+3]:
                 resistance = highs[i]
                 break
 
         support = None
         for i in range(len(df) - 8, 8, -1):
-            window = lows[i-7:i+8]
-            if lows[i] == min(window) and lows[i] < lows[i-3] and lows[i] < lows[i+3]:
+            if lows[i] == min(lows[i-7:i+8]) and lows[i] < lows[i-3] and lows[i] < lows[i+3]:
                 support = lows[i]
                 break
 
@@ -195,7 +202,7 @@ class BreakRetestBot:
                     "break_time": datetime.now()
                 })
                 send_telegram(
-                    f"🚀 <b>LONG BREAKOUT [BloFin]</b> {symbol}\n"
+                    f"🚀 <b>LONG BREAKOUT</b> {symbol}\n"
                     f"Resistance: <code>{resistance:.4f}</code>\n"
                     f"Zone: {zone[0]:.4f} - {zone[1]:.4f}"
                 )
@@ -220,7 +227,7 @@ class BreakRetestBot:
                     "break_time": datetime.now()
                 })
                 send_telegram(
-                    f"🔻 <b>SHORT BREAKDOWN [BloFin]</b> {symbol}\n"
+                    f"🔻 <b>SHORT BREAKDOWN</b> {symbol}\n"
                     f"Support: <code>{support:.4f}</code>\n"
                     f"Zone: {zone[0]:.4f} - {zone[1]:.4f}"
                 )
@@ -231,7 +238,7 @@ class BreakRetestBot:
             zone_bottom, zone_top = state["zone"]
             direction = state["direction"]
 
-            # Extra check: HTF bias moet nog kloppen
+            # HTF bias moet nog kloppen
             if direction == "long" and htf_bias != "bullish":
                 return None
             if direction == "short" and htf_bias != "bearish":
@@ -346,7 +353,6 @@ class BreakRetestBot:
 
         # ========== LIVE ORDERS ==========
         try:
-            # 1. Market entry
             entry_order = self.exchange.create_order(
                 symbol=symbol,
                 type="market",
@@ -355,7 +361,6 @@ class BreakRetestBot:
             )
             logger.info(f"Market {side} geplaatst: {entry_order.get('id')}")
 
-            # 2. Stop Loss
             sl_order = self.exchange.create_order(
                 symbol=symbol,
                 type="STOP_MARKET",
@@ -368,7 +373,6 @@ class BreakRetestBot:
             )
             logger.info(f"Stop Loss geplaatst: {sl_order.get('id')}")
 
-            # 3. Take Profit
             tp_order = self.exchange.create_order(
                 symbol=symbol,
                 type="LIMIT",
