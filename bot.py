@@ -290,9 +290,12 @@ class BreakRetestBot:
             calculated_amount = MAX_RISK_USDT / risk_per_unit
             market = self.exchange.market(symbol)
             min_amount = market['limits']['amount']['min']
+            max_amount = market['limits']['amount'].get('max', float('inf'))
             
             if calculated_amount < min_amount:
                 calculated_amount = min_amount
+            if max_amount and calculated_amount > max_amount:
+                calculated_amount = max_amount
             
             return float(self.exchange.amount_to_precision(symbol, calculated_amount))
         except Exception as e:
@@ -327,7 +330,6 @@ class BreakRetestBot:
         symbol = setup["symbol"]
         direction = setup["direction"]
         
-        # Opgelost: Altijd netjes converteren naar normale Python floats i.p.v. numpy.float64
         entry = float(setup["entry"])
         stop = float(setup["stop"])
         target = float(setup["target"])
@@ -362,16 +364,19 @@ class BreakRetestBot:
             except Exception:
                 pass
 
+            # Open market order
             entry_order = self.exchange.create_order(symbol=symbol, type="market", side=side, amount=amount)
             
+            # Stop Loss (gebruik market met stopLossPrice i.p.v. STOP_MARKET)
             self.exchange.create_order(
-                symbol=symbol, type="STOP_MARKET", side=side_close, amount=amount,
-                params={"stopPrice": stop, "reduceOnly": True}
+                symbol=symbol, type="market", side=side_close, amount=amount,
+                params={"stopLossPrice": stop, "reduceOnly": True}
             )
             
+            # Take Profit (gebruik limit met takeProfitPrice of target prijs)
             self.exchange.create_order(
-                symbol=symbol, type="LIMIT", side=side_close, amount=amount, price=target,
-                params={"reduceOnly": True}
+                symbol=symbol, type="limit", side=side_close, amount=amount, price=target,
+                params={"takeProfitPrice": target, "reduceOnly": True}
             )
 
             self.state[symbol]["in_position"] = True
@@ -381,8 +386,8 @@ class BreakRetestBot:
             send_telegram(f"⚠️ <b>Order Fout op {symbol}</b>: {e}")
 
     def run(self):
-        logger.info("Break & Retest Bot (Gecorrigeerd) gestart...")
-        send_telegram("🤖 <b>Break & Retest Bot (Gecorrigeerd) gestart!</b>")
+        logger.info("Break & Retest Bot (BloFin Fix) gestart...")
+        send_telegram("🤖 <b>Break & Retest Bot gestart!</b>")
         
         while True:
             self.check_open_positions()
