@@ -23,6 +23,7 @@ SYMBOLS = [
 
 LEVERAGE = 12
 BASE_RISK_USD = 5.0                  # Basis risico per trade
+MIN_MARGIN_USDT = 1.50               # Minimale eigen marge per trade (vóór hefboom)
 MIN_SCORE = 3                        # Minimum score om te traden (3 of 4)
 MAX_OPEN_POSITIONS = 2               # Maximum aantal open posities
 COOLDOWN_SECONDS = 900               # 15 minuten cooldown per coin
@@ -263,7 +264,13 @@ def run_bot():
 
             atr_pct = (current_atr / current_price) * 100 if current_price > 0 else 1.0
             dyn_mult = max(0.5, min(2.0, 1.0 / (atr_pct if atr_pct > 0 else 1.0)))
+            
+            # Bereken notional en forceer de minimale marge ondergrens van 1.50 USDT
             notional = BASE_RISK_USD * LEVERAGE * dyn_mult
+            min_notional = MIN_MARGIN_USDT * LEVERAGE
+            if notional < min_notional:
+                notional = min_notional
+
             raw_qty = notional / current_price
             market = exchange.market(symbol)
             min_amt = market['limits']['amount']['min']
@@ -272,7 +279,6 @@ def run_bot():
             qty = exchange.amount_to_precision(symbol, raw_qty)
 
             # --- OPGEDRAAIDE LOGICA (INVERTEREN) ---
-            # Als de markt score aangeeft voor LONG, gaan we nu SHORT
             if bullish_score >= MIN_SCORE:
                 order = exchange.create_market_sell_order(symbol, qty)
                 entry = float(order.get('average', current_price) or current_price)
@@ -280,7 +286,6 @@ def run_bot():
                 send_telegram_message(f"🔄 *Inverted Short [{bullish_score}/{MIN_SCORE}] op {symbol}* | Entry: `{entry}`")
                 last_trade_time[symbol] = time.time()
 
-            # Als de markt score aangeeft voor SHORT, gaan we nu LONG
             elif bearish_score >= MIN_SCORE:
                 order = exchange.create_market_buy_order(symbol, qty)
                 entry = float(order.get('average', current_price) or current_price)
@@ -294,7 +299,7 @@ def run_bot():
 
 if __name__ == "__main__":
     exchange.load_markets()
-    send_telegram_message("🤖 *Inverted Trading Bot gestart (Longs/Shorts omgedraaid)*")
+    send_telegram_message("🤖 *Inverted Trading Bot gestart (Minimale Marge: 1.50 USDT)*")
     while True:
         run_bot()
         time.sleep(60)
