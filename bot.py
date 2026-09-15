@@ -22,7 +22,9 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 SYMBOLS = [
     "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT",
-    "XRP/USDT", "ADA/USDT", "DOGE/USDT", "AVAX/USDT"
+    "XRP/USDT", "ADA/USDT", "DOGE/USDT", "AVAX/USDT",
+    "ZEC/USDT", "XLM/USDT", "HBAR/USDT", "XMR/USDT",
+    "TRX/USDT", "THETA/USDT", "LTC/USDT"
 ]
 
 # Timeframes & Strategie Parameters
