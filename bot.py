@@ -80,6 +80,14 @@ class BreakRetestBot:
             "options": {"defaultType": "future"}
         })
 
+        # Belangrijk: Markets inladen voor BloFin zodat symbolen herkend worden
+        logger.info("Bezig met inladen van exchange markten (load_markets)...")
+        try:
+            self.exchange.load_markets()
+            logger.info("Markten succesvol ingeladen!")
+        except Exception as e:
+            logger.error(f"Fout bij load_markets: {e}")
+
         self.state: Dict[str, dict] = {}
         for symbol in SYMBOLS:
             self.state[symbol] = {
