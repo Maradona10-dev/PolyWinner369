@@ -46,8 +46,8 @@ TIMEFRAME_FILTER = "5m"
 LOOKBACK = 50
 ZONE_ATR_MULT = 0.6
 MIN_BREAK_ATR = 1.4
-RR_RATIO = 2.0                  # Pas dit eventueel aan (bijv. 0.5) als je sneller winst wilt pakken via de prijsdoelen
-MAX_RISK_USDT = 1.0             # Maximaal ca. €1 risico per trade
+RR_RATIO = 2.0
+MAX_RISK_USDT = 1.0             # Richtlijn: max €1 risico per trade
 LEVERAGE = 7                    # Hefboom ingesteld op 7x
 ATR_LENGTH = 14
 EMA_FILTER_LENGTH = 20
@@ -300,9 +300,8 @@ class BreakRetestBot:
             return 0
 
     def check_open_positions(self):
-        """Controleert of open posities op de exchange nog bestaan; zo niet, reset status en stuur melding."""
         if PAPER_TRADING:
-            return  # Bij paper trading slaan we dit even overvrijheidshalve
+            return
 
         try:
             positions = self.exchange.fetch_positions(SYMBOLS)
@@ -311,11 +310,8 @@ class BreakRetestBot:
             for symbol in SYMBOLS:
                 if self.state[symbol]["in_position"]:
                     if symbol not in active_symbols:
-                        # Positie is niet meer actief op de exchange (gesloten door TP of SL)
                         logger.info(f"{symbol} | Positie is gesloten op de beurs.")
                         send_telegram(f"🏁 <b>TRADE GESLOTEN [BloFin]</b> {symbol}\nDe positie is afgerond (TP of SL geraakt).")
-                        
-                        # Reset de status zodat de bot weer verder kan met deze munt
                         self.state[symbol] = {
                             "direction": None,
                             "broke_out": False,
@@ -330,10 +326,12 @@ class BreakRetestBot:
     def execute_trade(self, setup: dict):
         symbol = setup["symbol"]
         direction = setup["direction"]
-        entry = setup["entry"]
-        stop = setup["stop"]
-        target = setup["target"]
-        zone = setup["zone"]
+        
+        # Opgelost: Altijd netjes converteren naar normale Python floats i.p.v. numpy.float64
+        entry = float(setup["entry"])
+        stop = float(setup["stop"])
+        target = float(setup["target"])
+        zone = (float(setup["zone"][0]), float(setup["zone"][1]))
 
         amount = self.calculate_position_size(symbol, entry, stop)
         if amount <= 0:
@@ -383,11 +381,10 @@ class BreakRetestBot:
             send_telegram(f"⚠️ <b>Order Fout op {symbol}</b>: {e}")
 
     def run(self):
-        logger.info("Break & Retest Bot (met positie-tracker) gestart...")
-        send_telegram("🤖 <b>Break & Retest Bot gestart!</b>")
+        logger.info("Break & Retest Bot (Gecorrigeerd) gestart...")
+        send_telegram("🤖 <b>Break & Retest Bot (Gecorrigeerd) gestart!</b>")
         
         while True:
-            # Controleer eerst of er lopende trades zijn gesloten op de beurs
             self.check_open_positions()
 
             for symbol in SYMBOLS:
