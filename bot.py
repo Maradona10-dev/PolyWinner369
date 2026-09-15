@@ -47,7 +47,8 @@ LOOKBACK = 50
 ZONE_ATR_MULT = 0.6
 MIN_BREAK_ATR = 1.4
 RR_RATIO = 2.0
-MAX_RISK_USDT = 1.0             # Maximaal ca. €1 risico per trade (wordt verhoogd naar exchange minimum indien te laag)
+MAX_RISK_USDT = 1.0             # Richtlijn: max €1 risico per trade
+LEVERAGE = 7                    # Hefboom ingesteld op 7x
 ATR_LENGTH = 14
 EMA_FILTER_LENGTH = 20
 SCAN_INTERVAL = 12
@@ -308,15 +309,12 @@ class BreakRetestBot:
             if risk_per_unit <= 0:
                 return 0
             
-            # Bereken hoeveelheid op basis van max €1 risico
             calculated_amount = MAX_RISK_USDT / risk_per_unit
             
-            # Controleer het minimum vereiste van de beurs (BloFin)
             market = self.exchange.market(symbol)
             min_amount = market['limits']['amount']['min']
             
             if calculated_amount < min_amount:
-                logger.info(f"{symbol} | Qty ({calculated_amount:.4f}) te laag voor exchange. Verhoogd naar minimum: {min_amount}")
                 calculated_amount = min_amount
             
             formatted_amount = self.exchange.amount_to_precision(symbol, calculated_amount)
@@ -351,7 +349,7 @@ class BreakRetestBot:
             f"Take Profit:<code>{target:.4f}</code>\n"
             f"Risk:Reward → 1:{RR_RATIO}\n"
             f"Zone: {zone[0]:.4f} - {zone[1]:.4f}\n"
-            f"Qty: {amount}"
+            f"Qty: {amount} (Lev: {LEVERAGE}x)"
         )
         send_telegram(msg)
 
@@ -362,8 +360,15 @@ class BreakRetestBot:
             self.state[symbol]["in_position"] = True
             return
 
-        # ========== LIVE ORDERS ==========
+        # ========== LIVE ORDERS & LEVERAGE ==========
         try:
+            # Zet eerst de hefboom op 7x voor dit symbool
+            try:
+                self.exchange.set_leverage(LEVERAGE, symbol)
+                logger.info(f"Leverage ingesteld op {LEVERAGE}x voor {symbol}")
+            except Exception as lev_err:
+                logger.warning(f"Kon leverage niet instellen (mogelijk al ingesteld): {lev_err}")
+
             entry_order = self.exchange.create_order(
                 symbol=symbol,
                 type="market",
@@ -396,7 +401,7 @@ class BreakRetestBot:
 
             self.state[symbol]["in_position"] = True
             send_telegram(
-                f"📌 <b>LIVE ORDERS GEPLAATST [BloFin]</b> {symbol}\n"
+                f"📌 <b>LIVE ORDERS GEPLAATST [7x Lev]</b> {symbol}\n"
                 f"Order ID: {entry_order.get('id')}"
             )
         except Exception as e:
@@ -404,8 +409,8 @@ class BreakRetestBot:
             send_telegram(f"⚠️ <b>Order Fout op {symbol}</b>: {e}")
 
     def run(self):
-        logger.info("Break & Retest Bot (Long & Short) voor BloFin gestart...")
-        send_telegram("🤖 <b>Break & Retest Bot (Long & Short) gestart!</b>")
+        logger.info("Break & Retest Bot (7x Leverage) voor BloFin gestart...")
+        send_telegram("🤖 <b>Break & Retest Bot (7x Leverage) gestart!</b>")
         
         while True:
             for symbol in SYMBOLS:
