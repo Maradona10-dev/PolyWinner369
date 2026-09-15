@@ -47,7 +47,7 @@ LOOKBACK = 50
 ZONE_ATR_MULT = 0.6
 MIN_BREAK_ATR = 1.4
 RR_RATIO = 2.0
-RISK_PER_TRADE = 0.005          # 0.5% risico per trade
+MAX_RISK_USDT = 1.0             # Maximaal ca. €1 risico per trade (wordt verhoogd naar exchange minimum indien te laag)
 ATR_LENGTH = 14
 EMA_FILTER_LENGTH = 20
 SCAN_INTERVAL = 12
@@ -302,17 +302,28 @@ class BreakRetestBot:
 
         return None
 
-    def calculate_position_size(self, entry: float, stop: float) -> float:
+    def calculate_position_size(self, symbol: str, entry: float, stop: float) -> float:
         try:
-            balance = self.exchange.fetch_balance()
-            usdt = balance.get("USDT", {}).get("free", 0)
-            risk_amount = usdt * RISK_PER_TRADE
             risk_per_unit = abs(entry - stop)
             if risk_per_unit <= 0:
                 return 0
-            return round(risk_amount / risk_per_unit, 4)
+            
+            # Bereken hoeveelheid op basis van max €1 risico
+            calculated_amount = MAX_RISK_USDT / risk_per_unit
+            
+            # Controleer het minimum vereiste van de beurs (BloFin)
+            market = self.exchange.market(symbol)
+            min_amount = market['limits']['amount']['min']
+            
+            if calculated_amount < min_amount:
+                logger.info(f"{symbol} | Qty ({calculated_amount:.4f}) te laag voor exchange. Verhoogd naar minimum: {min_amount}")
+                calculated_amount = min_amount
+            
+            formatted_amount = self.exchange.amount_to_precision(symbol, calculated_amount)
+            return float(formatted_amount)
+            
         except Exception as e:
-            logger.error(f"Position size error: {e}")
+            logger.error(f"Position size error for {symbol}: {e}")
             return 0
 
     def execute_trade(self, setup: dict):
@@ -323,7 +334,7 @@ class BreakRetestBot:
         target = setup["target"]
         zone = setup["zone"]
 
-        amount = self.calculate_position_size(entry, stop)
+        amount = self.calculate_position_size(symbol, entry, stop)
         if amount <= 0:
             logger.warning(f"{symbol} | Ongeldige positiegrootte")
             return
