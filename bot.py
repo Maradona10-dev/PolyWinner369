@@ -46,8 +46,8 @@ TIMEFRAME_FILTER = "5m"
 LOOKBACK = 50
 ZONE_ATR_MULT = 0.6
 MIN_BREAK_ATR = 1.4
-RR_RATIO = 2.0
-MAX_RISK_USDT = 1.0             # Richtlijn: max €1 risico per trade
+RR_RATIO = 2.0                  # Pas dit eventueel aan (bijv. 0.5) als je sneller winst wilt pakken via de prijsdoelen
+MAX_RISK_USDT = 1.0             # Maximaal ca. €1 risico per trade
 LEVERAGE = 7                    # Hefboom ingesteld op 7x
 ATR_LENGTH = 14
 EMA_FILTER_LENGTH = 20
@@ -90,10 +90,9 @@ class BreakRetestBot:
             "secret": API_SECRET,
             "password": API_PASSWORD,
             "enableRateLimit": True,
-            "options": {"defaultType": "swap"}  # Cruciaal voor BloFin swaps/perpetuals
+            "options": {"defaultType": "swap"}
         })
 
-        # Markets laden
         try:
             self.exchange.load_markets()
             logger.info(f"Markets geladen. Aantal beschikbare markten: {len(self.exchange.markets)}")
@@ -103,9 +102,9 @@ class BreakRetestBot:
         self.state: Dict[str, dict] = {}
         for symbol in SYMBOLS:
             self.state[symbol] = {
-                "direction": None,          # "long" of "short"
+                "direction": None,
                 "broke_out": False,
-                "zone": None,               # (bottom, top)
+                "zone": None,
                 "level": None,
                 "break_time": None,
                 "in_position": False
@@ -124,7 +123,6 @@ class BreakRetestBot:
             return None
 
     def get_higher_tf_bias(self, symbol: str) -> Optional[str]:
-        """Geeft 'bullish', 'bearish' of None terug"""
         df = self.fetch_ohlcv(symbol, TIMEFRAME_FILTER, limit=50)
         if df is None or len(df) < EMA_FILTER_LENGTH + 5:
             return None
@@ -146,7 +144,6 @@ class BreakRetestBot:
         return None
 
     def find_zones(self, df: pd.DataFrame) -> Tuple[Optional[float], Optional[float]]:
-        """Geeft (resistance, support) terug"""
         if len(df) < 30:
             return None, None
 
@@ -184,7 +181,7 @@ class BreakRetestBot:
         resistance, support = self.find_zones(df_1m)
         htf_bias = self.get_higher_tf_bias(symbol)
 
-        # ========== LONG SETUP ==========
+        # Long Setup
         if not state["broke_out"] and resistance is not None and htf_bias == "bullish":
             strong_break = (
                 current["close"] > resistance and
@@ -207,9 +204,8 @@ class BreakRetestBot:
                     f"Resistance: <code>{resistance:.4f}</code>\n"
                     f"Zone: {zone[0]:.4f} - {zone[1]:.4f}"
                 )
-                logger.info(f"{symbol} | LONG BREAKOUT @ {resistance:.4f}")
 
-        # ========== SHORT SETUP ==========
+        # Short Setup
         if not state["broke_out"] and support is not None and htf_bias == "bearish":
             strong_break = (
                 current["close"] < support and
@@ -232,14 +228,12 @@ class BreakRetestBot:
                     f"Support: <code>{support:.4f}</code>\n"
                     f"Zone: {zone[0]:.4f} - {zone[1]:.4f}"
                 )
-                logger.info(f"{symbol} | SHORT BREAKDOWN @ {support:.4f}")
 
-        # ========== RETEST + ENTRY ==========
+        # Retest + Entry
         if state["broke_out"] and state["zone"] and not state["in_position"]:
             zone_bottom, zone_top = state["zone"]
             direction = state["direction"]
 
-            # HTF bias moet nog kloppen
             if direction == "long" and htf_bias != "bullish":
                 return None
             if direction == "short" and htf_bias != "bearish":
@@ -257,14 +251,7 @@ class BreakRetestBot:
                     stop = zone_bottom - (atr * 0.3)
                     risk = entry - stop
                     target = entry + (risk * RR_RATIO)
-                    return {
-                        "symbol": symbol,
-                        "direction": "long",
-                        "entry": entry,
-                        "stop": stop,
-                        "target": target,
-                        "zone": state["zone"]
-                    }
+                    return {"symbol": symbol, "direction": "long", "entry": entry, "stop": stop, "target": target, "zone": state["zone"]}
 
             elif direction == "short":
                 touched = current["high"] >= zone_bottom and current["high"] <= zone_top * 1.002
@@ -278,20 +265,11 @@ class BreakRetestBot:
                     stop = zone_top + (atr * 0.3)
                     risk = stop - entry
                     target = entry - (risk * RR_RATIO)
-                    return {
-                        "symbol": symbol,
-                        "direction": "short",
-                        "entry": entry,
-                        "stop": stop,
-                        "target": target,
-                        "zone": state["zone"]
-                    }
+                    return {"symbol": symbol, "direction": "short", "entry": entry, "stop": stop, "target": target, "zone": state["zone"]}
 
-        # Reset oude setups
         if state["broke_out"] and state["break_time"]:
             age = (datetime.now() - state["break_time"]).total_seconds() / 60
             if age > MAX_BREAKOUT_AGE_MINUTES:
-                logger.info(f"{symbol} | Setup verlopen → reset")
                 state.update({
                     "direction": None,
                     "broke_out": False,
@@ -310,19 +288,44 @@ class BreakRetestBot:
                 return 0
             
             calculated_amount = MAX_RISK_USDT / risk_per_unit
-            
             market = self.exchange.market(symbol)
             min_amount = market['limits']['amount']['min']
             
             if calculated_amount < min_amount:
                 calculated_amount = min_amount
             
-            formatted_amount = self.exchange.amount_to_precision(symbol, calculated_amount)
-            return float(formatted_amount)
-            
+            return float(self.exchange.amount_to_precision(symbol, calculated_amount))
         except Exception as e:
             logger.error(f"Position size error for {symbol}: {e}")
             return 0
+
+    def check_open_positions(self):
+        """Controleert of open posities op de exchange nog bestaan; zo niet, reset status en stuur melding."""
+        if PAPER_TRADING:
+            return  # Bij paper trading slaan we dit even overvrijheidshalve
+
+        try:
+            positions = self.exchange.fetch_positions(SYMBOLS)
+            active_symbols = {p['symbol'] for p in positions if float(p.get('contracts', 0)) > 0}
+
+            for symbol in SYMBOLS:
+                if self.state[symbol]["in_position"]:
+                    if symbol not in active_symbols:
+                        # Positie is niet meer actief op de exchange (gesloten door TP of SL)
+                        logger.info(f"{symbol} | Positie is gesloten op de beurs.")
+                        send_telegram(f"🏁 <b>TRADE GESLOTEN [BloFin]</b> {symbol}\nDe positie is afgerond (TP of SL geraakt).")
+                        
+                        # Reset de status zodat de bot weer verder kan met deze munt
+                        self.state[symbol] = {
+                            "direction": None,
+                            "broke_out": False,
+                            "zone": None,
+                            "level": None,
+                            "break_time": None,
+                            "in_position": False
+                        }
+        except Exception as e:
+            logger.error(f"Fout bij controleren open posities: {e}")
 
     def execute_trade(self, setup: dict):
         symbol = setup["symbol"]
@@ -334,13 +337,11 @@ class BreakRetestBot:
 
         amount = self.calculate_position_size(symbol, entry, stop)
         if amount <= 0:
-            logger.warning(f"{symbol} | Ongeldige positiegrootte")
             return
 
         side = "buy" if direction == "long" else "sell"
         side_close = "sell" if direction == "long" else "buy"
 
-        # Telegram bericht
         emoji = "✅" if direction == "long" else "🔻"
         msg = (
             f"{emoji} <b>{direction.upper()} ENTRY [BloFin]</b> {symbol}\n\n"
@@ -348,71 +349,47 @@ class BreakRetestBot:
             f"Stop Loss:  <code>{stop:.4f}</code>\n"
             f"Take Profit:<code>{target:.4f}</code>\n"
             f"Risk:Reward → 1:{RR_RATIO}\n"
-            f"Zone: {zone[0]:.4f} - {zone[1]:.4f}\n"
             f"Qty: {amount} (Lev: {LEVERAGE}x)"
         )
         send_telegram(msg)
-
-        logger.info(f"{direction.upper()} {symbol} | Entry {entry:.4f} | SL {stop:.4f} | TP {target:.4f}")
 
         if PAPER_TRADING:
             logger.info(f"[PAPER] {direction.upper()} trade gesimuleerd → {symbol}")
             self.state[symbol]["in_position"] = True
             return
 
-        # ========== LIVE ORDERS & LEVERAGE ==========
         try:
-            # Zet eerst de hefboom op 7x voor dit symbool
             try:
                 self.exchange.set_leverage(LEVERAGE, symbol)
-                logger.info(f"Leverage ingesteld op {LEVERAGE}x voor {symbol}")
-            except Exception as lev_err:
-                logger.warning(f"Kon leverage niet instellen (mogelijk al ingesteld): {lev_err}")
+            except Exception:
+                pass
 
-            entry_order = self.exchange.create_order(
-                symbol=symbol,
-                type="market",
-                side=side,
-                amount=amount
+            entry_order = self.exchange.create_order(symbol=symbol, type="market", side=side, amount=amount)
+            
+            self.exchange.create_order(
+                symbol=symbol, type="STOP_MARKET", side=side_close, amount=amount,
+                params={"stopPrice": stop, "reduceOnly": True}
             )
-            logger.info(f"Market {side} geplaatst: {entry_order.get('id')}")
-
-            sl_order = self.exchange.create_order(
-                symbol=symbol,
-                type="STOP_MARKET",
-                side=side_close,
-                amount=amount,
-                params={
-                    "stopPrice": stop,
-                    "reduceOnly": True
-                }
-            )
-            logger.info(f"Stop Loss geplaatst: {sl_order.get('id')}")
-
-            tp_order = self.exchange.create_order(
-                symbol=symbol,
-                type="LIMIT",
-                side=side_close,
-                amount=amount,
-                price=target,
+            
+            self.exchange.create_order(
+                symbol=symbol, type="LIMIT", side=side_close, amount=amount, price=target,
                 params={"reduceOnly": True}
             )
-            logger.info(f"Take Profit geplaatst: {tp_order.get('id')}")
 
             self.state[symbol]["in_position"] = True
-            send_telegram(
-                f"📌 <b>LIVE ORDERS GEPLAATST [7x Lev]</b> {symbol}\n"
-                f"Order ID: {entry_order.get('id')}"
-            )
+            send_telegram(f"📌 <b>LIVE ORDERS GEPLAATST [7x Lev]</b> {symbol}")
         except Exception as e:
-            logger.error(f"Order execution error for {symbol}: {e}")
+            logger.error(f"Order error {symbol}: {e}")
             send_telegram(f"⚠️ <b>Order Fout op {symbol}</b>: {e}")
 
     def run(self):
-        logger.info("Break & Retest Bot (7x Leverage) voor BloFin gestart...")
-        send_telegram("🤖 <b>Break & Retest Bot (7x Leverage) gestart!</b>")
+        logger.info("Break & Retest Bot (met positie-tracker) gestart...")
+        send_telegram("🤖 <b>Break & Retest Bot gestart!</b>")
         
         while True:
+            # Controleer eerst of er lopende trades zijn gesloten op de beurs
+            self.check_open_positions()
+
             for symbol in SYMBOLS:
                 try:
                     df_1m = self.fetch_ohlcv(symbol, TIMEFRAME_ENTRY, limit=80)
@@ -423,7 +400,7 @@ class BreakRetestBot:
                 except Exception as e:
                     logger.error(f"Fout bij scannen van {symbol}: {e}")
                 
-                time.sleep(2)  # Pauze tussen munten i.v.m. rate limits
+                time.sleep(2)
             
             time.sleep(SCAN_INTERVAL)
 
