@@ -40,7 +40,7 @@ SYMBOLS = [
     "LTC/USDT:USDT"
 ]
 
-# Strategie parameters (Harde Saldo-Beveiliging)
+# Strategie parameters (Vaste Marge Model voor stabiele trades)
 TIMEFRAME_ENTRY = "1m"
 TIMEFRAME_FILTER = "5m"
 
@@ -48,8 +48,8 @@ LOOKBACK = 50
 ZONE_ATR_MULT = 0.6
 MIN_BREAK_ATR = 1.4
 RR_RATIO = 2.0
-MAX_RISK_USDT = 5.0           # Realistisch risico zodat het altijd past bij een klein saldo
-MIN_RISK_PERCENT = 0.003      # Houdt stop-losses op een veilige minimale afstand
+DESIRED_MARGIN_USDT = 3.0     # Vaste marge die per trade wordt ingezet (bijv. 3 euro per positie!)
+MIN_RISK_PERCENT = 0.004      # Zorgt voor een gezonde minimale stop-loss afstand
 LEVERAGE = 7                    
 ATR_LENGTH = 14
 EMA_FILTER_LENGTH = 20
@@ -304,7 +304,7 @@ class BreakRetestBot:
                     f"Zone: {zone[0]:.4f} - {zone[1]:.4f}"
                 )
 
-        # Retest + Entry met strenge stop-loss controle
+        # Retest + Entry met stabiele stop-loss en vaste marge-opzet
         if state["broke_out"] and state["zone"] and not state["in_position"]:
             zone_bottom, zone_top = state["zone"]
             direction = state["direction"]
@@ -368,7 +368,7 @@ class BreakRetestBot:
 
         return None
 
-    def calculate_position_size(self, symbol: str, entry: float, stop: float) -> float:
+    def calculate_position_size(self, symbol: str, entry: float) -> float:
         try:
             free_balance = 10.0 
             try:
@@ -377,20 +377,14 @@ class BreakRetestBot:
             except Exception:
                 pass
 
-            risk_per_unit = abs(entry - stop)
-            if risk_per_unit <= 0:
-                return 0
-            
-            # Basis berekening op basis van ingesteld risico
-            calculated_amount = MAX_RISK_USDT / risk_per_unit
-            
-            # STRIKTE GRENS: De benodigde marge mag nooit meer zijn dan 85% van je werkelijke vrije saldo
-            max_allowed_margin = free_balance * 0.85
-            max_allowed_position_value = max_allowed_margin * LEVERAGE
-            max_qty_by_balance = max_allowed_position_value / entry
-            
-            if calculated_amount > max_qty_by_balance:
-                calculated_amount = max_qty_by_balance
+            # VASTE MARGE BEREKENING: We pakken direct de gewenste marge (bijv 3 USDT)
+            # Met 7x hefboom betekent dit dat de positiewaarde = DESIRED_MARGIN_USDT * LEVERAGE is.
+            target_margin = min(DESIRED_MARGIN_USDT, free_balance * 0.85)
+            if target_margin < 1.0:
+                target_margin = free_balance * 0.5  # Als saldo heel laag is, pak de helft
+
+            position_value = target_margin * LEVERAGE
+            calculated_amount = position_value / entry
 
             market = self.exchange.market(symbol)
             min_amount = float(market['limits']['amount']['min'])
@@ -466,7 +460,7 @@ class BreakRetestBot:
         target = float(setup["target"])
         zone = (float(setup["zone"][0]), float(setup["zone"][1]))
 
-        amount = self.calculate_position_size(symbol, entry, stop)
+        amount = self.calculate_position_size(symbol, entry)
         if amount <= 0:
             return
 
@@ -475,12 +469,12 @@ class BreakRetestBot:
 
         emoji = "✅" if direction == "long" else "🔻"
         msg = (
-            f"{emoji} <b>{direction.upper()} ENTRY [SALDO GEOPTIMALISEERD]</b> {symbol}\n\n"
+            f"{emoji} <b>{direction.upper()} ENTRY [VASTE MARGE]</b> {symbol}\n\n"
             f"Entry:      <code>{entry:.4f}</code>\n"
             f"Stop Loss:  <code>{stop:.4f}</code>\n"
             f"Take Profit:<code>{target:.4f}</code>\n"
             f"Risk:Reward → 1:{RR_RATIO}\n"
-            f"Qty: {amount} (Lev: {LEVERAGE}x - Risico: {MAX_RISK_USDT} USDT)"
+            f"Marge inzet: ±{DESIRED_MARGIN_USDT} USDT (Lev: {LEVERAGE}x)"
         )
         send_telegram(msg)
 
@@ -516,14 +510,14 @@ class BreakRetestBot:
 
             self.state[symbol]["in_position"] = True
             self.state[symbol]["entry_price"] = entry
-            send_telegram(f"📌 <b>GEÜPDATE POSITIE GEPLAATST [7x]</b> {symbol}")
+            send_telegram(f"📌 <b>POSITIE GEPLAATST [Vaste Marge]</b> {symbol}")
         except Exception as e:
             logger.error(f"Order error {symbol}: {e}")
             send_telegram(f"⚠️ <b>Order Fout op {symbol}</b>: {e}")
 
     def run(self):
-        logger.info("Break & Retest Bot (Saldo Beveiliging Actief) gestart...")
-        send_telegram("🤖 <b>Break & Retest Bot gestart! (Saldo-beveiliging tegen Insufficient Margin)</b>")
+        logger.info("Break & Retest Bot (Vaste Marge Model) gestart...")
+        send_telegram("🤖 <b>Break & Retest Bot gestart! (Vaste Marge van ~3 USDT per trade)</b>")
         
         while True:
             self.check_open_positions_and_orders()
@@ -537,8 +531,7 @@ class BreakRetestBot:
                 try:
                     df_1m = self.fetch_ohlcv(symbol, TIMEFRAME_ENTRY, limit=80)
                     if df_1m is not None:
-                        setup = self.check_setup(symbol, df_1m)
-                        if setup and not self.state[symbol]["in_position"]:
+                        setup = self.check_setup(symbol, df_1m)                  if setup and not self.state[symbol]["in_position"]:
                             self.execute_trade(setup)
                 except Exception as e:
                     logger.error(f"Fout bij scannen van {symbol}: {e}")
