@@ -5,6 +5,7 @@ import time
 import logging
 import os
 import requests
+import json
 from datetime import datetime
 from typing import Dict, Optional, Tuple
 
@@ -47,13 +48,15 @@ LOOKBACK = 50
 ZONE_ATR_MULT = 0.6
 MIN_BREAK_ATR = 1.4
 RR_RATIO = 2.0
-MAX_RISK_USDT = 4.0             # Mooie balans voor actie en risico
-LEVERAGE = 7                    # Hefboom 7x
+MAX_RISK_USDT = 5.0             
+LEVERAGE = 7                    
 ATR_LENGTH = 14
 EMA_FILTER_LENGTH = 20
 SCAN_INTERVAL = 12
 MAX_BREAKOUT_AGE_MINUTES = 22
-MAX_ACTIVE_ORDERS = 5           # Maximaal aantal gelijktijdige open posities
+MAX_ACTIVE_ORDERS = 5           
+
+TRADE_LOG_FILE = "trade_history.json"
 
 # ====================================================
 
@@ -108,8 +111,77 @@ class BreakRetestBot:
                 "zone": None,
                 "level": None,
                 "break_time": None,
-                "in_position": False
+                "in_position": False,
+                "entry_price": 0.0
             }
+            
+        self.last_report_date = datetime.now().date()
+
+    def log_completed_trade(self, symbol: str, direction: str, entry: float, exit_price: float, pnl: float):
+        """Slaat elke gesloten trade op in een JSON-bestand voor analyse."""
+        trade_data = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": symbol,
+            "direction": direction,
+            "entry": entry,
+            "exit": exit_price,
+            "pnl": pnl,
+            "win": pnl > 0
+        }
+        
+        trades = []
+        if os.path.exists(TRADE_LOG_FILE):
+            try:
+                with open(TRADE_LOG_FILE, "r") as f:
+                    trades = json.load(f)
+            except Exception:
+                trades = []
+                
+        trades.append(trade_data)
+        try:
+            with open(TRADE_LOG_FILE, "w") as f:
+                json.dump(trades, f, indent=4)
+        except Exception as e:
+            logger.error(f"Kon trade log niet wegschrijven: {e}")
+
+    def send_performance_report(self):
+        """Stuurt een dagelijkse samenvatting via Telegram."""
+        if not os.path.exists(TRADE_LOG_FILE):
+            return
+            
+        try:
+            with open(TRADE_LOG_FILE, "r") as f:
+                trades = json.load(f)
+        except Exception:
+            return
+            
+        if not trades:
+            return
+            
+        total_trades = len(trades)
+        wins = [t for t in trades if t["win"]]
+        winrate = (len(wins) / total_trades) * 100 if total_trades > 0 else 0
+        total_pnl = sum(t["pnl"] for t in trades)
+        
+        # Zoek beste en slechtste munt
+        coin_pnl = {}
+        for t in trades:
+            s = t["symbol"]
+            coin_pnl[s] = coin_pnl.get(s, 0.0) + t["pnl"]
+            
+        best_coin = max(coin_pnl, key=coin_pnl.get) if coin_pnl else "Nvt"
+        worst_coin = min(coin_pnl, key=coin_pnl.get) if coin_pnl else "Nvt"
+
+        report = (
+            f"📊 <b>DAGELIJKSE BOT RAPPORTAGE</b> 📊\n\n"
+            f"Totaal aantal trades: <b>{total_trades}</b>\n"
+            f"Winrate: <b>{winrate:.1f}%</b>\n"
+            f"Geschatte PnL: <b>{total_pnl:.2f} USDT</b>\n"
+            f"🏆 Beste munt: <b>{best_coin}</b> ({coin_pnl.get(best_coin, 0):.2f} USDT)\n"
+            f"⚠️ Slechtste munt: <b>{worst_coin}</b> ({coin_pnl.get(worst_coin, 0):.2f} USDT)\n\n"
+            f"<i>Doorgaan met data verzamelen richting de 100 trades!</i>"
+        )
+        send_telegram(report)
 
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 80) -> Optional[pd.DataFrame]:
         try:
@@ -290,28 +362,23 @@ class BreakRetestBot:
 
     def calculate_position_size(self, symbol: str, entry: float, stop: float) -> float:
         try:
-            # Haal live het beschikbare saldo op
-            balance = 32.0
+            balance = 32.0 
             try:
                 bal_info = self.exchange.fetch_balance()
                 balance = float(bal_info['USDT']['free'])
             except Exception:
                 pass
 
-            # Strikte marge-grens: Zorg dat de benodigde margin (Notionele waarde / Leverage) 
-            # nooit groter is dan ongeveer 85% van je werkelijke beschikbare saldo.
-            max_notional = balance * LEVERAGE * 0.85
-            max_qty_by_wallet = max_notional / entry
-
             risk_per_unit = abs(entry - stop)
             if risk_per_unit <= 0:
-                calculated_amount = max_qty_by_wallet
-            else:
-                calculated_amount = MAX_RISK_USDT / risk_per_unit
-
-            # Grijp direct in als de hoeveelheid te groot is voor je portemonnee
-            if calculated_amount > max_qty_by_wallet:
-                calculated_amount = max_qty_by_wallet
+                return 0
+            
+            calculated_amount = MAX_RISK_USDT / risk_per_unit
+            max_allowed_value = (balance * LEVERAGE) * 0.8
+            max_qty_by_balance = max_allowed_value / entry
+            
+            if calculated_amount > max_qty_by_balance:
+                calculated_amount = max_qty_by_balance
 
             market = self.exchange.market(symbol)
             min_amount = float(market['limits']['amount']['min'])
@@ -344,13 +411,32 @@ class BreakRetestBot:
             active_symbols = {p['symbol'] for p in active_positions}
             for symbol in SYMBOLS:
                 if self.state[symbol]["in_position"] and symbol not in active_symbols:
+                    # Positie is gesloten! Log een schatting van het resultaat op basis van entry en marktprijs
+                    closed_state = self.state[symbol]
+                    entry_p = closed_state.get("entry_price", 0)
+                    direction = closed_state.get("direction", "long")
+                    
+                    # Probeer actuele exit prijs te vinden
+                    exit_p = entry_p
+                    for p in positions:
+                        if p['symbol'] == symbol:
+                            exit_p = float(p.get('markPrice', entry_p))
+                            
+                    # Simuleer globale PnL voor de log
+                    pnl_est = (exit_p - entry_p) if direction == "long" else (entry_p - exit_p)
+                    pnl_est *= 5.0 # Indicatieve schatting op basis van risico/positie
+                    
+                    self.log_completed_trade(symbol, direction, entry_p, exit_p, pnl_est)
+
+                    # Reset state
                     self.state[symbol] = {
                         "direction": None,
                         "broke_out": False,
                         "zone": None,
                         "level": None,
                         "break_time": None,
-                        "in_position": False
+                        "in_position": False,
+                        "entry_price": 0.0
                     }
 
             return total_active
@@ -393,6 +479,7 @@ class BreakRetestBot:
         if PAPER_TRADING:
             logger.info(f"[PAPER] {direction.upper()} trade gesimuleerd → {symbol}")
             self.state[symbol]["in_position"] = True
+            self.state[symbol]["entry_price"] = entry
             return
 
         try:
@@ -402,33 +489,42 @@ class BreakRetestBot:
             except Exception as ex:
                 logger.warning(f"Kon margin mode of leverage niet instellen voor {symbol}: {ex}")
 
-            # Open market order
-            self.exchange.create_order(symbol=symbol, type="market", side=side, amount=amount)
+            order_params = {
+                "marginMode": "isolated",
+                "leverage": LEVERAGE
+            }
+
+            self.exchange.create_order(symbol=symbol, type="market", side=side, amount=amount, params=order_params)
             
-            # Stop Loss
             self.exchange.create_order(
                 symbol=symbol, type="market", side=side_close, amount=amount,
-                params={"stopLossPrice": float(stop), "reduceOnly": True}
+                params={"stopLossPrice": float(stop), "reduceOnly": True, "marginMode": "isolated"}
             )
             
-            # Take Profit
             self.exchange.create_order(
                 symbol=symbol, type="limit", side=side_close, amount=amount, price=float(target),
-                params={"takeProfitPrice": float(target), "reduceOnly": True}
+                params={"takeProfitPrice": float(target), "reduceOnly": True, "marginMode": "isolated"}
             )
 
             self.state[symbol]["in_position"] = True
+            self.state[symbol]["entry_price"] = entry
             send_telegram(f"📌 <b>LIVE ISOLATED ORDERS GEPLAATST [7x]</b> {symbol}")
         except Exception as e:
             logger.error(f"Order error {symbol}: {e}")
             send_telegram(f"⚠️ <b>Order Fout op {symbol}</b>: {e}")
 
     def run(self):
-        logger.info("Break & Retest Bot (Saldo-begrensd) gestart...")
-        send_telegram("🤖 <b>Break & Retest Bot gestart! (Saldo-begrensd & Actief)</b>")
+        logger.info("Break & Retest Bot (Met Trade Logging) gestart...")
+        send_telegram("🤖 <b>Break & Retest Bot gestart! (Modus: ISOLATED + Trade Logging actief)</b>")
         
         while True:
             self.check_open_positions_and_orders()
+
+            # Controleer of we een dagelijkse rapportage moeten sturen (elke dag om middernacht of switch van dag)
+            current_date = datetime.now().date()
+            if current_date != self.last_report_date:
+                self.send_performance_report()
+                self.last_report_date = current_date
 
             for symbol in SYMBOLS:
                 try:
