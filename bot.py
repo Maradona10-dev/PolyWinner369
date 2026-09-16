@@ -8,7 +8,8 @@ import requests
 import json
 from datetime import datetime
 from typing import Dict, Optional, Tuple
-from flask import Thread, Flask
+import threading
+from flask import Flask
 
 # ====================== RAILWAY & CONFIG ======================
 app = Flask(__name__)
@@ -131,7 +132,6 @@ class MultiFactorBot:
 
         # 15M Data & Liquidity Sweeps
         c_curr = df_15m.iloc[-1]
-        l_curr = df_15m.iloc[-1]
         
         prev_low = df_15m["low"].iloc[-LOOKBACK:-1].min()
         prev_high = df_15m["high"].iloc[-LOOKBACK:-1].max()
