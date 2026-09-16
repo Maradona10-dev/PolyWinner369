@@ -48,7 +48,7 @@ LOOKBACK = 50
 ZONE_ATR_MULT = 0.6
 MIN_BREAK_ATR = 1.4
 RR_RATIO = 2.0
-DESIRED_MARGIN_USDT = 3.0     # Vaste marge die per trade wordt ingezet (bijv. 3 euro per positie!)
+DESIRED_MARGIN_USDT = 3.0     # Vaste marge die per trade wordt ingezet (ongeveer 3 euro per positie!)
 MIN_RISK_PERCENT = 0.004      # Zorgt voor een gezonde minimale stop-loss afstand
 LEVERAGE = 7                    
 ATR_LENGTH = 14
@@ -377,11 +377,9 @@ class BreakRetestBot:
             except Exception:
                 pass
 
-            # VASTE MARGE BEREKENING: We pakken direct de gewenste marge (bijv 3 USDT)
-            # Met 7x hefboom betekent dit dat de positiewaarde = DESIRED_MARGIN_USDT * LEVERAGE is.
             target_margin = min(DESIRED_MARGIN_USDT, free_balance * 0.85)
             if target_margin < 1.0:
-                target_margin = free_balance * 0.5  # Als saldo heel laag is, pak de helft
+                target_margin = free_balance * 0.5
 
             position_value = target_margin * LEVERAGE
             calculated_amount = position_value / entry
@@ -458,7 +456,6 @@ class BreakRetestBot:
         entry = float(setup["entry"])
         stop = float(setup["stop"])
         target = float(setup["target"])
-        zone = (float(setup["zone"][0]), float(setup["zone"][1]))
 
         amount = self.calculate_position_size(symbol, entry)
         if amount <= 0:
@@ -531,7 +528,8 @@ class BreakRetestBot:
                 try:
                     df_1m = self.fetch_ohlcv(symbol, TIMEFRAME_ENTRY, limit=80)
                     if df_1m is not None:
-                        setup = self.check_setup(symbol, df_1m)                  if setup and not self.state[symbol]["in_position"]:
+                        setup = self.check_setup(symbol, df_1m)
+                        if setup and not self.state[symbol]["in_position"]:
                             self.execute_trade(setup)
                 except Exception as e:
                     logger.error(f"Fout bij scannen van {symbol}: {e}")
