@@ -47,13 +47,13 @@ LOOKBACK = 50
 ZONE_ATR_MULT = 0.6
 MIN_BREAK_ATR = 1.4
 RR_RATIO = 2.0
-MAX_RISK_USDT = 1.0             # Richtlijn: max €1 risico per trade
-LEVERAGE = 7                    # Hefboom ingesteld op 7x
+MAX_RISK_USDT = 5.0             # Iets meer risico/actie per trade toegestaan
+LEVERAGE = 7                    # Hefboom 7x
 ATR_LENGTH = 14
 EMA_FILTER_LENGTH = 20
 SCAN_INTERVAL = 12
 MAX_BREAKOUT_AGE_MINUTES = 22
-MAX_ACTIVE_ORDERS = 5           # Maximaal aantal gelijktijdige open orders/posities
+MAX_ACTIVE_ORDERS = 5           # Maximaal aantal gelijktijdige open posities
 
 # ====================================================
 
@@ -290,11 +290,28 @@ class BreakRetestBot:
 
     def calculate_position_size(self, symbol: str, entry: float, stop: float) -> float:
         try:
+            # Haal beschikbaar saldo op van de exchange om te voorkomen dat orders te groot worden
+            balance = 32.0 # Standaard fallback gebaseerd op je wallet
+            try:
+                bal_info = self.exchange.fetch_balance()
+                balance = float(bal_info['USDT']['free'])
+            except Exception:
+                pass
+
             risk_per_unit = abs(entry - stop)
             if risk_per_unit <= 0:
                 return 0
             
+            # Bereken op basis van risico, maar begrens direct op wat je account effectief aankan met de hefboom
             calculated_amount = MAX_RISK_USDT / risk_per_unit
+            
+            # Veiligheidsgrens: Zorg dat de positiewa waarde (entry * amount) niet groter is dan ca. 80% van je totale hefboom-capaciteit
+            max_allowed_value = (balance * LEVERAGE) * 0.8
+            max_qty_by_balance = max_allowed_value / entry
+            
+            if calculated_amount > max_qty_by_balance:
+                calculated_amount = max_qty_by_balance
+
             market = self.exchange.market(symbol)
             min_amount = float(market['limits']['amount']['min'])
             max_amount = float(market['limits']['amount'].get('max', float('inf')))
@@ -379,7 +396,6 @@ class BreakRetestBot:
 
         try:
             try:
-                # Zet de marge modus expliciet op 'isolated' en pas de hefboom toe
                 self.exchange.set_margin_mode('isolated', symbol)
                 self.exchange.set_leverage(LEVERAGE, symbol)
             except Exception as ex:
@@ -408,7 +424,7 @@ class BreakRetestBot:
 
     def run(self):
         logger.info("Break & Retest Bot (Isolated Margin) gestart...")
-        send_telegram("🤖 <b>Break & Retest Bot gestart! (Modus: ISOLATED, Max 5 orders)</b>")
+        send_telegram("🤖 <b>Break & Retest Bot gestart! (Modus: ISOLATED, Actief & Risicovol)</b>")
         
         while True:
             self.check_open_positions_and_orders()
