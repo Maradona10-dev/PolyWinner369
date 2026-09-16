@@ -467,7 +467,6 @@ class MultiFactorBot:
             )
             logger.info(log_msg)
             
-            # Stuur alleen watch melding naar Telegram als score nabij de drempel komt maar nog geen 5m trigger heeft
             if score >= MIN_SCORE and not break_5m:
                 send_telegram(
                     f"👀 <b>{direction.upper()} WATCH STATE</b>\n"
@@ -475,7 +474,6 @@ class MultiFactorBot:
                     f"Wachten op 5m breakout trigger... ⏳"
                 )
 
-        # STRENGE EIS: Alleen handelen als score >= MIN_SCORE EN de 5m breakout (trigger) er daadwerkelijk is!
         if score >= MIN_SCORE and break_5m:
             logger.info(">>> 5M TRIGGER BEVESTIGD VOOR %s! TRADE WORDT GESTART.", symbol)
             return {
@@ -554,11 +552,42 @@ class MultiFactorBot:
         )
 
     def verify_protection_orders(self, symbol: str) -> bool:
+        """
+        Strikte verificatie: Controleert of ZOWEL de Stop Loss 
+        als de Take Profit daadwerkelijk actief zijn op de exchange.
+        """
         try:
             open_orders = self.exchange.fetch_open_orders(symbol)
-            has_sl = any(o.get("type") in ["stop", "stop_market", "loss"] or o.get("info", {}).get("stopLoss") for o in open_orders)
-            has_tp = any(o.get("type") in ["limit", "take_profit", "take_profit_market"] or o.get("info", {}).get("takeProfit") for o in open_orders)
-            return has_sl or has_tp
+            
+            has_sl = False
+            has_tp = False
+
+            for o in open_orders:
+                o_type = str(o.get("type", "")).lower()
+                info = o.get("info", {})
+                
+                # Check of het een Stop Loss / trigger order is
+                if (
+                    o_type in ["stop", "stop_market", "loss", "trigger"] or
+                    o.get("stopPrice") is not None or
+                    info.get("stopLoss") is not None or
+                    info.get("triggerPrice") is not None
+                ):
+                    has_sl = True
+
+                # Check of het een Take Profit / limit order is
+                if (
+                    o_type in ["limit", "take_profit", "take_profit_market"] or
+                    info.get("takeProfit") is not None
+                ):
+                    if o.get("reduceOnly") or info.get("reduceOnly") == "true":
+                        has_tp = True
+                    elif o_type in ["take_profit", "take_profit_market"]:
+                        has_tp = True
+
+            # BEIDE moeten aanwezig zijn om True terug te geven
+            return has_sl and has_tp
+
         except Exception as exc:
             logger.error("Kon open orders niet verifiëren voor %s: %s", symbol, exc)
             return False
@@ -687,28 +716,40 @@ class MultiFactorBot:
 
             close_side = "sell" if direction == "long" else "buy"
 
-            if not sl_supported:
-                self.exchange.create_order(
-                    symbol=symbol, type="stop", side=close_side, amount=amount, price=None,
-                    params={"triggerPrice": stop, "reduceOnly": True}
-                )
-            if not tp_supported:
-                self.exchange.create_order(
-                    symbol=symbol, type="limit", side=close_side, amount=amount, price=target,
-                    params={"reduceOnly": True}
-                )
+            # Strikte controle van bescherming op de exchange
+            protection_active = self.verify_protection_orders(symbol)
 
-            time.sleep(1)
-            protection_active = self.verify_protection_orders(symbol) or sl_supported or tp_supported
+            # Fallback: als attached orders niet direct zichtbaar zijn, plaats ze handmatig als losse orders
+            if not protection_active:
+                logger.warning("Attached SL/TP niet direct gevonden in open orders, val terug op losse protectie-orders...")
+                
+                try:
+                    self.exchange.create_order(
+                        symbol=symbol, type="stop", side=close_side, amount=amount, price=None,
+                        params={"triggerPrice": stop, "reduceOnly": True}
+                    )
+                except Exception as e:
+                    logger.error("Kon losse SL fallback niet plaatsen: %s", e)
+
+                try:
+                    self.exchange.create_order(
+                        symbol=symbol, type="limit", side=close_side, amount=amount, price=target,
+                        params={"reduceOnly": True}
+                    )
+                except Exception as e:
+                    logger.error("Kon losse TP fallback niet plaatsen: %s", e)
+                
+                time.sleep(1.5)
+                protection_active = self.verify_protection_orders(symbol)
 
             if not protection_active:
                 send_telegram(
-                    f"⚠️ <b>PROTECTION ERROR</b>\n"
-                    f"Positie geopend op {symbol}, maar SL/TP kon niet worden geverifieerd!"
+                    f"⚠️ <b>CRITICAL: PROTECTION ERROR</b>\n"
+                    f"Positie geopend op {symbol}, maar SL en/of TP konden NIET worden geverifieerd!"
                 )
             else:
                 send_telegram(
-                    f"✅ <b>SL/TP VERIFIED</b>\n"
+                    f"✅ <b>SL/TP STRICTLY VERIFIED</b>\n"
                     f"Symbol: <b>{symbol}</b>\n"
                     f"Actual Entry: <code>{actual_entry:.8f}</code>\n"
                     f"SL: <code>{stop:.8f}</code> | TP: <code>{target:.8f}</code>"
@@ -737,7 +778,7 @@ class MultiFactorBot:
 
     def run(self) -> None:
         send_telegram(
-            "🚀 <b>Multi-Factor Bot v2 (Smart Scoring) gestart</b>\n"
+            "🚀 <b>Multi-Factor Bot v2 (Smart Scoring + Strict Protection) gestart</b>\n"
             f"{len(SYMBOLS)} symbolen | Min Score: {MIN_SCORE} | Max posities: {MAX_ACTIVE_POSITIONS}"
         )
 
