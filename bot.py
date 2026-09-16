@@ -46,7 +46,7 @@ TIMEFRAME_FILTER = "5m"
 
 LOOKBACK = 50
 ZONE_ATR_MULT = 0.6
-MIN_BREAK_ATR = 1.6     # Strengere eis voor uitbraken (filtert slechte trades weg)
+MIN_BREAK_ATR = 1.6     # Strengere eis voor uitbraken
 RR_RATIO = 2.0
 DESIRED_MARGIN_USDT = 5.0     
 MIN_RISK_PERCENT = 0.005      
@@ -377,10 +377,12 @@ class BreakRetestBot:
             except Exception:
                 pass
 
-            # Veiligere marge berekening om "Insufficient margin" te voorkomen
-            target_margin = min(DESIRED_MARGIN_USDT, free_balance * 0.5)
-            if target_margin < 1.0:
-                target_margin = max(free_balance * 0.3, 1.0)
+            # Dynamische marge berekening op basis van werkelijk beschikbaar vrij saldo
+            safe_free = max(free_balance - 2.0, 1.0)
+            target_margin = min(DESIRED_MARGIN_USDT, safe_free * 0.4)
+            
+            if target_margin < 1.5:
+                target_margin = max(safe_free * 0.5, 1.0)
 
             position_value = target_margin * LEVERAGE
             calculated_amount = position_value / entry
@@ -467,7 +469,7 @@ class BreakRetestBot:
 
         emoji = "✅" if direction == "long" else "🔻"
         msg = (
-            f"{emoji} <b>{direction.upper()} ENTRY [FINETUNED]</b> {symbol}\n\n"
+            f"{emoji} <b>{direction.upper()} ENTRY [DYNAMISCH]</b> {symbol}\n\n"
             f"Entry:      <code>{entry:.4f}</code>\n"
             f"Stop Loss:  <code>{stop:.4f}</code>\n"
             f"Take Profit:<code>{target:.4f}</code>\n"
@@ -508,14 +510,14 @@ class BreakRetestBot:
 
             self.state[symbol]["in_position"] = True
             self.state[symbol]["entry_price"] = entry
-            send_telegram(f"📌 <b>POSITIE GEPLAATST [Finetuned]</b> {symbol}")
+            send_telegram(f"📌 <b>POSITIE GEPLAATST [Dynamische Marge]</b> {symbol}")
         except Exception as e:
             logger.error(f"Order error {symbol}: {e}")
             send_telegram(f"⚠️ <b>Order Fout op {symbol}</b>: {e}")
 
     def run(self):
-        logger.info("Break & Retest Bot (Finetuned Model) gestart...")
-        send_telegram("🤖 <b>Break & Retest Bot gestart! (Finetuned: strengere uitbraken & veilige marge)</b>")
+        logger.info("Break & Retest Bot (Dynamisch Marge Model) gestart...")
+        send_telegram("🤖 <b>Break & Retest Bot gestart! (Dynamische marge & strakke filters)</b>")
         
         while True:
             self.check_open_positions_and_orders()
