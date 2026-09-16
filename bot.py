@@ -265,9 +265,8 @@ class MultiFactorBot:
             if symbol not in SYMBOLS:
                 continue
 
+            # Punt 1: Fallback naar contractSize verwijderd om onjuiste positiedetectie te voorkomen
             contracts_raw = position.get("contracts")
-            if contracts_raw is None:
-                contracts_raw = position.get("contractSize")
 
             try:
                 contracts = abs(float(contracts_raw or 0))
@@ -587,6 +586,13 @@ class MultiFactorBot:
             )
             return
 
+        # Punt 2: Controleer exchange-specifieke feature support voor attached TP/SL
+        sl_supported = self.exchange.feature_value(symbol, "createOrder", "stopLoss")
+        tp_supported = self.exchange.feature_value(symbol, "createOrder", "takeProfit")
+
+        logger.info("BloFin attached SL support for %s: %s", symbol, sl_supported)
+        logger.info("BloFin attached TP support for %s: %s", symbol, tp_supported)
+
         msg = (
             f"🎯 <b>MULTI-FACTOR SIGNAL "
             f"({setup['score']}/100)</b>\n"
@@ -669,13 +675,13 @@ class MultiFactorBot:
             params = {
                 "marginMode": "isolated",
                 "reduceOnly": False,
-                "stopLoss": {
-                    "triggerPrice": stop,
-                },
-                "takeProfit": {
-                    "triggerPrice": target,
-                },
             }
+
+            # Voeg attached TP/SL alleen toe als CCXT/BloFin aangeeft dat het wordt ondersteund
+            if sl_supported:
+                params["stopLoss"] = {"triggerPrice": stop}
+            if tp_supported:
+                params["takeProfit"] = {"triggerPrice": target}
 
             entry_order = self.exchange.create_order(
                 symbol=symbol,
@@ -691,6 +697,42 @@ class MultiFactorBot:
             )
 
             time.sleep(1)
+
+            # Als attached TP/SL niet worden ondersteund door de exchange/versie, plaatsen we ze hier apart als reduce-only orders
+            close_side = "sell" if direction == "long" else "buy"
+
+            if not sl_supported:
+                try:
+                    self.exchange.create_order(
+                        symbol=symbol,
+                        type="stop",
+                        side=close_side,
+                        amount=amount,
+                        price=None,
+                        params={
+                            "triggerPrice": stop,
+                            "reduceOnly": True,
+                        }
+                    )
+                    logger.info("Separate Stop Loss order placed for %s at %s", symbol, stop)
+                except Exception as sl_exc:
+                    logger.error("Failed to place separate Stop Loss for %s: %s", symbol, sl_exc)
+
+            if not tp_supported:
+                try:
+                    self.exchange.create_order(
+                        symbol=symbol,
+                        type="limit",
+                        side=close_side,
+                        amount=amount,
+                        price=target,
+                        params={
+                            "reduceOnly": True,
+                        }
+                    )
+                    logger.info("Separate Take Profit order placed for %s at %s", symbol, target)
+                except Exception as tp_exc:
+                    logger.error("Failed to place separate Take Profit for %s: %s", symbol, tp_exc)
 
             positions = self.fetch_open_positions()
             live_position = positions.get(symbol)
