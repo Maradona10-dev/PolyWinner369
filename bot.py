@@ -29,7 +29,7 @@ PAPER_TRADING = os.environ.get("PAPER_TRADING", "False").lower() == "true"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# BloFin Perpetual Symbols
+# BloFin Perpetual Symbols (Uitgebreid naar 20 munten met lagere BTC-correlatie / high-beta)
 SYMBOLS = [
     "BTC/USDT:USDT",
     "ETH/USDT:USDT",
@@ -40,7 +40,17 @@ SYMBOLS = [
     "ADA/USDT:USDT",
     "AVAX/USDT:USDT",
     "LINK/USDT:USDT",
-    "SUI/USDT:USDT"
+    "SUI/USDT:USDT",
+    "NEAR/USDT:USDT",
+    "APT/USDT:USDT",
+    "ARB/USDT:USDT",
+    "OP/USDT:USDT",
+    "INJ/USDT:USDT",
+    "PEPE/USDT:USDT",
+    "RENDER/USDT:USDT",
+    "WIF/USDT:USDT",
+    "ENA/USDT:USDT",
+    "TON/USDT:USDT"
 ]
 
 # Strategie parameters (gebaseerd op je 15M/1H logica)
@@ -241,7 +251,7 @@ class MultiFactorBot:
             logger.error(f"Execution error on {symbol}: {e}")
 
     def run(self):
-        send_telegram("🚀 <b>Multi-Factor Scanner & Bot gestart op BloFin!</b>")
+        send_telegram(f"🚀 <b>Multi-Factor Scanner & Bot gestart op BloFin ({len(SYMBOLS)} munten actief)!</b>")
         while True:
             for symbol in SYMBOLS:
                 try:
