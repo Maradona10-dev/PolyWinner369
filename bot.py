@@ -40,7 +40,7 @@ SYMBOLS = [
     "LTC/USDT:USDT"
 ]
 
-# Strategie parameters (Vol Risico Modus)
+# Strategie parameters (Harde Saldo-Beveiliging)
 TIMEFRAME_ENTRY = "1m"
 TIMEFRAME_FILTER = "5m"
 
@@ -48,14 +48,14 @@ LOOKBACK = 50
 ZONE_ATR_MULT = 0.6
 MIN_BREAK_ATR = 1.4
 RR_RATIO = 2.0
-MAX_RISK_USDT = 8.0           # Vol risico per trade om positie-omvang op te schroeven
-MIN_RISK_PERCENT = 0.002      # Voldoende afstand om extreme hoeveelheden te voorkomen
+MAX_RISK_USDT = 5.0           # Realistisch risico zodat het altijd past bij een klein saldo
+MIN_RISK_PERCENT = 0.003      # Houdt stop-losses op een veilige minimale afstand
 LEVERAGE = 7                    
 ATR_LENGTH = 14
 EMA_FILTER_LENGTH = 20
 SCAN_INTERVAL = 12
 MAX_BREAKOUT_AGE_MINUTES = 22
-MAX_ACTIVE_ORDERS = 2           # Strikt maximaal 2 posities tegelijk!
+MAX_ACTIVE_ORDERS = 2           # Maximaal 2 posities tegelijk
 
 TRADE_LOG_FILE = "trade_history.json"
 
@@ -304,7 +304,7 @@ class BreakRetestBot:
                     f"Zone: {zone[0]:.4f} - {zone[1]:.4f}"
                 )
 
-        # Retest + Entry met robuuste stop-loss controle
+        # Retest + Entry met strenge stop-loss controle
         if state["broke_out"] and state["zone"] and not state["in_position"]:
             zone_bottom, zone_top = state["zone"]
             direction = state["direction"]
@@ -325,7 +325,7 @@ class BreakRetestBot:
                 )
                 if touched and confirm:
                     entry = close
-                    stop = float(zone_bottom - (atr * 0.4))
+                    stop = float(zone_bottom - (atr * 0.5))
                     
                     min_stop_distance = entry * MIN_RISK_PERCENT
                     if (entry - stop) < min_stop_distance:
@@ -344,7 +344,7 @@ class BreakRetestBot:
                 )
                 if touched and confirm:
                     entry = close
-                    stop = float(zone_top + (atr * 0.4))
+                    stop = float(zone_top + (atr * 0.5))
                     
                     min_stop_distance = entry * MIN_RISK_PERCENT
                     if (stop - entry) < min_stop_distance:
@@ -370,10 +370,10 @@ class BreakRetestBot:
 
     def calculate_position_size(self, symbol: str, entry: float, stop: float) -> float:
         try:
-            balance = 32.0 
+            free_balance = 10.0 
             try:
                 bal_info = self.exchange.fetch_balance()
-                balance = float(bal_info['USDT']['free'])
+                free_balance = float(bal_info['USDT']['free'])
             except Exception:
                 pass
 
@@ -381,10 +381,13 @@ class BreakRetestBot:
             if risk_per_unit <= 0:
                 return 0
             
+            # Basis berekening op basis van ingesteld risico
             calculated_amount = MAX_RISK_USDT / risk_per_unit
-            # Maximaal toestaan tot 90% van de totale hefboomcapaciteit voor maximale inzet
-            max_allowed_value = (balance * LEVERAGE) * 0.90
-            max_qty_by_balance = max_allowed_value / entry
+            
+            # STRIKTE GRENS: De benodigde marge mag nooit meer zijn dan 85% van je werkelijke vrije saldo
+            max_allowed_margin = free_balance * 0.85
+            max_allowed_position_value = max_allowed_margin * LEVERAGE
+            max_qty_by_balance = max_allowed_position_value / entry
             
             if calculated_amount > max_qty_by_balance:
                 calculated_amount = max_qty_by_balance
@@ -472,7 +475,7 @@ class BreakRetestBot:
 
         emoji = "✅" if direction == "long" else "🔻"
         msg = (
-            f"{emoji} <b>{direction.upper()} ENTRY [VOL RISICO MODUS]</b> {symbol}\n\n"
+            f"{emoji} <b>{direction.upper()} ENTRY [SALDO GEOPTIMALISEERD]</b> {symbol}\n\n"
             f"Entry:      <code>{entry:.4f}</code>\n"
             f"Stop Loss:  <code>{stop:.4f}</code>\n"
             f"Take Profit:<code>{target:.4f}</code>\n"
@@ -513,14 +516,14 @@ class BreakRetestBot:
 
             self.state[symbol]["in_position"] = True
             self.state[symbol]["entry_price"] = entry
-            send_telegram(f"📌 <b>VOLLE RISICO POSITIE GEPLAATST [Max 2 tegelijk]</b> {symbol}")
+            send_telegram(f"📌 <b>GEÜPDATE POSITIE GEPLAATST [7x]</b> {symbol}")
         except Exception as e:
             logger.error(f"Order error {symbol}: {e}")
             send_telegram(f"⚠️ <b>Order Fout op {symbol}</b>: {e}")
 
     def run(self):
-        logger.info("Break & Retest Bot (Vol Risico Modus - Max 2 posities) gestart...")
-        send_telegram("🤖 <b>Break & Retest Bot gestart! (Vol Risico Modus, max 2 posities actief)</b>")
+        logger.info("Break & Retest Bot (Saldo Beveiliging Actief) gestart...")
+        send_telegram("🤖 <b>Break & Retest Bot gestart! (Saldo-beveiliging tegen Insufficient Margin)</b>")
         
         while True:
             self.check_open_positions_and_orders()
