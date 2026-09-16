@@ -131,9 +131,9 @@ class BreakRetestBot:
         current = df.iloc[-1]
         prev = df.iloc[-2]
 
-        price_above_ema = current["close"] > current["ema"]
-        ema_rising = current["ema"] > prev["ema"]
-        last_bullish = current["close"] > current["open"]
+        price_above_ema = float(current["close"]) > float(current["ema"])
+        ema_rising = float(current["ema"]) > float(prev["ema"])
+        last_bullish = float(current["close"]) > float(current["open"])
 
         bull_score = sum([price_above_ema, ema_rising, last_bullish])
         bear_score = sum([not price_above_ema, not ema_rising, not last_bullish])
@@ -150,7 +150,7 @@ class BreakRetestBot:
 
         highs = df["high"].values
         lows = df["low"].values
-        atr = df["atr"].iloc[-1]
+        atr = float(df["atr"].iloc[-1])
 
         if pd.isna(atr) or atr == 0:
             return None, None
@@ -158,13 +158,13 @@ class BreakRetestBot:
         resistance = None
         for i in range(len(df) - 8, 8, -1):
             if highs[i] == max(highs[i-7:i+8]) and highs[i] > highs[i-3] and highs[i] > highs[i+3]:
-                resistance = highs[i]
+                resistance = float(highs[i])
                 break
 
         support = None
         for i in range(len(df) - 8, 8, -1):
             if lows[i] == min(lows[i-7:i+8]) and lows[i] < lows[i-3] and lows[i] < lows[i+3]:
-                support = lows[i]
+                support = float(lows[i])
                 break
 
         return resistance, support
@@ -174,7 +174,7 @@ class BreakRetestBot:
             return None
 
         current = df_1m.iloc[-1]
-        atr = current["atr"]
+        atr = float(current["atr"])
         if pd.isna(atr) or atr == 0:
             return None
 
@@ -182,22 +182,26 @@ class BreakRetestBot:
         resistance, support = self.find_zones(df_1m)
         htf_bias = self.get_higher_tf_bias(symbol)
 
+        close = float(current["close"])
+        open_p = float(current["open"])
+        vol = float(current["volume"])
+
         # Long Setup
         if not state["broke_out"] and resistance is not None and htf_bias == "bullish":
             strong_break = (
-                current["close"] > resistance and
-                (current["close"] - resistance) > atr * MIN_BREAK_ATR and
-                current["close"] > current["open"] and
-                current["volume"] > df_1m["volume"].iloc[-10:-1].mean() * 0.8
+                close > resistance and
+                (close - resistance) > atr * MIN_BREAK_ATR and
+                close > open_p and
+                vol > float(df_1m["volume"].iloc[-10:-1].mean()) * 0.8
             )
             if strong_break:
                 half = atr * ZONE_ATR_MULT
-                zone = (resistance - half * 0.4, resistance + half * 0.8)
+                zone = (float(resistance - half * 0.4), float(resistance + half * 0.8))
                 state.update({
                     "direction": "long",
                     "broke_out": True,
                     "zone": zone,
-                    "level": resistance,
+                    "level": float(resistance),
                     "break_time": datetime.now()
                 })
                 send_telegram(
@@ -209,19 +213,19 @@ class BreakRetestBot:
         # Short Setup
         if not state["broke_out"] and support is not None and htf_bias == "bearish":
             strong_break = (
-                current["close"] < support and
-                (support - current["close"]) > atr * MIN_BREAK_ATR and
-                current["close"] < current["open"] and
-                current["volume"] > df_1m["volume"].iloc[-10:-1].mean() * 0.8
+                close < support and
+                (support - close) > atr * MIN_BREAK_ATR and
+                close < open_p and
+                vol > float(df_1m["volume"].iloc[-10:-1].mean()) * 0.8
             )
             if strong_break:
                 half = atr * ZONE_ATR_MULT
-                zone = (support - half * 0.8, support + half * 0.4)
+                zone = (float(support - half * 0.8), float(support + half * 0.4))
                 state.update({
                     "direction": "short",
                     "broke_out": True,
                     "zone": zone,
-                    "level": support,
+                    "level": float(support),
                     "break_time": datetime.now()
                 })
                 send_telegram(
@@ -234,6 +238,8 @@ class BreakRetestBot:
         if state["broke_out"] and state["zone"] and not state["in_position"]:
             zone_bottom, zone_top = state["zone"]
             direction = state["direction"]
+            low = float(current["low"])
+            high = float(current["high"])
 
             if direction == "long" and htf_bias != "bullish":
                 return None
@@ -241,31 +247,31 @@ class BreakRetestBot:
                 return None
 
             if direction == "long":
-                touched = current["low"] <= zone_top and current["low"] >= zone_bottom * 0.998
+                touched = low <= zone_top and low >= zone_bottom * 0.998
                 confirm = (
-                    current["close"] > current["open"] and
-                    current["close"] > zone_top * 0.998 and
-                    current["low"] <= zone_top
+                    close > open_p and
+                    close > zone_top * 0.998 and
+                    low <= zone_top
                 )
                 if touched and confirm:
-                    entry = current["close"]
-                    stop = zone_bottom - (atr * 0.3)
+                    entry = close
+                    stop = float(zone_bottom - (atr * 0.3))
                     risk = entry - stop
-                    target = entry + (risk * RR_RATIO)
+                    target = float(entry + (risk * RR_RATIO))
                     return {"symbol": symbol, "direction": "long", "entry": entry, "stop": stop, "target": target, "zone": state["zone"]}
 
             elif direction == "short":
-                touched = current["high"] >= zone_bottom and current["high"] <= zone_top * 1.002
+                touched = high >= zone_bottom and high <= zone_top * 1.002
                 confirm = (
-                    current["close"] < current["open"] and
-                    current["close"] < zone_bottom * 1.002 and
-                    current["high"] >= zone_bottom
+                    close < open_p and
+                    close < zone_bottom * 1.002 and
+                    high >= zone_bottom
                 )
                 if touched and confirm:
-                    entry = current["close"]
-                    stop = zone_top + (atr * 0.3)
+                    entry = close
+                    stop = float(zone_top + (atr * 0.3))
                     risk = stop - entry
-                    target = entry - (risk * RR_RATIO)
+                    target = float(entry - (risk * RR_RATIO))
                     return {"symbol": symbol, "direction": "short", "entry": entry, "stop": stop, "target": target, "zone": state["zone"]}
 
         if state["broke_out"] and state["break_time"]:
@@ -290,33 +296,35 @@ class BreakRetestBot:
             
             calculated_amount = MAX_RISK_USDT / risk_per_unit
             market = self.exchange.market(symbol)
-            min_amount = market['limits']['amount']['min']
-            max_amount = market['limits']['amount'].get('max', float('inf'))
+            min_amount = float(market['limits']['amount']['min'])
+            max_amount = float(market['limits']['amount'].get('max', float('inf')))
             
             if calculated_amount < min_amount:
                 calculated_amount = min_amount
             if max_amount and calculated_amount > max_amount:
                 calculated_amount = max_amount
             
-            return float(self.exchange.amount_to_precision(symbol, calculated_amount))
+            # Zorg dat de hoeveelheid netjes voldoet aan de precision regels van BloFin
+            precision_amount = market['precision']['amount']
+            if precision_amount:
+                # Afronden op de juiste decimalen van de beurs
+                return float(self.exchange.amount_to_precision(symbol, calculated_amount))
+            return float(calculated_amount)
         except Exception as e:
             logger.error(f"Position size error for {symbol}: {e}")
             return 0
 
     def check_open_positions_and_orders(self) -> int:
-        """Controleert hoeveel open posities en open orders er momenteel op de beurs staan."""
         if PAPER_TRADING:
             return sum(1 for s in SYMBOLS if self.state[s]["in_position"])
 
         try:
-            # Haal openstaande orders en open posities op
             open_orders = self.exchange.fetch_open_orders()
             positions = self.exchange.fetch_positions(SYMBOLS)
             active_positions = [p for p in positions if float(p.get('contracts', 0)) > 0]
 
             total_active = len(open_orders) + len(active_positions)
             
-            # Synchroniseer lokale status
             active_symbols = {p['symbol'] for p in active_positions}
             for symbol in SYMBOLS:
                 if self.state[symbol]["in_position"] and symbol not in active_symbols:
@@ -335,7 +343,6 @@ class BreakRetestBot:
             return 0
 
     def execute_trade(self, setup: dict):
-        # Controleer eerst of we het maximum aantal open orders/posities al hebben bereikt
         active_count = self.check_open_positions_and_orders()
         if active_count >= MAX_ACTIVE_ORDERS:
             logger.info(f"Max aantal actieve orders/posities bereikt ({active_count}/{MAX_ACTIVE_ORDERS}). Trade overgeslagen.")
@@ -381,16 +388,16 @@ class BreakRetestBot:
             # Open market order
             self.exchange.create_order(symbol=symbol, type="market", side=side, amount=amount)
             
-            # Stop Loss
+            # Stop Loss (met gepaste floats)
             self.exchange.create_order(
                 symbol=symbol, type="market", side=side_close, amount=amount,
-                params={"stopLossPrice": stop, "reduceOnly": True}
+                params={"stopLossPrice": float(stop), "reduceOnly": True}
             )
             
-            # Take Profit
+            # Take Profit (met gepaste floats)
             self.exchange.create_order(
-                symbol=symbol, type="limit", side=side_close, amount=amount, price=target,
-                params={"takeProfitPrice": target, "reduceOnly": True}
+                symbol=symbol, type="limit", side=side_close, amount=amount, price=float(target),
+                params={"takeProfitPrice": float(target), "reduceOnly": True}
             )
 
             self.state[symbol]["in_position"] = True
@@ -400,11 +407,10 @@ class BreakRetestBot:
             send_telegram(f"⚠️ <b>Order Fout op {symbol}</b>: {e}")
 
     def run(self):
-        logger.info("Break & Retest Bot (Max Orders Limiet) gestart...")
-        send_telegram("🤖 <b>Break & Retest Bot gestart! (Max 5 orders limiet)</b>")
+        logger.info("Break & Retest Bot (Fix JSON + Precision) gestart...")
+        send_telegram("🤖 <b>Break & Retest Bot gestart! (Met JSON & Precision fixes)</b>")
         
         while True:
-            # Controleer periodiek de status
             self.check_open_positions_and_orders()
 
             for symbol in SYMBOLS:
