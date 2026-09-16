@@ -47,7 +47,7 @@ LOOKBACK = 50
 ZONE_ATR_MULT = 0.6
 MIN_BREAK_ATR = 1.4
 RR_RATIO = 2.0
-MAX_RISK_USDT = 5.0             # Iets meer risico/actie per trade toegestaan
+MAX_RISK_USDT = 4.0             # Mooie balans voor actie en risico
 LEVERAGE = 7                    # Hefboom 7x
 ATR_LENGTH = 14
 EMA_FILTER_LENGTH = 20
@@ -290,27 +290,28 @@ class BreakRetestBot:
 
     def calculate_position_size(self, symbol: str, entry: float, stop: float) -> float:
         try:
-            # Haal beschikbaar saldo op van de exchange om te voorkomen dat orders te groot worden
-            balance = 32.0 # Standaard fallback gebaseerd op je wallet
+            # Haal live het beschikbare saldo op
+            balance = 32.0
             try:
                 bal_info = self.exchange.fetch_balance()
                 balance = float(bal_info['USDT']['free'])
             except Exception:
                 pass
 
+            # Strikte marge-grens: Zorg dat de benodigde margin (Notionele waarde / Leverage) 
+            # nooit groter is dan ongeveer 85% van je werkelijke beschikbare saldo.
+            max_notional = balance * LEVERAGE * 0.85
+            max_qty_by_wallet = max_notional / entry
+
             risk_per_unit = abs(entry - stop)
             if risk_per_unit <= 0:
-                return 0
-            
-            # Bereken op basis van risico, maar begrens direct op wat je account effectief aankan met de hefboom
-            calculated_amount = MAX_RISK_USDT / risk_per_unit
-            
-            # Veiligheidsgrens: Zorg dat de positiewa waarde (entry * amount) niet groter is dan ca. 80% van je totale hefboom-capaciteit
-            max_allowed_value = (balance * LEVERAGE) * 0.8
-            max_qty_by_balance = max_allowed_value / entry
-            
-            if calculated_amount > max_qty_by_balance:
-                calculated_amount = max_qty_by_balance
+                calculated_amount = max_qty_by_wallet
+            else:
+                calculated_amount = MAX_RISK_USDT / risk_per_unit
+
+            # Grijp direct in als de hoeveelheid te groot is voor je portemonnee
+            if calculated_amount > max_qty_by_wallet:
+                calculated_amount = max_qty_by_wallet
 
             market = self.exchange.market(symbol)
             min_amount = float(market['limits']['amount']['min'])
@@ -423,8 +424,8 @@ class BreakRetestBot:
             send_telegram(f"⚠️ <b>Order Fout op {symbol}</b>: {e}")
 
     def run(self):
-        logger.info("Break & Retest Bot (Isolated Margin) gestart...")
-        send_telegram("🤖 <b>Break & Retest Bot gestart! (Modus: ISOLATED, Actief & Risicovol)</b>")
+        logger.info("Break & Retest Bot (Saldo-begrensd) gestart...")
+        send_telegram("🤖 <b>Break & Retest Bot gestart! (Saldo-begrensd & Actief)</b>")
         
         while True:
             self.check_open_positions_and_orders()
