@@ -40,22 +40,22 @@ SYMBOLS = [
     "LTC/USDT:USDT"
 ]
 
-# Strategie parameters (Finetuned tegen valse uitbraken)
+# Strategie parameters (Vast en gecontroleerd)
 TIMEFRAME_ENTRY = "1m"
 TIMEFRAME_FILTER = "5m"
 
 LOOKBACK = 50
 ZONE_ATR_MULT = 0.6
-MIN_BREAK_ATR = 1.6     # Strengere eis voor uitbraken
+MIN_BREAK_ATR = 1.6     
 RR_RATIO = 2.0
-DESIRED_MARGIN_USDT = 5.0     
+FIXED_MARGIN_USDT = 5.0       # Altijd exact 5 USDT marge
 MIN_RISK_PERCENT = 0.005      
-LEVERAGE = 10                   
+FIXED_LEVERAGE = 10           # ALTIJD 10x hefboom voor alles (geen 50x meer!)
 ATR_LENGTH = 14
 EMA_FILTER_LENGTH = 20
 SCAN_INTERVAL = 12
 MAX_BREAKOUT_AGE_MINUTES = 22
-MAX_ACTIVE_ORDERS = 2           # Maximaal 2 posities tegelijk
+MAX_ACTIVE_ORDERS = 2         # Maximaal 2 posities tegelijk
 
 TRADE_LOG_FILE = "trade_history.json"
 
@@ -369,22 +369,9 @@ class BreakRetestBot:
         return None
 
     def calculate_position_size(self, symbol: str, entry: float) -> float:
+        """Berekent exact de positiegrootte voor een vaste 5 USDT marge bij 10x hefboom."""
         try:
-            free_balance = 10.0 
-            try:
-                bal_info = self.exchange.fetch_balance()
-                free_balance = float(bal_info['USDT']['free'])
-            except Exception:
-                pass
-
-            # Dynamische marge berekening op basis van werkelijk beschikbaar vrij saldo
-            safe_free = max(free_balance - 2.0, 1.0)
-            target_margin = min(DESIRED_MARGIN_USDT, safe_free * 0.4)
-            
-            if target_margin < 1.5:
-                target_margin = max(safe_free * 0.5, 1.0)
-
-            position_value = target_margin * LEVERAGE
+            position_value = FIXED_MARGIN_USDT * FIXED_LEVERAGE
             calculated_amount = position_value / entry
 
             market = self.exchange.market(symbol)
@@ -396,13 +383,10 @@ class BreakRetestBot:
             if max_amount and calculated_amount > max_amount:
                 calculated_amount = max_amount
             
-            precision_amount = market['precision']['amount']
-            if precision_amount:
-                return float(self.exchange.amount_to_precision(symbol, calculated_amount))
-            return float(calculated_amount)
+            return float(self.exchange.amount_to_precision(symbol, calculated_amount))
         except Exception as e:
             logger.error(f"Position size error for {symbol}: {e}")
-            return 0
+            return 0.0
 
     def check_open_positions_and_orders(self) -> int:
         if PAPER_TRADING:
@@ -428,7 +412,7 @@ class BreakRetestBot:
                             exit_p = float(p.get('markPrice', entry_p))
                             
                     pnl_est = (exit_p - entry_p) if direction == "long" else (entry_p - exit_p)
-                    pnl_est *= 5.0 
+                    pnl_est *= FIXED_MARGIN_USDT 
                     
                     self.log_completed_trade(symbol, direction, entry_p, exit_p, pnl_est)
 
@@ -469,12 +453,12 @@ class BreakRetestBot:
 
         emoji = "✅" if direction == "long" else "🔻"
         msg = (
-            f"{emoji} <b>{direction.upper()} ENTRY [DYNAMISCH]</b> {symbol}\n\n"
+            f"{emoji} <b>{direction.upper()} ENTRY [VAST 5 USDT]</b> {symbol}\n\n"
             f"Entry:      <code>{entry:.4f}</code>\n"
             f"Stop Loss:  <code>{stop:.4f}</code>\n"
             f"Take Profit:<code>{target:.4f}</code>\n"
             f"Risk:Reward → 1:{RR_RATIO}\n"
-            f"Marge inzet: ±{DESIRED_MARGIN_USDT} USDT (Lev: {LEVERAGE}x)"
+            f"Marge inzet: <b>{FIXED_MARGIN_USDT} USDT</b> (Lev: {FIXED_LEVERAGE}x)"
         )
         send_telegram(msg)
 
@@ -487,13 +471,13 @@ class BreakRetestBot:
         try:
             try:
                 self.exchange.set_margin_mode('isolated', symbol)
-                self.exchange.set_leverage(LEVERAGE, symbol)
+                self.exchange.set_leverage(FIXED_LEVERAGE, symbol)
             except Exception as ex:
                 logger.warning(f"Kon margin mode of leverage niet instellen voor {symbol}: {ex}")
 
             order_params = {
                 "marginMode": "isolated",
-                "leverage": LEVERAGE
+                "leverage": FIXED_LEVERAGE
             }
 
             self.exchange.create_order(symbol=symbol, type="market", side=side, amount=amount, params=order_params)
@@ -510,14 +494,17 @@ class BreakRetestBot:
 
             self.state[symbol]["in_position"] = True
             self.state[symbol]["entry_price"] = entry
-            send_telegram(f"📌 <b>POSITIE GEPLAATST [Dynamische Marge]</b> {symbol}")
+            send_telegram(f"📌 <b>POSITIE GEPLAATST (Vaste 5 USDT Marge)</b> {symbol}")
+            
+            time.sleep(1.5)
+
         except Exception as e:
             logger.error(f"Order error {symbol}: {e}")
             send_telegram(f"⚠️ <b>Order Fout op {symbol}</b>: {e}")
 
     def run(self):
-        logger.info("Break & Retest Bot (Dynamisch Marge Model) gestart...")
-        send_telegram("🤖 <b>Break & Retest Bot gestart! (Dynamische marge & strakke filters)</b>")
+        logger.info("Break & Retest Bot (Vast 10x / 5 USDT Model) gestart...")
+        send_telegram("🤖 <b>Break & Retest Bot gestart! (Vastgesteld op 10x hefboom & 5 USDT marge)</b>")
         
         while True:
             self.check_open_positions_and_orders()
