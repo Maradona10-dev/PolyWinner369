@@ -304,10 +304,8 @@ class BreakRetestBot:
             if max_amount and calculated_amount > max_amount:
                 calculated_amount = max_amount
             
-            # Zorg dat de hoeveelheid netjes voldoet aan de precision regels van BloFin
             precision_amount = market['precision']['amount']
             if precision_amount:
-                # Afronden op de juiste decimalen van de beurs
                 return float(self.exchange.amount_to_precision(symbol, calculated_amount))
             return float(calculated_amount)
         except Exception as e:
@@ -365,12 +363,12 @@ class BreakRetestBot:
 
         emoji = "✅" if direction == "long" else "🔻"
         msg = (
-            f"{emoji} <b>{direction.upper()} ENTRY [BloFin]</b> {symbol}\n\n"
+            f"{emoji} <b>{direction.upper()} ENTRY [BloFin - ISOLATED]</b> {symbol}\n\n"
             f"Entry:      <code>{entry:.4f}</code>\n"
             f"Stop Loss:  <code>{stop:.4f}</code>\n"
             f"Take Profit:<code>{target:.4f}</code>\n"
             f"Risk:Reward → 1:{RR_RATIO}\n"
-            f"Qty: {amount} (Lev: {LEVERAGE}x)"
+            f"Qty: {amount} (Lev: {LEVERAGE}x - Isolated)"
         )
         send_telegram(msg)
 
@@ -381,34 +379,36 @@ class BreakRetestBot:
 
         try:
             try:
+                # Zet de marge modus expliciet op 'isolated' en pas de hefboom toe
+                self.exchange.set_margin_mode('isolated', symbol)
                 self.exchange.set_leverage(LEVERAGE, symbol)
-            except Exception:
-                pass
+            except Exception as ex:
+                logger.warning(f"Kon margin mode of leverage niet instellen voor {symbol}: {ex}")
 
             # Open market order
             self.exchange.create_order(symbol=symbol, type="market", side=side, amount=amount)
             
-            # Stop Loss (met gepaste floats)
+            # Stop Loss
             self.exchange.create_order(
                 symbol=symbol, type="market", side=side_close, amount=amount,
                 params={"stopLossPrice": float(stop), "reduceOnly": True}
             )
             
-            # Take Profit (met gepaste floats)
+            # Take Profit
             self.exchange.create_order(
                 symbol=symbol, type="limit", side=side_close, amount=amount, price=float(target),
                 params={"takeProfitPrice": float(target), "reduceOnly": True}
             )
 
             self.state[symbol]["in_position"] = True
-            send_telegram(f"📌 <b>LIVE ORDERS GEPLAATST [7x Lev]</b> {symbol}")
+            send_telegram(f"📌 <b>LIVE ISOLATED ORDERS GEPLAATST [7x]</b> {symbol}")
         except Exception as e:
             logger.error(f"Order error {symbol}: {e}")
             send_telegram(f"⚠️ <b>Order Fout op {symbol}</b>: {e}")
 
     def run(self):
-        logger.info("Break & Retest Bot (Fix JSON + Precision) gestart...")
-        send_telegram("🤖 <b>Break & Retest Bot gestart! (Met JSON & Precision fixes)</b>")
+        logger.info("Break & Retest Bot (Isolated Margin) gestart...")
+        send_telegram("🤖 <b>Break & Retest Bot gestart! (Modus: ISOLATED, Max 5 orders)</b>")
         
         while True:
             self.check_open_positions_and_orders()
