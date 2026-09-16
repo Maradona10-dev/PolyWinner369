@@ -48,7 +48,7 @@ LOOKBACK = 50
 ZONE_ATR_MULT = 0.6
 MIN_BREAK_ATR = 1.4
 RR_RATIO = 2.0
-MAX_RISK_USDT = 5.0             
+MAX_RISK_USDT = 20.0          # Flink verhoogd voor grotere posities & serieuze winsten!
 LEVERAGE = 7                    
 ATR_LENGTH = 14
 EMA_FILTER_LENGTH = 20
@@ -163,7 +163,6 @@ class BreakRetestBot:
         winrate = (len(wins) / total_trades) * 100 if total_trades > 0 else 0
         total_pnl = sum(t["pnl"] for t in trades)
         
-        # Zoek beste en slechtste munt
         coin_pnl = {}
         for t in trades:
             s = t["symbol"]
@@ -179,7 +178,7 @@ class BreakRetestBot:
             f"Geschatte PnL: <b>{total_pnl:.2f} USDT</b>\n"
             f"🏆 Beste munt: <b>{best_coin}</b> ({coin_pnl.get(best_coin, 0):.2f} USDT)\n"
             f"⚠️ Slechtste munt: <b>{worst_coin}</b> ({coin_pnl.get(worst_coin, 0):.2f} USDT)\n\n"
-            f"<i>Doorgaan met data verzamelen richting de 100 trades!</i>"
+            f"<i>Op weg naar de 100 trades voor adaptieve analyse!</i>"
         )
         send_telegram(report)
 
@@ -411,24 +410,20 @@ class BreakRetestBot:
             active_symbols = {p['symbol'] for p in active_positions}
             for symbol in SYMBOLS:
                 if self.state[symbol]["in_position"] and symbol not in active_symbols:
-                    # Positie is gesloten! Log een schatting van het resultaat op basis van entry en marktprijs
                     closed_state = self.state[symbol]
                     entry_p = closed_state.get("entry_price", 0)
                     direction = closed_state.get("direction", "long")
                     
-                    # Probeer actuele exit prijs te vinden
                     exit_p = entry_p
                     for p in positions:
                         if p['symbol'] == symbol:
                             exit_p = float(p.get('markPrice', entry_p))
                             
-                    # Simuleer globale PnL voor de log
                     pnl_est = (exit_p - entry_p) if direction == "long" else (entry_p - exit_p)
-                    pnl_est *= 5.0 # Indicatieve schatting op basis van risico/positie
+                    pnl_est *= 5.0 
                     
                     self.log_completed_trade(symbol, direction, entry_p, exit_p, pnl_est)
 
-                    # Reset state
                     self.state[symbol] = {
                         "direction": None,
                         "broke_out": False,
@@ -467,12 +462,12 @@ class BreakRetestBot:
 
         emoji = "✅" if direction == "long" else "🔻"
         msg = (
-            f"{emoji} <b>{direction.upper()} ENTRY [BloFin - ISOLATED]</b> {symbol}\n\n"
+            f"{emoji} <b>{direction.upper()} ENTRY [BloFin - GROTE POSITIE]</b> {symbol}\n\n"
             f"Entry:      <code>{entry:.4f}</code>\n"
             f"Stop Loss:  <code>{stop:.4f}</code>\n"
             f"Take Profit:<code>{target:.4f}</code>\n"
             f"Risk:Reward → 1:{RR_RATIO}\n"
-            f"Qty: {amount} (Lev: {LEVERAGE}x - Isolated)"
+            f"Qty: {amount} (Lev: {LEVERAGE}x - Risico: {MAX_RISK_USDT} USDT)"
         )
         send_telegram(msg)
 
@@ -508,19 +503,18 @@ class BreakRetestBot:
 
             self.state[symbol]["in_position"] = True
             self.state[symbol]["entry_price"] = entry
-            send_telegram(f"📌 <b>LIVE ISOLATED ORDERS GEPLAATST [7x]</b> {symbol}")
+            send_telegram(f"📌 <b>LIVE ISOLATED ORDERS GEPLAATST [7x - Grote Positie]</b> {symbol}")
         except Exception as e:
             logger.error(f"Order error {symbol}: {e}")
             send_telegram(f"⚠️ <b>Order Fout op {symbol}</b>: {e}")
 
     def run(self):
-        logger.info("Break & Retest Bot (Met Trade Logging) gestart...")
-        send_telegram("🤖 <b>Break & Retest Bot gestart! (Modus: ISOLATED + Trade Logging actief)</b>")
+        logger.info("Break & Retest Bot (Grote Posities + Logging) gestart...")
+        send_telegram("🤖 <b>Break & Retest Bot gestart! (Modus: Grotere Posities & Logging)</b>")
         
         while True:
             self.check_open_positions_and_orders()
 
-            # Controleer of we een dagelijkse rapportage moeten sturen (elke dag om middernacht of switch van dag)
             current_date = datetime.now().date()
             if current_date != self.last_report_date:
                 self.send_performance_report()
