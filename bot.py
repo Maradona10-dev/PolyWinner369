@@ -54,7 +54,6 @@ SYMBOLS = [
     "RENDER/USDT:USDT",
     "WIF/USDT:USDT",
     "ENA/USDT:USDT",
-    "TON/USDT:USDT",
 ]
 
 SCAN_TF = "15m"
@@ -889,11 +888,9 @@ def run_web():
 
 
 if __name__ == "__main__":
-    # Start de Flask webserver in een achtergrond-thread (voor Railway healthchecks)
     web_thread = threading.Thread(target=run_web)
     web_thread.daemon = True
     web_thread.start()
 
-    # Start de Multi-Factor Bot
     bot = MultiFactorBot()
     bot.run()
