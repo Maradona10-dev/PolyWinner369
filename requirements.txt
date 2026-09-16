@@ -1,4 +1,5 @@
 ccxt
 pandas
 pandas_ta
+flask
 requests
