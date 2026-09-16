@@ -40,7 +40,7 @@ SYMBOLS = [
     "LTC/USDT:USDT"
 ]
 
-# Strategie parameters (Vaste Marge Model voor stabiele trades)
+# Strategie parameters (Verhoogde marge voor grotere posities)
 TIMEFRAME_ENTRY = "1m"
 TIMEFRAME_FILTER = "5m"
 
@@ -48,9 +48,9 @@ LOOKBACK = 50
 ZONE_ATR_MULT = 0.6
 MIN_BREAK_ATR = 1.4
 RR_RATIO = 2.0
-DESIRED_MARGIN_USDT = 3.0     # Vaste marge die per trade wordt ingezet (ongeveer 3 euro per positie!)
+DESIRED_MARGIN_USDT = 5.0     # Vaste marge verhoogd naar 5 USDT per trade!
 MIN_RISK_PERCENT = 0.004      # Zorgt voor een gezonde minimale stop-loss afstand
-LEVERAGE = 7                    
+LEVERAGE = 10                   # Hefboom verhoogd naar 10x voor dikkere posities
 ATR_LENGTH = 14
 EMA_FILTER_LENGTH = 20
 SCAN_INTERVAL = 12
@@ -304,7 +304,7 @@ class BreakRetestBot:
                     f"Zone: {zone[0]:.4f} - {zone[1]:.4f}"
                 )
 
-        # Retest + Entry met stabiele stop-loss en vaste marge-opzet
+        # Retest + Entry met stabiele stop-loss en verhoogde vaste marge
         if state["broke_out"] and state["zone"] and not state["in_position"]:
             zone_bottom, zone_top = state["zone"]
             direction = state["direction"]
@@ -466,7 +466,7 @@ class BreakRetestBot:
 
         emoji = "✅" if direction == "long" else "🔻"
         msg = (
-            f"{emoji} <b>{direction.upper()} ENTRY [VASTE MARGE]</b> {symbol}\n\n"
+            f"{emoji} <b>{direction.upper()} ENTRY [VERHOOGDE MARGE]</b> {symbol}\n\n"
             f"Entry:      <code>{entry:.4f}</code>\n"
             f"Stop Loss:  <code>{stop:.4f}</code>\n"
             f"Take Profit:<code>{target:.4f}</code>\n"
@@ -507,14 +507,14 @@ class BreakRetestBot:
 
             self.state[symbol]["in_position"] = True
             self.state[symbol]["entry_price"] = entry
-            send_telegram(f"📌 <b>POSITIE GEPLAATST [Vaste Marge]</b> {symbol}")
+            send_telegram(f"📌 <b>POSITIE GEPLAATST [5 USDT Marge]</b> {symbol}")
         except Exception as e:
             logger.error(f"Order error {symbol}: {e}")
             send_telegram(f"⚠️ <b>Order Fout op {symbol}</b>: {e}")
 
     def run(self):
-        logger.info("Break & Retest Bot (Vaste Marge Model) gestart...")
-        send_telegram("🤖 <b>Break & Retest Bot gestart! (Vaste Marge van ~3 USDT per trade)</b>")
+        logger.info("Break & Retest Bot (Verhoogde Marge Model) gestart...")
+        send_telegram("🤖 <b>Break & Retest Bot gestart! (Vaste Marge van ~5 USDT per trade)</b>")
         
         while True:
             self.check_open_positions_and_orders()
