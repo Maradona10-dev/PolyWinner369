@@ -48,7 +48,7 @@ LOOKBACK = 50
 ZONE_ATR_MULT = 0.6
 MIN_BREAK_ATR = 1.4
 RR_RATIO = 2.0
-MAX_RISK_USDT = 20.0          # Flink verhoogd voor grotere posities & serieuze winsten!
+MAX_RISK_USDT = 3.0           # Perfect afgestemd op je saldo (groter dan voorheen, maar past wel!)
 LEVERAGE = 7                    
 ATR_LENGTH = 14
 EMA_FILTER_LENGTH = 20
@@ -462,7 +462,7 @@ class BreakRetestBot:
 
         emoji = "✅" if direction == "long" else "🔻"
         msg = (
-            f"{emoji} <b>{direction.upper()} ENTRY [BloFin - GROTE POSITIE]</b> {symbol}\n\n"
+            f"{emoji} <b>{direction.upper()} ENTRY [BloFin - GEOPTIMALISEERD]</b> {symbol}\n\n"
             f"Entry:      <code>{entry:.4f}</code>\n"
             f"Stop Loss:  <code>{stop:.4f}</code>\n"
             f"Take Profit:<code>{target:.4f}</code>\n"
@@ -503,14 +503,14 @@ class BreakRetestBot:
 
             self.state[symbol]["in_position"] = True
             self.state[symbol]["entry_price"] = entry
-            send_telegram(f"📌 <b>LIVE ISOLATED ORDERS GEPLAATST [7x - Grote Positie]</b> {symbol}")
+            send_telegram(f"📌 <b>LIVE ISOLATED ORDERS GEPLAATST [7x - Optimaal Saldo]</b> {symbol}")
         except Exception as e:
             logger.error(f"Order error {symbol}: {e}")
             send_telegram(f"⚠️ <b>Order Fout op {symbol}</b>: {e}")
 
     def run(self):
-        logger.info("Break & Retest Bot (Grote Posities + Logging) gestart...")
-        send_telegram("🤖 <b>Break & Retest Bot gestart! (Modus: Grotere Posities & Logging)</b>")
+        logger.info("Break & Retest Bot (Geoptimaliseerde Marge + Logging) gestart...")
+        send_telegram("🤖 <b>Break & Retest Bot gestart! (Marge geoptimaliseerd op 3 USDT risico)</b>")
         
         while True:
             self.check_open_positions_and_orders()
