@@ -48,7 +48,8 @@ LOOKBACK = 50
 ZONE_ATR_MULT = 0.6
 MIN_BREAK_ATR = 1.4
 RR_RATIO = 2.0
-MAX_RISK_USDT = 3.0           # Perfect afgestemd op je saldo (groter dan voorheen, maar past wel!)
+MAX_RISK_USDT = 1.5           # Aangepast naar 1.5 om margin errors te voorkomen
+MIN_RISK_PERCENT = 0.001      # Veiligheidsmarge tegen te krappe stop-losses
 LEVERAGE = 7                    
 ATR_LENGTH = 14
 EMA_FILTER_LENGTH = 20
@@ -118,7 +119,6 @@ class BreakRetestBot:
         self.last_report_date = datetime.now().date()
 
     def log_completed_trade(self, symbol: str, direction: str, entry: float, exit_price: float, pnl: float):
-        """Slaat elke gesloten trade op in een JSON-bestand voor analyse."""
         trade_data = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "symbol": symbol,
@@ -145,7 +145,6 @@ class BreakRetestBot:
             logger.error(f"Kon trade log niet wegschrijven: {e}")
 
     def send_performance_report(self):
-        """Stuurt een dagelijkse samenvatting via Telegram."""
         if not os.path.exists(TRADE_LOG_FILE):
             return
             
@@ -305,7 +304,7 @@ class BreakRetestBot:
                     f"Zone: {zone[0]:.4f} - {zone[1]:.4f}"
                 )
 
-        # Retest + Entry
+        # Retest + Entry met strenge stop-loss controle
         if state["broke_out"] and state["zone"] and not state["in_position"]:
             zone_bottom, zone_top = state["zone"]
             direction = state["direction"]
@@ -327,6 +326,11 @@ class BreakRetestBot:
                 if touched and confirm:
                     entry = close
                     stop = float(zone_bottom - (atr * 0.3))
+                    
+                    min_stop_distance = entry * MIN_RISK_PERCENT
+                    if (entry - stop) < min_stop_distance:
+                        stop = entry - min_stop_distance
+
                     risk = entry - stop
                     target = float(entry + (risk * RR_RATIO))
                     return {"symbol": symbol, "direction": "long", "entry": entry, "stop": stop, "target": target, "zone": state["zone"]}
@@ -335,12 +339,17 @@ class BreakRetestBot:
                 touched = high >= zone_bottom and high <= zone_top * 1.002
                 confirm = (
                     close < open_p and
-                    close < zone_bottom * 1.002 and
+                    close < zone_top * 1.002 and
                     high >= zone_bottom
                 )
                 if touched and confirm:
                     entry = close
                     stop = float(zone_top + (atr * 0.3))
+                    
+                    min_stop_distance = entry * MIN_RISK_PERCENT
+                    if (stop - entry) < min_stop_distance:
+                        stop = entry + min_stop_distance
+
                     risk = stop - entry
                     target = float(entry - (risk * RR_RATIO))
                     return {"symbol": symbol, "direction": "short", "entry": entry, "stop": stop, "target": target, "zone": state["zone"]}
@@ -373,7 +382,7 @@ class BreakRetestBot:
                 return 0
             
             calculated_amount = MAX_RISK_USDT / risk_per_unit
-            max_allowed_value = (balance * LEVERAGE) * 0.8
+            max_allowed_value = (balance * LEVERAGE) * 0.75
             max_qty_by_balance = max_allowed_value / entry
             
             if calculated_amount > max_qty_by_balance:
@@ -503,14 +512,14 @@ class BreakRetestBot:
 
             self.state[symbol]["in_position"] = True
             self.state[symbol]["entry_price"] = entry
-            send_telegram(f"📌 <b>LIVE ISOLATED ORDERS GEPLAATST [7x - Optimaal Saldo]</b> {symbol}")
+            send_telegram(f"📌 <b>LIVE ISOLATED ORDERS GEPLAATST [7x - Veilig Saldo]</b> {symbol}")
         except Exception as e:
             logger.error(f"Order error {symbol}: {e}")
             send_telegram(f"⚠️ <b>Order Fout op {symbol}</b>: {e}")
 
     def run(self):
-        logger.info("Break & Retest Bot (Geoptimaliseerde Marge + Logging) gestart...")
-        send_telegram("🤖 <b>Break & Retest Bot gestart! (Marge geoptimaliseerd op 3 USDT risico)</b>")
+        logger.info("Break & Retest Bot (Geoptimaliseerde Marge + Stop-Loss Beveiliging) gestart...")
+        send_telegram("🤖 <b>Break & Retest Bot gestart! (Marge & Stop-Loss beveiliging actief)</b>")
         
         while True:
             self.check_open_positions_and_orders()
