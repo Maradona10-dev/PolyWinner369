@@ -40,17 +40,17 @@ SYMBOLS = [
     "LTC/USDT:USDT"
 ]
 
-# Strategie parameters (Verhoogde marge voor grotere posities)
+# Strategie parameters (Finetuned tegen valse uitbraken)
 TIMEFRAME_ENTRY = "1m"
 TIMEFRAME_FILTER = "5m"
 
 LOOKBACK = 50
 ZONE_ATR_MULT = 0.6
-MIN_BREAK_ATR = 1.4
+MIN_BREAK_ATR = 1.6     # Strengere eis voor uitbraken (filtert slechte trades weg)
 RR_RATIO = 2.0
-DESIRED_MARGIN_USDT = 5.0     # Vaste marge verhoogd naar 5 USDT per trade!
-MIN_RISK_PERCENT = 0.004      # Zorgt voor een gezonde minimale stop-loss afstand
-LEVERAGE = 10                   # Hefboom verhoogd naar 10x voor dikkere posities
+DESIRED_MARGIN_USDT = 5.0     
+MIN_RISK_PERCENT = 0.005      
+LEVERAGE = 10                   
 ATR_LENGTH = 14
 EMA_FILTER_LENGTH = 20
 SCAN_INTERVAL = 12
@@ -304,7 +304,7 @@ class BreakRetestBot:
                     f"Zone: {zone[0]:.4f} - {zone[1]:.4f}"
                 )
 
-        # Retest + Entry met stabiele stop-loss en verhoogde vaste marge
+        # Retest + Entry
         if state["broke_out"] and state["zone"] and not state["in_position"]:
             zone_bottom, zone_top = state["zone"]
             direction = state["direction"]
@@ -377,9 +377,10 @@ class BreakRetestBot:
             except Exception:
                 pass
 
-            target_margin = min(DESIRED_MARGIN_USDT, free_balance * 0.85)
+            # Veiligere marge berekening om "Insufficient margin" te voorkomen
+            target_margin = min(DESIRED_MARGIN_USDT, free_balance * 0.5)
             if target_margin < 1.0:
-                target_margin = free_balance * 0.5
+                target_margin = max(free_balance * 0.3, 1.0)
 
             position_value = target_margin * LEVERAGE
             calculated_amount = position_value / entry
@@ -466,7 +467,7 @@ class BreakRetestBot:
 
         emoji = "✅" if direction == "long" else "🔻"
         msg = (
-            f"{emoji} <b>{direction.upper()} ENTRY [VERHOOGDE MARGE]</b> {symbol}\n\n"
+            f"{emoji} <b>{direction.upper()} ENTRY [FINETUNED]</b> {symbol}\n\n"
             f"Entry:      <code>{entry:.4f}</code>\n"
             f"Stop Loss:  <code>{stop:.4f}</code>\n"
             f"Take Profit:<code>{target:.4f}</code>\n"
@@ -507,14 +508,14 @@ class BreakRetestBot:
 
             self.state[symbol]["in_position"] = True
             self.state[symbol]["entry_price"] = entry
-            send_telegram(f"📌 <b>POSITIE GEPLAATST [5 USDT Marge]</b> {symbol}")
+            send_telegram(f"📌 <b>POSITIE GEPLAATST [Finetuned]</b> {symbol}")
         except Exception as e:
             logger.error(f"Order error {symbol}: {e}")
             send_telegram(f"⚠️ <b>Order Fout op {symbol}</b>: {e}")
 
     def run(self):
-        logger.info("Break & Retest Bot (Verhoogde Marge Model) gestart...")
-        send_telegram("🤖 <b>Break & Retest Bot gestart! (Vaste Marge van ~5 USDT per trade)</b>")
+        logger.info("Break & Retest Bot (Finetuned Model) gestart...")
+        send_telegram("🤖 <b>Break & Retest Bot gestart! (Finetuned: strengere uitbraken & veilige marge)</b>")
         
         while True:
             self.check_open_positions_and_orders()
