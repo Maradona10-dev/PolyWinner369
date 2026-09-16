@@ -53,6 +53,7 @@ ATR_LENGTH = 14
 EMA_FILTER_LENGTH = 20
 SCAN_INTERVAL = 12
 MAX_BREAKOUT_AGE_MINUTES = 22
+MAX_ACTIVE_ORDERS = 5           # Maximaal aantal gelijktijdige open orders/posities
 
 # ====================================================
 
@@ -302,31 +303,44 @@ class BreakRetestBot:
             logger.error(f"Position size error for {symbol}: {e}")
             return 0
 
-    def check_open_positions(self):
+    def check_open_positions_and_orders(self) -> int:
+        """Controleert hoeveel open posities en open orders er momenteel op de beurs staan."""
         if PAPER_TRADING:
-            return
+            return sum(1 for s in SYMBOLS if self.state[s]["in_position"])
 
         try:
+            # Haal openstaande orders en open posities op
+            open_orders = self.exchange.fetch_open_orders()
             positions = self.exchange.fetch_positions(SYMBOLS)
-            active_symbols = {p['symbol'] for p in positions if float(p.get('contracts', 0)) > 0}
+            active_positions = [p for p in positions if float(p.get('contracts', 0)) > 0]
 
+            total_active = len(open_orders) + len(active_positions)
+            
+            # Synchroniseer lokale status
+            active_symbols = {p['symbol'] for p in active_positions}
             for symbol in SYMBOLS:
-                if self.state[symbol]["in_position"]:
-                    if symbol not in active_symbols:
-                        logger.info(f"{symbol} | Positie is gesloten op de beurs.")
-                        send_telegram(f"🏁 <b>TRADE GESLOTEN [BloFin]</b> {symbol}\nDe positie is afgerond (TP of SL geraakt).")
-                        self.state[symbol] = {
-                            "direction": None,
-                            "broke_out": False,
-                            "zone": None,
-                            "level": None,
-                            "break_time": None,
-                            "in_position": False
-                        }
+                if self.state[symbol]["in_position"] and symbol not in active_symbols:
+                    self.state[symbol] = {
+                        "direction": None,
+                        "broke_out": False,
+                        "zone": None,
+                        "level": None,
+                        "break_time": None,
+                        "in_position": False
+                    }
+
+            return total_active
         except Exception as e:
-            logger.error(f"Fout bij controleren open posities: {e}")
+            logger.error(f"Fout bij controleren open orders/posities: {e}")
+            return 0
 
     def execute_trade(self, setup: dict):
+        # Controleer eerst of we het maximum aantal open orders/posities al hebben bereikt
+        active_count = self.check_open_positions_and_orders()
+        if active_count >= MAX_ACTIVE_ORDERS:
+            logger.info(f"Max aantal actieve orders/posities bereikt ({active_count}/{MAX_ACTIVE_ORDERS}). Trade overgeslagen.")
+            return
+
         symbol = setup["symbol"]
         direction = setup["direction"]
         
@@ -365,15 +379,15 @@ class BreakRetestBot:
                 pass
 
             # Open market order
-            entry_order = self.exchange.create_order(symbol=symbol, type="market", side=side, amount=amount)
+            self.exchange.create_order(symbol=symbol, type="market", side=side, amount=amount)
             
-            # Stop Loss (gebruik market met stopLossPrice i.p.v. STOP_MARKET)
+            # Stop Loss
             self.exchange.create_order(
                 symbol=symbol, type="market", side=side_close, amount=amount,
                 params={"stopLossPrice": stop, "reduceOnly": True}
             )
             
-            # Take Profit (gebruik limit met takeProfitPrice of target prijs)
+            # Take Profit
             self.exchange.create_order(
                 symbol=symbol, type="limit", side=side_close, amount=amount, price=target,
                 params={"takeProfitPrice": target, "reduceOnly": True}
@@ -386,11 +400,12 @@ class BreakRetestBot:
             send_telegram(f"⚠️ <b>Order Fout op {symbol}</b>: {e}")
 
     def run(self):
-        logger.info("Break & Retest Bot (BloFin Fix) gestart...")
-        send_telegram("🤖 <b>Break & Retest Bot gestart!</b>")
+        logger.info("Break & Retest Bot (Max Orders Limiet) gestart...")
+        send_telegram("🤖 <b>Break & Retest Bot gestart! (Max 5 orders limiet)</b>")
         
         while True:
-            self.check_open_positions()
+            # Controleer periodiek de status
+            self.check_open_positions_and_orders()
 
             for symbol in SYMBOLS:
                 try:
