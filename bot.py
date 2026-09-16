@@ -66,16 +66,17 @@ EMA_MID = 50
 EMA_SLOW = 200
 ATR_LEN = 14
 VOLUME_LEN = 20
-VOLUME_MULT = 1.20
+VOLUME_MULT = 1.15
 
-MIN_SCORE = 75
+# Nieuwe drempelwaarde en puntensysteem
+MIN_SCORE = 65
+MAX_POSSIBLE_SCORE = 90
 
 FIXED_MARGIN_USDT = 5.0
 FIXED_LEVERAGE = 10
 
 MAX_ACTIVE_POSITIONS = 2
 
-# SL = 1.5 ATR, TP = 2R.
 STOP_ATR_MULT = 1.5
 RISK_REWARD = 2.0
 
@@ -249,10 +250,6 @@ class MultiFactorBot:
     # ---------------------- POSITIONS ----------------------
 
     def fetch_open_positions(self) -> Optional[Dict[str, dict]]:
-        """
-        Geeft None terug bij een API/netwerkfout zodat we het verschil 
-        weten tussen 'geen posities' en 'een mislukte sync'.
-        """
         try:
             positions = self.exchange.fetch_positions(SYMBOLS)
         except Exception as exc:
@@ -291,10 +288,6 @@ class MultiFactorBot:
         return result
 
     def sync_positions(self) -> bool:
-        """
-        Synchroniseert posities. Als de API faalt (retourneert None), 
-        wordt de lokale staat NIET overschreven om valse sluitingen te voorkomen.
-        """
         open_positions = self.fetch_open_positions()
         if open_positions is None:
             return False
@@ -302,7 +295,6 @@ class MultiFactorBot:
         with self.lock:
             for symbol in SYMBOLS:
                 position = open_positions.get(symbol)
-
                 was_in_position = self.state[symbol]["in_position"]
 
                 if position:
@@ -326,7 +318,6 @@ class MultiFactorBot:
                         }
                     )
 
-                    # Als hij lokaal wel in positie stond maar nu niet meer -> Melding POSITION CLOSED
                     if was_in_position:
                         send_telegram(
                             f"📭 <b>POSITION CLOSED</b>\n"
@@ -343,29 +334,18 @@ class MultiFactorBot:
             if state["in_position"]
         )
 
-    # ---------------------- STRATEGY ----------------------
+    # ---------------------- STRATEGY (NEW SCORING) ----------------------
 
     def analyze_coin(self, symbol: str) -> Optional[dict]:
         df_15m = self.fetch_ohlcv(symbol, SCAN_TF, limit=80)
         df_1h = self.fetch_ohlcv(symbol, TREND_TF, limit=250)
         df_5m = self.fetch_ohlcv(symbol, CONFIRM_TF, limit=40)
-        df_btc = self.fetch_ohlcv(
-            "BTC/USDT:USDT",
-            SCAN_TF,
-            limit=20,
-        )
+        df_btc = self.fetch_ohlcv("BTC/USDT:USDT", SCAN_TF, limit=20)
 
-        if any(
-            df is None
-            for df in [df_15m, df_1h, df_5m, df_btc]
-        ):
+        if any(df is None for df in [df_15m, df_1h, df_5m, df_btc]):
             return None
 
-        if (
-            len(df_15m) < LOOKBACK + 5
-            or len(df_5m) < 5
-            or len(df_btc) < 5
-        ):
+        if len(df_15m) < LOOKBACK + 5 or len(df_5m) < 5 or len(df_btc) < 5:
             return None
 
         h_curr = self.last_closed(df_1h)
@@ -374,107 +354,134 @@ class MultiFactorBot:
         m5_prev = df_5m.iloc[-3] if USE_CLOSED_CANDLES else df_5m.iloc[-2]
         btc_curr = self.last_closed(df_btc)
 
-        bullish_trend = (
-            h_curr["ema20"] > h_curr["ema50"]
-            and h_curr["ema50"] > h_curr["ema200"]
-        )
+        # --- 1. TREND (25 punten) ---
+        h_trend_ok = (h_curr["ema20"] > h_curr["ema50"]) and (h_curr["ema50"] > h_curr["ema200"])
+        h_bear_ok = (h_curr["ema20"] < h_curr["ema50"]) and (h_curr["ema50"] < h_curr["ema200"])
+        m15_trend_ok = c_curr["ema20"] > c_curr["ema50"]
+        m15_bear_ok = c_curr["ema20"] < c_curr["ema50"]
 
-        bearish_trend = (
-            h_curr["ema20"] < h_curr["ema50"]
-            and h_curr["ema50"] < h_curr["ema200"]
-        )
-
+        # --- 2. SETUP (25 punten) ---
         current_index = len(df_15m) - 2 if USE_CLOSED_CANDLES else len(df_15m) - 1
         start_index = current_index - LOOKBACK
-
         if start_index < 0:
             return None
 
         previous_window = df_15m.iloc[start_index:current_index]
-
         prev_low = previous_window["low"].min()
         prev_high = previous_window["high"].max()
 
-        long_sweep = (
-            c_curr["low"] < prev_low
-            and c_curr["close"] > prev_low
-        )
+        long_sweep = (c_curr["low"] < prev_low) and (c_curr["close"] > prev_low)
+        short_sweep = (c_curr["high"] > prev_high) and (c_curr["close"] < prev_high)
 
-        short_sweep = (
-            c_curr["high"] > prev_high
-            and c_curr["close"] < prev_high
-        )
+        # Nette pullback richting EMA20 (prijs bevindt zich dichtbij EMA20)
+        dist_ema20 = abs(c_curr["close"] - c_curr["ema20"]) / c_curr["close"]
+        pullback_ok = dist_ema20 <= 0.008
 
-        volume_ok = (
-            c_curr["volume"]
-            > c_curr["vol_sma"] * VOLUME_MULT
-        )
-
+        # --- 3. MOMENTUM (25 punten) ---
         long_break = m5_curr["close"] > m5_prev["high"]
         short_break = m5_curr["close"] < m5_prev["low"]
 
+        volume_ok = c_curr["volume"] > (c_curr["vol_sma"] * VOLUME_MULT)
+
+        # --- 4. RELATIVE STRENGTH (10 punten) ---
         btc_base = df_btc.iloc[-5]["close"]
         coin_base = df_15m.iloc[-5]["close"]
-
         if btc_base <= 0 or coin_base <= 0:
             return None
 
-        btc_return = (
-            btc_curr["close"] / btc_base
-        ) - 1
-
-        coin_return = (
-            c_curr["close"] / coin_base
-        ) - 1
-
+        btc_return = (btc_curr["close"] / btc_base) - 1
+        coin_return = (c_curr["close"] / coin_base) - 1
         relative = coin_return - btc_return
 
-        strong_relative = relative > 0.002
-        weak_relative = relative < -0.002
+        strong_relative = relative > 0.0015
+        weak_relative = relative < -0.0015
 
+        # --- 5. VOLATILITEIT (5 punten) ---
         atr_ratio = c_curr["atr"] / c_curr["close"]
+        atr_ok = atr_ratio > 0.003
 
+        # --- BEREKENING LONG SCORE ---
         long_score = 0
-        long_score += 15 if bullish_trend else 0
-        long_score += 10 if c_curr["ema20"] > c_curr["ema50"] else 0
-        long_score += 20 if long_sweep else 0
-        long_score += 5 if c_curr["close"] > c_curr["ema20"] else 0
-        long_score += 10 if volume_ok else 0
+        long_trend_pts = 15 if h_trend_ok else (10 if h_curr["ema20"] > h_curr["ema50"] else 0)
+        long_score += long_trend_pts
+        long_score += 10 if m15_trend_ok else 0
+
+        long_setup_pts = 15 if long_sweep else 0
+        long_setup_pts += 10 if pullback_ok else 0
+        long_score += long_setup_pts
+
+        long_mom_pts = 15 if long_break else 0
+        long_mom_pts += 10 if volume_ok else 0
+        long_score += long_mom_pts
+
         long_score += 10 if strong_relative else 0
-        long_score += 10 if long_break else 0
-        long_score += 5 if atr_ratio > 0.004 else 0
+        long_score += 5 if atr_ok else 0
 
+        # --- BEREKENING SHORT SCORE ---
         short_score = 0
-        short_score += 15 if bearish_trend else 0
-        short_score += 10 if c_curr["ema20"] < c_curr["ema50"] else 0
-        short_score += 20 if short_sweep else 0
-        short_score += 5 if c_curr["close"] < c_curr["ema20"] else 0
-        short_score += 10 if volume_ok else 0
+        short_trend_pts = 15 if h_bear_ok else (10 if h_curr["ema20"] < h_curr["ema50"] else 0)
+        short_score += short_trend_pts
+        short_score += 10 if m15_bear_ok else 0
+
+        short_setup_pts = 15 if short_sweep else 0
+        short_setup_pts += 10 if pullback_ok else 0
+        short_score += short_setup_pts
+
+        short_mom_pts = 15 if short_break else 0
+        short_mom_pts += 10 if volume_ok else 0
+        short_score += short_mom_pts
+
         short_score += 10 if weak_relative else 0
-        short_score += 10 if short_break else 0
-        short_score += 5 if atr_ratio > 0.004 else 0
+        short_score += 5 if atr_ok else 0
 
-        if (
-            long_score >= MIN_SCORE
-            and long_score > short_score
-        ):
+        # Bepaal actieve richting op basis van hoogste score
+        if long_score >= short_score:
+            direction = "long"
+            score = long_score
+            h_trend = h_trend_ok
+            m15_trend = m15_trend_ok
+            sweep = long_sweep
+            break_5m = long_break
+            rel_ok = strong_relative
+        else:
+            direction = "short"
+            score = short_score
+            h_trend = h_bear_ok
+            m15_trend = m15_bear_ok
+            sweep = short_sweep
+            break_5m = short_break
+            rel_ok = weak_relative
+
+        # Gedetailleerde log voor interessante setups (score >= 50)
+        if score >= 50:
+            log_msg = (
+                f"\n--- WATCH / SETUP: {symbol} ({direction.upper()}) --- Score: {score}/{MAX_POSSIBLE_SCORE}\n"
+                f"1H trend       {'✅' if h_trend else '❌'}\n"
+                f"15M trend      {'✅' if m15_trend else '❌'}\n"
+                f"Sweep          {'✅' if sweep else '❌'}\n"
+                f"Pullback       {'✅' if pullback_ok else '❌'}\n"
+                f"Volume         {'✅' if volume_ok else '❌'}\n"
+                f"Relative       {'✅' if rel_ok else '❌'}\n"
+                f"5M breakout    {'✅' if break_5m else '❌'}\n"
+                f"ATR            {'✅' if atr_ok else '❌'}"
+            )
+            logger.info(log_msg)
+            
+            # Stuur alleen watch melding naar Telegram als score nabij de drempel komt maar nog geen 5m trigger heeft
+            if score >= MIN_SCORE and not break_5m:
+                send_telegram(
+                    f"👀 <b>{direction.upper()} WATCH STATE</b>\n"
+                    f"Symbol: <b>{symbol}</b> | Score: <b>{score}/{MAX_POSSIBLE_SCORE}</b>\n"
+                    f"Wachten op 5m breakout trigger... ⏳"
+                )
+
+        # STRENGE EIS: Alleen handelen als score >= MIN_SCORE EN de 5m breakout (trigger) er daadwerkelijk is!
+        if score >= MIN_SCORE and break_5m:
+            logger.info(">>> 5M TRIGGER BEVESTIGD VOOR %s! TRADE WORDT GESTART.", symbol)
             return {
                 "symbol": symbol,
-                "direction": "long",
-                "score": long_score,
-                "price": float(c_curr["close"]),
-                "atr": float(c_curr["atr"]),
-                "timestamp": c_curr["timestamp"].isoformat(),
-            }
-
-        if (
-            short_score >= MIN_SCORE
-            and short_score > long_score
-        ):
-            return {
-                "symbol": symbol,
-                "direction": "short",
-                "score": short_score,
+                "direction": direction,
+                "score": score,
                 "price": float(c_curr["close"]),
                 "atr": float(c_curr["atr"]),
                 "timestamp": c_curr["timestamp"].isoformat(),
@@ -500,7 +507,6 @@ class MultiFactorBot:
         )
 
         base_amount = position_value / entry
-
         contracts = base_amount / contract_size
 
         contracts = float(
@@ -548,17 +554,11 @@ class MultiFactorBot:
         )
 
     def verify_protection_orders(self, symbol: str) -> bool:
-        """
-        Controleert of er daadwerkelijk actieve open/stop orders (SL/TP) 
-        aanwezig zijn voor het opgegeven symbool op de exchange.
-        """
         try:
             open_orders = self.exchange.fetch_open_orders(symbol)
             has_sl = any(o.get("type") in ["stop", "stop_market", "loss"] or o.get("info", {}).get("stopLoss") for o in open_orders)
             has_tp = any(o.get("type") in ["limit", "take_profit", "take_profit_market"] or o.get("info", {}).get("takeProfit") for o in open_orders)
-            
-            # Soms zitten ze verwerkt in de positie zelf bij attached orders (check open_orders of exchange-specifiek)
-            return has_sl or has_tp # Minimaal controle of er actieve bescherming is
+            return has_sl or has_tp
         except Exception as exc:
             logger.error("Kon open orders niet verifiëren voor %s: %s", symbol, exc)
             return False
@@ -583,7 +583,6 @@ class MultiFactorBot:
                 )
                 return
 
-        # Voorlopige SL/TP op basis van referentieprijs voor de melding
         if direction == "long":
             stop = reference_price - (atr * STOP_ATR_MULT)
             target = reference_price + ((reference_price - stop) * RISK_REWARD)
@@ -606,7 +605,7 @@ class MultiFactorBot:
         tp_supported = self.exchange.feature_value(symbol, "createOrder", "takeProfit")
 
         send_telegram(
-            f"🎯 <b>ENTRY SIGNAL ({setup['score']}/100)</b>\n"
+            f"🎯 <b>ENTRY TRIGGERED ({setup['score']}/{MAX_POSSIBLE_SCORE})</b>\n"
             f"Symbol: <b>{symbol}</b>\n"
             f"Direction: <b>{direction.upper()}</b>\n"
             f"Contracts: <code>{amount}</code>"
@@ -668,7 +667,6 @@ class MultiFactorBot:
             logger.info("Entry order submitted: %s", entry_order.get("id"))
             time.sleep(1.5)
 
-            # Haal de WERKELIJKE fill / entry op via open posities
             open_positions = self.fetch_open_positions()
             live_position = open_positions.get(symbol) if open_positions else None
 
@@ -677,7 +675,6 @@ class MultiFactorBot:
 
             actual_entry = live_position["entry_price"]
 
-            # Herbereken SL/TP op basis van de DAADWERKELIJKE entry-prijs
             if direction == "long":
                 stop = actual_entry - (atr * STOP_ATR_MULT)
                 target = actual_entry + ((actual_entry - stop) * RISK_REWARD)
@@ -690,7 +687,6 @@ class MultiFactorBot:
 
             close_side = "sell" if direction == "long" else "buy"
 
-            # Als attached orders niet werden ondersteund, plaatsen we ze nu los op basis van de werkelijke entry
             if not sl_supported:
                 self.exchange.create_order(
                     symbol=symbol, type="stop", side=close_side, amount=amount, price=None,
@@ -702,7 +698,6 @@ class MultiFactorBot:
                     params={"reduceOnly": True}
                 )
 
-            # Controleer of de bescherming daadwerkelijk actief is
             time.sleep(1)
             protection_active = self.verify_protection_orders(symbol) or sl_supported or tp_supported
 
@@ -742,8 +737,8 @@ class MultiFactorBot:
 
     def run(self) -> None:
         send_telegram(
-            "🚀 <b>Multi-Factor Bot v2 gestart</b>\n"
-            f"{len(SYMBOLS)} symbolen | Max posities: {MAX_ACTIVE_POSITIONS}"
+            "🚀 <b>Multi-Factor Bot v2 (Smart Scoring) gestart</b>\n"
+            f"{len(SYMBOLS)} symbolen | Min Score: {MIN_SCORE} | Max posities: {MAX_ACTIVE_POSITIONS}"
         )
 
         self.sync_positions()
@@ -759,7 +754,6 @@ class MultiFactorBot:
                 if self.active_position_count() < MAX_ACTIVE_POSITIONS:
                     for symbol in SYMBOLS:
                         try:
-                            # Altijd syncen voordat we kijken of we mogen handelen
                             self.sync_positions()
 
                             if self.active_position_count() >= MAX_ACTIVE_POSITIONS:
