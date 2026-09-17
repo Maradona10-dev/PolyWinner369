@@ -20,7 +20,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def health_check():
-    return "BloFin Multi-Factor Bot v2.2 is running!", 200
+    return "BloFin Multi-Factor Bot v2.3 is running!", 200
 
 
 API_KEY = os.environ.get("EXCHANGE_API_KEY", "")
@@ -89,9 +89,9 @@ NEAR_SWEEP_ATR = 0.15
 
 # ====================== ENTRY ======================
 
-# Score >= 50 + 5m break  OF  score >= 65 zonder break.
-MIN_SCORE = 50
-STRONG_SCORE = 65
+# Score >= 42 + 5m break  OF  score >= 55 zonder break.
+MIN_SCORE = 42
+STRONG_SCORE = 55
 MAX_POSSIBLE_SCORE = 85
 
 
@@ -1335,7 +1335,7 @@ class MultiFactorBot:
     def run(self) -> None:
 
         send_telegram(
-            "🚀 <b>Multi-Factor Bot v2.2 gestart</b>\n"
+            "🚀 <b>Multi-Factor Bot v2.3 gestart</b>\n"
             f"{len(SYMBOLS)} symbolen\n"
             f"Min score: {MIN_SCORE}/{MAX_POSSIBLE_SCORE}\n"
             f"Strong score (geen 5m nodig): {STRONG_SCORE}\n"
