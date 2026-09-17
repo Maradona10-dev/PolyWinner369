@@ -40,6 +40,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 # ====================== SYMBOLS ======================
 
 SYMBOLS = [
+    # Majors
     "BTC/USDT:USDT",
     "ETH/USDT:USDT",
     "SOL/USDT:USDT",
@@ -47,18 +48,58 @@ SYMBOLS = [
     "XRP/USDT:USDT",
     "DOGE/USDT:USDT",
     "ADA/USDT:USDT",
+    "TRX/USDT:USDT",
+    "TON/USDT:USDT",
+    "LTC/USDT:USDT",
+    "BCH/USDT:USDT",
     "AVAX/USDT:USDT",
     "LINK/USDT:USDT",
+    "DOT/USDT:USDT",
+    # L2 / L1
     "SUI/USDT:USDT",
     "NEAR/USDT:USDT",
     "APT/USDT:USDT",
     "ARB/USDT:USDT",
     "OP/USDT:USDT",
     "INJ/USDT:USDT",
-    "PEPE/USDT:USDT",
-    "RENDER/USDT:USDT",
-    "WIF/USDT:USDT",
+    "SEI/USDT:USDT",
+    "TIA/USDT:USDT",
+    "ATOM/USDT:USDT",
+    "HBAR/USDT:USDT",
+    "FIL/USDT:USDT",
+    "STX/USDT:USDT",
+    "IMX/USDT:USDT",
+    "STRK/USDT:USDT",
+    "POL/USDT:USDT",
+    # DeFi
+    "UNI/USDT:USDT",
+    "AAVE/USDT:USDT",
+    "LDO/USDT:USDT",
+    "ONDO/USDT:USDT",
     "ENA/USDT:USDT",
+    "CRV/USDT:USDT",
+    "MKR/USDT:USDT",
+    "RUNE/USDT:USDT",
+    # AI / narrative
+    "RENDER/USDT:USDT",
+    "FET/USDT:USDT",
+    "TAO/USDT:USDT",
+    "WLD/USDT:USDT",
+    "JUP/USDT:USDT",
+    # Memes / high vol
+    "PEPE/USDT:USDT",
+    "WIF/USDT:USDT",
+    "BONK/USDT:USDT",
+    "FLOKI/USDT:USDT",
+    "SHIB/USDT:USDT",
+    "ORDI/USDT:USDT",
+    "GALA/USDT:USDT",
+    # Extra
+    "ETC/USDT:USDT",
+    "XLM/USDT:USDT",
+    "ALGO/USDT:USDT",
+    "SAND/USDT:USDT",
+    "APE/USDT:USDT",
 ]
 
 
@@ -114,7 +155,7 @@ RISK_REWARD = 2.0
 USE_CLOSED_CANDLES = True
 
 SCAN_SLEEP_SECONDS = 60
-SYMBOL_SLEEP_SECONDS = 1.5
+SYMBOL_SLEEP_SECONDS = 0.35
 POSITION_SYNC_SECONDS = 60
 WATCH_COOLDOWN_SECONDS = 15 * 60
 
@@ -198,21 +239,32 @@ class MultiFactorBot:
 
         self.exchange.load_markets()
 
+        available = [
+            symbol
+            for symbol in SYMBOLS
+            if symbol in self.exchange.markets
+        ]
         missing = [
             symbol
             for symbol in SYMBOLS
             if symbol not in self.exchange.markets
         ]
 
-        if missing:
+        if not available:
             raise RuntimeError(
-                "Symbols not available on BloFin: "
-                + ", ".join(missing)
+                "Geen enkel symbool beschikbaar op BloFin."
             )
 
+        if missing:
+            logger.warning(
+                "Niet beschikbaar op BloFin, overgeslagen: %s",
+                ", ".join(missing),
+            )
+
+        SYMBOLS[:] = available
+
         logger.info(
-            "Markets geladen. %d/%d symbolen beschikbaar.",
-            len(SYMBOLS),
+            "Markets geladen. %d symbolen beschikbaar.",
             len(SYMBOLS),
         )
 
