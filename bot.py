@@ -20,20 +20,27 @@ app = Flask(__name__)
 
 @app.route("/")
 def health_check():
-    return "BloFin Multi-Factor Bot v2 is running!", 200
+    return "BloFin Multi-Factor Bot v2.1 is running!", 200
 
 
 API_KEY = os.environ.get("EXCHANGE_API_KEY", "")
 API_SECRET = os.environ.get("EXCHANGE_SECRET", "")
 API_PASSWORD = os.environ.get("EXCHANGE_PASSWORD", "")
 
+# Aangepast naar BloFin
 EXCHANGE_ID = "blofin"
 
-PAPER_TRADING = os.environ.get("PAPER_TRADING", "False").lower() == "true"
+PAPER_TRADING = (
+    os.environ.get("PAPER_TRADING", "False").lower() == "true"
+)
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+
+# ====================== SYMBOLS ======================
+
+# Originele munten aangevuld met 6 sterke, liquide perpetualswap symbolen voor BloFin
 SYMBOLS = [
     "BTC/USDT:USDT",
     "ETH/USDT:USDT",
@@ -54,64 +61,106 @@ SYMBOLS = [
     "RENDER/USDT:USDT",
     "WIF/USDT:USDT",
     "ENA/USDT:USDT",
+    # + 6 extra toegevoegde munten:
+    "TIA/USDT:USDT",
+    "SEI/USDT:USDT",
+    "ATOM/USDT:USDT",
+    "RUNE/USDT:USDT",
+    "FET/USDT:USDT",
+    "HBAR/USDT:USDT",
 ]
+
+
+# ====================== TIMEFRAMES ======================
 
 SCAN_TF = "15m"
 CONFIRM_TF = "5m"
 TREND_TF = "1h"
 
+
+# ====================== INDICATORS ======================
+
 LOOKBACK = 12
+
 EMA_FAST = 20
 EMA_MID = 50
 EMA_SLOW = 200
+
 ATR_LEN = 14
 VOLUME_LEN = 20
-VOLUME_MULT = 1.15
 
-# Nieuwe drempelwaarde en puntensysteem
-MIN_SCORE = 65
+# Volume moet 20% boven het gemiddelde liggen.
+VOLUME_MULT = 1.20
+
+
+# ====================== ENTRY ======================
+
+MIN_SCORE = 60
 MAX_POSSIBLE_SCORE = 90
+
+
+# ====================== POSITION SIZE ======================
 
 FIXED_MARGIN_USDT = 5.0
 FIXED_LEVERAGE = 10
 
 MAX_ACTIVE_POSITIONS = 2
 
+
+# ====================== SL / TP ======================
+
 STOP_ATR_MULT = 1.5
 RISK_REWARD = 2.0
 
+
+# ====================== BOT BEHAVIOUR ======================
+
 USE_CLOSED_CANDLES = True
+SCAN_SLEEP_SECONDS = 60
+SYMBOL_SLEEP_SECONDS = 1.5
+POSITION_SYNC_SECONDS = 60
+WATCH_COOLDOWN_SECONDS = 15 * 60
+
+
+# ====================== LOGGING ======================
 
 TRADE_LOG_FILE = "trade_history.json"
-
-SCAN_SLEEP_SECONDS = 60
-SYMBOL_SLEEP_SECONDS = 3
-POSITION_SYNC_SECONDS = 60
-
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     handlers=[logging.StreamHandler()],
 )
+
 logger = logging.getLogger(__name__)
 
 
-# ====================== HELPERS ======================
+# ====================== TELEGRAM ======================
 
 def send_telegram(message: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        url = (
+            f"https://api.telegram.org/"
+            f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        )
+
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": message,
             "parse_mode": "HTML",
         }
-        response = requests.post(url, json=payload, timeout=5)
+
+        response = requests.post(
+            url,
+            json=payload,
+            timeout=5,
+        )
+
         response.raise_for_status()
+
     except Exception as exc:
         logger.error("Telegram error: %s", exc)
 
@@ -123,11 +172,13 @@ def utc_now() -> str:
 # ====================== BOT ======================
 
 class MultiFactorBot:
+
     def __init__(self):
+
         if not API_KEY or not API_SECRET or not API_PASSWORD:
             raise RuntimeError(
-                "EXCHANGE_API_KEY, EXCHANGE_SECRET and EXCHANGE_PASSWORD "
-                "must be configured."
+                "EXCHANGE_API_KEY, EXCHANGE_SECRET and "
+                "EXCHANGE_PASSWORD must be configured."
             )
 
         exchange_class = getattr(ccxt, EXCHANGE_ID)
@@ -146,10 +197,16 @@ class MultiFactorBot:
 
         self.exchange.load_markets()
 
-        missing = [s for s in SYMBOLS if s not in self.exchange.markets]
+        missing = [
+            symbol
+            for symbol in SYMBOLS
+            if symbol not in self.exchange.markets
+        ]
+
         if missing:
             raise RuntimeError(
-                f"Symbols not available on BloFin: {', '.join(missing)}"
+                "Symbols not available on BloFin: "
+                + ", ".join(missing)
             )
 
         logger.info(
@@ -159,20 +216,20 @@ class MultiFactorBot:
         )
 
         self.state: Dict[str, dict] = {
-            s: {
+            symbol: {
                 "in_position": False,
                 "entry_price": 0.0,
                 "side": None,
                 "contracts": 0.0,
                 "last_sync": None,
             }
-            for s in SYMBOLS
+            for symbol in SYMBOLS
         }
 
         self.last_position_sync = 0.0
+        self.last_watch: Dict[str, float] = {}
         self.lock = threading.Lock()
 
-    # ---------------------- MARKET DATA ----------------------
 
     def fetch_ohlcv(
         self,
@@ -180,6 +237,7 @@ class MultiFactorBot:
         timeframe: str,
         limit: int = 250,
     ) -> Optional[pd.DataFrame]:
+
         try:
             ohlcv = self.exchange.fetch_ohlcv(
                 symbol,
@@ -208,8 +266,17 @@ class MultiFactorBot:
                 utc=True,
             )
 
-            for col in ["open", "high", "low", "close", "volume"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
+            for column in [
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+            ]:
+                df[column] = pd.to_numeric(
+                    df[column],
+                    errors="coerce",
+                )
 
             df["atr"] = ta.atr(
                 df["high"],
@@ -217,9 +284,22 @@ class MultiFactorBot:
                 df["close"],
                 length=ATR_LEN,
             )
-            df["ema20"] = ta.ema(df["close"], length=EMA_FAST)
-            df["ema50"] = ta.ema(df["close"], length=EMA_MID)
-            df["ema200"] = ta.ema(df["close"], length=EMA_SLOW)
+
+            df["ema20"] = ta.ema(
+                df["close"],
+                length=EMA_FAST,
+            )
+
+            df["ema50"] = ta.ema(
+                df["close"],
+                length=EMA_MID,
+            )
+
+            df["ema200"] = ta.ema(
+                df["close"],
+                length=EMA_SLOW,
+            )
+
             df["vol_sma"] = ta.sma(
                 df["volume"],
                 length=VOLUME_LEN,
@@ -241,32 +321,47 @@ class MultiFactorBot:
             )
             return None
 
-    def last_closed(self, df: pd.DataFrame) -> pd.Series:
+
+    def last_closed(
+        self,
+        df: pd.DataFrame,
+    ) -> pd.Series:
+
         if USE_CLOSED_CANDLES and len(df) >= 2:
             return df.iloc[-2]
 
         return df.iloc[-1]
 
-    # ---------------------- POSITIONS ----------------------
 
-    def fetch_open_positions(self) -> Optional[Dict[str, dict]]:
+    def fetch_open_positions(
+        self,
+    ) -> Optional[Dict[str, dict]]:
+
         try:
-            positions = self.exchange.fetch_positions(SYMBOLS)
+            positions = self.exchange.fetch_positions(
+                SYMBOLS
+            )
         except Exception as exc:
-            logger.error("Position sync failed (API error): %s", exc)
+            logger.error(
+                "Position sync failed: %s",
+                exc,
+            )
             return None
 
         result: Dict[str, dict] = {}
 
         for position in positions:
             symbol = position.get("symbol")
+
             if symbol not in SYMBOLS:
                 continue
 
             contracts_raw = position.get("contracts")
 
             try:
-                contracts = abs(float(contracts_raw or 0))
+                contracts = abs(
+                    float(contracts_raw or 0)
+                )
             except (TypeError, ValueError):
                 contracts = 0.0
 
@@ -274,7 +369,13 @@ class MultiFactorBot:
                 continue
 
             side = position.get("side")
-            entry_price = float(position.get("entryPrice") or 0)
+
+            try:
+                entry_price = float(
+                    position.get("entryPrice") or 0
+                )
+            except (TypeError, ValueError):
+                entry_price = 0.0
 
             result[symbol] = {
                 "in_position": True,
@@ -287,15 +388,16 @@ class MultiFactorBot:
 
         return result
 
+
     def sync_positions(self) -> bool:
         open_positions = self.fetch_open_positions()
+
         if open_positions is None:
             return False
 
         with self.lock:
             for symbol in SYMBOLS:
                 position = open_positions.get(symbol)
-                was_in_position = self.state[symbol]["in_position"]
 
                 if position:
                     self.state[symbol].update(
@@ -308,6 +410,8 @@ class MultiFactorBot:
                         }
                     )
                 else:
+                    was_in_position = self.state[symbol]["in_position"]
+
                     self.state[symbol].update(
                         {
                             "in_position": False,
@@ -319,191 +423,184 @@ class MultiFactorBot:
                     )
 
                     if was_in_position:
+                        logger.info(
+                            "Position closed detected: %s",
+                            symbol,
+                        )
                         send_telegram(
-                            f"📭 <b>POSITION CLOSED</b>\n"
-                            f"Symbol: <b>{symbol}</b>\n"
-                            f"Positie is gesloten op de exchange."
+                            f"📕 <b>POSITION CLOSED</b>\n"
+                            f"{symbol}"
                         )
 
+        self.last_position_sync = time.time()
         return True
 
+
     def active_position_count(self) -> int:
-        return sum(
-            1
-            for state in self.state.values()
-            if state["in_position"]
-        )
+        with self.lock:
+            return sum(
+                1
+                for state in self.state.values()
+                if state["in_position"]
+            )
 
-    # ---------------------- STRATEGY (NEW SCORING) ----------------------
 
-    def analyze_coin(self, symbol: str) -> Optional[dict]:
+    def analyze_coin(
+        self,
+        symbol: str,
+    ) -> Optional[dict]:
+
         df_15m = self.fetch_ohlcv(symbol, SCAN_TF, limit=80)
         df_1h = self.fetch_ohlcv(symbol, TREND_TF, limit=250)
         df_5m = self.fetch_ohlcv(symbol, CONFIRM_TF, limit=40)
         df_btc = self.fetch_ohlcv("BTC/USDT:USDT", SCAN_TF, limit=20)
 
-        if any(df is None for df in [df_15m, df_1h, df_5m, df_btc]):
+        if any(
+            df is None
+            for df in [df_15m, df_1h, df_5m, df_btc]
+        ):
             return None
 
-        if len(df_15m) < LOOKBACK + 5 or len(df_5m) < 5 or len(df_btc) < 5:
+        if (
+            len(df_15m) < LOOKBACK + 5
+            or len(df_5m) < 5
+            or len(df_btc) < 5
+        ):
             return None
 
         h_curr = self.last_closed(df_1h)
         c_curr = self.last_closed(df_15m)
         m5_curr = self.last_closed(df_5m)
-        m5_prev = df_5m.iloc[-3] if USE_CLOSED_CANDLES else df_5m.iloc[-2]
+
+        if USE_CLOSED_CANDLES:
+            m5_prev = df_5m.iloc[-3]
+        else:
+            m5_prev = df_5m.iloc[-2]
+
         btc_curr = self.last_closed(df_btc)
 
-        # --- 1. TREND (25 punten) ---
-        h_trend_ok = (h_curr["ema20"] > h_curr["ema50"]) and (h_curr["ema50"] > h_curr["ema200"])
-        h_bear_ok = (h_curr["ema20"] < h_curr["ema50"]) and (h_curr["ema50"] < h_curr["ema200"])
-        m15_trend_ok = c_curr["ema20"] > c_curr["ema50"]
-        m15_bear_ok = c_curr["ema20"] < c_curr["ema50"]
+        bullish_trend = (
+            h_curr["ema20"] > h_curr["ema50"]
+            and h_curr["ema50"] > h_curr["ema200"]
+        )
 
-        # --- 2. SETUP (25 punten) ---
-        current_index = len(df_15m) - 2 if USE_CLOSED_CANDLES else len(df_15m) - 1
+        bearish_trend = (
+            h_curr["ema20"] < h_curr["ema50"]
+            and h_curr["ema50"] < h_curr["ema200"]
+        )
+
+        current_index = (
+            len(df_15m) - 2
+            if USE_CLOSED_CANDLES
+            else len(df_15m) - 1
+        )
+
         start_index = current_index - LOOKBACK
+
         if start_index < 0:
             return None
 
         previous_window = df_15m.iloc[start_index:current_index]
+
         prev_low = previous_window["low"].min()
         prev_high = previous_window["high"].max()
 
-        long_sweep = (c_curr["low"] < prev_low) and (c_curr["close"] > prev_low)
-        short_sweep = (c_curr["high"] > prev_high) and (c_curr["close"] < prev_high)
+        long_sweep = (
+            c_curr["low"] < prev_low
+            and c_curr["close"] > prev_low
+        )
 
-        # Nette pullback richting EMA20 (prijs bevindt zich dichtbij EMA20)
-        dist_ema20 = abs(c_curr["close"] - c_curr["ema20"]) / c_curr["close"]
-        pullback_ok = dist_ema20 <= 0.008
+        short_sweep = (
+            c_curr["high"] > prev_high
+            and c_curr["close"] < prev_high
+        )
 
-        # --- 3. MOMENTUM (25 punten) ---
+        volume_ok = (
+            c_curr["volume"]
+            > c_curr["vol_sma"] * VOLUME_MULT
+        )
+
         long_break = m5_curr["close"] > m5_prev["high"]
         short_break = m5_curr["close"] < m5_prev["low"]
 
-        volume_ok = c_curr["volume"] > (c_curr["vol_sma"] * VOLUME_MULT)
-
-        # --- 4. RELATIVE STRENGTH (10 punten) ---
         btc_base = df_btc.iloc[-5]["close"]
         coin_base = df_15m.iloc[-5]["close"]
+
         if btc_base <= 0 or coin_base <= 0:
             return None
 
         btc_return = (btc_curr["close"] / btc_base) - 1
         coin_return = (c_curr["close"] / coin_base) - 1
+
         relative = coin_return - btc_return
+        strong_relative = relative > 0.002
+        weak_relative = relative < -0.002
 
-        strong_relative = relative > 0.0015
-        weak_relative = relative < -0.0015
-
-        # --- 5. VOLATILITEIT (5 punten) ---
         atr_ratio = c_curr["atr"] / c_curr["close"]
-        atr_ok = atr_ratio > 0.003
 
-        # --- BEREKENING LONG SCORE ---
+        # Long Score
         long_score = 0
-        long_trend_pts = 15 if h_trend_ok else (10 if h_curr["ema20"] > h_curr["ema50"] else 0)
-        long_score += long_trend_pts
-        long_score += 10 if m15_trend_ok else 0
+        if bullish_trend: long_score += 15
+        if c_curr["ema20"] > c_curr["ema50"]: long_score += 10
+        if long_sweep: long_score += 20
+        if c_curr["close"] > c_curr["ema20"]: long_score += 5
+        if volume_ok: long_score += 10
+        if strong_relative: long_score += 10
+        if long_break: long_score += 10
+        if atr_ratio > 0.004: long_score += 5
 
-        long_setup_pts = 15 if long_sweep else 0
-        long_setup_pts += 10 if pullback_ok else 0
-        long_score += long_setup_pts
-
-        long_mom_pts = 15 if long_break else 0
-        long_mom_pts += 10 if volume_ok else 0
-        long_score += long_mom_pts
-
-        long_score += 10 if strong_relative else 0
-        long_score += 5 if atr_ok else 0
-
-        # --- BEREKENING SHORT SCORE ---
+        # Short Score
         short_score = 0
-        short_trend_pts = 15 if h_bear_ok else (10 if h_curr["ema20"] < h_curr["ema50"] else 0)
-        short_score += short_trend_pts
-        short_score += 10 if m15_bear_ok else 0
+        if bearish_trend: short_score += 15
+        if c_curr["ema20"] < c_curr["ema50"]: short_score += 10
+        if short_sweep: short_score += 20
+        if c_curr["close"] < c_curr["ema20"]: short_score += 5
+        if volume_ok: short_score += 10
+        if weak_relative: short_score += 10
+        if short_break: short_score += 10
+        if atr_ratio > 0.004: short_score += 5
 
-        short_setup_pts = 15 if short_sweep else 0
-        short_setup_pts += 10 if pullback_ok else 0
-        short_score += short_setup_pts
-
-        short_mom_pts = 15 if short_break else 0
-        short_mom_pts += 10 if volume_ok else 0
-        short_score += short_mom_pts
-
-        short_score += 10 if weak_relative else 0
-        short_score += 5 if atr_ok else 0
-
-        # Bepaal actieve richting op basis van hoogste score
-        if long_score >= short_score:
-            direction = "long"
-            score = long_score
-            h_trend = h_trend_ok
-            m15_trend = m15_trend_ok
-            sweep = long_sweep
-            break_5m = long_break
-            rel_ok = strong_relative
-        else:
-            direction = "short"
-            score = short_score
-            h_trend = h_bear_ok
-            m15_trend = m15_bear_ok
-            sweep = short_sweep
-            break_5m = short_break
-            rel_ok = weak_relative
-
-        # Gedetailleerde log voor interessante setups (score >= 50)
-        if score >= 50:
-            log_msg = (
-                f"\n--- WATCH / SETUP: {symbol} ({direction.upper()}) --- Score: {score}/{MAX_POSSIBLE_SCORE}\n"
-                f"1H trend       {'✅' if h_trend else '❌'}\n"
-                f"15M trend      {'✅' if m15_trend else '❌'}\n"
-                f"Sweep          {'✅' if sweep else '❌'}\n"
-                f"Pullback       {'✅' if pullback_ok else '❌'}\n"
-                f"Volume         {'✅' if volume_ok else '❌'}\n"
-                f"Relative       {'✅' if rel_ok else '❌'}\n"
-                f"5M breakout    {'✅' if break_5m else '❌'}\n"
-                f"ATR            {'✅' if atr_ok else '❌'}"
-            )
-            logger.info(log_msg)
-            
-            if score >= MIN_SCORE and not break_5m:
-                send_telegram(
-                    f"👀 <b>{direction.upper()} WATCH STATE</b>\n"
-                    f"Symbol: <b>{symbol}</b> | Score: <b>{score}/{MAX_POSSIBLE_SCORE}</b>\n"
-                    f"Wachten op 5m breakout trigger... ⏳"
-                )
-
-        if score >= MIN_SCORE and break_5m:
-            logger.info(">>> 5M TRIGGER BEVESTIGD VOOR %s! TRADE WORDT GESTART.", symbol)
+        if (
+            long_score >= MIN_SCORE
+            and long_score > short_score
+        ):
             return {
                 "symbol": symbol,
-                "direction": direction,
-                "score": score,
+                "direction": "long",
+                "score": long_score,
                 "price": float(c_curr["close"]),
                 "atr": float(c_curr["atr"]),
                 "timestamp": c_curr["timestamp"].isoformat(),
+                "confirmation": long_break,
+            }
+
+        if (
+            short_score >= MIN_SCORE
+            and short_score > long_score
+        ):
+            return {
+                "symbol": symbol,
+                "direction": "short",
+                "score": short_score,
+                "price": float(c_curr["close"]),
+                "atr": float(c_curr["atr"]),
+                "timestamp": c_curr["timestamp"].isoformat(),
+                "confirmation": short_break,
             }
 
         return None
 
-    # ---------------------- ORDER SIZING ----------------------
 
     def calculate_contracts(
         self,
         symbol: str,
         entry: float,
     ) -> float:
+
         market = self.exchange.market(symbol)
+        contract_size = float(market.get("contractSize") or 1)
 
-        contract_size = float(
-            market.get("contractSize") or 1
-        )
-
-        position_value = (
-            FIXED_MARGIN_USDT * FIXED_LEVERAGE
-        )
-
+        position_value = FIXED_MARGIN_USDT * FIXED_LEVERAGE
         base_amount = position_value / entry
         contracts = base_amount / contract_size
 
@@ -521,23 +618,16 @@ class MultiFactorBot:
         max_amount = amount_limits.get("max")
 
         if min_amount is not None and contracts < float(min_amount):
-            raise ValueError(
-                f"{symbol}: calculated contracts {contracts} "
-                f"below exchange minimum {min_amount}"
-            )
+            raise ValueError(f"{symbol}: calculated contracts {contracts} below minimum {min_amount}")
 
         if max_amount is not None and contracts > float(max_amount):
-            raise ValueError(
-                f"{symbol}: calculated contracts {contracts} "
-                f"above exchange maximum {max_amount}"
-            )
+            raise ValueError(f"{symbol}: calculated contracts {contracts} above maximum {max_amount}")
 
         if contracts <= 0:
-            raise ValueError(
-                f"{symbol}: calculated contract amount is <= 0"
-            )
+            raise ValueError(f"{symbol}: calculated contract amount is <= 0")
 
         return contracts
+
 
     def price_to_precision(
         self,
@@ -551,48 +641,27 @@ class MultiFactorBot:
             )
         )
 
-    def verify_protection_orders(self, symbol: str) -> bool:
-        """
-        Strikte verificatie: Controleert of ZOWEL de Stop Loss 
-        als de Take Profit daadwerkelijk actief zijn op de exchange.
-        """
-        try:
-            open_orders = self.exchange.fetch_open_orders(symbol)
-            
-            has_sl = False
-            has_tp = False
 
-            for o in open_orders:
-                o_type = str(o.get("type", "")).lower()
-                info = o.get("info", {})
-                
-                # Check of het een Stop Loss / trigger order is
-                if (
-                    o_type in ["stop", "stop_market", "loss", "trigger"] or
-                    o.get("stopPrice") is not None or
-                    info.get("stopLoss") is not None or
-                    info.get("triggerPrice") is not None
-                ):
-                    has_sl = True
+    def send_watch(self, setup: dict) -> None:
+        symbol = setup["symbol"]
+        now = time.time()
+        last = self.last_watch.get(symbol, 0)
 
-                # Check of het een Take Profit / limit order is
-                if (
-                    o_type in ["limit", "take_profit", "take_profit_market"] or
-                    info.get("takeProfit") is not None
-                ):
-                    if o.get("reduceOnly") or info.get("reduceOnly") == "true":
-                        has_tp = True
-                    elif o_type in ["take_profit", "take_profit_market"]:
-                        has_tp = True
+        if now - last < WATCH_COOLDOWN_SECONDS:
+            return
 
-            # BEIDE moeten aanwezig zijn om True terug te geven
-            return has_sl and has_tp
+        self.last_watch[symbol] = now
+        direction = setup["direction"]
+        score = setup["score"]
 
-        except Exception as exc:
-            logger.error("Kon open orders niet verifiëren voor %s: %s", symbol, exc)
-            return False
+        send_telegram(
+            f"👀 <b>WATCH</b>\n"
+            f"{symbol}\n"
+            f"Direction: <b>{direction.upper()}</b>\n"
+            f"Score: <b>{score}/{MAX_POSSIBLE_SCORE}</b>\n"
+            f"Waiting for 5m confirmation."
+        )
 
-    # ---------------------- EXECUTION ----------------------
 
     def execute_trade(self, setup: dict) -> None:
         symbol = setup["symbol"]
@@ -605,19 +674,15 @@ class MultiFactorBot:
                 return
 
             if self.active_position_count() >= MAX_ACTIVE_POSITIONS:
-                logger.info(
-                    "Max active positions reached (%d). Skip %s.",
-                    MAX_ACTIVE_POSITIONS,
-                    symbol,
-                )
+                logger.info("Max active positions reached. Skip %s.", symbol)
                 return
 
         if direction == "long":
-            stop = reference_price - (atr * STOP_ATR_MULT)
+            stop = reference_price - atr * STOP_ATR_MULT
             target = reference_price + ((reference_price - stop) * RISK_REWARD)
             side = "buy"
         else:
-            stop = reference_price + (atr * STOP_ATR_MULT)
+            stop = reference_price + atr * STOP_ATR_MULT
             target = reference_price - ((stop - reference_price) * RISK_REWARD)
             side = "sell"
 
@@ -630,156 +695,280 @@ class MultiFactorBot:
             logger.error("Sizing error on %s: %s", symbol, exc)
             return
 
-        sl_supported = self.exchange.feature_value(symbol, "createOrder", "stopLoss")
-        tp_supported = self.exchange.feature_value(symbol, "createOrder", "takeProfit")
-
         send_telegram(
-            f"🎯 <b>ENTRY TRIGGERED ({setup['score']}/{MAX_POSSIBLE_SCORE})</b>\n"
-            f"Symbol: <b>{symbol}</b>\n"
+            f"🎯 <b>ENTRY TRIGGERED</b>\n"
+            f"{symbol}\n"
             f"Direction: <b>{direction.upper()}</b>\n"
-            f"Contracts: <code>{amount}</code>"
+            f"Score: <b>{setup['score']}/{MAX_POSSIBLE_SCORE}</b>\n"
+            f"Reference: <code>{reference_price:.8f}</code>\n"
+            f"Initial SL: <code>{stop:.8f}</code>\n"
+            f"Initial TP: <code>{target:.8f}</code>\n"
+            f"Contracts: <code>{amount}</code>\n"
+            f"Margin: {FIXED_MARGIN_USDT} USDT\n"
+            f"Leverage: {FIXED_LEVERAGE}x"
         )
 
         if PAPER_TRADING:
             logger.info(
                 "[PAPER] %s %s amount=%s entry=%s SL=%s TP=%s",
-                direction.upper(), symbol, amount, reference_price, stop, target,
+                direction.upper(), symbol, amount, reference_price, stop, target
             )
 
             with self.lock:
-                self.state[symbol].update(
-                    {
-                        "in_position": True,
-                        "entry_price": reference_price,
-                        "side": direction,
-                        "contracts": amount,
-                        "last_sync": utc_now(),
-                    }
-                )
+                self.state[symbol].update({
+                    "in_position": True,
+                    "entry_price": reference_price,
+                    "side": direction,
+                    "contracts": amount,
+                    "last_sync": utc_now(),
+                })
+
+            self.log_trade({
+                "time": utc_now(),
+                "mode": "paper",
+                "symbol": symbol,
+                "direction": direction,
+                "score": setup["score"],
+                "entry": reference_price,
+                "stop": stop,
+                "target": target,
+                "contracts": amount,
+            })
 
             send_telegram(
-                f"✅ <b>SL/TP VERIFIED [PAPER]</b>\n"
-                f"Symbol: <b>{symbol}</b>\n"
-                f"SL: <code>{stop}</code> | TP: <code>{target}</code>"
+                f"📝 <b>PAPER ENTRY</b>\n"
+                f"{symbol} {direction.upper()}\n"
+                f"Entry: <code>{reference_price:.8f}</code>\n"
+                f"SL: <code>{stop:.8f}</code>\n"
+                f"TP: <code>{target:.8f}</code>"
             )
             return
 
         try:
-            self.exchange.set_margin_mode("isolated", symbol)
-        except Exception as exc:
-            logger.warning("set_margin_mode failed for %s: %s", symbol, exc)
+            try:
+                self.exchange.set_margin_mode("isolated", symbol)
+            except Exception as exc:
+                raise RuntimeError(f"Could not set isolated margin for {symbol}: {exc}")
 
-        try:
-            self.exchange.set_leverage(FIXED_LEVERAGE, symbol)
-        except Exception as exc:
-            logger.warning("set_leverage failed for %s: %s", symbol, exc)
-
-        try:
-            params = {
-                "marginMode": "isolated",
-                "reduceOnly": False,
-            }
-
-            if sl_supported:
-                params["stopLoss"] = {"triggerPrice": stop}
-            if tp_supported:
-                params["takeProfit"] = {"triggerPrice": target}
+            try:
+                self.exchange.set_leverage(FIXED_LEVERAGE, symbol)
+            except Exception as exc:
+                raise RuntimeError(f"Could not set leverage for {symbol}: {exc}")
 
             entry_order = self.exchange.create_order(
                 symbol=symbol,
                 type="market",
                 side=side,
                 amount=amount,
-                params=params,
+                params={
+                    "marginMode": "isolated",
+                    "reduceOnly": False,
+                },
             )
 
-            logger.info("Entry order submitted: %s", entry_order.get("id"))
-            time.sleep(1.5)
-
-            open_positions = self.fetch_open_positions()
-            live_position = open_positions.get(symbol) if open_positions else None
+            live_position = None
+            for attempt in range(5):
+                time.sleep(1)
+                positions = self.fetch_open_positions()
+                if positions is None:
+                    continue
+                live_position = positions.get(symbol)
+                if live_position:
+                    break
 
             if not live_position:
-                raise RuntimeError("Entry order geplaatst, maar geen open positie gevonden tijdens verificatie.")
+                raise RuntimeError("Entry order returned, but no open position found.")
 
-            actual_entry = live_position["entry_price"]
+            actual_entry = float(live_position["entry_price"])
+            actual_contracts = float(live_position["contracts"])
 
             if direction == "long":
-                stop = actual_entry - (atr * STOP_ATR_MULT)
-                target = actual_entry + ((actual_entry - stop) * RISK_REWARD)
+                actual_stop = actual_entry - atr * STOP_ATR_MULT
+                actual_target = actual_entry + ((actual_entry - actual_stop) * RISK_REWARD)
             else:
-                stop = actual_entry + (atr * STOP_ATR_MULT)
-                target = actual_entry - ((stop - actual_entry) * RISK_REWARD)
+                actual_stop = actual_entry + atr * STOP_ATR_MULT
+                actual_target = actual_entry - ((actual_stop - actual_entry) * RISK_REWARD)
 
-            stop = self.price_to_precision(symbol, stop)
-            target = self.price_to_precision(symbol, target)
-
+            actual_stop = self.price_to_precision(symbol, actual_stop)
+            actual_target = self.price_to_precision(symbol, actual_target)
             close_side = "sell" if direction == "long" else "buy"
 
-            # Strikte controle van bescherming op de exchange
-            protection_active = self.verify_protection_orders(symbol)
+            protection_ok = self.place_and_verify_protection(
+                symbol=symbol,
+                direction=direction,
+                amount=actual_contracts,
+                stop=actual_stop,
+                target=actual_target,
+                close_side=close_side,
+            )
 
-            # Fallback: als attached orders niet direct zichtbaar zijn, plaats ze handmatig als losse orders
-            if not protection_active:
-                logger.warning("Attached SL/TP niet direct gevonden in open orders, val terug op losse protectie-orders...")
-                
-                try:
-                    self.exchange.create_order(
-                        symbol=symbol, type="stop", side=close_side, amount=amount, price=None,
-                        params={"triggerPrice": stop, "reduceOnly": True}
-                    )
-                except Exception as e:
-                    logger.error("Kon losse SL fallback niet plaatsen: %s", e)
-
-                try:
-                    self.exchange.create_order(
-                        symbol=symbol, type="limit", side=close_side, amount=amount, price=target,
-                        params={"reduceOnly": True}
-                    )
-                except Exception as e:
-                    logger.error("Kon losse TP fallback niet plaatsen: %s", e)
-                
-                time.sleep(1.5)
-                protection_active = self.verify_protection_orders(symbol)
-
-            if not protection_active:
-                send_telegram(
-                    f"⚠️ <b>CRITICAL: PROTECTION ERROR</b>\n"
-                    f"Positie geopend op {symbol}, maar SL en/of TP konden NIET worden geverifieerd!"
-                )
-            else:
-                send_telegram(
-                    f"✅ <b>SL/TP STRICTLY VERIFIED</b>\n"
-                    f"Symbol: <b>{symbol}</b>\n"
-                    f"Actual Entry: <code>{actual_entry:.8f}</code>\n"
-                    f"SL: <code>{stop:.8f}</code> | TP: <code>{target:.8f}</code>"
-                )
+            if not protection_ok:
+                raise RuntimeError("SL/TP protection could not be verified.")
 
             with self.lock:
-                self.state[symbol].update(
-                    {
-                        "in_position": True,
-                        "entry_price": actual_entry,
-                        "side": live_position["side"],
-                        "contracts": live_position["contracts"],
-                        "last_sync": utc_now(),
-                    }
-                )
+                self.state[symbol].update({
+                    "in_position": True,
+                    "entry_price": actual_entry,
+                    "side": live_position["side"],
+                    "contracts": actual_contracts,
+                    "last_sync": utc_now(),
+                })
+
+            self.log_trade({
+                "time": utc_now(),
+                "mode": "live",
+                "symbol": symbol,
+                "direction": direction,
+                "score": setup["score"],
+                "entry_reference": reference_price,
+                "entry_actual": actual_entry,
+                "stop": actual_stop,
+                "target": actual_target,
+                "contracts": actual_contracts,
+                "order_id": entry_order.get("id"),
+            })
+
+            send_telegram(
+                f"✅ <b>ENTRY VERIFIED</b>\n"
+                f"{symbol} {direction.upper()}\n"
+                f"Score: <b>{setup['score']}/{MAX_POSSIBLE_SCORE}</b>\n"
+                f"Entry: <code>{actual_entry:.8f}</code>\n"
+                f"SL: <code>{actual_stop:.8f}</code>\n"
+                f"TP: <code>{actual_target:.8f}</code>\n"
+                f"Contracts: <code>{actual_contracts}</code>"
+            )
 
         except Exception as exc:
             logger.exception("Execution error on %s: %s", symbol, exc)
+            self.sync_positions()
             send_telegram(
-                f"❌ <b>PROTECTION ERROR / TRADE FAILED</b>\n"
-                f"Symbol: {symbol}\n"
-                f"Error: {str(exc)[:400]}"
+                f"❌ <b>TRADE ERROR</b>\n"
+                f"{symbol}\n"
+                f"{str(exc)[:500]}"
             )
 
-    # ---------------------- MAIN LOOP ----------------------
+
+    def place_and_verify_protection(
+        self,
+        symbol: str,
+        direction: str,
+        amount: float,
+        stop: float,
+        target: float,
+        close_side: str,
+    ) -> bool:
+        try:
+            sl_supported = self.exchange.feature_value(symbol, "createOrder", "stopLoss")
+            tp_supported = self.exchange.feature_value(symbol, "createOrder", "takeProfit")
+
+            if sl_supported and tp_supported:
+                self.exchange.create_order(
+                    symbol=symbol,
+                    type="market",
+                    side=close_side,
+                    amount=0,
+                    params={
+                        "reduceOnly": True,
+                        "stopLoss": {"triggerPrice": stop},
+                    },
+                )
+                self.exchange.create_order(
+                    symbol=symbol,
+                    type="market",
+                    side=close_side,
+                    amount=0,
+                    params={
+                        "reduceOnly": True,
+                        "takeProfit": {"triggerPrice": target},
+                    },
+                )
+            else:
+                self.exchange.create_order(
+                    symbol=symbol,
+                    type="stop",
+                    side=close_side,
+                    amount=amount,
+                    price=None,
+                    params={
+                        "triggerPrice": stop,
+                        "reduceOnly": True,
+                    },
+                )
+                self.exchange.create_order(
+                    symbol=symbol,
+                    type="limit",
+                    side=close_side,
+                    amount=amount,
+                    price=target,
+                    params={
+                        "reduceOnly": True,
+                    },
+                )
+
+            time.sleep(1)
+            return self.verify_protection_orders(symbol)
+
+        except Exception as exc:
+            logger.error("Protection error on %s: %s", symbol, exc)
+            return False
+
+
+    def verify_protection_orders(self, symbol: str) -> bool:
+        try:
+            open_orders = self.exchange.fetch_open_orders(symbol)
+        except Exception as exc:
+            logger.error("Could not fetch protection orders for %s: %s", symbol, exc)
+            return False
+
+        has_sl = False
+        has_tp = False
+
+        for order in open_orders:
+            order_type = str(order.get("type") or "").lower()
+            info = order.get("info") or {}
+            info_text = json.dumps(info).lower()
+
+            if (
+                order_type in ["stop", "stop_market", "stop_loss", "loss"]
+                or "stoploss" in info_text
+                or '"sl"' in info_text
+            ):
+                has_sl = True
+
+            if (
+                order_type in ["take_profit", "take_profit_market"]
+                or (order_type == "limit" and ("takeprofit" in info_text or '"tp"' in info_text))
+                or "takeprofit" in info_text
+            ):
+                has_tp = True
+
+        return has_sl and has_tp
+
+
+    def log_trade(self, trade: dict) -> None:
+        try:
+            history = []
+            if os.path.exists(TRADE_LOG_FILE):
+                with open(TRADE_LOG_FILE, "r", encoding="utf-8") as file:
+                    history = json.load(file)
+            if not isinstance(history, list):
+                history = []
+            history.append(trade)
+            history = history[-1000:]
+            with open(TRADE_LOG_FILE, "w", encoding="utf-8") as file:
+                json.dump(history, file, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            logger.error("Could not log trade: %s", exc)
+
 
     def run(self) -> None:
         send_telegram(
-            "🚀 <b>Multi-Factor Bot v2 (Smart Scoring + Strict Protection) gestart</b>\n"
-            f"{len(SYMBOLS)} symbolen | Min Score: {MIN_SCORE} | Max posities: {MAX_ACTIVE_POSITIONS}"
+            "🚀 <b>Multi-Factor Bot v2.1 gestart (BloFin)</b>\n"
+            f"{len(SYMBOLS)} symbolen\n"
+            f"Min score: {MIN_SCORE}/{MAX_POSSIBLE_SCORE}\n"
+            f"Max posities: {MAX_ACTIVE_POSITIONS}\n"
+            f"Paper trading: {PAPER_TRADING}\n"
+            f"Scan: iedere ~{SCAN_SLEEP_SECONDS}s"
         )
 
         self.sync_positions()
@@ -788,26 +977,32 @@ class MultiFactorBot:
             cycle_start = time.time()
 
             try:
-                if time.time() - self.last_position_sync >= POSITION_SYNC_SECONDS:
-                    self.sync_positions()
-                    self.last_position_sync = time.time()
+                if not self.sync_positions():
+                    time.sleep(SCAN_SLEEP_SECONDS)
+                    continue
 
-                if self.active_position_count() < MAX_ACTIVE_POSITIONS:
+                if self.active_position_count() >= MAX_ACTIVE_POSITIONS:
+                    logger.info("Maximum open positions reached.")
+                else:
                     for symbol in SYMBOLS:
                         try:
-                            self.sync_positions()
-
                             if self.active_position_count() >= MAX_ACTIVE_POSITIONS:
                                 break
 
-                            if self.state[symbol]["in_position"]:
-                                continue
+                            with self.lock:
+                                if self.state[symbol]["in_position"]:
+                                    continue
 
                             setup = self.analyze_coin(symbol)
+                            if setup is None:
+                                time.sleep(SYMBOL_SLEEP_SECONDS)
+                                continue
 
-                            if setup:
-                                logger.info("Signal: %s %s score=%s", symbol, setup["direction"], setup["score"])
-                                self.execute_trade(setup)
+                            if setup["score"] >= MIN_SCORE:
+                                if setup["confirmation"]:
+                                    self.execute_trade(setup)
+                                else:
+                                    self.send_watch(setup)
 
                         except Exception as exc:
                             logger.exception("Loop error for %s: %s", symbol, exc)
