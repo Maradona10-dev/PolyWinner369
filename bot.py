@@ -158,7 +158,8 @@ SCAN_SLEEP_SECONDS = 60
 SYMBOL_SLEEP_SECONDS = 0.35
 POSITION_SYNC_SECONDS = 60
 WATCH_COOLDOWN_SECONDS = 15 * 60
-SCORE_REPORT_SECONDS = 15 * 60
+# Twee score-updates per uur, ook bij lage scores (10/20/25).
+SCORE_REPORT_SECONDS = 30 * 60
 
 PROTECTION_RETRIES = 3
 PROTECTION_RETRY_SLEEP = 1.2
@@ -1412,10 +1413,20 @@ class MultiFactorBot:
 
 
     def publish_score_summary(self, cycle_scores: list) -> None:
-        """Log top scores every cycle; Telegram every 15 minutes."""
+        """Log top scores every cycle; Telegram every few minutes."""
+
+        now = time.time()
+        due = now - self.last_score_report >= SCORE_REPORT_SECONDS
 
         if not cycle_scores:
             logger.info("Score summary: geen geldige scans deze ronde.")
+            if due:
+                self.last_score_report = now
+                send_telegram(
+                    "📊 <b>Score scan</b>\n"
+                    "Geen geldige candles deze ronde.\n"
+                    "Check Railway op Fetch error."
+                )
             return
 
         top_long = sorted(
@@ -1428,9 +1439,6 @@ class MultiFactorBot:
             key=lambda x: x["short_score"],
             reverse=True,
         )[:5]
-
-        best_long = top_long[0]
-        best_short = top_short[0]
 
         def short_name(symbol: str) -> str:
             return symbol.split("/")[0]
@@ -1451,23 +1459,24 @@ class MultiFactorBot:
             MIN_SCORE,
         )
 
-        now = time.time()
-        if now - self.last_score_report < SCORE_REPORT_SECONDS:
+        if not due:
             return
 
         self.last_score_report = now
 
+        best_long = top_long[0]
+        best_short = top_short[0]
+
         send_telegram(
-            "📊 <b>Score scan</b>\n"
+            "📊 Score scan\n"
             f"Drempel: {MIN_SCORE}/{MAX_POSSIBLE_SCORE}\n"
+            f"Scans: {len(cycle_scores)}\n"
             f"Beste long: {short_name(best_long['symbol'])} "
             f"{best_long['long_score']}\n"
             f"Beste short: {short_name(best_short['symbol'])} "
-            f"{best_short['short_score']}\n\n"
+            f"{best_short['short_score']}\n"
             f"Top 5 long: {long_txt}\n"
-            f"Top 5 short: {short_txt}\n\n"
-            "Geen trade zolang beste score onder de drempel blijft "
-            "of 5m-bevestiging ontbreekt."
+            f"Top 5 short: {short_txt}"
         )
 
     # ====================== MAIN LOOP ======================
