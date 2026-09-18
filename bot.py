@@ -923,22 +923,42 @@ class MultiFactorBot:
                 )
                 return
 
+        send_telegram(
+            f"🎯 ENTRY READY\n"
+            f"{symbol} {direction.upper()} score {setup['score']}"
+        )
+
+        try:
+            atr_val = float(atr or 0.0)
+        except (TypeError, ValueError):
+            atr_val = 0.0
+
+        if atr_val <= 0:
+            logger.error("ATR invalid on %s: %s", symbol, atr)
+            send_telegram(
+                f"❌ Geen trade {symbol}: ATR ongeldig"
+            )
+            return
+
         if direction == "long":
-            stop = reference_price - atr * STOP_ATR_MULT
+            stop = reference_price - atr_val * STOP_ATR_MULT
             target = reference_price + ((reference_price - stop) * RISK_REWARD)
             side = "buy"
         else:
-            stop = reference_price + atr * STOP_ATR_MULT
+            stop = reference_price + atr_val * STOP_ATR_MULT
             target = reference_price - ((stop - reference_price) * RISK_REWARD)
             side = "sell"
 
-        stop = self.price_to_precision(symbol, stop)
-        target = self.price_to_precision(symbol, target)
-
         try:
+            stop = self.price_to_precision(symbol, stop)
+            target = self.price_to_precision(symbol, target)
             amount = self.calculate_contracts(symbol, reference_price)
         except Exception as exc:
             logger.error("Sizing error on %s: %s", symbol, exc)
+            send_telegram(
+                f"❌ Geen trade {symbol}\n"
+                f"Sizing/minima: {str(exc)[:300]}"
+            )
             return
 
         send_telegram(
