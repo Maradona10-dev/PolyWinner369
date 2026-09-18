@@ -20,7 +20,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def health_check():
-    return "BloFin Multi-Factor Bot v2.3 is running!", 200
+    return "BloFin Multi-Factor Bot v2.4 is running!", 200
 
 
 API_KEY = os.environ.get("EXCHANGE_API_KEY", "")
@@ -121,8 +121,8 @@ EMA_SLOW = 200
 ATR_LEN = 14
 VOLUME_LEN = 20
 
-# Iets soepeler dan 1.20 zodat volume vaker meedoet.
-VOLUME_MULT = 1.15
+# 10% extra volume is genoeg; 20% blokkeerde te veel 15m-bars.
+VOLUME_MULT = 1.10
 
 # Near-sweep: low/high mag tot 0.15 ATR voorbij lookback liggen.
 NEAR_SWEEP_ATR = 0.15
@@ -130,8 +130,8 @@ NEAR_SWEEP_ATR = 0.15
 
 # ====================== ENTRY ======================
 
-# Score >= 42 + 5m break  OF  score >= 55 zonder break.
-MIN_SCORE = 42
+# Score >= 39 + 5m break  OF  score >= 55 zonder break.
+MIN_SCORE = 39
 STRONG_SCORE = 55
 MAX_POSSIBLE_SCORE = 85
 
@@ -591,8 +591,10 @@ class MultiFactorBot:
             h_curr["ema20"] < h_curr["ema50"]
             and h_curr["ema50"] < h_curr["ema200"]
         )
-        h_mild_bull = h_curr["ema20"] > h_curr["ema50"]
-        h_mild_bear = h_curr["ema20"] < h_curr["ema50"]
+        h_fast_bull = h_curr["ema20"] > h_curr["ema50"]
+        h_fast_bear = h_curr["ema20"] < h_curr["ema50"]
+        h_slow_bull = h_curr["ema50"] > h_curr["ema200"]
+        h_slow_bear = h_curr["ema50"] < h_curr["ema200"]
 
         current_index = (
             len(df_15m) - 2
@@ -662,8 +664,10 @@ class MultiFactorBot:
 
         if h_stack_bull:
             long_score += 15
-        elif h_mild_bull:
-            long_score += 8
+        elif h_fast_bull:
+            long_score += 10
+        elif h_slow_bull:
+            long_score += 6
 
         if c_curr["ema20"] > c_curr["ema50"]:
             long_score += 10
@@ -698,8 +702,10 @@ class MultiFactorBot:
 
         if h_stack_bear:
             short_score += 15
-        elif h_mild_bear:
-            short_score += 8
+        elif h_fast_bear:
+            short_score += 10
+        elif h_slow_bear:
+            short_score += 6
 
         if c_curr["ema20"] < c_curr["ema50"]:
             short_score += 10
@@ -1387,7 +1393,7 @@ class MultiFactorBot:
     def run(self) -> None:
 
         send_telegram(
-            "🚀 <b>Multi-Factor Bot v2.3 gestart</b>\n"
+            "🚀 <b>Multi-Factor Bot v2.4 gestart</b>\n"
             f"{len(SYMBOLS)} symbolen\n"
             f"Min score: {MIN_SCORE}/{MAX_POSSIBLE_SCORE}\n"
             f"Strong score (geen 5m nodig): {STRONG_SCORE}\n"
