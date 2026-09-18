@@ -353,19 +353,36 @@ class MultiFactorBot:
                 length=EMA_MID,
             )
 
-            df["ema200"] = ta.ema(
-                df["close"],
-                length=EMA_SLOW,
-            )
+            # EMA200 alleen als er genoeg candles zijn.
+            # Anders gooit dropna() de hele 15m/5m-tabel weg.
+            if len(df) >= EMA_SLOW + 5:
+                df["ema200"] = ta.ema(
+                    df["close"],
+                    length=EMA_SLOW,
+                )
+            else:
+                df["ema200"] = float("nan")
 
             df["vol_sma"] = ta.sma(
                 df["volume"],
                 length=VOLUME_LEN,
             )
 
-            df = df.dropna().reset_index(drop=True)
+            required = [
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+            ]
+            optional = ["atr", "ema20", "ema50", "vol_sma"]
+            for column in optional:
+                if column in df.columns and df[column].notna().any():
+                    required.append(column)
 
-            if len(df) < 10:
+            df = df.dropna(subset=required).reset_index(drop=True)
+
+            if len(df) < 5:
                 return None
 
             return df
@@ -1458,7 +1475,7 @@ class MultiFactorBot:
     def run(self) -> None:
 
         send_telegram(
-            "🚀 <b>Multi-Factor Bot v2.4 gestart</b>\n"
+            "🚀 <b>Multi-Factor Bot v2.4.1 gestart</b>\n"
             f"{len(SYMBOLS)} symbolen\n"
             f"Min score: {MIN_SCORE}/{MAX_POSSIBLE_SCORE}\n"
             f"Strong score (geen 5m nodig): {STRONG_SCORE}\n"
