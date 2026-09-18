@@ -158,6 +158,7 @@ SCAN_SLEEP_SECONDS = 60
 SYMBOL_SLEEP_SECONDS = 0.35
 POSITION_SYNC_SECONDS = 60
 WATCH_COOLDOWN_SECONDS = 15 * 60
+SCORE_REPORT_SECONDS = 15 * 60
 
 PROTECTION_RETRIES = 3
 PROTECTION_RETRY_SLEEP = 1.2
@@ -281,6 +282,7 @@ class MultiFactorBot:
 
         self.last_position_sync = 0.0
         self.last_watch: Dict[str, float] = {}
+        self.last_score_report = 0.0
         self.lock = threading.Lock()
 
 
@@ -771,19 +773,23 @@ class MultiFactorBot:
             and (short_break or short_score >= STRONG_SCORE)
         )
 
+        setup = None
+
         if long_entry:
-            return pack("long", long_score, True)
+            setup = pack("long", long_score, True)
+        elif short_entry:
+            setup = pack("short", short_score, True)
+        elif long_score >= MIN_SCORE and long_score > short_score:
+            setup = pack("long", long_score, False)
+        elif short_score >= MIN_SCORE and short_score > long_score:
+            setup = pack("short", short_score, False)
 
-        if short_entry:
-            return pack("short", short_score, True)
-
-        if long_score >= MIN_SCORE and long_score > short_score:
-            return pack("long", long_score, False)
-
-        if short_score >= MIN_SCORE and short_score > long_score:
-            return pack("short", short_score, False)
-
-        return None
+        return {
+            "symbol": symbol,
+            "long_score": long_score,
+            "short_score": short_score,
+            "setup": setup,
+        }
 
 
     # ====================== ORDER SIZING ======================
@@ -1388,6 +1394,65 @@ class MultiFactorBot:
             logger.error("Could not write trade log: %s", exc)
 
 
+    def publish_score_summary(self, cycle_scores: list) -> None:
+        """Log top scores every cycle; Telegram every 15 minutes."""
+
+        if not cycle_scores:
+            logger.info("Score summary: geen geldige scans deze ronde.")
+            return
+
+        top_long = sorted(
+            cycle_scores,
+            key=lambda x: x["long_score"],
+            reverse=True,
+        )[:5]
+        top_short = sorted(
+            cycle_scores,
+            key=lambda x: x["short_score"],
+            reverse=True,
+        )[:5]
+
+        best_long = top_long[0]
+        best_short = top_short[0]
+
+        def short_name(symbol: str) -> str:
+            return symbol.split("/")[0]
+
+        long_txt = ", ".join(
+            f"{short_name(x['symbol'])} {x['long_score']}"
+            for x in top_long
+        )
+        short_txt = ", ".join(
+            f"{short_name(x['symbol'])} {x['short_score']}"
+            for x in top_short
+        )
+
+        logger.info(
+            "TOP L: %s | TOP S: %s | drempel=%s",
+            long_txt,
+            short_txt,
+            MIN_SCORE,
+        )
+
+        now = time.time()
+        if now - self.last_score_report < SCORE_REPORT_SECONDS:
+            return
+
+        self.last_score_report = now
+
+        send_telegram(
+            "📊 <b>Score scan</b>\n"
+            f"Drempel: {MIN_SCORE}/{MAX_POSSIBLE_SCORE}\n"
+            f"Beste long: {short_name(best_long['symbol'])} "
+            f"{best_long['long_score']}\n"
+            f"Beste short: {short_name(best_short['symbol'])} "
+            f"{best_short['short_score']}\n\n"
+            f"Top 5 long: {long_txt}\n"
+            f"Top 5 short: {short_txt}\n\n"
+            "Geen trade zolang beste score onder de drempel blijft "
+            "of 5m-bevestiging ontbreekt."
+        )
+
     # ====================== MAIN LOOP ======================
 
     def run(self) -> None:
@@ -1437,6 +1502,8 @@ class MultiFactorBot:
 
                 else:
 
+                    cycle_scores = []
+
                     for symbol in SYMBOLS:
 
                         try:
@@ -1448,10 +1515,21 @@ class MultiFactorBot:
                                 break
 
                             with self.lock:
-                                if self.state[symbol]["in_position"]:
-                                    continue
+                                in_pos = self.state[symbol]["in_position"]
 
-                            setup = self.analyze_coin(symbol)
+                            report = self.analyze_coin(symbol)
+
+                            if report is None:
+                                time.sleep(SYMBOL_SLEEP_SECONDS)
+                                continue
+
+                            cycle_scores.append(report)
+
+                            if in_pos:
+                                time.sleep(SYMBOL_SLEEP_SECONDS)
+                                continue
+
+                            setup = report.get("setup")
 
                             if setup is None:
                                 time.sleep(SYMBOL_SLEEP_SECONDS)
@@ -1493,6 +1571,8 @@ class MultiFactorBot:
                             )
 
                         time.sleep(SYMBOL_SLEEP_SECONDS)
+
+                    self.publish_score_summary(cycle_scores)
 
             except Exception as exc:
                 logger.exception("Main loop error: %s", exc)
