@@ -130,9 +130,9 @@ NEAR_SWEEP_ATR = 0.15
 
 # ====================== ENTRY ======================
 
-# Score >= 39 + 5m break  OF  score >= 55 zonder break.
+# Score >= 39 + 5m break  OF  score >= 45 zonder break.
 MIN_SCORE = 39
-STRONG_SCORE = 55
+STRONG_SCORE = 45
 MAX_POSSIBLE_SCORE = 85
 
 
@@ -1479,7 +1479,7 @@ class MultiFactorBot:
     def run(self) -> None:
 
         send_telegram(
-            "🚀 <b>Multi-Factor Bot v2.4.2 gestart</b>\n"
+            "🚀 <b>Multi-Factor Bot v2.4.3 gestart</b>\n"
             f"{len(SYMBOLS)} symbolen\n"
             f"Min score: {MIN_SCORE}/{MAX_POSSIBLE_SCORE}\n"
             f"Strong score (geen 5m nodig): {STRONG_SCORE}\n"
