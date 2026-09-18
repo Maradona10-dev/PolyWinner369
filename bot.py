@@ -369,19 +369,9 @@ class MultiFactorBot:
                 length=VOLUME_LEN,
             )
 
-            required = [
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume",
-            ]
-            optional = ["atr", "ema20", "ema50", "vol_sma"]
-            for column in optional:
-                if column in df.columns and df[column].notna().any():
-                    required.append(column)
-
-            df = df.dropna(subset=required).reset_index(drop=True)
+            # Geen dropna op indicatoren: anders verdwijnen korte
+            # 5m/15m-series en faalt de hele scan.
+            df = df.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
 
             if len(df) < 5:
                 return None
@@ -577,19 +567,15 @@ class MultiFactorBot:
         symbol: str,
     ) -> Optional[dict]:
 
-        df_15m = self.fetch_ohlcv(symbol, SCAN_TF, limit=80)
+        df_15m = self.fetch_ohlcv(symbol, SCAN_TF, limit=120)
         df_1h = self.fetch_ohlcv(symbol, TREND_TF, limit=250)
-        df_5m = self.fetch_ohlcv(symbol, CONFIRM_TF, limit=40)
-        df_btc = self.fetch_ohlcv("BTC/USDT:USDT", SCAN_TF, limit=20)
+        df_5m = self.fetch_ohlcv(symbol, CONFIRM_TF, limit=80)
+        df_btc = self.fetch_ohlcv("BTC/USDT:USDT", SCAN_TF, limit=80)
 
-        if any(df is None for df in [df_15m, df_1h, df_5m, df_btc]):
+        if df_15m is None or df_1h is None or df_5m is None:
             return None
 
-        if (
-            len(df_15m) < LOOKBACK + 5
-            or len(df_5m) < 5
-            or len(df_btc) < 5
-        ):
+        if len(df_15m) < LOOKBACK + 5 or len(df_5m) < 5:
             return None
 
         h_curr = self.last_closed(df_1h)
@@ -601,7 +587,11 @@ class MultiFactorBot:
         else:
             m5_prev = df_5m.iloc[-2]
 
-        btc_curr = self.last_closed(df_btc)
+        btc_curr = (
+            self.last_closed(df_btc)
+            if df_btc is not None and len(df_btc) >= 5
+            else None
+        )
 
         h_stack_bull = (
             h_curr["ema20"] > h_curr["ema50"]
@@ -656,25 +646,30 @@ class MultiFactorBot:
             and c_curr["close"] < prev_high
         )
 
-        volume_ok = (
-            c_curr["volume"]
-            > c_curr["vol_sma"] * VOLUME_MULT
-        )
+        try:
+            vol_sma = float(c_curr["vol_sma"] or 0.0)
+        except (TypeError, ValueError):
+            vol_sma = 0.0
+
+        volume_ok = bool(vol_sma > 0 and c_curr["volume"] > vol_sma * VOLUME_MULT)
 
         long_break = m5_curr["close"] > m5_prev["high"]
         short_break = m5_curr["close"] < m5_prev["low"]
 
-        btc_base = df_btc.iloc[-5]["close"]
-        coin_base = df_15m.iloc[-5]["close"]
+        relative = 0.0
+        if btc_curr is not None and df_btc is not None and len(df_btc) >= 5 and len(df_15m) >= 5:
+            btc_base = float(df_btc.iloc[-5]["close"] or 0.0)
+            coin_base = float(df_15m.iloc[-5]["close"] or 0.0)
+            if btc_base > 0 and coin_base > 0:
+                btc_return = (float(btc_curr["close"]) / btc_base) - 1
+                coin_return = (float(c_curr["close"]) / coin_base) - 1
+                relative = coin_return - btc_return
 
-        if btc_base <= 0 or coin_base <= 0:
-            return None
-
-        btc_return = (btc_curr["close"] / btc_base) - 1
-        coin_return = (c_curr["close"] / coin_base) - 1
-        relative = coin_return - btc_return
-
-        atr_ratio = c_curr["atr"] / c_curr["close"] if c_curr["close"] else 0.0
+        try:
+            atr_now = float(c_curr["atr"] or 0.0)
+        except (TypeError, ValueError):
+            atr_now = 0.0
+        atr_ratio = atr_now / float(c_curr["close"]) if c_curr["close"] else 0.0
 
         # =================================================
         # LONG SCORE  (max 85)
@@ -1484,7 +1479,7 @@ class MultiFactorBot:
     def run(self) -> None:
 
         send_telegram(
-            "🚀 <b>Multi-Factor Bot v2.4.1 gestart</b>\n"
+            "🚀 <b>Multi-Factor Bot v2.4.2 gestart</b>\n"
             f"{len(SYMBOLS)} symbolen\n"
             f"Min score: {MIN_SCORE}/{MAX_POSSIBLE_SCORE}\n"
             f"Strong score (geen 5m nodig): {STRONG_SCORE}\n"
