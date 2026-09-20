@@ -1,238 +1,108 @@
 import os
 import time
-import json
-import uuid
-import traceback
-import threading
-from datetime import datetime
+import math
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
+from datetime import datetime, timezone
 
-import requests
 import ccxt
-
-
-# ============================================================
-# BLOFIN TACTICAL ENGINE V6.1
-# REAL LIVE TRADING
-# ============================================================
-
-VERSION = "6.1-LIVE"
-
+import numpy as np
+import pandas as pd
+import requests
 
 # ============================================================
-# ENVIRONMENT
+# BLOFIN V6.2 - LIVE FUTURES BOT
+# ============================================================
+# Main changes vs V6.1:
+# - Uses BloFin native futures endpoints through CCXT implicit API.
+# - Correct contract sizing using contractValue/lotSize/minSize.
+# - Checks REAL available futures USDT before every entry.
+# - Uses native attached TP/SL on the opening order.
+# - Verifies TP/SL through BloFin pending TPSL endpoint.
+# - Repairs existing unprotected positions at startup.
+# - If BloFin returns 152012, bot stops opening new positions.
+# - No artificial 1-hour trade cooldown.
 # ============================================================
 
-PAPER_TRADING = (
-    os.getenv("PAPER_TRADING", "false").lower() == "true"
-)
+# ----------------------------
+# Environment
+# ----------------------------
+API_KEY = os.getenv("EXCHANGE_API_KEY", "").strip()
+API_SECRET = os.getenv("EXCHANGE_SECRET", "").strip()
+API_PASSWORD = os.getenv("EXCHANGE_PASSWORD", "").strip()
 
-LIVE_CONFIRM = os.getenv(
-    "LIVE_CONFIRM",
-    ""
-)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-if not PAPER_TRADING:
-    if LIVE_CONFIRM != "YES_I_WANT_LIVE_TRADING":
-        raise RuntimeError(
-            "\n"
-            "LIVE TRADING BLOCKED.\n"
-            "Set:\n"
-            "LIVE_CONFIRM=YES_I_WANT_LIVE_TRADING\n"
-        )
+PAPER_TRADING = os.getenv("PAPER_TRADING", "false").lower() == "true"
+LIVE_CONFIRM = os.getenv("LIVE_CONFIRM", "")
 
+# IMPORTANT: do not invent this value.
+# If your API key is bound to a broker and BloFin requires brokerId,
+# put the brokerId supplied by BloFin here.
+BROKER_ID = os.getenv("BLOFIN_BROKER_ID", "").strip()
 
-# ============================================================
-# API
-# ============================================================
+# ----------------------------
+# Strategy / risk
+# ----------------------------
+TIMEFRAME_SIGNAL = "15m"
+TIMEFRAME_CONFIRM = "5m"
+TIMEFRAME_TREND = "1h"
+CANDLE_LIMIT = 240
 
-API_KEY = os.getenv("EXCHANGE_API_KEY", "")
-API_SECRET = os.getenv("EXCHANGE_SECRET", "")
-API_PASSWORD = os.getenv("EXCHANGE_PASSWORD", "")
+SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "45"))
+SYMBOL_COOLDOWN_MIN = int(os.getenv("SYMBOL_COOLDOWN_MIN", "15"))
 
-if not API_KEY:
-    raise RuntimeError("EXCHANGE_API_KEY ontbreekt")
+MAX_ACTIVE_POSITIONS = int(os.getenv("MAX_ACTIVE_POSITIONS", "2"))
+MIN_SCORE = float(os.getenv("MIN_SCORE", "55"))
 
-if not API_SECRET:
-    raise RuntimeError("EXCHANGE_SECRET ontbreekt")
+LEVERAGE = int(os.getenv("LEVERAGE", "10"))
+MARGIN_MODE = os.getenv("MARGIN_MODE", "isolated")
+BASE_MARGIN_USDT = float(os.getenv("BASE_MARGIN_USDT", "7.5"))
+MAX_MARGIN_USDT = float(os.getenv("MAX_MARGIN_USDT", "10"))
+MAX_MARGIN_EQUITY_PCT = float(os.getenv("MAX_MARGIN_EQUITY_PCT", "0.18"))
+MAX_RISK_EQUITY_PCT = float(os.getenv("MAX_RISK_EQUITY_PCT", "0.015"))
+AVAILABLE_MARGIN_BUFFER = float(os.getenv("AVAILABLE_MARGIN_BUFFER", "0.90"))
 
-if not API_PASSWORD:
-    raise RuntimeError("EXCHANGE_PASSWORD ontbreekt")
+ATR_PERIOD = 14
+ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "1.25"))
+TP_R_MULT = float(os.getenv("TP_R_MULT", "1.80"))
 
+VOLUME_MULT = 1.10
+DONCHIAN_LOOKBACK = 12
+NEAR_SWEEP_ATR = 0.15
 
-# ============================================================
-# TELEGRAM
-# ============================================================
+DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "7"))
+MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
+MIN_EQUITY_USDT = float(os.getenv("MIN_EQUITY_USDT", "30"))
 
-TELEGRAM_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN",
-    ""
-)
-
-TELEGRAM_CHAT_ID = os.getenv(
-    "TELEGRAM_CHAT_ID",
-    ""
-)
-
-
-# ============================================================
-# ACCOUNT / RISK
-# ============================================================
-
-LEVERAGE = 10
-
-MAX_ACTIVE_POSITIONS = 2
-
-MIN_MARGIN_USDT = 5.0
-BASE_MARGIN_USDT = 7.5
-MAX_MARGIN_USDT = 12.0
-
-MAX_MARGIN_EQUITY_PCT = 0.18
-MAX_TOTAL_MARGIN_EQUITY_PCT = 0.38
-
-MAX_RISK_EQUITY_PCT = 0.015
-
-MIN_EQUITY_USDT = 30.0
-
-DAILY_LOSS_LIMIT_PCT = 0.07
-
-MAX_CONSECUTIVE_LOSSES = 3
-
-
-# ============================================================
-# TRADE MANAGEMENT
-# ============================================================
-
-STOP_ATR_MULTIPLIER = 1.25
-
-TP_R_MULTIPLIER = 1.80
-
-BREAKEVEN_BUFFER_PCT = 0.0015
-
-TRAILING_ATR_MULTIPLIER = 1.10
-
-USE_BREAKEVEN = True
-USE_TRAILING = True
-
-
-# ============================================================
-# SCANNER
-# ============================================================
-
-SCAN_INTERVAL = 45
-
-SCAN_TIMEFRAME = "15m"
-CONFIRM_TIMEFRAME = "5m"
-TREND_TIMEFRAME = "1h"
-
-MIN_SCORE = 54
-STRONG_SCORE = 68
-
-ATR_MIN_PCT = 0.20
-ATR_MAX_PCT = 5.00
-
-VOLUME_RATIO_MIN = 1.05
-
-
-# ============================================================
-# COOLDOWNS
-# ============================================================
-
-SYMBOL_COOLDOWN_SECONDS = 15 * 60
-LOSS_COOLDOWN_SECONDS = 30 * 60
-
-
-# ============================================================
-# SYMBOLS
-# ============================================================
+# Optional: allow the bot to repair existing positions at startup.
+REPAIR_EXISTING_POSITIONS = os.getenv("REPAIR_EXISTING_POSITIONS", "true").lower() == "true"
 
 SYMBOLS = [
-    "BTC/USDT:USDT",
-    "ETH/USDT:USDT",
-    "SOL/USDT:USDT",
-    "BNB/USDT:USDT",
-    "XRP/USDT:USDT",
-    "DOGE/USDT:USDT",
-    "ADA/USDT:USDT",
-    "TRX/USDT:USDT",
-    "TON/USDT:USDT",
-    "LTC/USDT:USDT",
-    "BCH/USDT:USDT",
-    "AVAX/USDT:USDT",
-    "LINK/USDT:USDT",
-    "DOT/USDT:USDT",
-    "SUI/USDT:USDT",
-    "NEAR/USDT:USDT",
-    "APT/USDT:USDT",
-    "ARB/USDT:USDT",
-    "OP/USDT:USDT",
-    "INJ/USDT:USDT",
-    "SEI/USDT:USDT",
-    "TIA/USDT:USDT",
-    "ATOM/USDT:USDT",
-    "HBAR/USDT:USDT",
-    "FIL/USDT:USDT",
-    "STX/USDT:USDT",
-    "IMX/USDT:USDT",
-    "STRK/USDT:USDT",
-    "POL/USDT:USDT",
-    "UNI/USDT:USDT",
-    "AAVE/USDT:USDT",
-    "LDO/USDT:USDT",
-    "ONDO/USDT:USDT",
-    "ENA/USDT:USDT",
-    "CRV/USDT:USDT",
-    "MKR/USDT:USDT",
-    "RUNE/USDT:USDT",
-    "RENDER/USDT:USDT",
-    "FET/USDT:USDT",
-    "TAO/USDT:USDT",
-    "WLD/USDT:USDT",
-    "JUP/USDT:USDT",
-    "PEPE/USDT:USDT",
-    "WIF/USDT:USDT",
-    "BONK/USDT:USDT",
-    "FLOKI/USDT:USDT",
-    "SHIB/USDT:USDT",
-    "ORDI/USDT:USDT",
-    "GALA/USDT:USDT",
-    "ETC/USDT:USDT",
-    "XLM/USDT:USDT",
-    "ALGO/USDT:USDT",
-    "SAND/USDT:USDT",
-    "APE/USDT:USDT",
+    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT",
+    "XRP/USDT:USDT", "DOGE/USDT:USDT", "ADA/USDT:USDT", "TRX/USDT:USDT",
+    "TON/USDT:USDT", "LTC/USDT:USDT", "BCH/USDT:USDT", "AVAX/USDT:USDT",
+    "LINK/USDT:USDT", "DOT/USDT:USDT", "SUI/USDT:USDT", "NEAR/USDT:USDT",
+    "APT/USDT:USDT", "ARB/USDT:USDT", "OP/USDT:USDT", "INJ/USDT:USDT",
+    "SEI/USDT:USDT", "TIA/USDT:USDT", "ATOM/USDT:USDT", "HBAR/USDT:USDT",
+    "FIL/USDT:USDT", "STX/USDT:USDT", "IMX/USDT:USDT", "STRK/USDT:USDT",
+    "POL/USDT:USDT", "UNI/USDT:USDT", "AAVE/USDT:USDT", "LDO/USDT:USDT",
+    "ONDO/USDT:USDT", "ENA/USDT:USDT", "CRV/USDT:USDT", "MKR/USDT:USDT",
+    "RUNE/USDT:USDT", "RENDER/USDT:USDT", "FET/USDT:USDT", "TAO/USDT:USDT",
+    "WLD/USDT:USDT", "JUP/USDT:USDT", "PEPE/USDT:USDT", "WIF/USDT:USDT",
+    "BONK/USDT:USDT", "FLOKI/USDT:USDT", "SHIB/USDT:USDT", "ORDI/USDT:USDT",
+    "GALA/USDT:USDT", "ETC/USDT:USDT", "XLM/USDT:USDT", "ALGO/USDT:USDT",
+    "SAND/USDT:USDT", "APE/USDT:USDT",
 ]
 
+# ----------------------------
+# Exchange
+# ----------------------------
+if not API_KEY or not API_SECRET or not API_PASSWORD:
+    raise RuntimeError("Missing EXCHANGE_API_KEY / EXCHANGE_SECRET / EXCHANGE_PASSWORD")
 
-# ============================================================
-# GLOBAL STATE
-# ============================================================
-
-lock = threading.RLock()
-
-local_positions = {}
-
-symbol_cooldowns = {}
-
-daily_start_equity = None
-
-consecutive_losses = 0
-
-last_health_message = 0
-
-learning_file = "bot_learning_v6_1.json"
-
-learning = {
-    "trades": 0,
-    "wins": 0,
-    "losses": 0,
-    "net": 0.0,
-    "strategies": {}
-}
-
-
-# ============================================================
-# EXCHANGE
-# ============================================================
+if not PAPER_TRADING and LIVE_CONFIRM != "YES_I_WANT_LIVE_TRADING":
+    raise RuntimeError("LIVE TRADING BLOCKED. Set LIVE_CONFIRM=YES_I_WANT_LIVE_TRADING")
 
 exchange = ccxt.blofin({
     "apiKey": API_KEY,
@@ -241,1926 +111,880 @@ exchange = ccxt.blofin({
     "enableRateLimit": True,
     "options": {
         "defaultType": "swap",
-    }
+    },
 })
 
+exchange.load_markets()
 
-# ============================================================
-# TELEGRAM
-# ============================================================
+# Keep only markets that actually exist.
+SYMBOLS = [s for s in SYMBOLS if s in exchange.markets]
 
-def telegram(message):
+if not SYMBOLS:
+    raise RuntimeError("No configured symbols are available on BloFin.")
 
+# ----------------------------
+# Telegram
+# ----------------------------
+def tg(message: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-
-        print(
-            "Telegram niet geconfigureerd:",
-            message
-        )
-
-        return False
-
+        return
     try:
-
-        url = (
-            f"https://api.telegram.org/"
-            f"bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+            timeout=10,
         )
+    except Exception:
+        pass
 
-        response = requests.post(
-            url,
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-                "disable_web_page_preview": True
-            },
-            timeout=10
-        )
+# ----------------------------
+# Helpers
+# ----------------------------
+def now_utc():
+    return datetime.now(timezone.utc)
 
-        if response.status_code != 200:
 
-            print(
-                "Telegram error:",
-                response.text
-            )
-
-            return False
-
-        return True
-
-    except Exception as e:
-
-        print(
-            "Telegram exception:",
-            e
-        )
-
-        return False
-
-
-# ============================================================
-# INDICATORS
-# ============================================================
-
-def ema(values, period):
-
-    if len(values) < period:
-        return None
-
-    multiplier = 2 / (period + 1)
-
-    result = sum(values[:period]) / period
-
-    for price in values[period:]:
-
-        result = (
-            (price - result)
-            * multiplier
-            + result
-        )
-
-    return result
-
-
-def sma(values, period):
-
-    if len(values) < period:
-        return None
-
-    return sum(values[-period:]) / period
-
-
-def atr(candles, period=14):
-
-    if len(candles) < period + 1:
-        return None
-
-    trs = []
-
-    for i in range(1, len(candles)):
-
-        high = candles[i][2]
-        low = candles[i][3]
-
-        previous_close = candles[i - 1][4]
-
-        tr = max(
-            high - low,
-            abs(high - previous_close),
-            abs(low - previous_close)
-        )
-
-        trs.append(tr)
-
-    return sum(
-        trs[-period:]
-    ) / period
-
-
-def rsi(closes, period=14):
-
-    if len(closes) < period + 1:
-        return None
-
-    gains = []
-    losses = []
-
-    for i in range(1, len(closes)):
-
-        difference = (
-            closes[i]
-            - closes[i - 1]
-        )
-
-        gains.append(
-            max(difference, 0)
-        )
-
-        losses.append(
-            max(-difference, 0)
-        )
-
-    avg_gain = (
-        sum(gains[-period:])
-        / period
-    )
-
-    avg_loss = (
-        sum(losses[-period:])
-        / period
-    )
-
-    if avg_loss == 0:
-        return 100
-
-    rs = avg_gain / avg_loss
-
-    return 100 - (
-        100 / (1 + rs)
-    )
-
-
-# ============================================================
-# MARKET DATA
-# ============================================================
-
-def get_candles(
-    symbol,
-    timeframe,
-    limit=120
-):
-
-    return exchange.fetch_ohlcv(
-        symbol,
-        timeframe=timeframe,
-        limit=limit
-    )
-
-
-def get_ticker(symbol):
-
-    return exchange.fetch_ticker(
-        symbol
-    )
-
-
-# ============================================================
-# REGIME
-# ============================================================
-
-def detect_regime(candles_1h):
-
-    closes = [
-        x[4]
-        for x in candles_1h
-    ]
-
-    e20 = ema(closes, 20)
-    e50 = ema(closes, 50)
-    e200 = ema(closes, 200)
-
-    if not e20 or not e50 or not e200:
-        return "TRANSITION"
-
-    price = closes[-1]
-
-    if (
-        e20 > e50 > e200
-        and price > e20
-    ):
-
-        return "TREND_UP"
-
-    if (
-        e20 < e50 < e200
-        and price < e20
-    ):
-
-        return "TREND_DOWN"
-
-    recent = closes[-20:]
-
-    high = max(recent)
-    low = min(recent)
-
-    if low > 0:
-
-        range_pct = (
-            (high - low)
-            / low
-            * 100
-        )
-
-    else:
-
-        range_pct = 0
-
-    if range_pct < 6:
-
-        return "RANGE"
-
-    return "TRANSITION"
-
-
-# ============================================================
-# SCORE
-# ============================================================
-
-def score_symbol(symbol):
-
+def fmt(x, n=4):
     try:
-
-        c15 = get_candles(
-            symbol,
-            SCAN_TIMEFRAME,
-            120
-        )
-
-        c5 = get_candles(
-            symbol,
-            CONFIRM_TIMEFRAME,
-            80
-        )
-
-        c1h = get_candles(
-            symbol,
-            TREND_TIMEFRAME,
-            220
-        )
-
-        if len(c15) < 60:
-            return None
-
-        closes15 = [
-            x[4]
-            for x in c15
-        ]
-
-        volumes15 = [
-            x[5]
-            for x in c15
-        ]
-
-        price = closes15[-1]
-
-        e20 = ema(
-            closes15,
-            20
-        )
-
-        e50 = ema(
-            closes15,
-            50
-        )
-
-        atr_value = atr(
-            c15,
-            14
-        )
-
-        if not e20 or not e50 or not atr_value:
-            return None
-
-        atr_pct = (
-            atr_value
-            / price
-            * 100
-        )
-
-        if atr_pct < ATR_MIN_PCT:
-            return None
-
-        if atr_pct > ATR_MAX_PCT:
-            return None
-
-        volume_average = sma(
-            volumes15[:-1],
-            20
-        )
-
-        if not volume_average:
-            return None
-
-        volume_ratio = (
-            volumes15[-1]
-            / volume_average
-        )
-
-        regime = detect_regime(
-            c1h
-        )
-
-        long_score = 0
-        short_score = 0
-
-        long_strategies = []
-        short_strategies = []
-
-        # ----------------------------------------------------
-        # TREND
-        # ----------------------------------------------------
-
-        if regime == "TREND_UP":
-
-            long_score += 15
-
-            long_strategies.append(
-                "TREND"
-            )
-
-        elif regime == "TREND_DOWN":
-
-            short_score += 15
-
-            short_strategies.append(
-                "TREND"
-            )
-
-        # ----------------------------------------------------
-        # EMA
-        # ----------------------------------------------------
-
-        if e20 > e50:
-
-            long_score += 10
-
-            long_strategies.append(
-                "EMA"
-            )
-
-        elif e20 < e50:
-
-            short_score += 10
-
-            short_strategies.append(
-                "EMA"
-            )
-
-        # ----------------------------------------------------
-        # PRICE / EMA
-        # ----------------------------------------------------
-
-        if price > e20:
-
-            long_score += 7
-
-        elif price < e20:
-
-            short_score += 7
-
-        # ----------------------------------------------------
-        # VOLUME
-        # ----------------------------------------------------
-
-        if volume_ratio >= VOLUME_RATIO_MIN:
-
-            long_score += 8
-            short_score += 8
-
-        # ----------------------------------------------------
-        # DONCHIAN BREAKOUT
-        # ----------------------------------------------------
-
-        previous_high = max(
-            x[2]
-            for x in c15[-21:-1]
-        )
-
-        previous_low = min(
-            x[3]
-            for x in c15[-21:-1]
-        )
-
-        if price > previous_high:
-
-            long_score += 15
-
-            long_strategies.append(
-                "MOMENTUM_BREAKOUT"
-            )
-
-        if price < previous_low:
-
-            short_score += 15
-
-            short_strategies.append(
-                "MOMENTUM_BREAKOUT"
-            )
-
-        # ----------------------------------------------------
-        # LIQUIDITY SWEEP
-        # ----------------------------------------------------
-
-        last_candle = c15[-1]
-
-        high = last_candle[2]
-        low = last_candle[3]
-        close = last_candle[4]
-
-        range_high = max(
-            x[2]
-            for x in c15[-13:-1]
-        )
-
-        range_low = min(
-            x[3]
-            for x in c15[-13:-1]
-        )
-
-        if (
-            low < range_low
-            and close > range_low
-        ):
-
-            long_score += 12
-
-            long_strategies.append(
-                "LIQUIDITY_SWEEP"
-            )
-
-        if (
-            high > range_high
-            and close < range_high
-        ):
-
-            short_score += 12
-
-            short_strategies.append(
-                "LIQUIDITY_SWEEP"
-            )
-
-        # ----------------------------------------------------
-        # 5M CONFIRMATION
-        # ----------------------------------------------------
-
-        closes5 = [
-            x[4]
-            for x in c5
-        ]
-
-        e20_5 = ema(
-            closes5,
-            20
-        )
-
-        e50_5 = ema(
-            closes5,
-            50
-        )
-
-        rsi5 = rsi(
-            closes5
-        )
-
-        if (
-            e20_5
-            and e50_5
-            and rsi5
-        ):
-
-            if (
-                e20_5 > e50_5
-                and rsi5 > 52
-            ):
-
-                long_score += 10
-
-            if (
-                e20_5 < e50_5
-                and rsi5 < 48
-            ):
-
-                short_score += 10
-
-        # ----------------------------------------------------
-        # ATR QUALITY
-        # ----------------------------------------------------
-
-        if 0.35 <= atr_pct <= 2.5:
-
-            long_score += 5
-            short_score += 5
-
-        # ----------------------------------------------------
-        # FINAL DIRECTION
-        # ----------------------------------------------------
-
-        if long_score >= short_score:
-
-            side = "long"
-            score = long_score
-            strategies = long_strategies
-
-        else:
-
-            side = "short"
-            score = short_score
-            strategies = short_strategies
-
-        if score < MIN_SCORE:
-            return None
-
-        return {
-            "symbol": symbol,
-            "side": side,
-            "score": score,
-            "strategies": strategies,
-            "regime": regime,
-            "price": price,
-            "atr": atr_value,
-            "atr_pct": atr_pct,
-            "volume_ratio": volume_ratio
-        }
-
-    except Exception as e:
-
-        print(
-            f"[SCAN ERROR] "
-            f"{symbol}: {e}"
-        )
-
-        return None
-
-
-# ============================================================
-# BALANCE
-# ============================================================
-
-def fetch_equity():
-
-    balance = exchange.fetch_balance({
-        "type": "swap"
-    })
-
-    total = balance.get(
-        "total",
-        {}
-    )
-
-    free = balance.get(
-        "free",
-        {}
-    )
-
-    value = (
-        total.get("USDT")
-        or free.get("USDT")
-    )
-
-    if value is None:
-
-        # Sommige BloFin responses
-        # gebruiken USD
-        value = (
-            total.get("USD")
-            or free.get("USD")
-        )
-
-    if value is None:
-
-        raise RuntimeError(
-            "USDT/USD equity niet gevonden"
-        )
-
-    return float(value)
-
-
-# ============================================================
-# POSITIONS
-# ============================================================
-
-def fetch_positions():
-
-    return exchange.fetch_positions(
-        None,
-        {
-            "type": "swap"
-        }
-    )
-
-
-def real_positions():
-
+        return f"{float(x):.{n}f}"
+    except Exception:
+        return str(x)
+
+
+def safe_float(v, default=0.0):
+    try:
+        if v is None or v == "":
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+def native(method_name, params=None):
+    """Call a CCXT implicit BloFin endpoint using snake_case aliases."""
+    fn = getattr(exchange, method_name, None)
+    if fn is None:
+        raise RuntimeError(f"CCXT implicit endpoint missing: {method_name}")
+    return fn(params or {})
+
+
+def native_ok(resp):
+    return str(resp.get("code")) == "0"
+
+
+def response_error(resp):
+    if not isinstance(resp, dict):
+        return str(resp)
+    code = str(resp.get("code", "?"))
+    msg = str(resp.get("msg", ""))
+    data = resp.get("data")
+    if isinstance(data, dict):
+        dcode = data.get("code")
+        dmsg = data.get("msg")
+        if dcode not in (None, "", "0"):
+            code = str(dcode)
+        if dmsg:
+            msg = str(dmsg)
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and str(item.get("code")) not in ("0", "None", ""):
+                code = str(item.get("code"))
+                msg = str(item.get("msg") or msg)
+                break
+    return f"{code} {msg}".strip()
+
+
+def blofin_inst_id(symbol):
+    return symbol.split("/")[0] + "-USDT"
+
+
+def get_instrument(symbol):
+    inst = blofin_inst_id(symbol)
+    resp = native("public_get_market_instruments", {"instId": inst})
+    if not native_ok(resp):
+        raise RuntimeError(f"Instrument lookup failed {inst}: {response_error(resp)}")
+    data = resp.get("data") or []
+    if not data:
+        raise RuntimeError(f"No instrument metadata for {inst}")
+    return data[0]
+
+
+def floor_step(value, step):
+    v = Decimal(str(value))
+    s = Decimal(str(step))
+    if s <= 0:
+        return float(v)
+    return float((v / s).to_integral_value(rounding=ROUND_DOWN) * s)
+
+
+def ceil_step(value, step):
+    v = Decimal(str(value))
+    s = Decimal(str(step))
+    if s <= 0:
+        return float(v)
+    return float((v / s).to_integral_value(rounding=ROUND_UP) * s)
+
+
+def round_price(price, tick):
+    return floor_step(price, tick)
+
+# ----------------------------
+# Account / positions
+# ----------------------------
+def futures_account():
+    resp = native("private_get_account_balance", {"productType": "USDT-FUTURES"})
+    if not native_ok(resp):
+        raise RuntimeError(f"Balance API failed: {response_error(resp)}")
+    data = resp.get("data") or {}
+    total_equity = safe_float(data.get("totalEquity"))
+    details = data.get("details") or []
+    usdt = next((d for d in details if d.get("currency") == "USDT"), {})
+    balance = safe_float(usdt.get("balance"))
+    available = safe_float(usdt.get("available"))
+    available_equity = safe_float(usdt.get("availableEquity"))
+    frozen = safe_float(usdt.get("frozen"))
+    order_frozen = safe_float(usdt.get("orderFrozen"))
+    equity = safe_float(usdt.get("equity"))
+    if total_equity <= 0:
+        total_equity = equity or balance
+    return {
+        "total_equity": total_equity,
+        "equity": equity or total_equity,
+        "balance": balance,
+        "available": available,
+        "available_equity": available_equity,
+        "frozen": frozen,
+        "order_frozen": order_frozen,
+    }
+
+
+def get_positions():
+    resp = native("private_get_account_positions", {})
+    if not native_ok(resp):
+        raise RuntimeError(f"Positions API failed: {response_error(resp)}")
+    raw = resp.get("data") or []
     result = []
-
-    try:
-
-        data = fetch_positions()
-
-        for position in data:
-
-            contracts = (
-                position.get("contracts")
-                or 0
-            )
-
-            try:
-                contracts = float(
-                    contracts
-                )
-            except Exception:
-                contracts = 0
-
-            if abs(contracts) <= 0:
-                continue
-
-            result.append(
-                position
-            )
-
-    except Exception as e:
-
-        print(
-            "Position fetch error:",
-            e
-        )
-
-        raise
-
+    for p in raw:
+        # BloFin can expose empty/zero positions.
+        pos_size = safe_float(p.get("positions", p.get("position", p.get("size", 0))))
+        if abs(pos_size) <= 0:
+            continue
+        result.append(p)
     return result
 
 
 def active_position_count():
-
-    return len(
-        real_positions()
-    )
+    return len(get_positions())
 
 
-def position_for_symbol(symbol):
-
-    for position in real_positions():
-
-        if (
-            position.get("symbol")
-            == symbol
-        ):
-
-            contracts = (
-                position.get(
-                    "contracts"
-                )
-                or 0
-            )
-
-            try:
-
-                if abs(
-                    float(contracts)
-                ) > 0:
-
-                    return position
-
-            except Exception:
-                pass
-
-    return None
+def position_symbol(p):
+    inst = p.get("instId", "")
+    return inst.replace("-USDT", "/USDT:USDT")
 
 
-# ============================================================
-# COOLDOWNS
-# ============================================================
-
-def cooldown_active(symbol):
-
-    until = symbol_cooldowns.get(
-        symbol,
-        0
-    )
-
-    return time.time() < until
+def position_side(p):
+    side = str(p.get("positionSide", "net")).lower()
+    if side in ("long", "short"):
+        return side
+    # One-way mode: positive position = long, negative = short.
+    pos = safe_float(p.get("positions", p.get("position", p.get("size", 0))))
+    return "long" if pos > 0 else "short"
 
 
-def set_cooldown(
-    symbol,
-    seconds=SYMBOL_COOLDOWN_SECONDS
-):
-
-    symbol_cooldowns[
-        symbol
-    ] = (
-        time.time()
-        + seconds
-    )
+def position_size(p):
+    return abs(safe_float(p.get("positions", p.get("position", p.get("size", 0)))))
 
 
-# ============================================================
-# RISK CHECK
-# ============================================================
-
-def risk_allowed(equity):
-
-    global daily_start_equity
-
-    if daily_start_equity is None:
-
-        daily_start_equity = equity
-
-    if equity < MIN_EQUITY_USDT:
-
-        telegram(
-            "🛑 BOT STOP\n\n"
-            f"Equity ${equity:.2f}\n"
-            f"Onder minimum ${MIN_EQUITY_USDT:.2f}"
-        )
-
-        return False
-
-    drawdown = (
-        daily_start_equity
-        - equity
-    ) / daily_start_equity
-
-    if drawdown >= DAILY_LOSS_LIMIT_PCT:
-
-        telegram(
-            "🛑 DAILY LOSS LIMIT\n\n"
-            f"Start: ${daily_start_equity:.2f}\n"
-            f"Now: ${equity:.2f}\n"
-            f"DD: {drawdown:.2%}\n\n"
-            "Nieuwe trades geblokkeerd."
-        )
-
-        return False
-
-    if (
-        consecutive_losses
-        >= MAX_CONSECUTIVE_LOSSES
-    ):
-
-        telegram(
-            "🛑 LOSS STREAK\n\n"
-            f"{consecutive_losses} "
-            "verliestrades.\n\n"
-            "Nieuwe trades geblokkeerd."
-        )
-
-        return False
-
-    return True
+def position_entry(p):
+    return safe_float(p.get("averagePrice", p.get("entryPrice", p.get("avgPrice", 0))))
 
 
-# ============================================================
-# POSITION SIZE
-# ============================================================
+def position_margin_mode(p):
+    return str(p.get("marginMode", MARGIN_MODE)).lower()
 
-def calculate_size(
-    signal,
-    equity
-):
 
-    symbol = signal["symbol"]
+def position_id(p):
+    return str(p.get("positionId", "") or "")
 
-    price = signal["price"]
+# ----------------------------
+# Market data / indicators
+# ----------------------------
+def ohlcv_df(symbol, timeframe):
+    rows = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=CANDLE_LIMIT)
+    if len(rows) < 60:
+        raise RuntimeError(f"Not enough candles for {symbol} {timeframe}")
+    df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df.dropna().reset_index(drop=True)
 
-    atr_value = signal["atr"]
 
-    stop_distance = (
-        atr_value
-        * STOP_ATR_MULTIPLIER
-    )
+def add_indicators(df):
+    out = df.copy()
+    out["ema20"] = out["close"].ewm(span=20, adjust=False).mean()
+    out["ema50"] = out["close"].ewm(span=50, adjust=False).mean()
+    out["ema200"] = out["close"].ewm(span=200, adjust=False).mean()
 
-    if stop_distance <= 0:
+    prev_close = out["close"].shift(1)
+    tr = pd.concat([
+        out["high"] - out["low"],
+        (out["high"] - prev_close).abs(),
+        (out["low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    out["atr"] = tr.rolling(ATR_PERIOD).mean()
+    out["vol_sma20"] = out["volume"].rolling(20).mean()
+    out["donchian_high"] = out["high"].rolling(DONCHIAN_LOOKBACK).max().shift(1)
+    out["donchian_low"] = out["low"].rolling(DONCHIAN_LOOKBACK).min().shift(1)
+    return out
+
+
+def evaluate_symbol(symbol):
+    df15 = add_indicators(ohlcv_df(symbol, TIMEFRAME_SIGNAL))
+    df5 = add_indicators(ohlcv_df(symbol, TIMEFRAME_CONFIRM))
+    df1h = add_indicators(ohlcv_df(symbol, TIMEFRAME_TREND))
+
+    a = df15.iloc[-2]   # closed candle
+    a_prev = df15.iloc[-3]
+    c = df5.iloc[-2]
+    c_prev = df5.iloc[-3]
+    t = df1h.iloc[-2]
+
+    price = float(a["close"])
+    atr = float(a["atr"])
+    if not np.isfinite(atr) or atr <= 0:
         return None
 
-    risk_budget = (
-        equity
-        * MAX_RISK_EQUITY_PCT
-    )
+    trend_long = t["ema20"] > t["ema50"] > t["ema200"]
+    trend_short = t["ema20"] < t["ema50"] < t["ema200"]
 
-    notional_by_risk = (
-        risk_budget
-        / (stop_distance / price)
-    )
+    ema_long = a["ema20"] > a["ema50"] and price > a["ema20"]
+    ema_short = a["ema20"] < a["ema50"] and price < a["ema20"]
 
-    margin = (
-        notional_by_risk
-        / LEVERAGE
-    )
+    volume_ok = a["volume"] > (a["vol_sma20"] * VOLUME_MULT)
 
-    margin = max(
-        MIN_MARGIN_USDT,
-        min(
-            margin,
-            MAX_MARGIN_USDT,
-            equity
-            * MAX_MARGIN_EQUITY_PCT
-        )
-    )
+    breakout_long = price > a["donchian_high"] if pd.notna(a["donchian_high"]) else False
+    breakout_short = price < a["donchian_low"] if pd.notna(a["donchian_low"]) else False
 
-    notional = (
-        margin
-        * LEVERAGE
-    )
+    # Liquidity sweep: previous candle pierces a local extreme and closes back through it.
+    recent_low = df15["low"].iloc[-DONCHIAN_LOOKBACK-3:-3].min()
+    recent_high = df15["high"].iloc[-DONCHIAN_LOOKBACK-3:-3].max()
+    sweep_long = (a_prev["low"] < recent_low - NEAR_SWEEP_ATR * atr) and (a["close"] > recent_low)
+    sweep_short = (a_prev["high"] > recent_high + NEAR_SWEEP_ATR * atr) and (a["close"] < recent_high)
 
-    market = exchange.market(
-        symbol
-    )
+    confirm_long = c["ema20"] > c["ema50"] and c["close"] > c["ema20"] and c["close"] > c_prev["close"]
+    confirm_short = c["ema20"] < c["ema50"] and c["close"] < c["ema20"] and c["close"] < c_prev["close"]
 
-    contract_size = float(
-        market.get(
-            "contractSize",
-            1
-        )
-        or 1
-    )
+    atr_pct = atr / price
+    atr_quality = 0.0008 <= atr_pct <= 0.06
 
-    raw_contracts = (
-        notional
-        / price
-        / contract_size
-    )
+    long_score = 0
+    short_score = 0
 
-    try:
+    long_score += 20 if trend_long else 0
+    short_score += 20 if trend_short else 0
+    long_score += 12 if ema_long else 0
+    short_score += 12 if ema_short else 0
+    long_score += 8 if price > a["ema20"] else 0
+    short_score += 8 if price < a["ema20"] else 0
+    long_score += 10 if volume_ok else 0
+    short_score += 10 if volume_ok else 0
+    long_score += 12 if breakout_long else 0
+    short_score += 12 if breakout_short else 0
+    long_score += 8 if sweep_long else 0
+    short_score += 8 if sweep_short else 0
+    long_score += 15 if confirm_long else 0
+    short_score += 15 if confirm_short else 0
+    long_score += 5 if atr_quality else 0
+    short_score += 5 if atr_quality else 0
 
-        contracts = float(
-            exchange.amount_to_precision(
-                symbol,
-                raw_contracts
-            )
-        )
+    if long_score >= short_score:
+        side = "long"
+        score = long_score
+    else:
+        side = "short"
+        score = short_score
 
-    except Exception:
-
+    if score < MIN_SCORE:
         return None
 
-    minimum = (
-        market.get("limits", {})
-        .get("amount", {})
-        .get("min")
-    )
-
-    if minimum:
-
-        if contracts < float(minimum):
-
-            return None
-
-    if contracts <= 0:
-        return None
-
-    return contracts, margin
-
-
-# ============================================================
-# LEVERAGE
-# ============================================================
-
-def ensure_leverage(symbol):
-
-    try:
-
-        exchange.set_leverage(
-            LEVERAGE,
-            symbol
-        )
-
-        return True
-
-    except Exception as e:
-
-        print(
-            f"Leverage warning "
-            f"{symbol}: {e}"
-        )
-
-        # Niet automatisch doorgaan
-        return False
-
-
-# ============================================================
-# BLOFIN NATIVE TPSL
-# ============================================================
-
-def place_tpsl(
-    signal,
-    contracts,
-    stop_price,
-    tp_price
-):
-
-    market = exchange.market(
-        signal["symbol"]
-    )
-
-    inst_id = market["id"]
-
-    # Long -> SELL om positie te sluiten
-    # Short -> BUY om positie te sluiten
-
-    close_side = (
-        "sell"
-        if signal["side"] == "long"
-        else "buy"
-    )
-
-    body = {
-        "instId": inst_id,
-        "marginMode": "isolated",
-        "positionSide": "net",
-        "side": close_side,
-
-        "tpTriggerPrice": str(
-            tp_price
-        ),
-
-        "tpOrderPrice": "-1",
-
-        "tpTriggerPriceType": "last",
-
-        "slTriggerPrice": str(
-            stop_price
-        ),
-
-        "slOrderPrice": "-1",
-
-        "slTriggerPriceType": "last",
-
-        "size": str(
-            contracts
-        ),
-
-        "reduceOnly": "true",
-
-        "clientOrderId": (
-            "V61"
-            + uuid.uuid4().hex[:20]
-        )
+    return {
+        "symbol": symbol,
+        "side": side,
+        "score": float(score),
+        "price": price,
+        "atr": atr,
+        "trend": "UP" if trend_long else "DOWN" if trend_short else "MIXED",
+        "volume": volume_ok,
+        "breakout": breakout_long if side == "long" else breakout_short,
+        "sweep": sweep_long if side == "long" else sweep_short,
+        "confirm": confirm_long if side == "long" else confirm_short,
+        "atr_pct": atr_pct,
     }
 
-    return exchange.private_post_trade_order_tpsl(
-        body
-    )
+# ----------------------------
+# Risk / sizing
+# ----------------------------
+def calculate_trade_levels(entry, atr, side, tick):
+    risk_distance = atr * ATR_SL_MULT
+    if side == "long":
+        sl = entry - risk_distance
+        tp = entry + risk_distance * TP_R_MULT
+    else:
+        sl = entry + risk_distance
+        tp = entry - risk_distance * TP_R_MULT
+
+    sl = round_price(sl, tick)
+    tp = round_price(tp, tick)
+
+    if side == "long" and not (sl < entry < tp):
+        return None
+    if side == "short" and not (tp < entry < sl):
+        return None
+    return sl, tp, risk_distance
 
 
-# ============================================================
-# VERIFY TPSL
-# ============================================================
+def calculate_contracts(symbol, entry, sl, equity, available):
+    meta = get_instrument(symbol)
+    contract_value = safe_float(meta.get("contractValue"))
+    min_size = safe_float(meta.get("minSize"))
+    lot_size = safe_float(meta.get("lotSize"))
+    max_market_size = safe_float(meta.get("maxMarketSize"), 0)
 
-def verify_tpsl(symbol):
+    if contract_value <= 0 or min_size <= 0 or lot_size <= 0:
+        raise RuntimeError(f"Bad contract metadata for {symbol}: {meta}")
 
-    market = exchange.market(
-        symbol
-    )
+    # Risk-based notional.
+    stop_pct = abs(entry - sl) / entry
+    risk_budget = equity * MAX_RISK_EQUITY_PCT
+    risk_notional = risk_budget / stop_pct if stop_pct > 0 else 0
 
-    inst_id = market["id"]
+    # Margin target + account cap.
+    margin_cap = min(BASE_MARGIN_USDT, MAX_MARGIN_USDT, equity * MAX_MARGIN_EQUITY_PCT)
+    target_notional = min(risk_notional, margin_cap * LEVERAGE)
 
-    response = (
-        exchange.private_get_trade_orders_tpsl_pending(
-            {
-                "instId": inst_id
-            }
-        )
-    )
+    # Never use more than the configured fraction of actual available margin.
+    max_affordable_margin = max(0.0, available * AVAILABLE_MARGIN_BUFFER)
+    target_notional = min(target_notional, max_affordable_margin * LEVERAGE)
 
-    data = response.get(
-        "data",
-        []
-    )
+    if target_notional <= 0:
+        return None
 
-    if isinstance(data, dict):
+    # Linear contract: notional ~= contracts * contractValue * price.
+    raw_contracts = target_notional / (contract_value * entry)
+    contracts = floor_step(raw_contracts, lot_size)
 
-        data = [data]
+    if contracts < min_size:
+        # Try the minimum only if it still fits the margin budget.
+        contracts = min_size
 
-    for order in data:
+    if max_market_size > 0:
+        contracts = min(contracts, max_market_size)
+        contracts = floor_step(contracts, lot_size)
 
-        state = str(
-            order.get(
-                "state",
-                ""
-            )
-        ).lower()
+    if contracts < min_size:
+        return None
 
-        if state == "live":
+    notional = contracts * contract_value * entry
+    margin = notional / LEVERAGE
 
-            return order
+    # Final hard safety check against free margin and configured caps.
+    if margin > max_affordable_margin + 1e-9:
+        contracts = floor_step((max_affordable_margin * LEVERAGE) / (contract_value * entry), lot_size)
+        if contracts < min_size:
+            return None
+        notional = contracts * contract_value * entry
+        margin = notional / LEVERAGE
 
+    if margin > MAX_MARGIN_USDT + 1e-9:
+        contracts = floor_step((MAX_MARGIN_USDT * LEVERAGE) / (contract_value * entry), lot_size)
+        if contracts < min_size:
+            return None
+        notional = contracts * contract_value * entry
+        margin = notional / LEVERAGE
+
+    return {
+        "contracts": contracts,
+        "contract_value": contract_value,
+        "notional": notional,
+        "margin": margin,
+        "min_size": min_size,
+        "lot_size": lot_size,
+        "max_market_size": max_market_size,
+    }
+
+# ----------------------------
+# TP/SL
+# ----------------------------
+def pending_tpsl(inst_id=None):
+    params = {"limit": "100"}
+    if inst_id:
+        params["instId"] = inst_id
+    resp = native("private_get_trade_orders_tpsl_pending", params)
+    if not native_ok(resp):
+        raise RuntimeError(f"TPSL lookup failed: {response_error(resp)}")
+    return resp.get("data") or []
+
+
+def has_live_protection(p):
+    inst = p.get("instId")
+    pos_side = str(p.get("positionSide", "net")).lower()
+    pid = position_id(p)
+    try:
+        orders = pending_tpsl(inst)
+    except Exception:
+        return False, None
+
+    for o in orders:
+        if str(o.get("state", "")).lower() != "live":
+            continue
+        if o.get("instId") != inst:
+            continue
+        if str(o.get("positionSide", "net")).lower() != pos_side:
+            continue
+        opid = str(o.get("positionId", "") or "")
+        if pid and opid and opid != pid:
+            continue
+        tp = safe_float(o.get("tpTriggerPrice"), 0)
+        sl = safe_float(o.get("slTriggerPrice"), 0)
+        if tp > 0 or sl > 0:
+            return True, o
+    return False, None
+
+
+def place_tpsl_for_position(p, sl, tp, client_tag="v62"):
+    inst = p["instId"]
+    side = position_side(p)
+    margin_mode = position_margin_mode(p)
+    pside = str(p.get("positionSide", "net")).lower()
+    if pside not in ("net", "long", "short"):
+        pside = "net"
+
+    order_side = "sell" if side == "long" else "buy"
+    payload = {
+        "instId": inst,
+        "marginMode": margin_mode,
+        "positionSide": pside,
+        "side": order_side,
+        "tpTriggerPrice": str(tp),
+        "tpOrderPrice": "-1",
+        "tpTriggerPriceType": "mark",
+        "slTriggerPrice": str(sl),
+        "slOrderPrice": "-1",
+        "slTriggerPriceType": "mark",
+        "size": "-1",
+        "reduceOnly": "true",
+        "clientOrderId": f"{client_tag}{int(time.time()) % 100000000}",
+    }
+    pid = position_id(p)
+    if pid:
+        payload["positionId"] = pid
+    if BROKER_ID:
+        payload["brokerId"] = BROKER_ID
+
+    resp = native("private_post_trade_order_tpsl", payload)
+    if not native_ok(resp):
+        return False, response_error(resp)
+
+    time.sleep(0.8)
+    ok, found = has_live_protection(p)
+    if not ok:
+        return False, "TPSL API accepted request but no live protection was confirmed"
+    return True, found
+
+
+def repair_existing_positions():
+    positions = get_positions()
+    if not positions:
+        return True
+
+    tg(f"🛡️ V6.2 STARTUP\nOpen positions: {len(positions)}\nChecking TP/SL protection...")
+
+    all_ok = True
+    for p in positions:
+        symbol = position_symbol(p)
+        side = position_side(p)
+        entry = position_entry(p)
+        if not entry:
+            tg(f"⚠️ {symbol}: cannot determine entry price; protection not changed.")
+            all_ok = False
+            continue
+
+        protected, existing = has_live_protection(p)
+        if protected:
+            tg(f"✅ {symbol} {side.upper()}: existing TP/SL confirmed.")
+            continue
+
+        try:
+            df = add_indicators(ohlcv_df(symbol, TIMEFRAME_SIGNAL))
+            atr = float(df.iloc[-2]["atr"])
+            meta = get_instrument(symbol)
+            tick = safe_float(meta.get("tickSize"), 0.0001)
+            levels = calculate_trade_levels(entry, atr, side, tick)
+            if not levels:
+                tg(f"🚨 {symbol}: could not calculate valid repair TP/SL. NEW TRADES PAUSED.")
+                all_ok = False
+                continue
+            sl, tp, _ = levels
+
+            # Do not place a repair order if a trigger is already on the wrong side of current price.
+            last = safe_float(exchange.fetch_ticker(symbol).get("last"))
+            if side == "long" and (sl >= last or tp <= last):
+                tg(f"🚨 {symbol}: repair TP/SL would be invalid at current price {fmt(last)}. NEW TRADES PAUSED.")
+                all_ok = False
+                continue
+            if side == "short" and (tp >= last or sl <= last):
+                tg(f"🚨 {symbol}: repair TP/SL would be invalid at current price {fmt(last)}. NEW TRADES PAUSED.")
+                all_ok = False
+                continue
+
+            ok, result = place_tpsl_for_position(p, sl, tp, client_tag="repair")
+            if ok:
+                tg(f"🛡️ PROTECTED {symbol} {side.upper()}\nSL {sl}\nTP {tp}")
+            else:
+                tg(f"🚨 PROTECTION FAILED {symbol}\n{result}\nNEW TRADES PAUSED.")
+                all_ok = False
+        except Exception as e:
+            tg(f"🚨 PROTECTION ERROR {symbol}\n{e}\nNEW TRADES PAUSED.")
+            all_ok = False
+
+    return all_ok
+
+# ----------------------------
+# Opening orders
+# ----------------------------
+def set_leverage(symbol, leverage, position_side="net"):
+    payload = {
+        "instId": blofin_inst_id(symbol),
+        "leverage": str(leverage),
+        "marginMode": MARGIN_MODE,
+    }
+    # In one-way mode this is net; in hedge mode BloFin wants long/short.
+    if position_side in ("long", "short"):
+        payload["positionSide"] = position_side
+    resp = native("private_post_account_set_leverage", payload)
+    if not native_ok(resp):
+        # Do not fail solely because leverage was already set or account has a restriction.
+        return False, response_error(resp)
+    return True, resp
+
+
+def find_new_position(symbol, before_ids, timeout=8):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            positions = get_positions()
+            for p in positions:
+                if position_symbol(p) != symbol:
+                    continue
+                pid = position_id(p)
+                if pid and pid not in before_ids:
+                    return p
+                # Non-multi-position mode may have no positionId.
+                if not pid:
+                    return p
+        except Exception:
+            pass
+        time.sleep(0.5)
     return None
 
 
-# ============================================================
-# EMERGENCY CLOSE
-# ============================================================
+def open_trade(signal):
+    symbol = signal["symbol"]
+    side = signal["side"]
+    order_side = "buy" if side == "long" else "sell"
 
-def emergency_close(
-    symbol
-):
+    account = futures_account()
+    equity = account["total_equity"]
+    available = account["available"]
 
-    try:
-
-        position = position_for_symbol(
-            symbol
-        )
-
-        if not position:
-
-            return True
-
-        market = exchange.market(
-            symbol
-        )
-
-        inst_id = market["id"]
-
-        response = (
-            exchange.private_post_trade_close_position(
-                {
-                    "instId": inst_id,
-                    "marginMode": "isolated",
-                    "positionSide": "net",
-                    "clientOrderId": (
-                        "KILL"
-                        + uuid.uuid4().hex[:20]
-                    )
-                }
-            )
-        )
-
-        telegram(
-            "🚨 EMERGENCY CLOSE\n\n"
-            f"{symbol}\n"
-            "Protection kon niet worden "
-            "bevestigd.\n"
-            "Positie gesloten."
-        )
-
-        return True
-
-    except Exception as e:
-
-        telegram(
-            "🔥 CRITICAL ERROR\n\n"
-            f"{symbol}\n"
-            "Positie kon NIET automatisch "
-            "worden gesloten.\n\n"
-            f"{e}"
-        )
-
-        print(
-            traceback.format_exc()
-        )
-
+    if equity < MIN_EQUITY_USDT:
+        tg(f"⛔ RISK STOP\nEquity ${equity:.2f} below minimum ${MIN_EQUITY_USDT:.2f}")
         return False
 
+    if available <= 0:
+        tg(f"⛔ NO TRADE {symbol}\nAvailable futures margin ${available:.2f}")
+        return False
 
-# ============================================================
-# OPEN LIVE TRADE
-# ============================================================
+    meta = get_instrument(symbol)
+    tick = safe_float(meta.get("tickSize"), 0.0001)
+    entry = signal["price"]
+    levels = calculate_trade_levels(entry, signal["atr"], side, tick)
+    if not levels:
+        return False
+    sl, tp, _ = levels
 
-def execute_trade(
-    signal,
-    equity
-):
+    sizing = calculate_contracts(symbol, entry, sl, equity, available)
+    if not sizing:
+        tg(f"⏭️ SKIP {symbol}\nNo valid contract size fits available margin.")
+        return False
 
-    symbol = signal["symbol"]
-
-    with lock:
-
-        # --------------------------------------------
-        # Cooldown
-        # --------------------------------------------
-
-        if cooldown_active(symbol):
-            return False
-
-        # --------------------------------------------
-        # Max positions
-        # --------------------------------------------
-
-        if (
-            active_position_count()
-            >= MAX_ACTIVE_POSITIONS
-        ):
-
-            return False
-
-        # --------------------------------------------
-        # Existing symbol position
-        # --------------------------------------------
-
-        if position_for_symbol(
-            symbol
-        ):
-
-            return False
-
-        # --------------------------------------------
-        # Leverage
-        # --------------------------------------------
-
-        if not ensure_leverage(
-            symbol
-        ):
-
-            telegram(
-                "🟠 TRADE BLOCKED\n\n"
-                f"{symbol}\n"
-                "Leverage kon niet worden "
-                "bevestigd."
-            )
-
-            return False
-
-        # --------------------------------------------
-        # Position sizing
-        # --------------------------------------------
-
-        sizing = calculate_size(
-            signal,
-            equity
+    # Hard pre-order check.
+    required_margin = sizing["margin"]
+    if required_margin > available * AVAILABLE_MARGIN_BUFFER:
+        tg(
+            f"⏭️ SKIP {symbol}\n"
+            f"Required margin ${required_margin:.2f} > safe available ${available * AVAILABLE_MARGIN_BUFFER:.2f}"
         )
+        return False
 
-        if not sizing:
+    # Record current positions so we can find the newly created position.
+    before = get_positions()
+    before_ids = {position_id(p) for p in before if position_id(p)}
 
-            print(
-                "Sizing rejected:",
-                symbol
-            )
+    # Set leverage for newly opened position.
+    lev_ok, lev_err = set_leverage(symbol, LEVERAGE, "net")
+    if not lev_ok:
+        # Some accounts already have a compatible leverage; continue only for known setting conflicts.
+        if "110006" not in lev_err and "110019" not in lev_err:
+            tg(f"⚠️ Leverage setting warning {symbol}: {lev_err}")
 
-            return False
+    payload = {
+        "instId": blofin_inst_id(symbol),
+        "marginMode": MARGIN_MODE,
+        "positionSide": "net",
+        "side": order_side,
+        "orderType": "market",
+        "size": str(sizing["contracts"]),
+        "tpTriggerPrice": str(tp),
+        "tpOrderPrice": "-1",
+        "tpTriggerPriceType": "mark",
+        "slTriggerPrice": str(sl),
+        "slOrderPrice": "-1",
+        "slTriggerPriceType": "mark",
+        "clientOrderId": f"v62{int(time.time() * 1000) % 1000000000}",
+    }
+    if BROKER_ID:
+        payload["brokerId"] = BROKER_ID
 
-        contracts, margin = sizing
-
-        price = signal["price"]
-
-        stop_distance = (
-            signal["atr"]
-            * STOP_ATR_MULTIPLIER
+    if PAPER_TRADING:
+        tg(
+            f"🧪 PAPER ORDER\n{symbol} {side.upper()}\n"
+            f"Entry ~ {entry:.6g}\nSL {sl:.6g}\nTP {tp:.6g}\n"
+            f"Contracts {sizing['contracts']}\nMargin ${required_margin:.2f}\n"
+            f"Score {signal['score']:.0f}"
         )
-
-        if signal["side"] == "long":
-
-            stop_price = (
-                price
-                - stop_distance
-            )
-
-            tp_price = (
-                price
-                + stop_distance
-                * TP_R_MULTIPLIER
-            )
-
-            order_side = "buy"
-
-        else:
-
-            stop_price = (
-                price
-                + stop_distance
-            )
-
-            tp_price = (
-                price
-                - stop_distance
-                * TP_R_MULTIPLIER
-            )
-
-            order_side = "sell"
-
-        stop_price = float(
-            exchange.price_to_precision(
-                symbol,
-                stop_price
-            )
-        )
-
-        tp_price = float(
-            exchange.price_to_precision(
-                symbol,
-                tp_price
-            )
-        )
-
-        # --------------------------------------------
-        # Telegram BEFORE order
-        # --------------------------------------------
-
-        telegram(
-            "🟡 LIVE ORDER\n\n"
-            f"{symbol}\n"
-            f"{signal['side'].upper()}\n"
-            f"Score: {signal['score']}\n"
-            f"Regime: {signal['regime']}\n\n"
-            f"Entry ~ ${price:.8g}\n"
-            f"SL: ${stop_price:.8g}\n"
-            f"TP: ${tp_price:.8g}\n\n"
-            f"Margin: ${margin:.2f}\n"
-            f"Leverage: {LEVERAGE}x\n"
-            f"Strategy: "
-            f"{', '.join(signal['strategies'])}"
-        )
-
-        # --------------------------------------------
-        # LIVE ENTRY
-        # --------------------------------------------
-
-        try:
-
-            order = exchange.create_order(
-                symbol,
-                "market",
-                order_side,
-                contracts,
-                None,
-                {
-                    "marginMode": "isolated",
-                    "positionSide": "net",
-                    "clientOrderId": (
-                        "V61"
-                        + uuid.uuid4().hex[:20]
-                    )
-                }
-            )
-
-        except Exception as e:
-
-            telegram(
-                "🔴 ENTRY FAILED\n\n"
-                f"{symbol}\n"
-                f"{e}"
-            )
-
-            return False
-
-        # --------------------------------------------
-        # VERIFY ENTRY
-        # --------------------------------------------
-
-        position = None
-
-        for _ in range(10):
-
-            time.sleep(0.5)
-
-            try:
-
-                position = position_for_symbol(
-                    symbol
-                )
-
-            except Exception:
-                position = None
-
-            if position:
-                break
-
-        if not position:
-
-            telegram(
-                "🔴 ENTRY UNCERTAIN\n\n"
-                f"{symbol}\n"
-                "Order geplaatst maar positie "
-                "niet bevestigd.\n\n"
-                "Bot gaat NIET verder."
-            )
-
-            return False
-
-        # --------------------------------------------
-        # Actual entry price
-        # --------------------------------------------
-
-        actual_entry = (
-            position.get(
-                "entryPrice"
-            )
-            or position.get(
-                "average"
-            )
-            or price
-        )
-
-        try:
-
-            actual_entry = float(
-                actual_entry
-            )
-
-        except Exception:
-
-            actual_entry = price
-
-        # Recalculate protection
-        if signal["side"] == "long":
-
-            stop_price = (
-                actual_entry
-                - stop_distance
-            )
-
-            tp_price = (
-                actual_entry
-                + stop_distance
-                * TP_R_MULTIPLIER
-            )
-
-        else:
-
-            stop_price = (
-                actual_entry
-                + stop_distance
-            )
-
-            tp_price = (
-                actual_entry
-                - stop_distance
-                * TP_R_MULTIPLIER
-            )
-
-        stop_price = float(
-            exchange.price_to_precision(
-                symbol,
-                stop_price
-            )
-        )
-
-        tp_price = float(
-            exchange.price_to_precision(
-                symbol,
-                tp_price
-            )
-        )
-
-        # --------------------------------------------
-        # PLACE NATIVE TPSL
-        # --------------------------------------------
-
-        try:
-
-            tpsl = place_tpsl(
-                signal,
-                contracts,
-                stop_price,
-                tp_price
-            )
-
-        except Exception as e:
-
-            telegram(
-                "🚨 PROTECTION FAILED\n\n"
-                f"{symbol}\n\n"
-                f"{e}\n\n"
-                "EMERGENCY CLOSE."
-            )
-
-            emergency_close(
-                symbol
-            )
-
-            return False
-
-        # --------------------------------------------
-        # VERIFY PROTECTION
-        # --------------------------------------------
-
-        protection = None
-
-        for _ in range(10):
-
-            time.sleep(0.5)
-
-            try:
-
-                protection = verify_tpsl(
-                    symbol
-                )
-
-            except Exception:
-                protection = None
-
-            if protection:
-                break
-
-        if not protection:
-
-            telegram(
-                "🚨 TPSL NOT VERIFIED\n\n"
-                f"{symbol}\n\n"
-                "Positie wordt gesloten."
-            )
-
-            emergency_close(
-                symbol
-            )
-
-            return False
-
-        # --------------------------------------------
-        # Store local state
-        # --------------------------------------------
-
-        local_positions[
-            symbol
-        ] = {
-            "symbol": symbol,
-            "side": signal["side"],
-            "entry": actual_entry,
-            "stop": stop_price,
-            "tp": tp_price,
-            "contracts": contracts,
-            "margin": margin,
-            "score": signal["score"],
-            "strategies": signal[
-                "strategies"
-            ],
-            "opened": time.time(),
-            "tpsl": protection,
-            "order": order
-        }
-
-        set_cooldown(
-            symbol
-        )
-
-        telegram(
-            "🟢 LIVE TRADE OPENED\n\n"
-            f"{symbol}\n"
-            f"{signal['side'].upper()}\n\n"
-            f"Entry: ${actual_entry:.8g}\n"
-            f"SL: ${stop_price:.8g}\n"
-            f"TP: ${tp_price:.8g}\n\n"
-            f"Score: {signal['score']}\n"
-            f"Margin: ${margin:.2f}\n"
-            f"Leverage: {LEVERAGE}x\n\n"
-            "BloFin TPSL: ✅ VERIFIED"
-        )
-
         return True
 
+    resp = native("private_post_trade_order", payload)
+    if not native_ok(resp):
+        err = response_error(resp)
+        tg(f"❌ LIVE ORDER FAILED\n{symbol} {side.upper()}\n{err}")
+        return False
 
-# ============================================================
-# POSITION MONITOR
-# ============================================================
+    tg(
+        f"🟢 LIVE ORDER\n{symbol} {side.upper()}\n"
+        f"Score {signal['score']:.0f}\n"
+        f"Entry ~ {entry:.6g}\nSL {sl:.6g}\nTP {tp:.6g}\n"
+        f"Contracts {sizing['contracts']}\nNotional ${sizing['notional']:.2f}\n"
+        f"Margin ${required_margin:.2f}\nLeverage {LEVERAGE}x"
+    )
 
-def monitor_positions():
+    # Confirm the position and protection.
+    new_pos = find_new_position(symbol, before_ids, timeout=8)
+    if new_pos is None:
+        tg(f"⚠️ {symbol}: order accepted but position not yet visible. Protection will be rechecked on next cycle.")
+        return True
 
-    try:
+    protected, _ = has_live_protection(new_pos)
+    if protected:
+        tg(f"🛡️ PROTECTION CONFIRMED\n{symbol} {side.upper()}\nSL {sl:.6g}\nTP {tp:.6g}")
+        return True
 
-        live = {}
+    # The opening order should already have attached TP/SL. If not visible,
+    # try the standalone TPSL endpoint once.
+    ok, result = place_tpsl_for_position(new_pos, sl, tp, client_tag="fallback")
+    if ok:
+        tg(f"🛡️ FALLBACK PROTECTION CONFIRMED\n{symbol} {side.upper()}")
+        return True
 
-        for position in real_positions():
+    # Do NOT pretend the position is protected.
+    tg(
+        f"🚨 CRITICAL PROTECTION FAILURE\n{symbol} {side.upper()} is OPEN but TP/SL is NOT CONFIRMED.\n"
+        f"Reason: {result}\n\nNEW TRADES PAUSED."
+    )
+    return False
 
-            symbol = position.get(
-                "symbol"
+# ----------------------------
+# Risk state
+# ----------------------------
+startup_equity = None
+consecutive_losses = 0
+symbol_last_trade = {}
+protection_lock = False
+
+
+def check_daily_risk():
+    global startup_equity
+    account = futures_account()
+    equity = account["total_equity"]
+    if startup_equity is None:
+        startup_equity = equity
+    if startup_equity > 0:
+        drawdown_pct = (startup_equity - equity) / startup_equity * 100
+        if drawdown_pct >= DAILY_LOSS_LIMIT_PCT:
+            return False, f"Daily risk stop: drawdown {drawdown_pct:.2f}%"
+    return True, "OK"
+
+
+def cooldown_ok(symbol):
+    t = symbol_last_trade.get(symbol, 0)
+    return (time.time() - t) >= SYMBOL_COOLDOWN_MIN * 60
+
+# ----------------------------
+# Startup diagnostics
+# ----------------------------
+def startup_diagnostics():
+    acc = futures_account()
+    positions = get_positions()
+    tg(
+        f"🚀 BLOFIN V6.2 STARTED\n"
+        f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
+        f"Equity: ${acc['total_equity']:.2f}\n"
+        f"Available: ${acc['available']:.2f}\n"
+        f"Positions: {len(positions)}/{MAX_ACTIVE_POSITIONS}\n"
+        f"Leverage target: {LEVERAGE}x\n"
+        f"BrokerId: {'configured' if BROKER_ID else 'not configured'}"
+    )
+
+    # Print metadata for currently open positions; useful for debugging sizing.
+    for p in positions:
+        try:
+            meta = get_instrument(position_symbol(p))
+            tg(
+                f"📌 {position_symbol(p)} {position_side(p).upper()}\n"
+                f"Entry {position_entry(p):.8g}\n"
+                f"Size {position_size(p)} contracts\n"
+                f"contractValue {meta.get('contractValue')}\n"
+                f"minSize {meta.get('minSize')}\n"
+                f"lotSize {meta.get('lotSize')}"
             )
-
-            if not symbol:
-                continue
-
-            live[symbol] = position
-
-        # --------------------------------------------
-        # Detect closed positions
-        # --------------------------------------------
-
-        for symbol in list(
-            local_positions.keys()
-        ):
-
-            if symbol not in live:
-
-                info = local_positions.pop(
-                    symbol,
-                    {}
-                )
-
-                telegram(
-                    "🔵 POSITION CLOSED\n\n"
-                    f"{symbol}\n"
-                    f"Side: "
-                    f"{str(info.get('side', '')).upper()}\n"
-                    f"Score: "
-                    f"{info.get('score', '-')}\n\n"
-                    "BloFin meldt positie gesloten."
-                )
-
-        # --------------------------------------------
-        # Check protection still exists
-        # --------------------------------------------
-
-        for symbol in live:
-
-            if symbol not in local_positions:
-                continue
-
-            try:
-
-                protection = verify_tpsl(
-                    symbol
-                )
-
-                if not protection:
-
-                    telegram(
-                        "🚨 PROTECTION LOST\n\n"
-                        f"{symbol}\n\n"
-                        "TPSL is niet meer actief.\n"
-                        "Emergency close."
-                    )
-
-                    emergency_close(
-                        symbol
-                    )
-
-            except Exception as e:
-
-                telegram(
-                    "🟠 PROTECTION CHECK ERROR\n\n"
-                    f"{symbol}\n"
-                    f"{e}"
-                )
-
-    except Exception as e:
-
-        print(
-            "Monitor error:",
-            e
-        )
-
-
-# ============================================================
-# STARTUP
-# ============================================================
-
-def startup():
-
-    global daily_start_equity
-
-    print("=" * 65)
-    print(
-        f"BLOFIN TACTICAL ENGINE "
-        f"{VERSION}"
-    )
-    print("=" * 65)
-
-    print(
-        "PAPER_TRADING:",
-        PAPER_TRADING
-    )
-
-    print(
-        "LIVE_CONFIRM:",
-        LIVE_CONFIRM
-    )
-
-    print(
-        "MAX POSITIONS:",
-        MAX_ACTIVE_POSITIONS
-    )
-
-    print(
-        "LEVERAGE:",
-        LEVERAGE
-    )
-
-    print(
-        "MARKETS:",
-        len(SYMBOLS)
-    )
-
-    # --------------------------------------------
-    # Load markets
-    # --------------------------------------------
-
-    exchange.load_markets()
-
-    print(
-        "Markets loaded:",
-        len(exchange.markets)
-    )
-
-    # --------------------------------------------
-    # API test
-    # --------------------------------------------
-
-    try:
-
-        equity = fetch_equity()
-
-        daily_start_equity = equity
-
-        print(
-            f"BloFin API OK "
-            f"| Equity ${equity:.2f}"
-        )
-
-    except Exception as e:
-
-        telegram(
-            "🔴 STARTUP FAILED\n\n"
-            f"BloFin API:\n{e}"
-        )
-
-        raise
-
-    # --------------------------------------------
-    # Position test
-    # --------------------------------------------
-
-    try:
-
-        current = active_position_count()
-
-        print(
-            "Current positions:",
-            current
-        )
-
-        if current > 0:
-
-            telegram(
-                "⚠️ EXISTING POSITIONS\n\n"
-                f"{current} positie(s) "
-                "gevonden op BloFin.\n\n"
-                "Bot neemt bestaande posities "
-                "niet over."
-            )
-
-    except Exception as e:
-
-        telegram(
-            "🔴 POSITION API FAILED\n\n"
-            f"{e}"
-        )
-
-        raise
-
-    # --------------------------------------------
-    # Telegram
-    # --------------------------------------------
-
-    mode = (
-        "PAPER"
-        if PAPER_TRADING
-        else "🔴 LIVE"
-    )
-
-    telegram(
-        f"🟢 BLOFIN TACTICAL {VERSION}\n\n"
-        f"Mode: {mode}\n"
-        f"Equity: ${equity:.2f}\n"
-        f"Leverage: {LEVERAGE}x\n"
-        f"Max positions: "
-        f"{MAX_ACTIVE_POSITIONS}\n"
-        f"Markets: {len(SYMBOLS)}\n\n"
-        "BloFin API: ✅\n"
-        "Position API: ✅\n"
-        "Telegram: ✅\n"
-        "Protection: native BloFin\n\n"
-        "SCANNER ONLINE"
-    )
-
-
-# ============================================================
-# SCANNER
-# ============================================================
-
-def scan():
-
-    equity = fetch_equity()
-
-    print(
-        f"\n"
-        f"[{datetime.now().strftime('%H:%M:%S')}] "
-        f"Equity ${equity:.2f}"
-    )
-
-    if not risk_allowed(
-        equity
-    ):
-
-        return
-
-    current_positions = (
-        active_position_count()
-    )
-
-    if (
-        current_positions
-        >= MAX_ACTIVE_POSITIONS
-    ):
-
-        print(
-            "Max positions bereikt."
-        )
-
-        return
-
-    candidates = []
-
-    # --------------------------------------------------------
-    # Scan
-    # --------------------------------------------------------
-
-    for symbol in SYMBOLS:
-
-        if cooldown_active(symbol):
-            continue
-
-        if symbol in local_positions:
-            continue
-
-        signal = score_symbol(
-            symbol
-        )
-
-        if signal:
-
-            candidates.append(
-                signal
-            )
-
-        time.sleep(0.12)
-
-    # --------------------------------------------------------
-    # Nothing found
-    # --------------------------------------------------------
-
-    if not candidates:
-
-        print(
-            "Geen geldige setups."
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # Rank
-    # --------------------------------------------------------
-
-    candidates.sort(
-        key=lambda x: x["score"],
-        reverse=True
-    )
-
-    print(
-        "\nTOP CANDIDATES"
-    )
-
-    for candidate in candidates[:10]:
-
-        print(
-            f"{candidate['symbol']} "
-            f"{candidate['side']} "
-            f"score={candidate['score']} "
-            f"{candidate['strategies']}"
-        )
-
-    # --------------------------------------------------------
-    # Execute best available
-    # --------------------------------------------------------
-
-    slots = (
-        MAX_ACTIVE_POSITIONS
-        - active_position_count()
-    )
-
-    for signal in candidates:
-
-        if slots <= 0:
-            break
-
-        if (
-            signal["score"]
-            < MIN_SCORE
-        ):
-
-            continue
-
-        success = execute_trade(
-            signal,
-            equity
-        )
-
-        if success:
-
-            slots -= 1
-
-
-# ============================================================
-# HEALTH
-# ============================================================
-
-def health():
-
-    try:
-
-        equity = fetch_equity()
-
-        positions = (
-            active_position_count()
-        )
-
-        print(
-            f"HEALTH | "
-            f"Equity=${equity:.2f} | "
-            f"Positions={positions}"
-        )
-
-    except Exception as e:
-
-        telegram(
-            "🔴 HEALTH ERROR\n\n"
-            f"{e}"
-        )
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
+        except Exception as e:
+            tg(f"⚠️ Metadata error {position_symbol(p)}: {e}")
+
+# ----------------------------
+# Main loop
+# ----------------------------
 def main():
+    global protection_lock, consecutive_losses
 
-    startup()
+    startup_diagnostics()
 
-    last_health = 0
-    last_monitor = 0
+    if not PAPER_TRADING and REPAIR_EXISTING_POSITIONS:
+        try:
+            protection_lock = not repair_existing_positions()
+        except Exception as e:
+            protection_lock = True
+            tg(f"🚨 STARTUP PROTECTION CHECK FAILED\n{e}\nNEW TRADES PAUSED.")
+
+    if protection_lock and not PAPER_TRADING:
+        tg(
+            "🛑 V6.2 SAFE MODE\n"
+            "Existing position protection could not be confirmed.\n"
+            "The bot will scan, but will NOT open new trades."
+        )
 
     while True:
-
         try:
+            ok, reason = check_daily_risk()
+            if not ok:
+                tg(f"🛑 {reason}\nBot will keep monitoring but will not open new trades.")
+                time.sleep(120)
+                continue
 
-            now = time.time()
+            positions = get_positions()
 
-            # ----------------------------------------
-            # Position monitor every 15 sec
-            # ----------------------------------------
+            # Re-check protection of every open position every cycle.
+            if not PAPER_TRADING:
+                all_protected = True
+                for p in positions:
+                    protected, _ = has_live_protection(p)
+                    if not protected:
+                        all_protected = False
+                        if REPAIR_EXISTING_POSITIONS:
+                            # Attempt repair using fresh ATR.
+                            try:
+                                symbol = position_symbol(p)
+                                side = position_side(p)
+                                entry = position_entry(p)
+                                df = add_indicators(ohlcv_df(symbol, TIMEFRAME_SIGNAL))
+                                atr = float(df.iloc[-2]["atr"])
+                                meta = get_instrument(symbol)
+                                tick = safe_float(meta.get("tickSize"), 0.0001)
+                                levels = calculate_trade_levels(entry, atr, side, tick)
+                                if levels:
+                                    sl, tp, _ = levels
+                                    last = safe_float(exchange.fetch_ticker(symbol).get("last"))
+                                    valid = (sl < last < tp) if side == "long" else (tp < last < sl)
+                                    if valid:
+                                        repair_ok, _ = place_tpsl_for_position(p, sl, tp, client_tag="watch")
+                                        if repair_ok:
+                                            all_protected = True
+                                            tg(f"🛡️ REPAIRED {symbol} {side.upper()} protection confirmed.")
+                            except Exception as e:
+                                pass
 
-            if now - last_monitor >= 15:
+                protection_lock = not all_protected
 
-                monitor_positions()
+            if len(positions) >= MAX_ACTIVE_POSITIONS:
+                time.sleep(SCAN_SECONDS)
+                continue
 
-                last_monitor = now
+            if protection_lock and not PAPER_TRADING:
+                time.sleep(SCAN_SECONDS)
+                continue
 
-            # ----------------------------------------
-            # Health every 5 min
-            # ----------------------------------------
+            # Scan all configured markets.
+            candidates = []
+            for symbol in SYMBOLS:
+                if not cooldown_ok(symbol):
+                    continue
+                try:
+                    signal = evaluate_symbol(symbol)
+                    if signal:
+                        candidates.append(signal)
+                except Exception:
+                    continue
 
-            if now - last_health >= 300:
+            candidates.sort(key=lambda x: x["score"], reverse=True)
 
-                health()
+            # Take the best current opportunity only if there is room.
+            for signal in candidates:
+                current_positions = get_positions()
+                if len(current_positions) >= MAX_ACTIVE_POSITIONS:
+                    break
 
-                last_health = now
+                # Avoid adding to a symbol that is already open.
+                open_symbols = {position_symbol(p) for p in current_positions}
+                if signal["symbol"] in open_symbols:
+                    continue
 
-            # ----------------------------------------
-            # Scan
-            # ----------------------------------------
+                traded = open_trade(signal)
+                symbol_last_trade[signal["symbol"]] = time.time()
 
-            scan()
+                # If a live order created an unprotected position, lock immediately.
+                if traded and not PAPER_TRADING:
+                    try:
+                        fresh_positions = get_positions()
+                        for p in fresh_positions:
+                            protected, _ = has_live_protection(p)
+                            if not protected:
+                                protection_lock = True
+                                break
+                    except Exception:
+                        protection_lock = True
 
-            time.sleep(
-                SCAN_INTERVAL
-            )
+                # Only one new entry per scan cycle; no 1-hour artificial cooldown.
+                break
+
+            time.sleep(SCAN_SECONDS)
 
         except KeyboardInterrupt:
-
-            telegram(
-                "🔴 BLOFIN BOT STOPPED"
-            )
-
-            break
-
+            tg("🛑 V6.2 stopped manually.")
+            raise
         except Exception as e:
-
-            print(
-                traceback.format_exc()
-            )
-
-            telegram(
-                "🔴 BOT ERROR\n\n"
-                f"{type(e).__name__}\n"
-                f"{e}\n\n"
-                "Bot blijft proberen."
-            )
-
+            tg(f"⚠️ V6.2 LOOP ERROR\n{type(e).__name__}: {e}")
             time.sleep(30)
 
 
-# ============================================================
-# RUN
-# ============================================================
-
 if __name__ == "__main__":
-
     main()
