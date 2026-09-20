@@ -1,47 +1,79 @@
+# ============================================================
+# BLOFIN TACTICAL ENGINE V5.0
+# ============================================================
+#
+# Multi-regime / multi-strategy / adaptive crypto futures bot
+#
+# Strategies:
+#   1. MOMENTUM_BREAKOUT
+#   2. LIQUIDITY_SWEEP
+#   3. OI_DIVERGENCE
+#   4. TAKER_MOMENTUM
+#
+# Adaptive learning:
+#   - Persists strategy statistics to JSON
+#   - Tracks rolling results
+#   - Adjusts strategy weights gradually
+#   - Never changes aggressively after only a few trades
+#
+# Risk:
+#   - Risk based position sizing
+#   - Max active positions
+#   - Daily loss limit
+#   - Consecutive loss protection
+#   - Symbol cooldown
+#   - Cluster exposure protection
+#
+# Execution:
+#   - BloFin perpetual swaps through CCXT
+#   - Market entries
+#   - Separate SL / TP trigger orders
+#   - TP1 partial close
+#   - Break-even
+#   - ATR trailing runner
+#
+# IMPORTANT:
+# Test PAPER_TRADING=true first.
+# ============================================================
+
 import os
-import time
 import json
+import time
 import math
-import logging
+import traceback
 import threading
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from collections import defaultdict, deque
 
 import ccxt
 import pandas as pd
-import pandas_ta as ta
-import requests
-from flask import Flask
+import numpy as np
 
 
-# ====================== WEB / CONFIG ======================
-
-app = Flask(__name__)
-
-
-@app.route("/")
-def health_check():
-    return "BloFin Multi-Factor Bot v2.4 is running!", 200
-
-
-API_KEY = os.environ.get("EXCHANGE_API_KEY", "")
-API_SECRET = os.environ.get("EXCHANGE_SECRET", "")
-API_PASSWORD = os.environ.get("EXCHANGE_PASSWORD", "")
+# ============================================================
+# CONFIG
+# ============================================================
 
 EXCHANGE_ID = "blofin"
 
-PAPER_TRADING = (
-    os.environ.get("PAPER_TRADING", "False").lower() == "true"
-)
+API_KEY = os.getenv("EXCHANGE_API_KEY", "")
+API_SECRET = os.getenv("EXCHANGE_SECRET", "")
+API_PASSWORD = os.getenv("EXCHANGE_PASSWORD", "")
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() == "true"
 
+# ------------------------------------------------------------
+# Telegram
+# ------------------------------------------------------------
 
-# ====================== SYMBOLS ======================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# ------------------------------------------------------------
+# Symbols
+# ------------------------------------------------------------
 
 SYMBOLS = [
-    # Majors
     "BTC/USDT:USDT",
     "ETH/USDT:USDT",
     "SOL/USDT:USDT",
@@ -56,7 +88,6 @@ SYMBOLS = [
     "AVAX/USDT:USDT",
     "LINK/USDT:USDT",
     "DOT/USDT:USDT",
-    # L2 / L1
     "SUI/USDT:USDT",
     "NEAR/USDT:USDT",
     "APT/USDT:USDT",
@@ -72,7 +103,6 @@ SYMBOLS = [
     "IMX/USDT:USDT",
     "STRK/USDT:USDT",
     "POL/USDT:USDT",
-    # DeFi
     "UNI/USDT:USDT",
     "AAVE/USDT:USDT",
     "LDO/USDT:USDT",
@@ -81,13 +111,11 @@ SYMBOLS = [
     "CRV/USDT:USDT",
     "MKR/USDT:USDT",
     "RUNE/USDT:USDT",
-    # AI / narrative
     "RENDER/USDT:USDT",
     "FET/USDT:USDT",
     "TAO/USDT:USDT",
     "WLD/USDT:USDT",
     "JUP/USDT:USDT",
-    # Memes / high vol
     "PEPE/USDT:USDT",
     "WIF/USDT:USDT",
     "BONK/USDT:USDT",
@@ -95,7 +123,6 @@ SYMBOLS = [
     "SHIB/USDT:USDT",
     "ORDI/USDT:USDT",
     "GALA/USDT:USDT",
-    # Extra
     "ETC/USDT:USDT",
     "XLM/USDT:USDT",
     "ALGO/USDT:USDT",
@@ -103,1572 +130,3851 @@ SYMBOLS = [
     "APE/USDT:USDT",
 ]
 
+BTC_SYMBOL = "BTC/USDT:USDT"
 
-# ====================== TIMEFRAMES ======================
+# ------------------------------------------------------------
+# Timeframes
+# ------------------------------------------------------------
 
-SCAN_TF = "15m"
-CONFIRM_TF = "5m"
-TREND_TF = "1h"
+TF_FAST = "5m"
+TF_SIGNAL = "15m"
+TF_TREND = "1h"
 
+# ------------------------------------------------------------
+# Engine timing
+# ------------------------------------------------------------
 
-# ====================== INDICATORS ======================
+SCAN_INTERVAL_SECONDS = 45
+SYMBOL_DELAY_SECONDS = 0.20
 
-LOOKBACK = 12
+POSITION_SYNC_SECONDS = 45
+MANAGEMENT_INTERVAL_SECONDS = 20
 
-EMA_FAST = 20
-EMA_MID = 50
-EMA_SLOW = 200
-
-ATR_LEN = 14
-VOLUME_LEN = 20
-
-# 10% extra volume is genoeg; 20% blokkeerde te veel 15m-bars.
-VOLUME_MULT = 1.10
-
-# Near-sweep: low/high mag tot 0.15 ATR voorbij lookback liggen.
-NEAR_SWEEP_ATR = 0.15
-
-
-# ====================== ENTRY ======================
-
-# Directe entry vanaf 39. Geen 5m-poort meer.
-# 5m-break geeft alleen nog extra punten in de score.
-MIN_SCORE = 39
-STRONG_SCORE = 39
-MAX_POSSIBLE_SCORE = 85
-
-
-# ====================== POSITION SIZE ======================
-
-FIXED_MARGIN_USDT = 5.0
-FIXED_LEVERAGE = 10
+# ------------------------------------------------------------
+# Positions
+# ------------------------------------------------------------
 
 MAX_ACTIVE_POSITIONS = 2
 
+# Do NOT artificially limit trades to one per hour.
+GLOBAL_ENTRY_COOLDOWN_SECONDS = 0
 
-# ====================== SL / TP ======================
+SYMBOL_COOLDOWN_SECONDS = 15 * 60
+LOSS_COOLDOWN_SECONDS = 30 * 60
 
-STOP_ATR_MULT = 1.5
-RISK_REWARD = 2.0
+# ------------------------------------------------------------
+# Leverage / sizing
+# ------------------------------------------------------------
 
+LEVERAGE = 10
 
-# ====================== BOT BEHAVIOUR ======================
+MIN_MARGIN_USDT = 5.0
+BASE_MARGIN_USDT = 7.5
+MAX_MARGIN_USDT = 12.0
 
-USE_CLOSED_CANDLES = True
+MAX_MARGIN_EQUITY_PCT = 0.18
+MAX_TOTAL_MARGIN_EQUITY_PCT = 0.38
 
-SCAN_SLEEP_SECONDS = 60
-SYMBOL_SLEEP_SECONDS = 0.35
-POSITION_SYNC_SECONDS = 60
-WATCH_COOLDOWN_SECONDS = 15 * 60
-# Twee score-updates per uur, ook bij lage scores (10/20/25).
-SCORE_REPORT_SECONDS = 30 * 60
+# Actual risk to equity per trade.
+MAX_RISK_EQUITY_PCT = 0.015
 
-PROTECTION_RETRIES = 3
-PROTECTION_RETRY_SLEEP = 1.2
+# ------------------------------------------------------------
+# Profit objectives
+# ------------------------------------------------------------
 
+MIN_PROFIT_TARGET_USDT = 2.50
+IDEAL_PROFIT_TARGET_USDT = 5.00
+MAX_PROFIT_TARGET_USDT = 10.00
 
-# ====================== LOGGING ======================
+# These are NOT guaranteed targets.
+# They are used as an expected-value filter.
 
-TRADE_LOG_FILE = "trade_history.json"
+# ------------------------------------------------------------
+# Stops / targets
+# ------------------------------------------------------------
 
+ATR_SL_MULTIPLIER = 1.25
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[logging.StreamHandler()],
+TP1_R = 0.90
+TP2_R = 1.80
+
+TP1_CLOSE_PCT = 0.60
+
+BREAK_EVEN_BUFFER_PCT = 0.0015
+
+TRAIL_ATR_MULTIPLIER = 1.10
+
+# ------------------------------------------------------------
+# Signal thresholds
+# ------------------------------------------------------------
+
+MIN_SCORE = 54
+STRONG_SCORE = 68
+
+# ------------------------------------------------------------
+# Market filters
+# ------------------------------------------------------------
+
+MIN_ATR_PCT = 0.20
+MAX_ATR_PCT = 5.00
+
+MAX_SPREAD_PCT = 0.30
+
+MIN_VOLUME_RATIO = 1.05
+
+# ------------------------------------------------------------
+# Learning
+# ------------------------------------------------------------
+
+LEARNING_FILE = "bot_learning_v5.json"
+
+LEARNING_MIN_TRADES = 15
+
+LEARNING_WINDOW = 100
+
+WEIGHT_MIN = 0.65
+WEIGHT_MAX = 1.35
+
+# Learning is intentionally slow.
+LEARNING_RATE = 0.08
+
+# ------------------------------------------------------------
+# Safety
+# ------------------------------------------------------------
+
+DAILY_LOSS_LIMIT_PCT = 0.07
+
+MAX_CONSECUTIVE_LOSSES = 3
+
+MIN_EQUITY_USDT = 30.0
+
+# ------------------------------------------------------------
+# Execution assumptions
+# ------------------------------------------------------------
+
+ESTIMATED_TAKER_FEE_PCT = 0.0006
+ESTIMATED_SLIPPAGE_PCT = 0.0005
+
+ROUND_TRIP_COST_PCT = (
+    ESTIMATED_TAKER_FEE_PCT * 2
+    + ESTIMATED_SLIPPAGE_PCT * 2
 )
 
-logger = logging.getLogger(__name__)
+# ------------------------------------------------------------
+# API caching
+# ------------------------------------------------------------
+
+BTC_CACHE_SECONDS = 45
+
+OI_CACHE_SECONDS = 60
+
+FUNDING_CACHE_SECONDS = 120
+
+TRADE_CACHE_SECONDS = 30
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def now_ts():
+    return time.time()
 
 
-# ====================== TELEGRAM ======================
+def utc_now():
+    return datetime.now(timezone.utc)
 
-def send_telegram(message: str) -> None:
+
+def safe_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def pct_change(a, b):
+    if not a:
+        return 0.0
+    return (b - a) / a
+
+
+def normalize_side(side):
+    if side in ("long", "buy"):
+        return "long"
+    return "short"
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+def send_telegram(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
     try:
+        import requests
+
         url = (
-            f"https://api.telegram.org/"
-            f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            f"https://api.telegram.org/bot"
+            f"{TELEGRAM_BOT_TOKEN}/sendMessage"
         )
 
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML",
-        }
-
-        response = requests.post(
+        requests.post(
             url,
-            json=payload,
-            timeout=5,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+            },
+            timeout=10,
         )
 
-        response.raise_for_status()
-
-    except Exception as exc:
-        logger.error("Telegram error: %s", exc)
+    except Exception as e:
+        print("Telegram error:", e)
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+# ============================================================
+# INDICATORS
+# ============================================================
+
+def ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
 
 
-# ====================== BOT ======================
+def atr(df, period=14):
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
 
-class MultiFactorBot:
+    prev_close = close.shift(1)
+
+    tr = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    return tr.rolling(period).mean()
+
+
+def rsi(series, period=14):
+    delta = series.diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(
+        alpha=1 / period,
+        adjust=False
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1 / period,
+        adjust=False
+    ).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+
+    return 100 - (100 / (1 + rs))
+
+
+def volume_ratio(df, period=20):
+    avg = df["volume"].rolling(period).mean()
+    return df["volume"] / avg.replace(0, np.nan)
+
+
+def donchian(df, period=20):
+    high = df["high"].rolling(period).max()
+    low = df["low"].rolling(period).min()
+
+    return high, low
+
+
+def candle_body_ratio(row):
+    rng = row["high"] - row["low"]
+
+    if rng <= 0:
+        return 0.0
+
+    return abs(row["close"] - row["open"]) / rng
+
+
+def upper_wick_ratio(row):
+    rng = row["high"] - row["low"]
+
+    if rng <= 0:
+        return 0.0
+
+    upper = row["high"] - max(
+        row["open"],
+        row["close"]
+    )
+
+    return upper / rng
+
+
+def lower_wick_ratio(row):
+    rng = row["high"] - row["low"]
+
+    if rng <= 0:
+        return 0.0
+
+    lower = min(
+        row["open"],
+        row["close"]
+    ) - row["low"]
+
+    return lower / rng
+
+
+# ============================================================
+# MARKET REGIME
+# ============================================================
+
+def detect_regime(df_1h, df_15m):
+
+    if len(df_1h) < 220 or len(df_15m) < 80:
+        return "UNKNOWN"
+
+    d1 = df_1h.copy()
+    d15 = df_15m.copy()
+
+    d1["ema20"] = ema(d1["close"], 20)
+    d1["ema50"] = ema(d1["close"], 50)
+    d1["ema200"] = ema(d1["close"], 200)
+
+    d15["ema20"] = ema(d15["close"], 20)
+    d15["ema50"] = ema(d15["close"], 50)
+    d15["atr"] = atr(d15)
+
+    last = d1.iloc[-1]
+    prev = d1.iloc[-5]
+
+    atr15 = d15["atr"].iloc[-1]
+    price15 = d15["close"].iloc[-1]
+
+    if not np.isfinite(atr15) or price15 <= 0:
+        return "UNKNOWN"
+
+    atr_pct = atr15 / price15 * 100
+
+    trend_up = (
+        last["ema20"] > last["ema50"]
+        > last["ema200"]
+    )
+
+    trend_down = (
+        last["ema20"] < last["ema50"]
+        < last["ema200"]
+    )
+
+    slope = pct_change(
+        prev["ema20"],
+        last["ema20"]
+    )
+
+    ema_spread = abs(
+        last["ema20"] - last["ema50"]
+    ) / last["close"]
+
+    # Extreme volatility.
+    if atr_pct > 4.0:
+        return "CHAOS"
+
+    # Strong directional environment.
+    if trend_up and slope > 0.001:
+        return "TREND_UP"
+
+    if trend_down and slope < -0.001:
+        return "TREND_DOWN"
+
+    # Tight moving average structure.
+    if ema_spread < 0.0025:
+        return "RANGE"
+
+    return "TRANSITION"
+
+
+# ============================================================
+# EXCHANGE
+# ============================================================
+
+class BlofinEngine:
 
     def __init__(self):
 
-        if not API_KEY or not API_SECRET or not API_PASSWORD:
-            raise RuntimeError(
-                "EXCHANGE_API_KEY, EXCHANGE_SECRET and "
-                "EXCHANGE_PASSWORD must be configured."
-            )
+        self.lock = threading.RLock()
 
-        exchange_class = getattr(ccxt, EXCHANGE_ID)
-
-        self.exchange = exchange_class(
-            {
-                "apiKey": API_KEY,
-                "secret": API_SECRET,
-                "password": API_PASSWORD,
-                "enableRateLimit": True,
-                "options": {
-                    "defaultType": "swap",
-                },
-            }
-        )
+        self.exchange = ccxt.blofin({
+            "apiKey": API_KEY,
+            "secret": API_SECRET,
+            "password": API_PASSWORD,
+            "enableRateLimit": True,
+            "options": {
+                "defaultType": "swap",
+            },
+        })
 
         self.exchange.load_markets()
 
-        available = [
-            symbol
-            for symbol in SYMBOLS
-            if symbol in self.exchange.markets
+        self.positions = {}
+
+        self.symbol_cooldowns = {}
+
+        self.loss_cooldowns = {}
+
+        self.last_global_entry = 0
+
+        self.last_position_sync = 0
+
+        self.last_management = 0
+
+        self.last_daily_reset = utc_now().date()
+
+        self.day_start_equity = None
+
+        self.daily_realized_pnl = 0.0
+
+        self.consecutive_losses = 0
+
+        self.paper_equity = 64.0
+
+        self.paper_positions = {}
+
+        self.oi_cache = {}
+
+        self.funding_cache = {}
+
+        self.trade_cache = {}
+
+        self.btc_cache = None
+
+        self.learning = self.load_learning()
+
+        self.validate_symbols()
+
+        self.configure_leverage()
+
+    # ========================================================
+    # LEARNING
+    # ========================================================
+
+    def default_learning(self):
+
+        strategies = [
+            "MOMENTUM_BREAKOUT",
+            "LIQUIDITY_SWEEP",
+            "OI_DIVERGENCE",
+            "TAKER_MOMENTUM",
         ]
-        missing = [
-            symbol
-            for symbol in SYMBOLS
-            if symbol not in self.exchange.markets
-        ]
 
-        if not available:
-            raise RuntimeError(
-                "Geen enkel symbool beschikbaar op BloFin."
-            )
-
-        if missing:
-            logger.warning(
-                "Niet beschikbaar op BloFin, overgeslagen: %s",
-                ", ".join(missing),
-            )
-
-        SYMBOLS[:] = available
-
-        logger.info(
-            "Markets geladen. %d symbolen beschikbaar.",
-            len(SYMBOLS),
-        )
-
-        self.state: Dict[str, dict] = {
-            symbol: {
-                "in_position": False,
-                "entry_price": 0.0,
-                "side": None,
-                "contracts": 0.0,
-                "last_sync": None,
-            }
-            for symbol in SYMBOLS
+        return {
+            "version": 5,
+            "created": utc_now().isoformat(),
+            "strategies": {
+                s: {
+                    "trades": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "gross_profit": 0.0,
+                    "gross_loss": 0.0,
+                    "net_pnl": 0.0,
+                    "avg_r": 0.0,
+                    "weight": 1.0,
+                    "recent": [],
+                }
+                for s in strategies
+            },
         }
 
-        self.last_position_sync = 0.0
-        self.last_watch: Dict[str, float] = {}
-        self.last_score_report = 0.0
-        self.lock = threading.Lock()
-
-
-    # ====================== MARKET DATA ======================
-
-    def fetch_ohlcv(
-        self,
-        symbol: str,
-        timeframe: str,
-        limit: int = 250,
-    ) -> Optional[pd.DataFrame]:
+    def load_learning(self):
 
         try:
 
-            ohlcv = self.exchange.fetch_ohlcv(
-                symbol,
-                timeframe,
-                limit=limit,
+            if not os.path.exists(LEARNING_FILE):
+                return self.default_learning()
+
+            with open(
+                LEARNING_FILE,
+                "r",
+                encoding="utf-8"
+            ) as f:
+                data = json.load(f)
+
+            default = self.default_learning()
+
+            for strategy in default["strategies"]:
+
+                if strategy not in data.get(
+                    "strategies",
+                    {}
+                ):
+                    data.setdefault(
+                        "strategies",
+                        {}
+                    )[strategy] = default[
+                        "strategies"
+                    ][strategy]
+
+            return data
+
+        except Exception as e:
+
+            print(
+                "Learning file error:",
+                e
             )
 
-            if not ohlcv or len(ohlcv) < 5:
-                return None
+            return self.default_learning()
 
-            df = pd.DataFrame(
-                ohlcv,
-                columns=[
-                    "timestamp",
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "volume",
-                ],
+    def save_learning(self):
+
+        try:
+
+            tmp = LEARNING_FILE + ".tmp"
+
+            with open(
+                tmp,
+                "w",
+                encoding="utf-8"
+            ) as f:
+                json.dump(
+                    self.learning,
+                    f,
+                    indent=2
+                )
+
+            os.replace(
+                tmp,
+                LEARNING_FILE
             )
 
-            df["timestamp"] = pd.to_datetime(
-                df["timestamp"],
-                unit="ms",
-                utc=True,
+        except Exception as e:
+            print(
+                "Could not save learning:",
+                e
             )
 
-            for column in [
+    def strategy_weight(self, strategy):
+
+        try:
+            return clamp(
+                float(
+                    self.learning[
+                        "strategies"
+                    ][strategy]["weight"]
+                ),
+                WEIGHT_MIN,
+                WEIGHT_MAX,
+            )
+
+        except Exception:
+            return 1.0
+
+    def learn_trade(
+        self,
+        strategy,
+        pnl,
+        r_multiple,
+    ):
+
+        if strategy not in self.learning[
+            "strategies"
+        ]:
+            return
+
+        s = self.learning[
+            "strategies"
+        ][strategy]
+
+        s["trades"] += 1
+
+        if pnl > 0:
+            s["wins"] += 1
+            s["gross_profit"] += pnl
+        else:
+            s["losses"] += 1
+            s["gross_loss"] += abs(pnl)
+
+        s["net_pnl"] += pnl
+
+        recent = s.setdefault(
+            "recent",
+            []
+        )
+
+        recent.append({
+            "time": utc_now().isoformat(),
+            "pnl": pnl,
+            "r": r_multiple,
+        })
+
+        if len(recent) > LEARNING_WINDOW:
+            del recent[
+                :-LEARNING_WINDOW
+            ]
+
+        values = [
+            x["r"]
+            for x in recent
+        ]
+
+        if values:
+            s["avg_r"] = (
+                sum(values) / len(values)
+            )
+
+        # ----------------------------------------------------
+        # Slow adaptive learning.
+        # ----------------------------------------------------
+
+        if s["trades"] >= LEARNING_MIN_TRADES:
+
+            win_rate = (
+                s["wins"] / s["trades"]
+            )
+
+            avg_r = s["avg_r"]
+
+            # Positive expectancy.
+            if avg_r > 0.15 and win_rate >= 0.42:
+
+                s["weight"] += LEARNING_RATE * 0.5
+
+            # Weak expectancy.
+            elif avg_r < -0.10:
+
+                s["weight"] -= LEARNING_RATE * 0.5
+
+            s["weight"] = clamp(
+                s["weight"],
+                WEIGHT_MIN,
+                WEIGHT_MAX
+            )
+
+        self.save_learning()
+
+    # ========================================================
+    # SYMBOLS
+    # ========================================================
+
+    def validate_symbols(self):
+
+        available = set(
+            self.exchange.symbols
+        )
+
+        valid = []
+
+        for symbol in SYMBOLS:
+
+            if symbol in available:
+                valid.append(symbol)
+
+        self.symbols = valid
+
+        print(
+            f"Loaded {len(self.symbols)} symbols."
+        )
+
+    # ========================================================
+    # LEVERAGE
+    # ========================================================
+
+    def configure_leverage(self):
+
+        if PAPER_TRADING:
+            return
+
+        for symbol in self.symbols:
+
+            try:
+
+                if hasattr(
+                    self.exchange,
+                    "set_leverage"
+                ):
+
+                    self.exchange.set_leverage(
+                        LEVERAGE,
+                        symbol
+                    )
+
+            except Exception as e:
+
+                print(
+                    f"Leverage {symbol}:",
+                    e
+                )
+
+    # ========================================================
+    # DATA
+    # ========================================================
+
+    def fetch_ohlcv(
+        self,
+        symbol,
+        timeframe,
+        limit=250
+    ):
+
+        raw = self.exchange.fetch_ohlcv(
+            symbol,
+            timeframe,
+            limit=limit
+        )
+
+        if not raw:
+            return None
+
+        df = pd.DataFrame(
+            raw,
+            columns=[
+                "timestamp",
                 "open",
                 "high",
                 "low",
                 "close",
                 "volume",
-            ]:
-                df[column] = pd.to_numeric(
-                    df[column],
-                    errors="coerce",
-                )
+            ]
+        )
 
-            df["atr"] = ta.atr(
-                df["high"],
-                df["low"],
-                df["close"],
-                length=ATR_LEN,
+        for c in [
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        ]:
+            df[c] = pd.to_numeric(
+                df[c],
+                errors="coerce"
             )
 
-            df["ema20"] = ta.ema(
-                df["close"],
-                length=EMA_FAST,
-            )
+        return df
 
-            df["ema50"] = ta.ema(
-                df["close"],
-                length=EMA_MID,
-            )
+    # ========================================================
+    # BTC CACHE
+    # ========================================================
 
-            # EMA200 alleen als er genoeg candles zijn.
-            # Anders gooit dropna() de hele 15m/5m-tabel weg.
-            if len(df) >= EMA_SLOW + 5:
-                df["ema200"] = ta.ema(
-                    df["close"],
-                    length=EMA_SLOW,
-                )
-            else:
-                df["ema200"] = float("nan")
+    def fetch_btc_context(self):
 
-            df["vol_sma"] = ta.sma(
-                df["volume"],
-                length=VOLUME_LEN,
-            )
+        now = now_ts()
 
-            # Geen dropna op indicatoren: anders verdwijnen korte
-            # 5m/15m-series en faalt de hele scan.
-            df = df.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
-
-            if len(df) < 5:
-                return None
-
-            return df
-
-        except Exception as exc:
-
-            logger.error(
-                "Fetch error %s (%s): %s",
-                symbol,
-                timeframe,
-                exc,
-            )
-
-            return None
-
-
-    def last_closed(
-        self,
-        df: pd.DataFrame,
-    ) -> pd.Series:
-
-        if USE_CLOSED_CANDLES and len(df) >= 2:
-            return df.iloc[-2]
-
-        return df.iloc[-1]
-
-
-    # ====================== POSITIONS ======================
-
-    def fetch_open_positions(
-        self,
-    ) -> Optional[Dict[str, dict]]:
+        if (
+            self.btc_cache
+            and now - self.btc_cache["time"]
+            < BTC_CACHE_SECONDS
+        ):
+            return self.btc_cache
 
         try:
 
-            positions = self.exchange.fetch_positions(
-                SYMBOLS
+            df15 = self.fetch_ohlcv(
+                BTC_SYMBOL,
+                TF_SIGNAL,
+                120
             )
 
-        except Exception as exc:
+            df1h = self.fetch_ohlcv(
+                BTC_SYMBOL,
+                TF_TREND,
+                220
+            )
 
-            logger.error(
-                "Position sync failed: %s",
-                exc,
+            regime = detect_regime(
+                df1h,
+                df15
+            )
+
+            close = df15["close"]
+
+            btc_change = pct_change(
+                close.iloc[-12],
+                close.iloc[-1]
+            )
+
+            result = {
+                "time": now,
+                "regime": regime,
+                "change": btc_change,
+                "df15": df15,
+                "df1h": df1h,
+            }
+
+            self.btc_cache = result
+
+            return result
+
+        except Exception as e:
+
+            print(
+                "BTC context error:",
+                e
             )
 
             return None
 
-        result: Dict[str, dict] = {}
+    # ========================================================
+    # OPEN INTEREST
+    # ========================================================
 
-        for position in positions:
+    def fetch_oi(self, symbol):
 
-            symbol = position.get("symbol")
+        now = now_ts()
 
-            if symbol not in SYMBOLS:
-                continue
+        cached = self.oi_cache.get(symbol)
 
-            contracts_raw = position.get("contracts")
+        if cached:
+            if (
+                now - cached["time"]
+                < OI_CACHE_SECONDS
+            ):
+                return cached
 
-            try:
-                contracts = abs(
-                    float(contracts_raw or 0)
+        try:
+
+            if not hasattr(
+                self.exchange,
+                "fetch_open_interest"
+            ):
+                return None
+
+            current = (
+                self.exchange.fetch_open_interest(
+                    symbol
                 )
-            except (TypeError, ValueError):
-                contracts = 0.0
+            )
 
-            if contracts <= 0:
-                continue
+            oi = safe_float(
+                current.get("openInterest")
+            )
 
-            side = position.get("side")
-
-            try:
-                entry_price = float(
-                    position.get("entryPrice") or 0
+            if oi <= 0:
+                oi = safe_float(
+                    current.get("openInterestValue")
                 )
-            except (TypeError, ValueError):
-                entry_price = 0.0
 
-            result[symbol] = {
-                "in_position": True,
-                "entry_price": entry_price,
-                "side": side,
-                "contracts": contracts,
-                "last_sync": utc_now(),
-                "raw": position,
+            result = {
+                "time": now,
+                "oi": oi,
             }
 
-        return result
+            self.oi_cache[symbol] = result
 
+            return result
 
-    def sync_positions(self) -> bool:
+        except Exception:
 
-        open_positions = self.fetch_open_positions()
+            return None
 
-        if open_positions is None:
-            return False
+    # ========================================================
+    # FUNDING
+    # ========================================================
 
-        with self.lock:
+    def fetch_funding(self, symbol):
 
-            for symbol in SYMBOLS:
+        now = now_ts()
 
-                position = open_positions.get(symbol)
+        cached = self.funding_cache.get(
+            symbol
+        )
 
-                if position:
+        if cached:
 
-                    self.state[symbol].update(
-                        {
-                            "in_position": True,
-                            "entry_price": position["entry_price"],
-                            "side": position["side"],
-                            "contracts": position["contracts"],
-                            "last_sync": position["last_sync"],
-                        }
-                    )
+            if (
+                now - cached["time"]
+                < FUNDING_CACHE_SECONDS
+            ):
+                return cached
+
+        try:
+
+            if not hasattr(
+                self.exchange,
+                "fetch_funding_rate"
+            ):
+                return None
+
+            data = (
+                self.exchange.fetch_funding_rate(
+                    symbol
+                )
+            )
+
+            rate = safe_float(
+                data.get("fundingRate")
+            )
+
+            result = {
+                "time": now,
+                "rate": rate,
+            }
+
+            self.funding_cache[symbol] = result
+
+            return result
+
+        except Exception:
+
+            return None
+
+    # ========================================================
+    # TAKER PRESSURE
+    # ========================================================
+
+    def fetch_taker_pressure(
+        self,
+        symbol,
+        limit=80
+    ):
+
+        now = now_ts()
+
+        cached = self.trade_cache.get(
+            symbol
+        )
+
+        if cached:
+
+            if (
+                now - cached["time"]
+                < TRADE_CACHE_SECONDS
+            ):
+                return cached
+
+        try:
+
+            trades = self.exchange.fetch_trades(
+                symbol,
+                limit=limit
+            )
+
+            if not trades:
+                return None
+
+            buy_volume = 0.0
+            sell_volume = 0.0
+            total = 0.0
+
+            for trade in trades:
+
+                amount = safe_float(
+                    trade.get("amount")
+                )
+
+                if amount <= 0:
+                    continue
+
+                side = trade.get("side")
+
+                total += amount
+
+                if side == "buy":
+                    buy_volume += amount
+
+                elif side == "sell":
+                    sell_volume += amount
+
+            if total <= 0:
+                return None
+
+            buy_ratio = (
+                buy_volume / total
+            )
+
+            result = {
+                "time": now,
+                "buy_ratio": buy_ratio,
+                "sell_ratio": 1 - buy_ratio,
+                "total": total,
+            }
+
+            self.trade_cache[symbol] = result
+
+            return result
+
+        except Exception:
+
+            return None
+
+    # ========================================================
+    # ORDERBOOK / SPREAD
+    # ========================================================
+
+    def spread_pct(self, symbol):
+
+        try:
+
+            book = self.exchange.fetch_order_book(
+                symbol,
+                limit=5
+            )
+
+            bid = safe_float(
+                book["bids"][0][0]
+            )
+
+            ask = safe_float(
+                book["asks"][0][0]
+            )
+
+            if bid <= 0 or ask <= 0:
+                return 999
+
+            mid = (bid + ask) / 2
+
+            return (
+                (ask - bid) / mid * 100
+            )
+
+        except Exception:
+
+            return 999
+
+    # ========================================================
+    # RELATIVE STRENGTH
+    # ========================================================
+
+    def relative_strength(
+        self,
+        symbol_df,
+        btc_df
+    ):
+
+        try:
+
+            n = min(
+                12,
+                len(symbol_df) - 1,
+                len(btc_df) - 1
+            )
+
+            if n <= 0:
+                return 0.0
+
+            asset_move = pct_change(
+                symbol_df["close"].iloc[-1-n],
+                symbol_df["close"].iloc[-1]
+            )
+
+            btc_move = pct_change(
+                btc_df["close"].iloc[-1-n],
+                btc_df["close"].iloc[-1]
+            )
+
+            return asset_move - btc_move
+
+        except Exception:
+
+            return 0.0
+
+    # ========================================================
+    # FEATURE ENGINE
+    # ========================================================
+
+    def enrich(self, df):
+
+        df = df.copy()
+
+        df["ema20"] = ema(
+            df["close"],
+            20
+        )
+
+        df["ema50"] = ema(
+            df["close"],
+            50
+        )
+
+        df["ema200"] = ema(
+            df["close"],
+            200
+        )
+
+        df["atr"] = atr(
+            df,
+            14
+        )
+
+        df["rsi"] = rsi(
+            df["close"],
+            14
+        )
+
+        df["volume_ratio"] = volume_ratio(
+            df,
+            20
+        )
+
+        high, low = donchian(
+            df,
+            20
+        )
+
+        df["donchian_high"] = high.shift(1)
+        df["donchian_low"] = low.shift(1)
+
+        df["body_ratio"] = df.apply(
+            candle_body_ratio,
+            axis=1
+        )
+
+        df["upper_wick"] = df.apply(
+            upper_wick_ratio,
+            axis=1
+        )
+
+        df["lower_wick"] = df.apply(
+            lower_wick_ratio,
+            axis=1
+        )
+
+        return df
+
+    # ========================================================
+    # BTC ALIGNMENT
+    # ========================================================
+
+    def btc_alignment(
+        self,
+        side,
+        btc_context
+    ):
+
+        if not btc_context:
+            return 0
+
+        regime = btc_context["regime"]
+
+        if side == "long":
+
+            if regime == "TREND_UP":
+                return 10
+
+            if regime == "TREND_DOWN":
+                return -10
+
+        else:
+
+            if regime == "TREND_DOWN":
+                return 10
+
+            if regime == "TREND_UP":
+                return -10
+
+        if regime == "RANGE":
+            return 0
+
+        return 2
+
+    # ========================================================
+    # STRATEGY 1: MOMENTUM BREAKOUT
+    # ========================================================
+
+    def strategy_breakout(
+        self,
+        symbol,
+        df15,
+        df5,
+        regime,
+        btc_context
+    ):
+
+        d = df15.iloc[-1]
+        prev = df15.iloc[-2]
+
+        long_signal = (
+            d["close"] > d["donchian_high"]
+            and d["volume_ratio"] >= 1.15
+            and d["body_ratio"] >= 0.45
+        )
+
+        short_signal = (
+            d["close"] < d["donchian_low"]
+            and d["volume_ratio"] >= 1.15
+            and d["body_ratio"] >= 0.45
+        )
+
+        candidates = []
+
+        for side, signal in [
+            ("long", long_signal),
+            ("short", short_signal),
+        ]:
+
+            if not signal:
+                continue
+
+            score = 0
+
+            # Base breakout.
+            score += 20
+
+            # Regime.
+            if side == "long" and regime == "TREND_UP":
+                score += 15
+
+            elif side == "short" and regime == "TREND_DOWN":
+                score += 15
+
+            elif regime == "RANGE":
+                score -= 8
+
+            elif regime == "CHAOS":
+                score -= 10
+
+            # EMA.
+            if side == "long":
+
+                if d["ema20"] > d["ema50"]:
+                    score += 8
+
+                if d["close"] > d["ema20"]:
+                    score += 5
+
+            else:
+
+                if d["ema20"] < d["ema50"]:
+                    score += 8
+
+                if d["close"] < d["ema20"]:
+                    score += 5
+
+            # Volume.
+            score += int(
+                clamp(
+                    (d["volume_ratio"] - 1)
+                    * 20,
+                    0,
+                    10
+                )
+            )
+
+            score += self.btc_alignment(
+                side,
+                btc_context
+            )
+
+            candidates.append({
+                "strategy": "MOMENTUM_BREAKOUT",
+                "side": side,
+                "score": score,
+                "reason": "Donchian breakout",
+            })
+
+        return candidates
+
+    # ========================================================
+    # STRATEGY 2: LIQUIDITY SWEEP
+    # ========================================================
+
+    def strategy_sweep(
+        self,
+        symbol,
+        df15,
+        df5,
+        regime,
+        btc_context
+    ):
+
+        d = df15.iloc[-1]
+
+        recent_high = df15[
+            "high"
+        ].iloc[-8:-1].max()
+
+        recent_low = df15[
+            "low"
+        ].iloc[-8:-1].min()
+
+        candidates = []
+
+        # Bearish liquidity sweep:
+        # high taken, candle closes back below.
+        bearish_sweep = (
+            d["high"] > recent_high
+            and d["close"] < recent_high
+            and d["upper_wick"] > 0.30
+        )
+
+        # Bullish liquidity sweep.
+        bullish_sweep = (
+            d["low"] < recent_low
+            and d["close"] > recent_low
+            and d["lower_wick"] > 0.30
+        )
+
+        if bullish_sweep:
+
+            score = 22
+
+            if regime in (
+                "RANGE",
+                "TRANSITION"
+            ):
+                score += 12
+
+            if d["rsi"] < 45:
+                score += 7
+
+            score += self.btc_alignment(
+                "long",
+                btc_context
+            )
+
+            candidates.append({
+                "strategy": "LIQUIDITY_SWEEP",
+                "side": "long",
+                "score": score,
+                "reason": "Sell-side liquidity sweep",
+            })
+
+        if bearish_sweep:
+
+            score = 22
+
+            if regime in (
+                "RANGE",
+                "TRANSITION"
+            ):
+                score += 12
+
+            if d["rsi"] > 55:
+                score += 7
+
+            score += self.btc_alignment(
+                "short",
+                btc_context
+            )
+
+            candidates.append({
+                "strategy": "LIQUIDITY_SWEEP",
+                "side": "short",
+                "score": score,
+                "reason": "Buy-side liquidity sweep",
+            })
+
+        return candidates
+
+    # ========================================================
+    # STRATEGY 3: OI + PRICE
+    # ========================================================
+
+    def strategy_oi(
+        self,
+        symbol,
+        df15,
+        oi_data,
+        regime,
+        btc_context
+    ):
+
+        if not oi_data:
+            return []
+
+        if len(df15) < 10:
+            return []
+
+        current_oi = safe_float(
+            oi_data.get("oi")
+        )
+
+        # We need an approximate historical OI proxy.
+        #
+        # Since some exchanges do not expose historical OI
+        # consistently through the unified API, we compare the
+        # current value with a locally stored previous value.
+        #
+        # The local history is maintained below.
+        #
+        if not hasattr(
+            self,
+            "oi_history"
+        ):
+            self.oi_history = defaultdict(
+                lambda: deque(
+                    maxlen=20
+                )
+            )
+
+        history = self.oi_history[
+            symbol
+        ]
+
+        if current_oi > 0:
+            history.append(
+                (
+                    now_ts(),
+                    current_oi
+                )
+            )
+
+        if len(history) < 3:
+            return []
+
+        old_oi = history[0][1]
+
+        if old_oi <= 0:
+            return []
+
+        oi_change = (
+            current_oi - old_oi
+        ) / old_oi
+
+        price_change = pct_change(
+            df15["close"].iloc[-6],
+            df15["close"].iloc[-1]
+        )
+
+        candidates = []
+
+        # Price up + OI up = continuation long.
+        if (
+            price_change > 0.002
+            and oi_change > 0.003
+        ):
+
+            score = 22
+
+            if regime == "TREND_UP":
+                score += 15
+
+            elif regime == "TREND_DOWN":
+                score -= 8
+
+            score += self.btc_alignment(
+                "long",
+                btc_context
+            )
+
+            candidates.append({
+                "strategy": "OI_DIVERGENCE",
+                "side": "long",
+                "score": score,
+                "reason": (
+                    "Price up + OI up "
+                    "continuation"
+                ),
+            })
+
+        # Price down + OI up = continuation short.
+        if (
+            price_change < -0.002
+            and oi_change > 0.003
+        ):
+
+            score = 22
+
+            if regime == "TREND_DOWN":
+                score += 15
+
+            elif regime == "TREND_UP":
+                score -= 8
+
+            score += self.btc_alignment(
+                "short",
+                btc_context
+            )
+
+            candidates.append({
+                "strategy": "OI_DIVERGENCE",
+                "side": "short",
+                "score": score,
+                "reason": (
+                    "Price down + OI up "
+                    "continuation"
+                ),
+            })
+
+        # Price up + OI down = potential long
+        # liquidation/profit-taking reversal.
+        if (
+            price_change > 0.003
+            and oi_change < -0.003
+            and regime in (
+                "RANGE",
+                "TRANSITION"
+            )
+        ):
+
+            score = 20
+
+            score += self.btc_alignment(
+                "short",
+                btc_context
+            )
+
+            candidates.append({
+                "strategy": "OI_DIVERGENCE",
+                "side": "short",
+                "score": score,
+                "reason": (
+                    "Price up + OI down "
+                    "reversal"
+                ),
+            })
+
+        # Price down + OI down = shorts covering.
+        if (
+            price_change < -0.003
+            and oi_change < -0.003
+            and regime in (
+                "RANGE",
+                "TRANSITION"
+            )
+        ):
+
+            score = 20
+
+            score += self.btc_alignment(
+                "long",
+                btc_context
+            )
+
+            candidates.append({
+                "strategy": "OI_DIVERGENCE",
+                "side": "long",
+                "score": score,
+                "reason": (
+                    "Price down + OI down "
+                    "reversal"
+                ),
+            })
+
+        return candidates
+
+    # ========================================================
+    # STRATEGY 4: TAKER MOMENTUM
+    # ========================================================
+
+    def strategy_taker(
+        self,
+        symbol,
+        df5,
+        taker,
+        regime,
+        btc_context
+    ):
+
+        if not taker:
+            return []
+
+        buy_ratio = taker[
+            "buy_ratio"
+        ]
+
+        d = df5.iloc[-1]
+
+        candidates = []
+
+        # Strong buy pressure.
+        if buy_ratio >= 0.61:
+
+            score = 20
+
+            if d["close"] > d["ema20"]:
+                score += 10
+
+            if d["ema20"] > d["ema50"]:
+                score += 8
+
+            if d["volume_ratio"] > 1.10:
+                score += 7
+
+            if regime == "TREND_UP":
+                score += 10
+
+            score += self.btc_alignment(
+                "long",
+                btc_context
+            )
+
+            candidates.append({
+                "strategy": "TAKER_MOMENTUM",
+                "side": "long",
+                "score": score,
+                "reason": (
+                    f"Strong taker buy "
+                    f"pressure {buy_ratio:.2f}"
+                ),
+            })
+
+        # Strong sell pressure.
+        if buy_ratio <= 0.39:
+
+            score = 20
+
+            if d["close"] < d["ema20"]:
+                score += 10
+
+            if d["ema20"] < d["ema50"]:
+                score += 8
+
+            if d["volume_ratio"] > 1.10:
+                score += 7
+
+            if regime == "TREND_DOWN":
+                score += 10
+
+            score += self.btc_alignment(
+                "short",
+                btc_context
+            )
+
+            candidates.append({
+                "strategy": "TAKER_MOMENTUM",
+                "side": "short",
+                "score": score,
+                "reason": (
+                    f"Strong taker sell "
+                    f"pressure {buy_ratio:.2f}"
+                ),
+            })
+
+        return candidates
+
+    # ========================================================
+    # MICROSTRUCTURE CONFIRMATION
+    # ========================================================
+
+    def confirm_candidate(
+        self,
+        candidate,
+        df5,
+        oi,
+        taker,
+        funding
+    ):
+
+        side = candidate["side"]
+
+        score = candidate["score"]
+
+        d = df5.iloc[-1]
+
+        # 5m directional confirmation.
+        if side == "long":
+
+            if (
+                d["close"] > d["ema20"]
+                and d["ema20"] > d["ema50"]
+            ):
+                score += 8
+
+            if d["rsi"] > 50:
+                score += 4
+
+            if taker:
+
+                if taker["buy_ratio"] > 0.56:
+                    score += 8
+
+                elif taker["buy_ratio"] < 0.44:
+                    score -= 8
+
+        else:
+
+            if (
+                d["close"] < d["ema20"]
+                and d["ema20"] < d["ema50"]
+            ):
+                score += 8
+
+            if d["rsi"] < 50:
+                score += 4
+
+            if taker:
+
+                if taker["sell_ratio"] > 0.56:
+                    score += 8
+
+                elif taker["sell_ratio"] < 0.44:
+                    score -= 8
+
+        # OI confirmation.
+        if oi:
+
+            if candidate["strategy"] == "OI_DIVERGENCE":
+                score += 6
+
+        # Funding as a crowding warning.
+        if funding:
+
+            rate = funding["rate"]
+
+            if side == "long":
+
+                if rate > 0.0008:
+                    score -= 5
+
+            else:
+
+                if rate < -0.0008:
+                    score -= 5
+
+        candidate = dict(candidate)
+
+        candidate["score"] = score
+
+        return candidate
+
+    # ========================================================
+    # CANDIDATE EVALUATION
+    # ========================================================
+
+    def evaluate_symbol(
+        self,
+        symbol,
+        btc_context
+    ):
+
+        try:
+
+            df15 = self.fetch_ohlcv(
+                symbol,
+                TF_SIGNAL,
+                150
+            )
+
+            df1h = self.fetch_ohlcv(
+                symbol,
+                TF_TREND,
+                220
+            )
+
+            if (
+                df15 is None
+                or df1h is None
+            ):
+                return []
+
+            if (
+                len(df15) < 80
+                or len(df1h) < 210
+            ):
+                return []
+
+            df15 = self.enrich(df15)
+            df1h = self.enrich(df1h)
+
+            regime = detect_regime(
+                df1h,
+                df15
+            )
+
+            d = df15.iloc[-1]
+
+            price = safe_float(
+                d["close"]
+            )
+
+            atr_value = safe_float(
+                d["atr"]
+            )
+
+            if price <= 0 or atr_value <= 0:
+                return []
+
+            atr_pct = (
+                atr_value / price * 100
+            )
+
+            if (
+                atr_pct < MIN_ATR_PCT
+                or atr_pct > MAX_ATR_PCT
+            ):
+                return []
+
+            # ------------------------------------------------
+            # Cheap filter before 5m/API-heavy calls.
+            # ------------------------------------------------
+
+            spread = self.spread_pct(
+                symbol
+            )
+
+            if spread > MAX_SPREAD_PCT:
+                return []
+
+            # ------------------------------------------------
+            # First strategy layer.
+            # ------------------------------------------------
+
+            prelim = []
+
+            df5 = self.fetch_ohlcv(
+                symbol,
+                TF_FAST,
+                120
+            )
+
+            if df5 is None or len(df5) < 70:
+                return []
+
+            df5 = self.enrich(df5)
+
+            prelim.extend(
+                self.strategy_breakout(
+                    symbol,
+                    df15,
+                    df5,
+                    regime,
+                    btc_context
+                )
+            )
+
+            prelim.extend(
+                self.strategy_sweep(
+                    symbol,
+                    df15,
+                    df5,
+                    regime,
+                    btc_context
+                )
+            )
+
+            # OI is only fetched for symbols
+            # which already have a technical candidate.
+            oi = self.fetch_oi(symbol)
+
+            prelim.extend(
+                self.strategy_oi(
+                    symbol,
+                    df15,
+                    oi,
+                    regime,
+                    btc_context
+                )
+            )
+
+            taker = self.fetch_taker_pressure(
+                symbol
+            )
+
+            prelim.extend(
+                self.strategy_taker(
+                    symbol,
+                    df5,
+                    taker,
+                    regime,
+                    btc_context
+                )
+            )
+
+            if not prelim:
+                return []
+
+            funding = self.fetch_funding(
+                symbol
+            )
+
+            final = []
+
+            rel = self.relative_strength(
+                df15,
+                btc_context["df15"]
+                if btc_context
+                else df15
+            )
+
+            for candidate in prelim:
+
+                candidate = self.confirm_candidate(
+                    candidate,
+                    df5,
+                    oi,
+                    taker,
+                    funding
+                )
+
+                side = candidate["side"]
+
+                # Relative strength.
+                if side == "long":
+
+                    if rel > 0.003:
+                        candidate["score"] += 6
+
+                    elif rel < -0.006:
+                        candidate["score"] -= 6
 
                 else:
 
-                    was_in_position = self.state[symbol]["in_position"]
+                    if rel < -0.003:
+                        candidate["score"] += 6
 
-                    self.state[symbol].update(
-                        {
-                            "in_position": False,
-                            "entry_price": 0.0,
-                            "side": None,
-                            "contracts": 0.0,
-                            "last_sync": utc_now(),
-                        }
-                    )
+                    elif rel > 0.006:
+                        candidate["score"] -= 6
 
-                    if was_in_position:
+                # Volume.
+                vr = safe_float(
+                    d["volume_ratio"]
+                )
 
-                        logger.info(
-                            "Position closed detected: %s",
-                            symbol,
-                        )
+                if vr >= MIN_VOLUME_RATIO:
+                    candidate["score"] += 3
 
-                        send_telegram(
-                            f"📕 <b>POSITION CLOSED</b>\n"
-                            f"{symbol}"
-                        )
+                # ATR quality.
+                if 0.30 <= atr_pct <= 3.0:
+                    candidate["score"] += 4
 
-        self.last_position_sync = time.time()
+                # Strategy learning weight.
+                weight = self.strategy_weight(
+                    candidate["strategy"]
+                )
+
+                raw_score = candidate[
+                    "score"
+                ]
+
+                candidate["raw_score"] = raw_score
+
+                candidate["score"] = (
+                    raw_score * weight
+                )
+
+                candidate["symbol"] = symbol
+
+                candidate["regime"] = regime
+
+                candidate["atr"] = atr_value
+
+                candidate["atr_pct"] = atr_pct
+
+                candidate["price"] = price
+
+                candidate["spread"] = spread
+
+                candidate["relative_strength"] = rel
+
+                candidate["oi"] = oi
+
+                candidate["taker"] = taker
+
+                candidate["funding"] = funding
+
+                final.append(candidate)
+
+            return final
+
+        except Exception as e:
+
+            print(
+                f"Evaluation error {symbol}:",
+                e
+            )
+
+            return []
+
+    # ========================================================
+    # CLUSTER CONTROL
+    # ========================================================
+
+    def symbol_cluster(self, symbol):
+
+        major = {
+            "BTC",
+            "ETH",
+            "BNB",
+            "SOL",
+            "XRP",
+            "ADA",
+            "TRX",
+            "TON",
+            "LTC",
+            "BCH",
+            "AVAX",
+            "LINK",
+            "DOT",
+        }
+
+        meme = {
+            "DOGE",
+            "PEPE",
+            "WIF",
+            "BONK",
+            "FLOKI",
+            "SHIB",
+            "JUP",
+        }
+
+        base = symbol.split("/")[0]
+
+        if base in major:
+            return "MAJOR"
+
+        if base in meme:
+            return "MEME"
+
+        return "ALT"
+
+    def cluster_exposure_ok(
+        self,
+        candidate
+    ):
+
+        cluster = self.symbol_cluster(
+            candidate["symbol"]
+        )
+
+        count = 0
+
+        for p in self.positions.values():
+
+            if self.symbol_cluster(
+                p["symbol"]
+            ) == cluster:
+                count += 1
+
+        # Never put both slots into a meme cluster.
+        if cluster == "MEME" and count >= 1:
+            return False
+
+        # Maximum 1 position per cluster.
+        if count >= 1:
+            return False
 
         return True
 
+    # ========================================================
+    # EQUITY
+    # ========================================================
 
-    def active_position_count(self) -> int:
+    def get_equity(self):
+
+        if PAPER_TRADING:
+            return self.paper_equity
+
+        try:
+
+            balance = self.exchange.fetch_balance()
+
+            total = safe_float(
+                balance.get("total", {}).get(
+                    "USDT"
+                )
+            )
+
+            if total <= 0:
+
+                total = safe_float(
+                    balance.get(
+                        "USDT",
+                        {}
+                    ).get("total")
+                )
+
+            if total <= 0:
+                return 0.0
+
+            return total
+
+        except Exception as e:
+
+            print(
+                "Equity error:",
+                e
+            )
+
+            return 0.0
+
+    # ========================================================
+    # DAILY SAFETY
+    # ========================================================
+
+    def reset_daily_state(self):
+
+        today = utc_now().date()
+
+        if today != self.last_daily_reset:
+
+            self.last_daily_reset = today
+
+            self.daily_realized_pnl = 0.0
+
+            self.consecutive_losses = 0
+
+            self.day_start_equity = (
+                self.get_equity()
+            )
+
+    def trading_allowed(self):
+
+        self.reset_daily_state()
+
+        equity = self.get_equity()
+
+        if equity <= 0:
+            return False
+
+        if equity < MIN_EQUITY_USDT:
+            print(
+                "SAFETY: equity below minimum."
+            )
+            return False
+
+        if (
+            self.day_start_equity
+            and self.day_start_equity > 0
+        ):
+
+            daily_drawdown = (
+                self.day_start_equity
+                - equity
+            ) / self.day_start_equity
+
+            if daily_drawdown >= DAILY_LOSS_LIMIT_PCT:
+
+                print(
+                    "SAFETY: daily loss limit."
+                )
+
+                return False
+
+        if (
+            self.consecutive_losses
+            >= MAX_CONSECUTIVE_LOSSES
+        ):
+
+            print(
+                "SAFETY: consecutive loss lock."
+            )
+
+            return False
+
+        return True
+
+    # ========================================================
+    # POSITION COUNT
+    # ========================================================
+
+    def active_position_count(self):
 
         with self.lock:
 
-            return sum(
-                1
-                for state in self.state.values()
-                if state["in_position"]
+            return len(
+                self.positions
             )
 
+    # ========================================================
+    # COOLDOWNS
+    # ========================================================
 
-    def emergency_close(self, symbol: str, amount: float, close_side: str) -> None:
-        """Sluit een onbeschermde positie market reduce-only."""
+    def symbol_available(self, symbol):
 
-        try:
-            self.exchange.create_order(
-                symbol=symbol,
-                type="market",
-                side=close_side,
-                amount=amount,
-                params={
-                    "marginMode": "isolated",
-                    "reduceOnly": True,
-                },
-            )
-            logger.warning("Emergency close submitted for %s", symbol)
-            send_telegram(
-                f"🚨 <b>EMERGENCY CLOSE</b>\n"
-                f"{symbol}\n"
-                f"SL/TP kon niet geverifieerd worden."
-            )
-        except Exception as exc:
-            logger.error("Emergency close failed for %s: %s", symbol, exc)
-            send_telegram(
-                f"🚨 <b>UNPROTECTED POSITION</b>\n"
-                f"{symbol}\n"
-                f"Kon niet automatisch sluiten: {str(exc)[:300]}"
-            )
+        now = now_ts()
 
-
-    # ====================== STRATEGY ======================
-
-    def analyze_coin(
-        self,
-        symbol: str,
-    ) -> Optional[dict]:
-
-        df_15m = self.fetch_ohlcv(symbol, SCAN_TF, limit=120)
-        df_1h = self.fetch_ohlcv(symbol, TREND_TF, limit=250)
-        df_5m = self.fetch_ohlcv(symbol, CONFIRM_TF, limit=80)
-        df_btc = self.fetch_ohlcv("BTC/USDT:USDT", SCAN_TF, limit=80)
-
-        if df_15m is None or df_1h is None or df_5m is None:
-            return None
-
-        if len(df_15m) < LOOKBACK + 5 or len(df_5m) < 5:
-            return None
-
-        h_curr = self.last_closed(df_1h)
-        c_curr = self.last_closed(df_15m)
-        m5_curr = self.last_closed(df_5m)
-
-        if USE_CLOSED_CANDLES:
-            m5_prev = df_5m.iloc[-3] if len(df_5m) >= 3 else df_5m.iloc[-2]
-        else:
-            m5_prev = df_5m.iloc[-2]
-
-        btc_curr = (
-            self.last_closed(df_btc)
-            if df_btc is not None and len(df_btc) >= 5
-            else None
-        )
-
-        h_stack_bull = (
-            h_curr["ema20"] > h_curr["ema50"]
-            and h_curr["ema50"] > h_curr["ema200"]
-        )
-        h_stack_bear = (
-            h_curr["ema20"] < h_curr["ema50"]
-            and h_curr["ema50"] < h_curr["ema200"]
-        )
-        h_fast_bull = h_curr["ema20"] > h_curr["ema50"]
-        h_fast_bear = h_curr["ema20"] < h_curr["ema50"]
-        h_slow_bull = h_curr["ema50"] > h_curr["ema200"]
-        h_slow_bear = h_curr["ema50"] < h_curr["ema200"]
-
-        current_index = (
-            len(df_15m) - 2
-            if USE_CLOSED_CANDLES
-            else len(df_15m) - 1
-        )
-
-        start_index = current_index - LOOKBACK
-
-        if start_index < 0:
-            return None
-
-        previous_window = df_15m.iloc[start_index:current_index]
-
-        prev_low = previous_window["low"].min()
-        prev_high = previous_window["high"].max()
-
-        long_sweep = (
-            c_curr["low"] < prev_low
-            and c_curr["close"] > prev_low
-        )
-        short_sweep = (
-            c_curr["high"] > prev_high
-            and c_curr["close"] < prev_high
-        )
-
-        atr_val = float(c_curr["atr"] or 0.0)
-
-        long_near_sweep = (
-            not long_sweep
-            and atr_val > 0
-            and c_curr["low"] <= prev_low + (atr_val * NEAR_SWEEP_ATR)
-            and c_curr["close"] > prev_low
-        )
-        short_near_sweep = (
-            not short_sweep
-            and atr_val > 0
-            and c_curr["high"] >= prev_high - (atr_val * NEAR_SWEEP_ATR)
-            and c_curr["close"] < prev_high
-        )
-
-        try:
-            vol_sma = float(c_curr["vol_sma"] or 0.0)
-        except (TypeError, ValueError):
-            vol_sma = 0.0
-
-        volume_ok = bool(vol_sma > 0 and c_curr["volume"] > vol_sma * VOLUME_MULT)
-
-        long_break = m5_curr["close"] > m5_prev["high"]
-        short_break = m5_curr["close"] < m5_prev["low"]
-
-        relative = 0.0
-        if btc_curr is not None and df_btc is not None and len(df_btc) >= 5 and len(df_15m) >= 5:
-            btc_base = float(df_btc.iloc[-5]["close"] or 0.0)
-            coin_base = float(df_15m.iloc[-5]["close"] or 0.0)
-            if btc_base > 0 and coin_base > 0:
-                btc_return = (float(btc_curr["close"]) / btc_base) - 1
-                coin_return = (float(c_curr["close"]) / coin_base) - 1
-                relative = coin_return - btc_return
-
-        try:
-            atr_now = float(c_curr["atr"] or 0.0)
-        except (TypeError, ValueError):
-            atr_now = 0.0
-        atr_ratio = atr_now / float(c_curr["close"]) if c_curr["close"] else 0.0
-
-        # =================================================
-        # LONG SCORE  (max 85)
-        # =================================================
-
-        long_score = 0
-
-        if h_stack_bull:
-            long_score += 15
-        elif h_fast_bull:
-            long_score += 10
-        elif h_slow_bull:
-            long_score += 6
-
-        if c_curr["ema20"] > c_curr["ema50"]:
-            long_score += 10
-
-        if long_sweep:
-            long_score += 20
-        elif long_near_sweep:
-            long_score += 8
-
-        if c_curr["close"] > c_curr["ema20"]:
-            long_score += 5
-
-        if volume_ok:
-            long_score += 10
-
-        if relative > 0.002:
-            long_score += 10
-        elif relative > 0.0005:
-            long_score += 5
-
-        if long_break:
-            long_score += 10
-
-        if atr_ratio > 0.003:
-            long_score += 5
-
-        # =================================================
-        # SHORT SCORE  (max 85)
-        # =================================================
-
-        short_score = 0
-
-        if h_stack_bear:
-            short_score += 15
-        elif h_fast_bear:
-            short_score += 10
-        elif h_slow_bear:
-            short_score += 6
-
-        if c_curr["ema20"] < c_curr["ema50"]:
-            short_score += 10
-
-        if short_sweep:
-            short_score += 20
-        elif short_near_sweep:
-            short_score += 8
-
-        if c_curr["close"] < c_curr["ema20"]:
-            short_score += 5
-
-        if volume_ok:
-            short_score += 10
-
-        if relative < -0.002:
-            short_score += 10
-        elif relative < -0.0005:
-            short_score += 5
-
-        if short_break:
-            short_score += 10
-
-        if atr_ratio > 0.003:
-            short_score += 5
-
-        logger.info(
-            "%s | L=%s S=%s | sweepL=%s nearL=%s | sweepS=%s nearS=%s | "
-            "5mL=%s 5mS=%s | vol=%s | rel=%.4f | atr%%=%.3f",
+        if now < self.symbol_cooldowns.get(
             symbol,
-            long_score,
-            short_score,
-            long_sweep,
-            long_near_sweep,
-            short_sweep,
-            short_near_sweep,
-            long_break,
-            short_break,
-            volume_ok,
-            relative,
-            atr_ratio * 100,
-        )
+            0
+        ):
+            return False
 
-        def pack(direction: str, score: int, confirmed: bool) -> dict:
-            return {
-                "symbol": symbol,
-                "direction": direction,
-                "score": score,
-                "price": float(c_curr["close"]),
-                "atr": float(c_curr["atr"]),
-                "timestamp": c_curr["timestamp"].isoformat(),
-                "confirmation": confirmed,
-            }
+        if now < self.loss_cooldowns.get(
+            symbol,
+            0
+        ):
+            return False
 
-        long_entry = (
-            long_score >= MIN_SCORE
-            and long_score > short_score
-        )
-        short_entry = (
-            short_score >= MIN_SCORE
-            and short_score > long_score
-        )
+        return True
 
-        setup = None
+    # ========================================================
+    # POSITION SIZE
+    # ========================================================
 
-        if long_entry:
-            setup = pack("long", long_score, True)
-        elif short_entry:
-            setup = pack("short", short_score, True)
-        elif long_score >= MIN_SCORE and long_score > short_score:
-            setup = pack("long", long_score, False)
-        elif short_score >= MIN_SCORE and short_score > long_score:
-            setup = pack("short", short_score, False)
-
-        return {
-            "symbol": symbol,
-            "long_score": long_score,
-            "short_score": short_score,
-            "setup": setup,
-        }
-
-
-    # ====================== ORDER SIZING ======================
-
-    def calculate_contracts(
+    def calculate_position_size(
         self,
-        symbol: str,
-        entry: float,
-    ) -> float:
+        candidate
+    ):
 
-        market = self.exchange.market(symbol)
+        equity = self.get_equity()
 
-        contract_size = float(
-            market.get("contractSize") or 1
+        if equity <= 0:
+            return None
+
+        entry = candidate["price"]
+
+        atr_value = candidate["atr"]
+
+        side = candidate["side"]
+
+        # ----------------------------------------------------
+        # Stop.
+        # ----------------------------------------------------
+
+        stop_distance = (
+            atr_value
+            * ATR_SL_MULTIPLIER
         )
 
-        position_value = (
-            FIXED_MARGIN_USDT
-            * FIXED_LEVERAGE
+        if side == "long":
+            stop = entry - stop_distance
+        else:
+            stop = entry + stop_distance
+
+        stop_pct = (
+            abs(entry - stop)
+            / entry
         )
 
-        base_amount = position_value / entry
-        contracts = base_amount / contract_size
+        if stop_pct <= 0:
+            return None
 
-        contracts = float(
-            self.exchange.amount_to_precision(
-                symbol,
-                contracts,
-            )
+        # ----------------------------------------------------
+        # Risk budget.
+        # ----------------------------------------------------
+
+        risk_budget = (
+            equity
+            * MAX_RISK_EQUITY_PCT
         )
 
-        limits = market.get("limits", {})
-        amount_limits = limits.get("amount", {})
+        # Stronger signals may use a little more
+        # of the allowed risk, but never above cap.
+        score_factor = clamp(
+            candidate["score"] / 80,
+            0.70,
+            1.0
+        )
 
-        min_amount = amount_limits.get("min")
-        max_amount = amount_limits.get("max")
+        risk_budget *= score_factor
 
-        if min_amount is not None and contracts < float(min_amount):
-            raise ValueError(
-                f"{symbol}: calculated contracts {contracts} "
-                f"below exchange minimum {min_amount}"
+        # ----------------------------------------------------
+        # Required notional.
+        # ----------------------------------------------------
+
+        notional = (
+            risk_budget / stop_pct
+        )
+
+        # ----------------------------------------------------
+        # Margin.
+        # ----------------------------------------------------
+
+        margin = (
+            notional / LEVERAGE
+        )
+
+        margin = clamp(
+            margin,
+            MIN_MARGIN_USDT,
+            MAX_MARGIN_USDT
+        )
+
+        max_by_equity = (
+            equity
+            * MAX_MARGIN_EQUITY_PCT
+        )
+
+        margin = min(
+            margin,
+            max_by_equity
+        )
+
+        # Total margin cap.
+        total_margin = sum(
+            p.get(
+                "margin",
+                0.0
+            )
+            for p in self.positions.values()
+        )
+
+        remaining_margin = (
+            equity
+            * MAX_TOTAL_MARGIN_EQUITY_PCT
+            - total_margin
+        )
+
+        if remaining_margin <= 0:
+            return None
+
+        margin = min(
+            margin,
+            remaining_margin
+        )
+
+        if margin < MIN_MARGIN_USDT:
+            return None
+
+        notional = (
+            margin * LEVERAGE
+        )
+
+        market = self.exchange.market(
+            candidate["symbol"]
+        )
+
+        contract_size = safe_float(
+            market.get("contractSize"),
+            1.0
+        )
+
+        raw_contracts = (
+            notional
+            / entry
+            / contract_size
+        )
+
+        try:
+
+            contracts = float(
+                self.exchange.amount_to_precision(
+                    candidate["symbol"],
+                    raw_contracts
+                )
             )
 
-        if max_amount is not None and contracts > float(max_amount):
-            raise ValueError(
-                f"{symbol}: calculated contracts {contracts} "
-                f"above exchange maximum {max_amount}"
-            )
+        except Exception:
+
+            contracts = raw_contracts
+
+        limits = market.get(
+            "limits",
+            {}
+        )
+
+        min_amount = safe_float(
+            limits.get(
+                "amount",
+                {}
+            ).get("min")
+        )
+
+        max_amount = safe_float(
+            limits.get(
+                "amount",
+                {}
+            ).get("max")
+        )
+
+        if min_amount and contracts < min_amount:
+            return None
+
+        if max_amount and contracts > max_amount:
+            contracts = max_amount
 
         if contracts <= 0:
-            raise ValueError(
-                f"{symbol}: calculated contract amount is <= 0"
-            )
+            return None
 
-        return contracts
+        actual_notional = (
+            contracts
+            * contract_size
+            * entry
+        )
 
+        actual_margin = (
+            actual_notional
+            / LEVERAGE
+        )
 
-    def price_to_precision(
+        # Expected TP2.
+        tp2 = (
+            entry
+            + stop_distance * TP2_R
+            if side == "long"
+            else entry
+            - stop_distance * TP2_R
+        )
+
+        expected_gross = (
+            actual_notional
+            * abs(tp2 - entry)
+            / entry
+        )
+
+        estimated_cost = (
+            actual_notional
+            * ROUND_TRIP_COST_PCT
+        )
+
+        expected_net = (
+            expected_gross
+            - estimated_cost
+        )
+
+        # Do not trade tiny setups where the expected
+        # move cannot reasonably pay the costs.
+        if expected_net < MIN_PROFIT_TARGET_USDT:
+
+            # Strong setups may still pass if expected
+            # gross is meaningful.
+            if (
+                candidate["score"]
+                < STRONG_SCORE
+                or expected_gross
+                < IDEAL_PROFIT_TARGET_USDT
+            ):
+                return None
+
+        return {
+            "contracts": contracts,
+            "margin": actual_margin,
+            "notional": actual_notional,
+            "entry": entry,
+            "stop": stop,
+            "stop_distance": stop_distance,
+            "stop_pct": stop_pct,
+            "tp1": (
+                entry
+                + stop_distance * TP1_R
+                if side == "long"
+                else entry
+                - stop_distance * TP1_R
+            ),
+            "tp2": tp2,
+            "expected_gross": expected_gross,
+            "expected_net": expected_net,
+        }
+
+    # ========================================================
+    # ORDER HELPERS
+    # ========================================================
+
+    def amount_precision(
         self,
-        symbol: str,
-        price: float,
-    ) -> float:
-
-        return float(
-            self.exchange.price_to_precision(
-                symbol,
-                price,
-            )
-        )
-
-
-    # ====================== WATCH MESSAGE ======================
-
-    def send_watch(
-        self,
-        setup: dict,
-    ) -> None:
-
-        symbol = setup["symbol"]
-        now = time.time()
-        last = self.last_watch.get(symbol, 0)
-
-        if now - last < WATCH_COOLDOWN_SECONDS:
-            return
-
-        self.last_watch[symbol] = now
-
-        send_telegram(
-            f"👀 <b>WATCH</b>\n"
-            f"{setup['symbol']}\n"
-            f"Direction: <b>{setup['direction'].upper()}</b>\n"
-            f"Score: <b>{setup['score']}/{MAX_POSSIBLE_SCORE}</b>\n"
-            f"Waiting for 5m confirmation."
-        )
-
-
-    # ====================== EXECUTION ======================
-
-    def execute_trade(
-        self,
-        setup: dict,
-    ) -> None:
-
-        symbol = setup["symbol"]
-        direction = setup["direction"]
-        reference_price = setup["price"]
-        atr = setup["atr"]
-
-        logger.info(
-            "execute_trade start %s %s score=%s atr=%s price=%s",
-            symbol,
-            direction,
-            setup.get("score"),
-            atr,
-            reference_price,
-        )
-
-        with self.lock:
-
-            if self.state[symbol]["in_position"]:
-                logger.warning(
-                    "Skip %s: state denkt dat er al een positie open is.",
-                    symbol,
-                )
-                send_telegram(
-                    f"⚠️ Skip {symbol}: bot denkt dat positie al open is. "
-                    f"Check BloFin."
-                )
-                return
-
-            if self.active_position_count() >= MAX_ACTIVE_POSITIONS:
-                logger.info(
-                    "Max active positions reached (%d). Skip %s.",
-                    MAX_ACTIVE_POSITIONS,
-                    symbol,
-                )
-                send_telegram(
-                    f"⚠️ Skip {symbol}: max {MAX_ACTIVE_POSITIONS} posities."
-                )
-                return
-
-        send_telegram(
-            f"🎯 ENTRY READY\n"
-            f"{symbol} {direction.upper()} score {setup['score']}"
-        )
+        symbol,
+        amount
+    ):
 
         try:
-            atr_val = float(atr or 0.0)
-        except (TypeError, ValueError):
-            atr_val = 0.0
 
-        if atr_val <= 0 or math.isnan(atr_val):
-            logger.error("ATR invalid on %s: %s", symbol, atr)
-            send_telegram(
-                f"❌ Geen trade {symbol}: ATR ongeldig"
+            return float(
+                self.exchange.amount_to_precision(
+                    symbol,
+                    amount
+                )
             )
-            return
 
-        if direction == "long":
-            stop = reference_price - atr_val * STOP_ATR_MULT
-            target = reference_price + ((reference_price - stop) * RISK_REWARD)
-            side = "buy"
-        else:
-            stop = reference_price + atr_val * STOP_ATR_MULT
-            target = reference_price - ((stop - reference_price) * RISK_REWARD)
-            side = "sell"
+        except Exception:
+
+            return amount
+
+    def price_precision(
+        self,
+        symbol,
+        price
+    ):
 
         try:
-            stop = self.price_to_precision(symbol, stop)
-            target = self.price_to_precision(symbol, target)
-            amount = self.calculate_contracts(symbol, reference_price)
-        except Exception as exc:
-            logger.error("Sizing error on %s: %s", symbol, exc)
-            send_telegram(
-                f"❌ Geen trade {symbol}\n"
-                f"Sizing/minima: {str(exc)[:300]}"
-            )
-            return
 
-        send_telegram(
-            f"🎯 <b>ENTRY TRIGGERED</b>\n"
-            f"{symbol}\n"
-            f"Direction: <b>{direction.upper()}</b>\n"
-            f"Score: <b>{setup['score']}/{MAX_POSSIBLE_SCORE}</b>\n"
-            f"Reference: <code>{reference_price:.8f}</code>\n"
-            f"Initial SL: <code>{stop:.8f}</code>\n"
-            f"Initial TP: <code>{target:.8f}</code>\n"
-            f"Contracts: <code>{amount}</code>\n"
-            f"Margin: {FIXED_MARGIN_USDT} USDT\n"
-            f"Leverage: {FIXED_LEVERAGE}x"
+            return float(
+                self.exchange.price_to_precision(
+                    symbol,
+                    price
+                )
+            )
+
+        except Exception:
+
+            return price
+
+    # ========================================================
+    # MARKET ENTRY
+    # ========================================================
+
+    def open_market_position(
+        self,
+        candidate,
+        sizing
+    ):
+
+        symbol = candidate["symbol"]
+
+        side = (
+            "buy"
+            if candidate["side"] == "long"
+            else "sell"
         )
 
-        # =================================================
-        # PAPER TRADING
-        # =================================================
+        amount = sizing["contracts"]
 
         if PAPER_TRADING:
 
-            logger.info(
-                "[PAPER] %s %s amount=%s entry=%s SL=%s TP=%s",
-                direction.upper(),
-                symbol,
-                amount,
-                reference_price,
-                stop,
-                target,
-            )
+            entry = sizing["entry"]
 
-            with self.lock:
-                self.state[symbol].update(
-                    {
-                        "in_position": True,
-                        "entry_price": reference_price,
-                        "side": direction,
-                        "contracts": amount,
-                        "last_sync": utc_now(),
-                    }
-                )
+            position = {
+                "symbol": symbol,
+                "side": candidate["side"],
+                "contracts": amount,
+                "original_contracts": amount,
+                "entry": entry,
+                "stop": sizing["stop"],
+                "original_stop": sizing["stop"],
+                "tp1": sizing["tp1"],
+                "tp2": sizing["tp2"],
+                "margin": sizing["margin"],
+                "notional": sizing["notional"],
+                "strategy": candidate["strategy"],
+                "score": candidate["score"],
+                "regime": candidate["regime"],
+                "tp1_done": False,
+                "breakeven": False,
+                "trail_stop": None,
+                "opened_at": now_ts(),
+                "reason": candidate["reason"],
+            }
 
-            self.log_trade(
-                {
-                    "time": utc_now(),
-                    "mode": "paper",
-                    "symbol": symbol,
-                    "direction": direction,
-                    "score": setup["score"],
-                    "entry": reference_price,
-                    "stop": stop,
-                    "target": target,
-                    "contracts": amount,
-                }
-            )
+            self.positions[symbol] = position
 
-            send_telegram(
-                f"📝 <b>PAPER ENTRY</b>\n"
-                f"{symbol} {direction.upper()}\n"
-                f"Entry: <code>{reference_price:.8f}</code>\n"
-                f"SL: <code>{stop:.8f}</code>\n"
-                f"TP: <code>{target:.8f}</code>"
-            )
-
-            return
-
-        # =================================================
-        # LIVE TRADING
-        # =================================================
+            return position
 
         try:
 
-            try:
-                self.exchange.set_margin_mode("isolated", symbol)
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Could not set isolated margin for {symbol}: {exc}"
-                )
-
-            try:
-                self.exchange.set_leverage(FIXED_LEVERAGE, symbol)
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Could not set leverage for {symbol}: {exc}"
-                )
-
-            entry_order = self.exchange.create_order(
-                symbol=symbol,
-                type="market",
-                side=side,
-                amount=amount,
-                params={
-                    "marginMode": "isolated",
+            order = self.exchange.create_order(
+                symbol,
+                "market",
+                side,
+                amount,
+                None,
+                {
                     "reduceOnly": False,
-                },
-            )
-
-            logger.info(
-                "Entry order submitted: %s",
-                entry_order.get("id"),
-            )
-
-            live_position = None
-
-            for attempt in range(5):
-                time.sleep(1)
-                positions = self.fetch_open_positions()
-                if positions is None:
-                    continue
-                live_position = positions.get(symbol)
-                if live_position:
-                    break
-
-            if not live_position:
-                raise RuntimeError(
-                    "Entry order returned, but no open position was found."
-                )
-
-            actual_entry = float(live_position["entry_price"])
-            actual_contracts = float(live_position["contracts"])
-
-            if direction == "long":
-                actual_stop = actual_entry - atr * STOP_ATR_MULT
-                actual_target = actual_entry + (
-                    (actual_entry - actual_stop) * RISK_REWARD
-                )
-            else:
-                actual_stop = actual_entry + atr * STOP_ATR_MULT
-                actual_target = actual_entry - (
-                    (actual_stop - actual_entry) * RISK_REWARD
-                )
-
-            actual_stop = self.price_to_precision(symbol, actual_stop)
-            actual_target = self.price_to_precision(symbol, actual_target)
-
-            close_side = "sell" if direction == "long" else "buy"
-
-            protection_ok = False
-
-            for attempt in range(1, PROTECTION_RETRIES + 1):
-                protection_ok = self.place_and_verify_protection(
-                    symbol=symbol,
-                    direction=direction,
-                    amount=actual_contracts,
-                    stop=actual_stop,
-                    target=actual_target,
-                    close_side=close_side,
-                )
-                if protection_ok:
-                    break
-                logger.warning(
-                    "Protection retry %s/%s for %s",
-                    attempt,
-                    PROTECTION_RETRIES,
-                    symbol,
-                )
-                time.sleep(PROTECTION_RETRY_SLEEP)
-
-            if not protection_ok:
-                logger.error(
-                    "Protection could not be verified for %s.",
-                    symbol,
-                )
-                send_telegram(
-                    f"🚨 <b>PROTECTION ERROR</b>\n"
-                    f"{symbol}\n"
-                    f"SL/TP could not be verified.\n"
-                    f"Closing position to avoid naked risk."
-                )
-                self.emergency_close(symbol, actual_contracts, close_side)
-                raise RuntimeError(
-                    "SL/TP protection could not be verified."
-                )
-
-            with self.lock:
-                self.state[symbol].update(
-                    {
-                        "in_position": True,
-                        "entry_price": actual_entry,
-                        "side": live_position["side"],
-                        "contracts": actual_contracts,
-                        "last_sync": utc_now(),
-                    }
-                )
-
-            self.log_trade(
-                {
-                    "time": utc_now(),
-                    "mode": "live",
-                    "symbol": symbol,
-                    "direction": direction,
-                    "score": setup["score"],
-                    "entry_reference": reference_price,
-                    "entry_actual": actual_entry,
-                    "stop": actual_stop,
-                    "target": actual_target,
-                    "contracts": actual_contracts,
-                    "order_id": entry_order.get("id"),
                 }
             )
 
-            send_telegram(
-                f"✅ <b>ENTRY VERIFIED</b>\n"
-                f"{symbol} {direction.upper()}\n"
-                f"Score: <b>{setup['score']}/{MAX_POSSIBLE_SCORE}</b>\n"
-                f"Entry: <code>{actual_entry:.8f}</code>\n"
-                f"SL: <code>{actual_stop:.8f}</code>\n"
-                f"TP: <code>{actual_target:.8f}</code>\n"
-                f"Contracts: <code>{actual_contracts}</code>"
+            time.sleep(0.5)
+
+            actual_entry = (
+                safe_float(
+                    order.get("average")
+                )
+                or safe_float(
+                    order.get("price")
+                )
+                or sizing["entry"]
             )
 
-        except Exception as exc:
+            position = {
+                "symbol": symbol,
+                "side": candidate["side"],
+                "contracts": amount,
+                "original_contracts": amount,
+                "entry": actual_entry,
+                "stop": sizing["stop"],
+                "original_stop": sizing["stop"],
+                "tp1": sizing["tp1"],
+                "tp2": sizing["tp2"],
+                "margin": sizing["margin"],
+                "notional": sizing["notional"],
+                "strategy": candidate["strategy"],
+                "score": candidate["score"],
+                "regime": candidate["regime"],
+                "tp1_done": False,
+                "breakeven": False,
+                "trail_stop": None,
+                "opened_at": now_ts(),
+                "entry_order_id": order.get("id"),
+                "reason": candidate["reason"],
+            }
 
-            logger.exception("Execution error on %s: %s", symbol, exc)
+            self.positions[symbol] = position
 
-            sync_ok = self.sync_positions()
+            return position
 
-            if not sync_ok:
-                logger.error(
-                    "Could not verify position state after execution error on %s.",
-                    symbol,
-                )
+        except Exception as e:
 
-            send_telegram(
-                f"❌ <b>TRADE ERROR</b>\n"
-                f"{symbol}\n"
-                f"{str(exc)[:500]}"
-            )
-
-
-    # ==========================================================
-    # PROTECTION
-    # ==========================================================
-
-    def place_and_verify_protection(
-        self,
-        symbol: str,
-        direction: str,
-        amount: float,
-        stop: float,
-        target: float,
-        close_side: str,
-    ) -> bool:
-
-        try:
-
-            sl_supported = False
-            tp_supported = False
-
-            try:
-                sl_supported = bool(
-                    self.exchange.feature_value(
-                        symbol,
-                        "createOrder",
-                        "stopLoss",
-                    )
-                )
-                tp_supported = bool(
-                    self.exchange.feature_value(
-                        symbol,
-                        "createOrder",
-                        "takeProfit",
-                    )
-                )
-            except Exception:
-                sl_supported = False
-                tp_supported = False
-
-            logger.info(
-                "Protection support %s | SL=%s TP=%s amount=%s",
+            print(
+                "ENTRY ERROR:",
                 symbol,
-                sl_supported,
-                tp_supported,
-                amount,
+                e
             )
 
-            # Altijd echte contract size gebruiken. Nooit amount=0.
+            return None
 
-            try:
-                sl_order = self.exchange.create_order(
-                    symbol=symbol,
-                    type="market",
-                    side=close_side,
-                    amount=amount,
-                    params={
-                        "reduceOnly": True,
-                        "stopLoss": {
-                            "triggerPrice": stop,
-                        },
-                    },
-                )
-                logger.info(
-                    "SL protection submitted for %s: %s",
-                    symbol,
-                    sl_order.get("id"),
-                )
-            except Exception as sl_exc:
-                logger.warning(
-                    "Attached SL failed on %s (%s). Trying stop order.",
-                    symbol,
-                    sl_exc,
-                )
-                sl_order = self.exchange.create_order(
-                    symbol=symbol,
-                    type="stop",
-                    side=close_side,
-                    amount=amount,
-                    price=None,
-                    params={
-                        "triggerPrice": stop,
-                        "reduceOnly": True,
-                    },
-                )
-                logger.info(
-                    "Separate SL submitted for %s: %s",
-                    symbol,
-                    sl_order.get("id"),
-                )
+    # ========================================================
+    # BLOFIN PROTECTION
+    # ========================================================
 
-            try:
-                tp_order = self.exchange.create_order(
-                    symbol=symbol,
-                    type="market",
-                    side=close_side,
-                    amount=amount,
-                    params={
-                        "reduceOnly": True,
-                        "takeProfit": {
-                            "triggerPrice": target,
-                        },
-                    },
-                )
-                logger.info(
-                    "TP protection submitted for %s: %s",
-                    symbol,
-                    tp_order.get("id"),
-                )
-            except Exception as tp_exc:
-                logger.warning(
-                    "Attached TP failed on %s (%s). Trying limit TP.",
-                    symbol,
-                    tp_exc,
-                )
-                tp_order = self.exchange.create_order(
-                    symbol=symbol,
-                    type="limit",
-                    side=close_side,
-                    amount=amount,
-                    price=target,
-                    params={
-                        "reduceOnly": True,
-                    },
-                )
-                logger.info(
-                    "Separate TP submitted for %s: %s",
-                    symbol,
-                    tp_order.get("id"),
-                )
-
-            time.sleep(1.2)
-            return self.verify_protection_orders(symbol)
-
-        except Exception as exc:
-
-            logger.error("Protection error on %s: %s", symbol, exc)
-            return False
-
-
-    def verify_protection_orders(
+    def create_protection(
         self,
-        symbol: str,
-    ) -> bool:
+        position
+    ):
 
-        try:
-            open_orders = self.exchange.fetch_open_orders(symbol)
-        except Exception as exc:
-            logger.error(
-                "Could not fetch protection orders for %s: %s",
-                symbol,
-                exc,
-            )
-            return False
+        symbol = position["symbol"]
 
-        has_sl = False
-        has_tp = False
+        side = position["side"]
 
-        for order in open_orders:
+        amount = position["contracts"]
 
-            order_type = str(order.get("type") or "").lower()
-            info = order.get("info") or {}
-            info_text = json.dumps(info).lower()
-            reduce_only = bool(
-                order.get("reduceOnly")
-                or info.get("reduceOnly")
-                or info.get("reduce_only")
-            )
+        close_side = (
+            "sell"
+            if side == "long"
+            else "buy"
+        )
 
-            if (
-                order_type in [
-                    "stop",
-                    "stop_market",
-                    "stop_loss",
-                    "loss",
-                    "trigger",
-                ]
-                or "stoploss" in info_text
-                or '"sl"' in info_text
-                or "stop_loss" in info_text
-            ):
-                has_sl = True
-
-            if (
-                order_type in [
-                    "take_profit",
-                    "take_profit_market",
-                ]
-                or "takeprofit" in info_text
-                or '"tp"' in info_text
-                or "take_profit" in info_text
-                or (order_type == "limit" and reduce_only)
-            ):
-                has_tp = True
-
-        logger.info(
-            "Protection verification %s: SL=%s TP=%s orders=%s",
+        stop = self.price_precision(
             symbol,
-            has_sl,
-            has_tp,
-            len(open_orders),
+            position["stop"]
         )
 
-        return has_sl and has_tp
+        tp = self.price_precision(
+            symbol,
+            position["tp2"]
+        )
 
+        amount = self.amount_precision(
+            symbol,
+            amount
+        )
 
-    # ====================== LOGGING ======================
+        if PAPER_TRADING:
+            return True
 
-    def log_trade(
-        self,
-        trade: dict,
-    ) -> None:
+        # ----------------------------------------------------
+        # IMPORTANT:
+        # BloFin can handle standalone TP/SL algo orders.
+        # We deliberately create them separately rather than
+        # relying on a combined CCXT TPSL request.
+        # ----------------------------------------------------
 
         try:
 
-            history = []
+            # STOP LOSS
+            sl_params = {
+                "stopLossPrice": stop,
+                "reduceOnly": True,
+            }
 
-            if os.path.exists(TRADE_LOG_FILE):
-                with open(TRADE_LOG_FILE, "r", encoding="utf-8") as file:
-                    history = json.load(file)
-
-            if not isinstance(history, list):
-                history = []
-
-            history.append(trade)
-            history = history[-1000:]
-
-            with open(TRADE_LOG_FILE, "w", encoding="utf-8") as file:
-                json.dump(
-                    history,
-                    file,
-                    indent=2,
-                    ensure_ascii=False,
-                )
-
-        except Exception as exc:
-            logger.error("Could not write trade log: %s", exc)
-
-
-    def publish_score_summary(self, cycle_scores: list) -> None:
-        """Log top scores every cycle; Telegram every few minutes."""
-
-        now = time.time()
-        due = now - self.last_score_report >= SCORE_REPORT_SECONDS
-
-        if not cycle_scores:
-            logger.info("Score summary: geen geldige scans deze ronde.")
-            if due:
-                self.last_score_report = now
-                send_telegram(
-                    "📊 <b>Score scan</b>\n"
-                    "Geen geldige candles deze ronde.\n"
-                    "Check Railway op Fetch error."
-                )
-            return
-
-        top_long = sorted(
-            cycle_scores,
-            key=lambda x: x["long_score"],
-            reverse=True,
-        )[:5]
-        top_short = sorted(
-            cycle_scores,
-            key=lambda x: x["short_score"],
-            reverse=True,
-        )[:5]
-
-        def short_name(symbol: str) -> str:
-            return symbol.split("/")[0]
-
-        long_txt = ", ".join(
-            f"{short_name(x['symbol'])} {x['long_score']}"
-            for x in top_long
-        )
-        short_txt = ", ".join(
-            f"{short_name(x['symbol'])} {x['short_score']}"
-            for x in top_short
-        )
-
-        logger.info(
-            "TOP L: %s | TOP S: %s | drempel=%s",
-            long_txt,
-            short_txt,
-            MIN_SCORE,
-        )
-
-        if not due:
-            return
-
-        self.last_score_report = now
-
-        best_long = top_long[0]
-        best_short = top_short[0]
-
-        send_telegram(
-            "📊 Score scan\n"
-            f"Drempel: {MIN_SCORE}/{MAX_POSSIBLE_SCORE}\n"
-            f"Scans: {len(cycle_scores)}\n"
-            f"Beste long: {short_name(best_long['symbol'])} "
-            f"{best_long['long_score']}\n"
-            f"Beste short: {short_name(best_short['symbol'])} "
-            f"{best_short['short_score']}\n"
-            f"Top 5 long: {long_txt}\n"
-            f"Top 5 short: {short_txt}"
-        )
-
-    # ====================== MAIN LOOP ======================
-
-    def run(self) -> None:
-
-        send_telegram(
-            "🚀 <b>Multi-Factor Bot v2.5.1 gestart</b>\n"
-            f"{len(SYMBOLS)} symbolen\n"
-            f"Min score: {MIN_SCORE}/{MAX_POSSIBLE_SCORE}\n"
-            f"Strong score (geen 5m nodig): {STRONG_SCORE}\n"
-            f"Max posities: {MAX_ACTIVE_POSITIONS}\n"
-            f"Paper trading: {PAPER_TRADING}\n"
-            f"Scan: iedere ~{SCAN_SLEEP_SECONDS}s"
-        )
-
-        initial_sync = self.sync_positions()
-
-        if not initial_sync:
-            send_telegram(
-                "🚨 <b>STARTUP ERROR</b>\n"
-                "Initial position sync failed.\n"
-                "Bot will not trade until the exchange "
-                "position state can be read."
+            self.exchange.create_order(
+                symbol,
+                "market",
+                close_side,
+                amount,
+                None,
+                sl_params
             )
 
-        while True:
+            # TAKE PROFIT
+            tp_params = {
+                "takeProfitPrice": tp,
+                "reduceOnly": True,
+            }
 
-            cycle_start = time.time()
+            self.exchange.create_order(
+                symbol,
+                "market",
+                close_side,
+                amount,
+                None,
+                tp_params
+            )
 
-            try:
+            return True
 
-                sync_ok = self.sync_positions()
+        except Exception as e:
 
-                if not sync_ok:
-                    logger.error(
-                        "Position sync failed. Skipping this entire scan cycle."
-                    )
-                    time.sleep(SCAN_SLEEP_SECONDS)
-                    continue
+            print(
+                "Protection error:",
+                symbol,
+                e
+            )
 
-                active_count = self.active_position_count()
+            return False
 
-                if active_count >= MAX_ACTIVE_POSITIONS:
-                    logger.info(
-                        "Maximum open positions reached: %d",
-                        active_count,
+    # ========================================================
+    # CLOSE POSITION
+    # ========================================================
+
+    def close_market(
+        self,
+        position,
+        amount=None
+    ):
+
+        symbol = position["symbol"]
+
+        side = position["side"]
+
+        amount = (
+            amount
+            if amount is not None
+            else position["contracts"]
+        )
+
+        amount = self.amount_precision(
+            symbol,
+            amount
+        )
+
+        if amount <= 0:
+            return False
+
+        close_side = (
+            "sell"
+            if side == "long"
+            else "buy"
+        )
+
+        if PAPER_TRADING:
+
+            return True
+
+        try:
+
+            self.exchange.create_order(
+                symbol,
+                "market",
+                close_side,
+                amount,
+                None,
+                {
+                    "reduceOnly": True,
+                }
+            )
+
+            return True
+
+        except Exception as e:
+
+            print(
+                "Close error:",
+                symbol,
+                e
+            )
+
+            return False
+
+    # ========================================================
+    # PAPER PNL
+    # ========================================================
+
+    def paper_pnl(
+        self,
+        position,
+        price,
+        amount=None
+    ):
+
+        if amount is None:
+            amount = position["contracts"]
+
+        market = self.exchange.market(
+            position["symbol"]
+        )
+
+        contract_size = safe_float(
+            market.get("contractSize"),
+            1.0
+        )
+
+        price_move = (
+            price
+            - position["entry"]
+        )
+
+        if position["side"] == "short":
+            price_move *= -1
+
+        return (
+            price_move
+            * amount
+            * contract_size
+        )
+
+    # ========================================================
+    # REGISTER TRADE RESULT
+    # ========================================================
+
+    def register_trade_result(
+        self,
+        position,
+        pnl
+    ):
+
+        strategy = position[
+            "strategy"
+        ]
+
+        risk = (
+            position["margin"]
+            * LEVERAGE
+            * (
+                abs(
+                    position["entry"]
+                    - position["original_stop"]
+                )
+                / position["entry"]
+            )
+        )
+
+        if risk <= 0:
+            risk = 1.0
+
+        r_multiple = (
+            pnl / risk
+        )
+
+        self.daily_realized_pnl += pnl
+
+        if pnl > 0:
+
+            self.consecutive_losses = 0
+
+        else:
+
+            self.consecutive_losses += 1
+
+            self.loss_cooldowns[
+                position["symbol"]
+            ] = (
+                now_ts()
+                + LOSS_COOLDOWN_SECONDS
+            )
+
+        self.symbol_cooldowns[
+            position["symbol"]
+        ] = (
+            now_ts()
+            + SYMBOL_COOLDOWN_SECONDS
+        )
+
+        self.learn_trade(
+            strategy,
+            pnl,
+            r_multiple
+        )
+
+        print(
+            f"TRADE CLOSED | "
+            f"{position['symbol']} | "
+            f"{strategy} | "
+            f"PnL ${pnl:.2f} | "
+            f"R {r_multiple:.2f}"
+        )
+
+        send_telegram(
+            f"🏁 TRADE CLOSED\n"
+            f"{position['symbol']}\n"
+            f"{strategy}\n"
+            f"PnL: ${pnl:.2f}\n"
+            f"R: {r_multiple:.2f}"
+        )
+
+    # ========================================================
+    # POSITION MANAGEMENT
+    # ========================================================
+
+    def manage_paper_position(
+        self,
+        position
+    ):
+
+        symbol = position["symbol"]
+
+        try:
+
+            ticker = self.exchange.fetch_ticker(
+                symbol
+            )
+
+            price = safe_float(
+                ticker.get("last")
+            )
+
+            if price <= 0:
+                return
+
+        except Exception:
+            return
+
+        side = position["side"]
+
+        # ----------------------------------------------------
+        # STOP
+        # ----------------------------------------------------
+
+        stop_hit = (
+            price <= position["stop"]
+            if side == "long"
+            else price >= position["stop"]
+        )
+
+        if stop_hit:
+
+            pnl = self.paper_pnl(
+                position,
+                price
+            )
+
+            self.paper_equity += pnl
+
+            self.register_trade_result(
+                position,
+                pnl
+            )
+
+            del self.positions[
+                symbol
+            ]
+
+            return
+
+        # ----------------------------------------------------
+        # TP1
+        # ----------------------------------------------------
+
+        tp1_hit = (
+            price >= position["tp1"]
+            if side == "long"
+            else price <= position["tp1"]
+        )
+
+        if (
+            tp1_hit
+            and not position["tp1_done"]
+        ):
+
+            partial = (
+                position["original_contracts"]
+                * TP1_CLOSE_PCT
+            )
+
+            partial = min(
+                partial,
+                position["contracts"]
+            )
+
+            if partial > 0:
+
+                pnl = self.paper_pnl(
+                    position,
+                    price,
+                    partial
+                )
+
+                self.paper_equity += pnl
+
+                position["contracts"] -= (
+                    partial
+                )
+
+                position["tp1_done"] = True
+
+                # Break-even.
+                if side == "long":
+
+                    position["stop"] = (
+                        position["entry"]
+                        * (
+                            1
+                            + BREAK_EVEN_BUFFER_PCT
+                        )
                     )
 
                 else:
 
-                    cycle_scores = []
+                    position["stop"] = (
+                        position["entry"]
+                        * (
+                            1
+                            - BREAK_EVEN_BUFFER_PCT
+                        )
+                    )
 
-                    for symbol in SYMBOLS:
+                position["breakeven"] = True
 
-                        try:
+                print(
+                    f"TP1 {symbol} | "
+                    f"partial pnl ${pnl:.2f}"
+                )
 
-                            if self.active_position_count() >= MAX_ACTIVE_POSITIONS:
-                                logger.info(
-                                    "Max positions reached. Stopping symbol scan."
-                                )
-                                break
+        # ----------------------------------------------------
+        # TP2
+        # ----------------------------------------------------
 
-                            with self.lock:
-                                in_pos = self.state[symbol]["in_position"]
+        tp2_hit = (
+            price >= position["tp2"]
+            if side == "long"
+            else price <= position["tp2"]
+        )
 
-                            report = self.analyze_coin(symbol)
+        if (
+            tp2_hit
+            and position["contracts"] > 0
+        ):
 
-                            if report is None:
-                                time.sleep(SYMBOL_SLEEP_SECONDS)
-                                continue
-
-                            cycle_scores.append(report)
-
-                            if in_pos:
-                                time.sleep(SYMBOL_SLEEP_SECONDS)
-                                continue
-
-                            setup = report.get("setup")
-
-                            if setup is None:
-                                time.sleep(SYMBOL_SLEEP_SECONDS)
-                                continue
-
-                            logger.info(
-                                "Signal: %s %s score=%s/%s confirmation=%s",
-                                symbol,
-                                setup["direction"],
-                                setup["score"],
-                                MAX_POSSIBLE_SCORE,
-                                setup["confirmation"],
-                            )
-
-                            if setup["score"] >= MIN_SCORE:
-
-                                if setup["confirmation"]:
-                                    logger.info(
-                                        "ENTRY READY: %s %s score=%s",
-                                        symbol,
-                                        setup["direction"],
-                                        setup["score"],
-                                    )
-                                    self.execute_trade(setup)
-                                else:
-                                    logger.info(
-                                        "WATCH: %s %s score=%s - waiting for 5m",
-                                        symbol,
-                                        setup["direction"],
-                                        setup["score"],
-                                    )
-                                    self.send_watch(setup)
-
-                        except Exception as exc:
-                            logger.exception(
-                                "Loop error for %s: %s",
-                                symbol,
-                                exc,
-                            )
-
-                        time.sleep(SYMBOL_SLEEP_SECONDS)
-
-                    self.publish_score_summary(cycle_scores)
-
-            except Exception as exc:
-                logger.exception("Main loop error: %s", exc)
-
-            elapsed = time.time() - cycle_start
-            sleep_for = max(1, SCAN_SLEEP_SECONDS - elapsed)
-
-            logger.info(
-                "Scan cycle complete in %.1fs. Sleeping %.1fs.",
-                elapsed,
-                sleep_for,
+            pnl = self.paper_pnl(
+                position,
+                price
             )
 
-            time.sleep(sleep_for)
+            self.paper_equity += pnl
+
+            self.register_trade_result(
+                position,
+                pnl
+            )
+
+            del self.positions[
+                symbol
+            ]
+
+            return
+
+        # ----------------------------------------------------
+        # TRAILING RUNNER
+        # ----------------------------------------------------
+
+        if position["tp1_done"]:
+
+            atr_estimate = abs(
+                position["entry"]
+                - position["original_stop"]
+            ) / ATR_SL_MULTIPLIER
+
+            if side == "long":
+
+                new_stop = (
+                    price
+                    - atr_estimate
+                    * TRAIL_ATR_MULTIPLIER
+                )
+
+                position["stop"] = max(
+                    position["stop"],
+                    new_stop
+                )
+
+            else:
+
+                new_stop = (
+                    price
+                    + atr_estimate
+                    * TRAIL_ATR_MULTIPLIER
+                )
+
+                position["stop"] = min(
+                    position["stop"],
+                    new_stop
+                )
+
+    # ========================================================
+    # MANAGE LIVE POSITION
+    # ========================================================
+
+    def manage_live_position(
+        self,
+        position
+    ):
+
+        # For live mode, BloFin's server-side
+        # protection remains the primary safety layer.
+        #
+        # We still monitor positions and can move the
+        # stop to break-even after TP1 conditions.
+
+        symbol = position["symbol"]
+
+        try:
+
+            ticker = self.exchange.fetch_ticker(
+                symbol
+            )
+
+            price = safe_float(
+                ticker.get("last")
+            )
+
+            if price <= 0:
+                return
+
+            side = position["side"]
+
+            tp1_hit = (
+                price >= position["tp1"]
+                if side == "long"
+                else price <= position["tp1"]
+            )
+
+            if (
+                tp1_hit
+                and not position["tp1_done"]
+            ):
+
+                partial = (
+                    position["original_contracts"]
+                    * TP1_CLOSE_PCT
+                )
+
+                partial = min(
+                    partial,
+                    position["contracts"]
+                )
+
+                if partial > 0:
+
+                    self.close_market(
+                        position,
+                        partial
+                    )
+
+                    position["contracts"] -= (
+                        partial
+                    )
+
+                    position["tp1_done"] = True
+
+                    # Move local state to BE.
+                    if side == "long":
+
+                        position["stop"] = (
+                            position["entry"]
+                            * (
+                                1
+                                + BREAK_EVEN_BUFFER_PCT
+                            )
+                        )
+
+                    else:
+
+                        position["stop"] = (
+                            position["entry"]
+                            * (
+                                1
+                                - BREAK_EVEN_BUFFER_PCT
+                            )
+                        )
+
+                    position["breakeven"] = True
+
+                    # Recreate protection.
+                    self.create_protection(
+                        position
+                    )
+
+        except Exception as e:
+
+            print(
+                "Live management error:",
+                symbol,
+                e
+            )
+
+    # ========================================================
+    # MANAGE ALL
+    # ========================================================
+
+    def manage_positions(self):
+
+        if (
+            now_ts()
+            - self.last_management
+            < MANAGEMENT_INTERVAL_SECONDS
+        ):
+            return
+
+        self.last_management = now_ts()
+
+        for symbol in list(
+            self.positions.keys()
+        ):
+
+            try:
+
+                position = self.positions[
+                    symbol
+                ]
+
+                if PAPER_TRADING:
+
+                    self.manage_paper_position(
+                        position
+                    )
+
+                else:
+
+                    self.manage_live_position(
+                        position
+                    )
+
+            except Exception as e:
+
+                print(
+                    "Position manager error:",
+                    e
+                )
+
+    # ========================================================
+    # EXECUTE CANDIDATE
+    # ========================================================
+
+    def execute_candidate(
+        self,
+        candidate
+    ):
+
+        with self.lock:
+
+            if not self.trading_allowed():
+                return False
+
+            if (
+                self.active_position_count()
+                >= MAX_ACTIVE_POSITIONS
+            ):
+                return False
+
+            symbol = candidate[
+                "symbol"
+            ]
+
+            if symbol in self.positions:
+                return False
+
+            if not self.symbol_available(
+                symbol
+            ):
+                return False
+
+            if not self.cluster_exposure_ok(
+                candidate
+            ):
+                return False
+
+            # No artificial global hourly cooldown.
+            if (
+                GLOBAL_ENTRY_COOLDOWN_SECONDS
+                > 0
+            ):
+
+                if (
+                    now_ts()
+                    - self.last_global_entry
+                    < GLOBAL_ENTRY_COOLDOWN_SECONDS
+                ):
+                    return False
+
+            if candidate["score"] < MIN_SCORE:
+                return False
+
+            sizing = (
+                self.calculate_position_size(
+                    candidate
+                )
+            )
+
+            if not sizing:
+                return False
+
+            print(
+                "\n=============================="
+            )
+
+            print(
+                "NEW CANDIDATE"
+            )
+
+            print(
+                "Symbol:",
+                symbol
+            )
+
+            print(
+                "Side:",
+                candidate["side"]
+            )
+
+            print(
+                "Strategy:",
+                candidate["strategy"]
+            )
+
+            print(
+                "Score:",
+                round(
+                    candidate["score"],
+                    1
+                )
+            )
+
+            print(
+                "Regime:",
+                candidate["regime"]
+            )
+
+            print(
+                "Margin:",
+                round(
+                    sizing["margin"],
+                    2
+                )
+            )
+
+            print(
+                "Expected net:",
+                round(
+                    sizing["expected_net"],
+                    2
+                )
+            )
+
+            print(
+                "Reason:",
+                candidate["reason"]
+            )
+
+            print(
+                "=============================="
+            )
+
+            position = (
+                self.open_market_position(
+                    candidate,
+                    sizing
+                )
+            )
+
+            if not position:
+                return False
+
+            # ------------------------------------------------
+            # Protection is mandatory in live mode.
+            # ------------------------------------------------
+
+            protection_ok = (
+                self.create_protection(
+                    position
+                )
+            )
+
+            if not protection_ok:
+
+                print(
+                    "CRITICAL: protection failed."
+                )
+
+                if not PAPER_TRADING:
+
+                    self.close_market(
+                        position
+                    )
+
+                self.positions.pop(
+                    symbol,
+                    None
+                )
+
+                return False
+
+            self.last_global_entry = (
+                now_ts()
+            )
+
+            send_telegram(
+                f"🚀 NEW TRADE\n"
+                f"{symbol}\n"
+                f"{candidate['side'].upper()}\n"
+                f"Strategy: "
+                f"{candidate['strategy']}\n"
+                f"Score: "
+                f"{candidate['score']:.1f}\n"
+                f"Regime: "
+                f"{candidate['regime']}\n"
+                f"Margin: "
+                f"${sizing['margin']:.2f}\n"
+                f"Expected: "
+                f"${sizing['expected_net']:.2f}"
+            )
+
+            return True
+
+    # ========================================================
+    # SCAN
+    # ========================================================
+
+    def scan(self):
+
+        if not self.trading_allowed():
+            return
+
+        if (
+            self.active_position_count()
+            >= MAX_ACTIVE_POSITIONS
+        ):
+            return
+
+        btc = self.fetch_btc_context()
+
+        if not btc:
+            return
+
+        all_candidates = []
+
+        # ----------------------------------------------------
+        # Scan every symbol.
+        # ----------------------------------------------------
+
+        for symbol in self.symbols:
+
+            if (
+                self.active_position_count()
+                >= MAX_ACTIVE_POSITIONS
+            ):
+                break
+
+            if symbol in self.positions:
+                continue
+
+            if not self.symbol_available(
+                symbol
+            ):
+                continue
+
+            try:
+
+                candidates = (
+                    self.evaluate_symbol(
+                        symbol,
+                        btc
+                    )
+                )
+
+                all_candidates.extend(
+                    candidates
+                )
+
+            except Exception as e:
+
+                print(
+                    "Scan error:",
+                    symbol,
+                    e
+                )
+
+            time.sleep(
+                SYMBOL_DELAY_SECONDS
+            )
+
+        if not all_candidates:
+            print(
+                f"[{datetime.now().strftime('%H:%M:%S')}] "
+                "No valid setups."
+            )
+            return
+
+        # ----------------------------------------------------
+        # Rank.
+        # ----------------------------------------------------
+
+        all_candidates.sort(
+            key=lambda x: x["score"],
+            reverse=True
+        )
+
+        # ----------------------------------------------------
+        # Avoid taking multiple versions of the same symbol.
+        # ----------------------------------------------------
+
+        selected = []
+
+        used_symbols = set()
+
+        for c in all_candidates:
+
+            if c["symbol"] in used_symbols:
+                continue
+
+            if c["score"] < MIN_SCORE:
+                continue
+
+            selected.append(c)
+
+            used_symbols.add(
+                c["symbol"]
+            )
+
+            if len(selected) >= 3:
+                break
+
+        if not selected:
+            print(
+                "No candidate passed score."
+            )
+            return
+
+        # ----------------------------------------------------
+        # Execute strongest opportunities.
+        # ----------------------------------------------------
+
+        for candidate in selected:
+
+            if (
+                self.active_position_count()
+                >= MAX_ACTIVE_POSITIONS
+            ):
+                break
+
+            self.execute_candidate(
+                candidate
+            )
+
+    # ========================================================
+    # LIVE POSITION SYNC
+    # ========================================================
+
+    def sync_live_positions(self):
+
+        if PAPER_TRADING:
+            return
+
+        if (
+            now_ts()
+            - self.last_position_sync
+            < POSITION_SYNC_SECONDS
+        ):
+            return
+
+        self.last_position_sync = now_ts()
+
+        try:
+
+            positions = (
+                self.exchange.fetch_positions(
+                    self.symbols
+                )
+            )
+
+            live_symbols = set()
+
+            for p in positions:
+
+                contracts = abs(
+                    safe_float(
+                        p.get("contracts")
+                    )
+                )
+
+                if contracts <= 0:
+                    continue
+
+                symbol = p.get(
+                    "symbol"
+                )
+
+                if not symbol:
+                    continue
+
+                live_symbols.add(
+                    symbol
+                )
+
+                if symbol not in self.positions:
+
+                    side = normalize_side(
+                        p.get("side")
+                    )
+
+                    entry = safe_float(
+                        p.get("entryPrice")
+                    )
+
+                    if entry <= 0:
+                        continue
+
+                    self.positions[
+                        symbol
+                    ] = {
+                        "symbol": symbol,
+                        "side": side,
+                        "contracts": contracts,
+                        "original_contracts": contracts,
+                        "entry": entry,
+                        "stop": entry,
+                        "original_stop": entry,
+                        "tp1": entry,
+                        "tp2": entry,
+                        "margin": safe_float(
+                            p.get("initialMargin")
+                        ),
+                        "notional": safe_float(
+                            p.get("notional")
+                        ),
+                        "strategy": "UNKNOWN",
+                        "score": 0,
+                        "regime": "UNKNOWN",
+                        "tp1_done": False,
+                        "breakeven": False,
+                        "opened_at": now_ts(),
+                    }
+
+            # Remove local positions no longer open.
+            for symbol in list(
+                self.positions.keys()
+            ):
+
+                if symbol not in live_symbols:
+
+                    # We cannot reliably reconstruct
+                    # exact realized PnL from position
+                    # disappearance alone, so do not train
+                    # the learning engine here.
+                    #
+                    # This is intentional: bad labels are
+                    # worse than missing labels.
+
+                    del self.positions[
+                        symbol
+                    ]
+
+        except Exception as e:
+
+            print(
+                "Position sync error:",
+                e
+            )
+
+    # ========================================================
+    # STATUS
+    # ========================================================
+
+    def status(self):
+
+        equity = self.get_equity()
+
+        print(
+            "\n"
+            "============================================\n"
+            " BLOFIN TACTICAL ENGINE V5\n"
+            "============================================"
+        )
+
+        print(
+            "Mode:",
+            "PAPER" if PAPER_TRADING
+            else "LIVE"
+        )
+
+        print(
+            "Equity:",
+            f"${equity:.2f}"
+        )
+
+        print(
+            "Positions:",
+            self.active_position_count(),
+            "/",
+            MAX_ACTIVE_POSITIONS
+        )
+
+        print(
+            "Daily PnL:",
+            f"${self.daily_realized_pnl:.2f}"
+        )
+
+        print(
+            "Consecutive losses:",
+            self.consecutive_losses
+        )
+
+        print(
+            "\nStrategy learning:"
+        )
+
+        for name, data in (
+            self.learning[
+                "strategies"
+            ].items()
+        ):
+
+            trades = data["trades"]
+
+            winrate = (
+                data["wins"] / trades
+                if trades
+                else 0
+            )
+
+            print(
+                f"  {name:<20} "
+                f"trades={trades:<4} "
+                f"WR={winrate:.1%} "
+                f"R={data['avg_r']:.2f} "
+                f"W={data['weight']:.2f}"
+            )
+
+        print(
+            "============================================\n"
+        )
+
+    # ========================================================
+    # MAIN LOOP
+    # ========================================================
+
+    def run(self):
+
+        print(
+            "\n"
+            "==================================================\n"
+            " BLOFIN TACTICAL ENGINE V5.0 STARTED\n"
+            "=================================================="
+        )
+
+        print(
+            "Mode:",
+            "PAPER TRADING"
+            if PAPER_TRADING
+            else "LIVE TRADING"
+        )
+
+        print(
+            f"Symbols: {len(self.symbols)}"
+        )
+
+        print(
+            f"Max positions: "
+            f"{MAX_ACTIVE_POSITIONS}"
+        )
+
+        print(
+            f"Leverage: {LEVERAGE}x"
+        )
+
+        print(
+            f"Min score: {MIN_SCORE}"
+        )
+
+        print(
+            "Self-learning: ENABLED"
+        )
+
+        print(
+            "==================================================\n"
+        )
+
+        self.day_start_equity = (
+            self.get_equity()
+        )
+
+        last_status = 0
+
+        while True:
+
+            cycle_start = now_ts()
+
+            try:
+
+                # --------------------------------------------
+                # Reset daily safety.
+                # --------------------------------------------
+
+                self.reset_daily_state()
+
+                # --------------------------------------------
+                # Sync live positions.
+                # --------------------------------------------
+
+                self.sync_live_positions()
+
+                # --------------------------------------------
+                # Manage existing positions.
+                # --------------------------------------------
+
+                self.manage_positions()
+
+                # --------------------------------------------
+                # Scan for new opportunities.
+                # --------------------------------------------
+
+                if self.trading_allowed():
+
+                    if (
+                        self.active_position_count()
+                        < MAX_ACTIVE_POSITIONS
+                    ):
+
+                        self.scan()
+
+                # --------------------------------------------
+                # Status.
+                # --------------------------------------------
+
+                if (
+                    now_ts()
+                    - last_status
+                    > 15 * 60
+                ):
+
+                    self.status()
+
+                    last_status = now_ts()
+
+            except KeyboardInterrupt:
+
+                print(
+                    "Bot stopped manually."
+                )
+
+                break
+
+            except Exception as e:
+
+                print(
+                    "\nMAIN LOOP ERROR:",
+                    e
+                )
+
+                traceback.print_exc()
+
+            # ----------------------------------------------
+            # Cycle timing.
+            # ----------------------------------------------
+
+            elapsed = (
+                now_ts()
+                - cycle_start
+            )
+
+            sleep_for = max(
+                2,
+                SCAN_INTERVAL_SECONDS
+                - elapsed
+            )
+
+            print(
+                f"Cycle finished in "
+                f"{elapsed:.1f}s | "
+                f"next cycle in "
+                f"{sleep_for:.1f}s"
+            )
+
+            time.sleep(
+                sleep_for
+            )
 
 
-# ====================== FLASK ======================
-
-def run_web():
-
-    port = int(os.environ.get("PORT", 8080))
-
-    app.run(
-        host="0.0.0.0",
-        port=port,
-    )
-
-
-# ====================== START ======================
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
 
-    web_thread = threading.Thread(target=run_web)
-    web_thread.daemon = True
-    web_thread.start()
+    if not API_KEY and not PAPER_TRADING:
 
-    bot = MultiFactorBot()
-    bot.run()
+        raise RuntimeError(
+            "EXCHANGE_API_KEY ontbreekt."
+        )
+
+    if not API_SECRET and not PAPER_TRADING:
+
+        raise RuntimeError(
+            "EXCHANGE_SECRET ontbreekt."
+        )
+
+    if not API_PASSWORD and not PAPER_TRADING:
+
+        raise RuntimeError(
+            "EXCHANGE_PASSWORD ontbreekt."
+        )
+
+    engine = BlofinEngine()
+
+    engine.run()
