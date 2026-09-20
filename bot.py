@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import math
 import logging
 import threading
 from datetime import datetime, timezone
@@ -910,9 +911,26 @@ class MultiFactorBot:
         reference_price = setup["price"]
         atr = setup["atr"]
 
+        logger.info(
+            "execute_trade start %s %s score=%s atr=%s price=%s",
+            symbol,
+            direction,
+            setup.get("score"),
+            atr,
+            reference_price,
+        )
+
         with self.lock:
 
             if self.state[symbol]["in_position"]:
+                logger.warning(
+                    "Skip %s: state denkt dat er al een positie open is.",
+                    symbol,
+                )
+                send_telegram(
+                    f"⚠️ Skip {symbol}: bot denkt dat positie al open is. "
+                    f"Check BloFin."
+                )
                 return
 
             if self.active_position_count() >= MAX_ACTIVE_POSITIONS:
@@ -920,6 +938,9 @@ class MultiFactorBot:
                     "Max active positions reached (%d). Skip %s.",
                     MAX_ACTIVE_POSITIONS,
                     symbol,
+                )
+                send_telegram(
+                    f"⚠️ Skip {symbol}: max {MAX_ACTIVE_POSITIONS} posities."
                 )
                 return
 
@@ -933,7 +954,7 @@ class MultiFactorBot:
         except (TypeError, ValueError):
             atr_val = 0.0
 
-        if atr_val <= 0:
+        if atr_val <= 0 or math.isnan(atr_val):
             logger.error("ATR invalid on %s: %s", symbol, atr)
             send_telegram(
                 f"❌ Geen trade {symbol}: ATR ongeldig"
@@ -1498,7 +1519,7 @@ class MultiFactorBot:
     def run(self) -> None:
 
         send_telegram(
-            "🚀 <b>Multi-Factor Bot v2.5 gestart</b>\n"
+            "🚀 <b>Multi-Factor Bot v2.5.1 gestart</b>\n"
             f"{len(SYMBOLS)} symbolen\n"
             f"Min score: {MIN_SCORE}/{MAX_POSSIBLE_SCORE}\n"
             f"Strong score (geen 5m nodig): {STRONG_SCORE}\n"
