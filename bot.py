@@ -10,9 +10,14 @@ import pandas as pd
 import requests
 
 # ============================================================
-# BLOFIN V6.3 - LIVE FUTURES BOT
+# BLOFIN V6.4 - LIVE FUTURES BOT
 # ============================================================
-# Main changes vs V6.2:
+# Main changes vs V6.3:
+# - Detects fully closed positions from BloFin position history.
+# - Sends Telegram PnL notification immediately after a close is detected.
+# - Reports realized PnL, fee, estimated net PnL, return, close reason and duration.
+# - Maintains session/day win/loss and net PnL counters.
+# - Seeds existing history at startup so old trades are not reported as new.
 # - Uses BloFin native futures endpoints through CCXT implicit API.
 # - Correct contract sizing using contractValue/lotSize/minSize.
 # - Checks REAL available futures USDT before every entry.
@@ -751,7 +756,7 @@ def open_trade(signal):
         "slTriggerPrice": str(sl),
         "slOrderPrice": "-1",
         "slTriggerPriceType": "mark",
-        "clientOrderId": f"v62{int(time.time() * 1000) % 1000000000}",
+        "clientOrderId": f"v64{int(time.time() * 1000) % 1000000000}",
     }
     if BROKER_ID:
         payload["brokerId"] = BROKER_ID
@@ -812,6 +817,172 @@ consecutive_losses = 0
 symbol_last_trade = {}
 protection_lock = False
 
+# ----------------------------
+# Closed-trade / PnL tracking
+# ----------------------------
+seen_closed_history_ids = set()
+daily_trade_date = None
+daily_trades = 0
+daily_wins = 0
+daily_losses = 0
+daily_net_pnl = 0.0
+daily_gross_pnl = 0.0
+daily_fees = 0.0
+
+
+def reset_daily_stats_if_needed():
+    global daily_trade_date, daily_trades, daily_wins, daily_losses
+    global daily_net_pnl, daily_gross_pnl, daily_fees
+    today = datetime.now().date().isoformat()
+    if daily_trade_date != today:
+        daily_trade_date = today
+        daily_trades = 0
+        daily_wins = 0
+        daily_losses = 0
+        daily_net_pnl = 0.0
+        daily_gross_pnl = 0.0
+        daily_fees = 0.0
+
+
+def closed_positions_history(limit=100):
+    resp = native("private_get_account_positions_history", {
+        "state": "closed",
+        "limit": str(limit),
+    })
+    if not native_ok(resp):
+        raise RuntimeError(f"Position history failed: {response_error(resp)}")
+    return resp.get("data") or []
+
+
+def close_reason(record):
+    # BloFin position-history records don't always expose a closeType, so
+    # infer it from available fields when possible.
+    raw = str(record.get("closeType", record.get("state", ""))).lower()
+    if raw in ("tp", "take_profit", "take-profit"):
+        return "TAKE PROFIT"
+    if raw in ("sl", "stop_loss", "stop-loss"):
+        return "STOP LOSS"
+    if raw in ("liquidated", "liquidation"):
+        return "LIQUIDATION"
+    if raw == "adl":
+        return "ADL"
+    if raw in ("mannual", "manual", "close"):
+        return "MANUAL / CLOSE"
+    return raw.upper() if raw else "CLOSED"
+
+
+def fmt_duration(start_ms, end_ms):
+    start = safe_float(start_ms)
+    end = safe_float(end_ms)
+    if start <= 0 or end <= 0 or end < start:
+        return "unknown"
+    seconds = int((end - start) / 1000)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def notify_closed_trade(record):
+    global daily_trades, daily_wins, daily_losses
+    global daily_net_pnl, daily_gross_pnl, daily_fees
+
+    reset_daily_stats_if_needed()
+
+    symbol = str(record.get("instId", "")).replace("-USDT", "/USDT:USDT")
+    side = str(record.get("positionSide", "net")).upper()
+    entry = safe_float(record.get("openAveragePrice"))
+    exit_price = safe_float(record.get("closeAveragePrice"))
+    gross_pnl = safe_float(record.get("realizedPnl"))
+    fee = abs(safe_float(record.get("fee")))
+    net_pnl = gross_pnl - fee
+    pnl_ratio = safe_float(record.get("realizedPnlRatio")) * 100
+    duration = fmt_duration(record.get("createTime"), record.get("updateTime"))
+    reason = close_reason(record)
+    close_positions = safe_float(record.get("closePositions"))
+
+    daily_trades += 1
+    if net_pnl >= 0:
+        daily_wins += 1
+    else:
+        daily_losses += 1
+    daily_gross_pnl += gross_pnl
+    daily_fees += fee
+    daily_net_pnl += net_pnl
+
+    icon = "🟢" if net_pnl >= 0 else "🔴"
+    sign = "+" if net_pnl >= 0 else ""
+    gross_sign = "+" if gross_pnl >= 0 else ""
+
+    tg(
+        f"{icon} POSITION CLOSED\n\n"
+        f"{symbol}\n"
+        f"{side}\n"
+        f"━━━━━━━━━━━━\n"
+        f"Entry: {entry:.8g}\n"
+        f"Exit:  {exit_price:.8g}\n"
+        f"Size:  {close_positions:g} contracts\n\n"
+        f"💰 Realized PnL: {gross_sign}${gross_pnl:.2f}\n"
+        f"📊 PnL ratio: {pnl_ratio:+.2f}%\n"
+        f"💸 Fee: -${fee:.2f}\n"
+        f"━━━━━━━━━━━━\n"
+        f"💵 Net PnL: {sign}${net_pnl:.2f}\n\n"
+        f"🎯 Closed by: {reason}\n"
+        f"⏱ Duration: {duration}\n\n"
+        f"📅 TODAY\n"
+        f"Trades: {daily_trades} | Wins: {daily_wins} | Losses: {daily_losses}\n"
+        f"Net PnL: {'+' if daily_net_pnl >= 0 else ''}${daily_net_pnl:.2f}"
+    )
+
+
+def seed_closed_history():
+    reset_daily_stats_if_needed()
+    try:
+        records = closed_positions_history(limit=100)
+        for r in records:
+            hid = str(r.get("historyId", ""))
+            if hid:
+                seen_closed_history_ids.add(hid)
+        tg(f"📚 PNL TRACKER READY\nKnown closed trades: {len(seen_closed_history_ids)}")
+    except Exception as e:
+        tg(f"⚠️ PNL tracker startup warning\n{e}")
+
+
+def check_for_closed_positions():
+    """Detect newly closed BloFin position-history records.
+
+    BloFin returns newest records first. We seed history at startup, then only
+    notify for historyIds that were not previously seen."""
+    reset_daily_stats_if_needed()
+    records = closed_positions_history(limit=100)
+    new_records = []
+    for r in reversed(records):
+        hid = str(r.get("historyId", ""))
+        if not hid or hid in seen_closed_history_ids:
+            continue
+        seen_closed_history_ids.add(hid)
+        new_records.append(r)
+
+    for r in new_records:
+        notify_closed_trade(r)
+
+    # Keep memory bounded. History IDs are only needed to avoid duplicates.
+    if len(seen_closed_history_ids) > 2000:
+        # Rebuild from the latest records, preserving newest IDs.
+        seen_closed_history_ids.clear()
+        for r in records:
+            hid = str(r.get("historyId", ""))
+            if hid:
+                seen_closed_history_ids.add(hid)
+
+    return len(new_records)
+
 
 def check_daily_risk():
     global startup_equity
@@ -837,7 +1008,7 @@ def startup_diagnostics():
     acc = futures_account()
     positions = get_positions()
     tg(
-        f"🚀 BLOFIN V6.3 STARTED\n"
+        f"🚀 BLOFIN V6.4 STARTED\n"
         f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
         f"Equity: ${acc['total_equity']:.2f}\n"
         f"Available: ${acc['available']:.2f}\n"
@@ -870,6 +1041,8 @@ def main():
     global protection_lock, consecutive_losses
 
     startup_diagnostics()
+    if not PAPER_TRADING:
+        seed_closed_history()
 
     if not PAPER_TRADING and REPAIR_EXISTING_POSITIONS:
         try:
@@ -880,13 +1053,21 @@ def main():
 
     if protection_lock and not PAPER_TRADING:
         tg(
-            "🛑 V6.3 SAFE MODE\n"
+            "🛑 V6.4 SAFE MODE\n"
             "Existing position protection could not be confirmed.\n"
             "The bot will scan, but will NOT open new trades."
         )
 
     while True:
         try:
+            # Detect positions that were closed since the previous cycle.
+            if not PAPER_TRADING:
+                try:
+                    check_for_closed_positions()
+                except Exception as e:
+                    # PnL tracking must never crash the trading loop.
+                    tg(f"⚠️ PNL TRACKER ERROR\n{e}")
+
             ok, reason = check_daily_risk()
             if not ok:
                 tg(f"🛑 {reason}\nBot will keep monitoring but will not open new trades.")
@@ -981,10 +1162,10 @@ def main():
             time.sleep(SCAN_SECONDS)
 
         except KeyboardInterrupt:
-            tg("🛑 V6.3 stopped manually.")
+            tg("🛑 V6.4 stopped manually.")
             raise
         except Exception as e:
-            tg(f"⚠️ V6.3 LOOP ERROR\n{type(e).__name__}: {e}")
+            tg(f"⚠️ V6.4 LOOP ERROR\n{type(e).__name__}: {e}")
             time.sleep(30)
 
 
