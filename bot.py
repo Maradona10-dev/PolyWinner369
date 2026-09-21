@@ -10,9 +10,9 @@ import pandas as pd
 import requests
 
 # ============================================================
-# BLOFIN V6.2 - LIVE FUTURES BOT
+# BLOFIN V6.3 - LIVE FUTURES BOT
 # ============================================================
-# Main changes vs V6.1:
+# Main changes vs V6.2:
 # - Uses BloFin native futures endpoints through CCXT implicit API.
 # - Correct contract sizing using contractValue/lotSize/minSize.
 # - Checks REAL available futures USDT before every entry.
@@ -57,9 +57,9 @@ MIN_SCORE = float(os.getenv("MIN_SCORE", "55"))
 
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 MARGIN_MODE = os.getenv("MARGIN_MODE", "isolated")
-BASE_MARGIN_USDT = float(os.getenv("BASE_MARGIN_USDT", "7.5"))
-MAX_MARGIN_USDT = float(os.getenv("MAX_MARGIN_USDT", "10"))
-MAX_MARGIN_EQUITY_PCT = float(os.getenv("MAX_MARGIN_EQUITY_PCT", "0.18"))
+BASE_MARGIN_USDT = float(os.getenv("BASE_MARGIN_USDT", "10"))
+MAX_MARGIN_USDT = float(os.getenv("MAX_MARGIN_USDT", "12"))
+MAX_MARGIN_EQUITY_PCT = float(os.getenv("MAX_MARGIN_EQUITY_PCT", "0.20"))
 MAX_RISK_EQUITY_PCT = float(os.getenv("MAX_RISK_EQUITY_PCT", "0.015"))
 AVAILABLE_MARGIN_BUFFER = float(os.getenv("AVAILABLE_MARGIN_BUFFER", "0.90"))
 
@@ -597,7 +597,7 @@ def repair_existing_positions():
     if not positions:
         return True
 
-    tg(f"🛡️ V6.2 STARTUP\nOpen positions: {len(positions)}\nChecking TP/SL protection...")
+    tg(f"🛡️ V6.3 STARTUP\nOpen positions: {len(positions)}\nChecking TP/SL protection...")
 
     all_ok = True
     for p in positions:
@@ -837,12 +837,14 @@ def startup_diagnostics():
     acc = futures_account()
     positions = get_positions()
     tg(
-        f"🚀 BLOFIN V6.2 STARTED\n"
+        f"🚀 BLOFIN V6.3 STARTED\n"
         f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
         f"Equity: ${acc['total_equity']:.2f}\n"
         f"Available: ${acc['available']:.2f}\n"
         f"Positions: {len(positions)}/{MAX_ACTIVE_POSITIONS}\n"
         f"Leverage target: {LEVERAGE}x\n"
+        f"Margin target: ${BASE_MARGIN_USDT:.2f} / max ${MAX_MARGIN_USDT:.2f}\n"
+        f"Risk cap: {MAX_RISK_EQUITY_PCT*100:.2f}% equity\n"
         f"BrokerId: {'configured' if BROKER_ID else 'not configured'}"
     )
 
@@ -878,7 +880,7 @@ def main():
 
     if protection_lock and not PAPER_TRADING:
         tg(
-            "🛑 V6.2 SAFE MODE\n"
+            "🛑 V6.3 SAFE MODE\n"
             "Existing position protection could not be confirmed.\n"
             "The bot will scan, but will NOT open new trades."
         )
@@ -979,10 +981,10 @@ def main():
             time.sleep(SCAN_SECONDS)
 
         except KeyboardInterrupt:
-            tg("🛑 V6.2 stopped manually.")
+            tg("🛑 V6.3 stopped manually.")
             raise
         except Exception as e:
-            tg(f"⚠️ V6.2 LOOP ERROR\n{type(e).__name__}: {e}")
+            tg(f"⚠️ V6.3 LOOP ERROR\n{type(e).__name__}: {e}")
             time.sleep(30)
 
 
