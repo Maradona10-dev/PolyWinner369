@@ -29,6 +29,9 @@ import requests
 # - Extra cooldown bij herhaald verlies op dezelfde munt
 # - LONG/SHORT dagstatistiek
 # - Position history: closed + liquidated + adl
+# - Pullback-entry: geen chase op impuls-candle / extended EMA
+# - Fill-check: skip als live prijs >0.40% van signaal is weggelopen
+# - SL altijd gecapt op MAX_STOP_PCT (2.8%), ook bij repair
 # ============================================================
 
 API_KEY = os.getenv("EXCHANGE_API_KEY", "").strip()
@@ -81,9 +84,15 @@ DONCHIAN_LOOKBACK = 12
 NEAR_SWEEP_ATR = 0.20
 ADX_TREND = float(os.getenv("ADX_TREND", "18"))
 ADX_CHOP = float(os.getenv("ADX_CHOP", "14"))
-RSI_LONG_MAX = float(os.getenv("RSI_LONG_MAX", "78"))
-RSI_SHORT_MIN = float(os.getenv("RSI_SHORT_MIN", "22"))
+RSI_LONG_MAX = float(os.getenv("RSI_LONG_MAX", "68"))
+RSI_SHORT_MIN = float(os.getenv("RSI_SHORT_MIN", "32"))
 RS_OVERRIDE = float(os.getenv("RS_OVERRIDE", "0.008"))
+MAX_EMA_EXT_PCT = 0.012
+PULLBACK_ATR = 0.45
+IMPULSE_15M_ATR = 1.30
+IMPULSE_1H_ATR = 1.60
+MAX_RUN_PCT = 0.035
+MAX_FILL_SLIP_PCT = 0.004
 
 DAILY_LOSS_LIMIT_PCT = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "5"))
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
@@ -415,21 +424,48 @@ def evaluate_symbol(symbol, btc):
     stack_short = t["ema20"] < t["ema50"] < t["ema200"]
     fast_long = t["ema20"] > t["ema50"]
     fast_short = t["ema20"] < t["ema50"]
-    ema_long = a["ema20"] > a["ema50"] and price > a["ema20"] and slope_up
-    ema_short = a["ema20"] < a["ema50"] and price < a["ema20"] and slope_down
+    ema20_15 = float(a["ema20"])
+    ema20_5 = float(c["ema20"])
+    ema_long = a["ema20"] > a["ema50"] and price >= ema20_15 and slope_up
+    ema_short = a["ema20"] < a["ema50"] and price <= ema20_15 and slope_down
     volume_ok = a["volume"] > (a["vol_sma20"] * VOLUME_MULT) if pd.notna(a["vol_sma20"]) else False
-    breakout_long = price > a["donchian_high"] if pd.notna(a["donchian_high"]) else False
-    breakout_short = price < a["donchian_low"] if pd.notna(a["donchian_low"]) else False
+
+    dist_ema = (price - ema20_15) / price
+    pulled_long = min(float(a["low"]), float(a_prev["low"])) <= ema20_15 + PULLBACK_ATR * atr
+    pulled_short = max(float(a["high"]), float(a_prev["high"])) >= ema20_15 - PULLBACK_ATR * atr
+    near_ema_long = abs(price - ema20_15) <= PULLBACK_ATR * atr or pulled_long
+    near_ema_short = abs(price - ema20_15) <= PULLBACK_ATR * atr or pulled_short
+    ext_long = dist_ema > MAX_EMA_EXT_PCT
+    ext_short = dist_ema < -MAX_EMA_EXT_PCT
+
+    bar15_range = float(a["high"] - a["low"])
+    bar1h_range = float(t["high"] - t["low"])
+    atr1h = float(t["atr"]) if pd.notna(t["atr"]) and t["atr"] > 0 else atr
+    impulse_15 = bar15_range > IMPULSE_15M_ATR * atr
+    impulse_1h = bar1h_range > IMPULSE_1H_ATR * atr1h
+    run8 = float(df15["close"].iloc[-2] / df15["close"].iloc[-10] - 1) if len(df15) >= 10 else 0.0
 
     recent_low = df15["low"].iloc[-DONCHIAN_LOOKBACK - 3:-3].min()
     recent_high = df15["high"].iloc[-DONCHIAN_LOOKBACK - 3:-3].max()
     sweep_long = (a_prev["low"] < recent_low - NEAR_SWEEP_ATR * atr) and (a["close"] > recent_low)
     sweep_short = (a_prev["high"] > recent_high + NEAR_SWEEP_ATR * atr) and (a["close"] < recent_high)
-    structure_long = breakout_long or sweep_long
-    structure_short = breakout_short or sweep_short
+    structure_long = (near_ema_long and ema_long) or sweep_long
+    structure_short = (near_ema_short and ema_short) or sweep_short
 
-    confirm_long = c["ema20"] > c["ema50"] and c["close"] > c["ema20"] and c["close"] > c_prev["close"]
-    confirm_short = c["ema20"] < c["ema50"] and c["close"] < c["ema20"] and c["close"] < c_prev["close"]
+    bounce_5m = float(c["low"]) <= ema20_5 + 0.35 * float(c["atr"] if pd.notna(c["atr"]) and c["atr"] > 0 else atr)
+    reject_5m = float(c["high"]) >= ema20_5 - 0.35 * float(c["atr"] if pd.notna(c["atr"]) and c["atr"] > 0 else atr)
+    confirm_long = (
+        c["ema20"] > c["ema50"]
+        and c["close"] > c["ema20"]
+        and c["close"] > c_prev["close"]
+        and bounce_5m
+    )
+    confirm_short = (
+        c["ema20"] < c["ema50"]
+        and c["close"] < c["ema20"]
+        and c["close"] < c_prev["close"]
+        and reject_5m
+    )
     atr_pct = atr / price
     atr_quality = 0.0018 <= atr_pct <= 0.035
     trending = adx >= ADX_TREND
@@ -501,6 +537,16 @@ def evaluate_symbol(symbol, btc):
         skip = skip or "rsi-overbought"
     if side == "short" and rsi <= RSI_SHORT_MIN:
         skip = skip or "rsi-oversold"
+    if side == "long" and (ext_long or not near_ema_long):
+        skip = skip or "no-pullback"
+    if side == "short" and (ext_short or not near_ema_short):
+        skip = skip or "no-pullback"
+    if impulse_15 or impulse_1h:
+        skip = skip or "impulse-chase"
+    if side == "long" and run8 > MAX_RUN_PCT:
+        skip = skip or "extended-run"
+    if side == "short" and run8 < -MAX_RUN_PCT:
+        skip = skip or "extended-run"
 
     if symbol not in MAJORS:
         strong_pos = rel >= RS_OVERRIDE
@@ -544,8 +590,7 @@ def evaluate_symbol(symbol, btc):
 
 def calculate_trade_levels(entry, atr, side, tick):
     risk_distance = max(atr * ATR_SL_MULT, entry * MIN_STOP_PCT)
-    if risk_distance / entry > MAX_STOP_PCT:
-        return None
+    risk_distance = min(risk_distance, entry * MAX_STOP_PCT)
     if side == "long":
         sl = entry - risk_distance
         tp = entry + risk_distance * TP_R_MULT
@@ -829,7 +874,16 @@ def open_trade(signal):
         return False
 
     tick = safe_float(get_instrument(symbol).get("tickSize"), 0.0001)
-    entry = signal["price"]
+    live = safe_float(exchange.fetch_ticker(symbol).get("last"), signal["price"])
+    signal_px = signal["price"]
+    if live <= 0:
+        return False
+    slip = (live - signal_px) / signal_px
+    if side == "long" and slip > MAX_FILL_SLIP_PCT:
+        return False
+    if side == "short" and slip < -MAX_FILL_SLIP_PCT:
+        return False
+    entry = live
     levels = calculate_trade_levels(entry, signal["atr"], side, tick)
     if not levels:
         return False
