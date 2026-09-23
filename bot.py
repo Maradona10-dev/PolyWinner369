@@ -533,9 +533,9 @@ def evaluate_symbol(symbol, btc):
         score -= 5
     if adx < ADX_TREND:
         skip = "adx-chop"
-    if side == "long" and symbol not in MAJORS and rel < 0:
+    if side == "long" and symbol not in MAJORS and rel < -RS_OVERRIDE:
         skip = skip or "weak-vs-btc"
-    if side == "short" and symbol not in MAJORS and rel > 0:
+    if side == "short" and symbol not in MAJORS and rel > RS_OVERRIDE:
         skip = skip or "strong-vs-btc"
     if side == "long" and rsi >= RSI_LONG_MAX:
         skip = skip or "rsi-overbought"
