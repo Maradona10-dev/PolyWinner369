@@ -11,34 +11,39 @@ import requests
 
 
 # ============================================================
-# BLOFIN V6.8 ADAPTIVE MOMENTUM ENGINE
+# BLOFIN V6.9 DUAL ENTRY MOMENTUM ENGINE
 # ============================================================
 #
-# Verbeteringen t.o.v. V6.7:
-# - SyntaxError clientOrderId opgelost
-# - TP + SL moeten BEIDE aanwezig zijn
-# - Directionele tick rounding voor SL/TP
-# - Volume/ATR zijn quality factors, geen directional tactics
-# - Multi-horizon relative strength: 15m / 45m / 90m
-# - Persistent relative-strength tactic
-# - Hard leverage failure: geen order bij leverage-fout
-# - Protection-lock controleert ALLE posities opnieuw
-# - Mislukte execution veroorzaakt geen cooldown
-# - Maximaal 3 execution attempts per scan
-# - Eén SUCCESVOLLE nieuwe trade per scan
-# - Adaptive regime scoring
-# - Momentum continuation
-# - Gradual pullback scoring
-# - Multi-factor 5m confirmation
-# - Relative-strength failure detection
-# - Entry-quality scoring
-# - Second-chance continuation
-# - Conservative learning
-# - Broker-side TP/SL
-# - Existing-position repair
-# - Daily Amsterdam risk reset
-# - LONG / SHORT statistics
-# - Per-symbol loss streak
+# NIEUW T.O.V. V6.8
+#
+# 1. EARLY_MOMENTUM
+#    Probeert een trend eerder te pakken:
+#    - breakout
+#    - volume
+#    - 5m bevestiging
+#    - momentum
+#    - trend alignment
+#    - nog niet te ver van EMA20
+#
+# 2. PULLBACK
+#    Bestaande gecontroleerde entry na terugtest.
+#
+# 3. IMPULSE MEMORY / NO CHASE
+#    Een grote recente candle wordt meerdere candles onthouden.
+#    De bot mag daarna niet zomaar de eerste kleine dip kopen.
+#
+# 4. RESET AFTER IMPULSE
+#    Na een extreme move moet eerst:
+#    - voldoende retracement plaatsvinden
+#    - minimaal 2 candles verstreken zijn
+#    - prijs weer redelijk dicht bij EMA20 komen
+#
+# 5. Telegram toont:
+#    Entry: EARLY_MOMENTUM
+#    of
+#    Entry: PULLBACK
+#
+# Alle V6.8 risk/protection onderdelen blijven behouden.
 #
 # Geschreven voor One-way / NET position mode.
 # ============================================================
@@ -96,10 +101,7 @@ LOSS_COOLDOWN_MIN = int(
 )
 
 REPEAT_LOSS_COOLDOWN_MIN = int(
-    os.getenv(
-        "REPEAT_LOSS_COOLDOWN_MIN",
-        "180"
-    )
+    os.getenv("REPEAT_LOSS_COOLDOWN_MIN", "180")
 )
 
 LOSS_PAUSE_MIN = int(
@@ -132,7 +134,7 @@ MAX_EXECUTION_ATTEMPTS_PER_SCAN = int(
 
 
 # ============================================================
-# ADAPTIVE SCORE
+# SCORE
 # ============================================================
 
 BASE_MIN_SCORE = float(
@@ -156,6 +158,116 @@ MIN_TACTICS = int(
 
 STRONG_MIN_TACTICS = int(
     os.getenv("STRONG_MIN_TACTICS", "4")
+)
+
+
+# ============================================================
+# V6.9 EARLY MOMENTUM
+# ============================================================
+
+EARLY_MIN_SCORE = float(
+    os.getenv("EARLY_MIN_SCORE", "62")
+)
+
+EARLY_MIN_TACTICS = int(
+    os.getenv("EARLY_MIN_TACTICS", "3")
+)
+
+EARLY_ADX_MIN = float(
+    os.getenv("EARLY_ADX_MIN", "16")
+)
+
+EARLY_ADX_MAX = float(
+    os.getenv("EARLY_ADX_MAX", "40")
+)
+
+EARLY_MAX_EMA_EXT_PCT = float(
+    os.getenv(
+        "EARLY_MAX_EMA_EXT_PCT",
+        "0.008"
+    )
+)
+
+EARLY_MAX_RUN_PCT = float(
+    os.getenv(
+        "EARLY_MAX_RUN_PCT",
+        "0.025"
+    )
+)
+
+EARLY_BREAKOUT_LOOKBACK = int(
+    os.getenv(
+        "EARLY_BREAKOUT_LOOKBACK",
+        "3"
+    )
+)
+
+EARLY_SETUP_BONUS = float(
+    os.getenv(
+        "EARLY_SETUP_BONUS",
+        "8"
+    )
+)
+
+EARLY_MAX_BODY_ATR = float(
+    os.getenv(
+        "EARLY_MAX_BODY_ATR",
+        "1.15"
+    )
+)
+
+EARLY_MAX_RANGE_ATR = float(
+    os.getenv(
+        "EARLY_MAX_RANGE_ATR",
+        "1.60"
+    )
+)
+
+
+# ============================================================
+# V6.9 IMPULSE MEMORY
+# ============================================================
+
+IMPULSE_MEMORY_BARS = int(
+    os.getenv(
+        "IMPULSE_MEMORY_BARS",
+        "6"
+    )
+)
+
+IMPULSE_MEMORY_BODY_ATR = float(
+    os.getenv(
+        "IMPULSE_MEMORY_BODY_ATR",
+        "1.20"
+    )
+)
+
+IMPULSE_MEMORY_RANGE_ATR = float(
+    os.getenv(
+        "IMPULSE_MEMORY_RANGE_ATR",
+        "1.65"
+    )
+)
+
+IMPULSE_RESET_ATR = float(
+    os.getenv(
+        "IMPULSE_RESET_ATR",
+        "0.80"
+    )
+)
+
+IMPULSE_RESET_MIN_BARS = int(
+    os.getenv(
+        "IMPULSE_RESET_MIN_BARS",
+        "2"
+    )
+)
+
+RESET_MAX_EMA_ATR = float(
+    os.getenv(
+        "RESET_MAX_EMA_ATR",
+        "0.55"
+    )
 )
 
 
@@ -203,7 +315,7 @@ AVAILABLE_MARGIN_BUFFER = float(
 
 
 # ============================================================
-# RISK / TP / SL
+# RISK
 # ============================================================
 
 ATR_PERIOD = 14
@@ -227,24 +339,15 @@ MAX_STOP_PCT = float(
 )
 
 MIN_NET_TP_USDT = float(
-    os.getenv(
-        "MIN_NET_TP_USDT",
-        "0.40"
-    )
+    os.getenv("MIN_NET_TP_USDT", "0.40")
 )
 
 TAKER_FEE_RATE = float(
-    os.getenv(
-        "TAKER_FEE_RATE",
-        "0.0006"
-    )
+    os.getenv("TAKER_FEE_RATE", "0.0006")
 )
 
 SLIPPAGE_RATE = float(
-    os.getenv(
-        "SLIPPAGE_RATE",
-        "0.0003"
-    )
+    os.getenv("SLIPPAGE_RATE", "0.0003")
 )
 
 
@@ -304,17 +407,11 @@ MAX_FILL_SLIP_PCT = 0.004
 # ============================================================
 
 DAILY_LOSS_LIMIT_PCT = float(
-    os.getenv(
-        "DAILY_LOSS_LIMIT_PCT",
-        "5"
-    )
+    os.getenv("DAILY_LOSS_LIMIT_PCT", "5")
 )
 
 MAX_CONSECUTIVE_LOSSES = int(
-    os.getenv(
-        "MAX_CONSECUTIVE_LOSSES",
-        "3"
-    )
+    os.getenv("MAX_CONSECUTIVE_LOSSES", "3")
 )
 
 MIN_EQUITY_USDT = float(
@@ -323,7 +420,7 @@ MIN_EQUITY_USDT = float(
 
 
 # ============================================================
-# PROTECTION
+# OTHER
 # ============================================================
 
 REPAIR_EXISTING_POSITIONS = (
@@ -333,23 +430,13 @@ REPAIR_EXISTING_POSITIONS = (
     ).lower() == "true"
 )
 
-
-# ============================================================
-# REPORTING
-# ============================================================
-
 SCORE_REPORT_MIN = int(
     os.getenv("SCORE_REPORT_MIN", "30")
 )
 
-
-# ============================================================
-# LEARNING
-# ============================================================
-
 LEARNING_FILE = os.getenv(
     "LEARNING_FILE",
-    "v68_learning.json"
+    "v69_learning.json"
 )
 
 LEARNING_MIN_TRADES = int(
@@ -357,23 +444,12 @@ LEARNING_MIN_TRADES = int(
 )
 
 LEARNING_MAX_BONUS = float(
-    os.getenv(
-        "LEARNING_MAX_BONUS",
-        "3.0"
-    )
+    os.getenv("LEARNING_MAX_BONUS", "3.0")
 )
 
 LEARNING_MAX_PENALTY = float(
-    os.getenv(
-        "LEARNING_MAX_PENALTY",
-        "-3.0"
-    )
+    os.getenv("LEARNING_MAX_PENALTY", "-3.0")
 )
-
-
-# ============================================================
-# SESSION
-# ============================================================
 
 NIGHT_END_UTC = 6
 CORE_START_UTC = 7
@@ -461,13 +537,11 @@ if not API_KEY or not API_SECRET or not API_PASSWORD:
 
 if (
     not PAPER_TRADING
-    and LIVE_CONFIRM
-    != "YES_I_WANT_LIVE_TRADING"
+    and LIVE_CONFIRM != "YES_I_WANT_LIVE_TRADING"
 ):
     raise RuntimeError(
         "LIVE TRADING BLOCKED. "
-        "Set LIVE_CONFIRM="
-        "YES_I_WANT_LIVE_TRADING"
+        "Set LIVE_CONFIRM=YES_I_WANT_LIVE_TRADING"
     )
 
 
@@ -494,7 +568,7 @@ SYMBOLS = [
 
 if not SYMBOLS:
     raise RuntimeError(
-        "No configured symbols are available on BloFin."
+        "No configured symbols available on BloFin."
     )
 
 
@@ -502,7 +576,7 @@ if not SYMBOLS:
 # TELEGRAM
 # ============================================================
 
-def tg(message: str):
+def tg(message):
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -550,25 +624,18 @@ def safe_float(v, default=0.0):
     try:
         if v is None or v == "":
             return default
-
         return float(v)
-
     except Exception:
         return default
 
 
 def native(method_name, params=None):
 
-    fn = getattr(
-        exchange,
-        method_name,
-        None
-    )
+    fn = getattr(exchange, method_name, None)
 
     if fn is None:
         raise RuntimeError(
-            f"CCXT implicit endpoint missing: "
-            f"{method_name}"
+            f"CCXT implicit endpoint missing: {method_name}"
         )
 
     return fn(params or {})
@@ -587,30 +654,18 @@ def response_error(resp):
     if not isinstance(resp, dict):
         return str(resp)
 
-    code = str(
-        resp.get("code", "?")
-    )
-
-    msg = str(
-        resp.get("msg", "")
-    )
+    code = str(resp.get("code", "?"))
+    msg = str(resp.get("msg", ""))
 
     data = resp.get("data")
 
     if isinstance(data, dict):
 
-        dcode = data.get("code")
-        dmsg = data.get("msg")
+        if data.get("code") not in (None, "", "0"):
+            code = str(data.get("code"))
 
-        if dcode not in (
-            None,
-            "",
-            "0",
-        ):
-            code = str(dcode)
-
-        if dmsg:
-            msg = str(dmsg)
+        if data.get("msg"):
+            msg = str(data.get("msg"))
 
     elif isinstance(data, list):
 
@@ -619,20 +674,11 @@ def response_error(resp):
             if not isinstance(item, dict):
                 continue
 
-            item_code = str(
-                item.get("code")
-            )
+            item_code = str(item.get("code"))
 
-            if item_code not in (
-                "0",
-                "None",
-                "",
-            ):
+            if item_code not in ("0", "None", ""):
                 code = item_code
-                msg = str(
-                    item.get("msg")
-                    or msg
-                )
+                msg = str(item.get("msg") or msg)
                 break
 
     return f"{code} {msg}".strip()
@@ -640,10 +686,7 @@ def response_error(resp):
 
 def blofin_inst_id(symbol):
 
-    return (
-        symbol.split("/")[0]
-        + "-USDT"
-    )
+    return symbol.split("/")[0] + "-USDT"
 
 
 def floor_step(value, step):
@@ -655,9 +698,7 @@ def floor_step(value, step):
         return float(v)
 
     return float(
-        (
-            v / s
-        ).to_integral_value(
+        (v / s).to_integral_value(
             rounding=ROUND_DOWN
         ) * s
     )
@@ -672,44 +713,25 @@ def ceil_step(value, step):
         return float(v)
 
     return float(
-        (
-            v / s
-        ).to_integral_value(
+        (v / s).to_integral_value(
             rounding=ROUND_UP
         ) * s
     )
 
 
-def round_trade_price(
-    price,
-    tick,
-    side,
-    kind
-):
+def round_trade_price(price, tick, side, kind):
 
     if side == "long":
 
         if kind == "sl":
-            return floor_step(
-                price,
-                tick
-            )
+            return floor_step(price, tick)
 
-        return ceil_step(
-            price,
-            tick
-        )
+        return ceil_step(price, tick)
 
     if kind == "sl":
-        return ceil_step(
-            price,
-            tick
-        )
+        return ceil_step(price, tick)
 
-    return floor_step(
-        price,
-        tick
-    )
+    return floor_step(price, tick)
 
 
 # ============================================================
@@ -722,9 +744,7 @@ def get_instrument(symbol):
 
     resp = native(
         "public_get_market_instruments",
-        {
-            "instId": inst
-        }
+        {"instId": inst}
     )
 
     if not native_ok(resp):
@@ -751,15 +771,12 @@ def futures_account():
 
     resp = native(
         "private_get_account_balance",
-        {
-            "productType": "USDT-FUTURES"
-        }
+        {"productType": "USDT-FUTURES"}
     )
 
     if not native_ok(resp):
         raise RuntimeError(
-            f"Balance API failed: "
-            f"{response_error(resp)}"
+            f"Balance API failed: {response_error(resp)}"
         )
 
     data = resp.get("data") or {}
@@ -814,15 +831,14 @@ def get_positions():
 
     if not native_ok(resp):
         raise RuntimeError(
-            f"Positions API failed: "
-            f"{response_error(resp)}"
+            f"Positions API failed: {response_error(resp)}"
         )
 
     result = []
 
     for p in resp.get("data") or []:
 
-        pos_size = safe_float(
+        size = safe_float(
             p.get(
                 "positions",
                 p.get(
@@ -832,7 +848,7 @@ def get_positions():
             )
         )
 
-        if abs(pos_size) > 0:
+        if abs(size) > 0:
             result.append(p)
 
     return result
@@ -851,10 +867,7 @@ def position_symbol(p):
 def position_side(p):
 
     side = str(
-        p.get(
-            "positionSide",
-            "net"
-        )
+        p.get("positionSide", "net")
     ).lower()
 
     if side in ("long", "short"):
@@ -870,11 +883,7 @@ def position_side(p):
         )
     )
 
-    return (
-        "long"
-        if pos > 0
-        else "short"
-    )
+    return "long" if pos > 0 else "short"
 
 
 def position_entry(p):
@@ -884,10 +893,7 @@ def position_entry(p):
             "averagePrice",
             p.get(
                 "entryPrice",
-                p.get(
-                    "avgPrice",
-                    0
-                )
+                p.get("avgPrice", 0)
             )
         )
     )
@@ -896,25 +902,19 @@ def position_entry(p):
 def position_margin_mode(p):
 
     return str(
-        p.get(
-            "marginMode",
-            MARGIN_MODE
-        )
+        p.get("marginMode", MARGIN_MODE)
     ).lower()
 
 
 def position_id(p):
 
     return str(
-        p.get(
-            "positionId",
-            ""
-        ) or ""
+        p.get("positionId", "") or ""
     )
 
 
 # ============================================================
-# MARKET DATA
+# DATA
 # ============================================================
 
 def ohlcv_df(symbol, timeframe):
@@ -927,8 +927,7 @@ def ohlcv_df(symbol, timeframe):
 
     if len(rows) < 60:
         raise RuntimeError(
-            f"Not enough candles for "
-            f"{symbol} {timeframe}"
+            f"Not enough candles {symbol} {timeframe}"
         )
 
     df = pd.DataFrame(
@@ -956,20 +955,14 @@ def ohlcv_df(symbol, timeframe):
             errors="coerce"
         )
 
-    return (
-        df.dropna()
-        .reset_index(drop=True)
-    )
+    return df.dropna().reset_index(drop=True)
 
 
 # ============================================================
 # INDICATORS
 # ============================================================
 
-def wilder_smooth(
-    series,
-    period
-):
+def wilder_smooth(series, period):
 
     return series.ewm(
         alpha=1 / period,
@@ -983,28 +976,19 @@ def add_indicators(df):
 
     out["ema20"] = (
         out["close"]
-        .ewm(
-            span=20,
-            adjust=False
-        )
+        .ewm(span=20, adjust=False)
         .mean()
     )
 
     out["ema50"] = (
         out["close"]
-        .ewm(
-            span=50,
-            adjust=False
-        )
+        .ewm(span=50, adjust=False)
         .mean()
     )
 
     out["ema200"] = (
         out["close"]
-        .ewm(
-            span=200,
-            adjust=False
-        )
+        .ewm(span=200, adjust=False)
         .mean()
     )
 
@@ -1023,25 +1007,16 @@ def add_indicators(df):
     tr = pd.concat(
         [
             out["high"] - out["low"],
-            (
-                out["high"]
-                - prev_close
-            ).abs(),
-            (
-                out["low"]
-                - prev_close
-            ).abs(),
+            (out["high"] - prev_close).abs(),
+            (out["low"] - prev_close).abs(),
         ],
         axis=1
     ).max(axis=1)
 
     out["atr"] = (
-        tr.rolling(
-            ATR_PERIOD
-        ).mean()
+        tr.rolling(ATR_PERIOD).mean()
     )
 
-    # RSI
     up = (
         out["close"]
         .diff()
@@ -1055,54 +1030,31 @@ def add_indicators(df):
     )
 
     rs = (
-        wilder_smooth(
-            up,
-            RSI_PERIOD
-        )
+        wilder_smooth(up, RSI_PERIOD)
         /
         wilder_smooth(
             down,
             RSI_PERIOD
-        ).replace(
-            0,
-            np.nan
-        )
+        ).replace(0, np.nan)
     )
 
     out["rsi"] = (
-        100
-        -
-        (
-            100
-            /
-            (1 + rs)
-        )
+        100 - 100 / (1 + rs)
     )
 
-    # ADX
     up_move = out["high"].diff()
     down_move = -out["low"].diff()
 
     plus_dm = np.where(
-        (
-            up_move > down_move
-        )
-        &
-        (
-            up_move > 0
-        ),
+        (up_move > down_move)
+        & (up_move > 0),
         up_move,
         0.0
     )
 
     minus_dm = np.where(
-        (
-            down_move > up_move
-        )
-        &
-        (
-            down_move > 0
-        ),
+        (down_move > up_move)
+        & (down_move > 0),
         down_move,
         0.0
     )
@@ -1114,50 +1066,32 @@ def add_indicators(df):
 
     plus_di = (
         100
-        *
-        wilder_smooth(
+        * wilder_smooth(
             pd.Series(
                 plus_dm,
                 index=out.index
             ),
             ADX_PERIOD
         )
-        /
-        atr_w.replace(
-            0,
-            np.nan
-        )
+        / atr_w.replace(0, np.nan)
     )
 
     minus_di = (
         100
-        *
-        wilder_smooth(
+        * wilder_smooth(
             pd.Series(
                 minus_dm,
                 index=out.index
             ),
             ADX_PERIOD
         )
-        /
-        atr_w.replace(
-            0,
-            np.nan
-        )
+        / atr_w.replace(0, np.nan)
     )
 
     dx = (
         100
-        *
-        (
-            plus_di
-            - minus_di
-        ).abs()
-        /
-        (
-            plus_di
-            + minus_di
-        ).replace(
+        * (plus_di - minus_di).abs()
+        / (plus_di + minus_di).replace(
             0,
             np.nan
         )
@@ -1179,40 +1113,28 @@ def add_indicators(df):
 
     out["donchian_high"] = (
         out["high"]
-        .rolling(
-            DONCHIAN_LOOKBACK
-        )
+        .rolling(DONCHIAN_LOOKBACK)
         .max()
         .shift(1)
     )
 
     out["donchian_low"] = (
         out["low"]
-        .rolling(
-            DONCHIAN_LOOKBACK
-        )
+        .rolling(DONCHIAN_LOOKBACK)
         .min()
         .shift(1)
     )
 
-    # Generic candle returns.
-    # On 15m:
-    # ret1 = 15m
-    # ret3 = 45m
-    # ret6 = 90m
     out["ret1"] = (
-        out["close"]
-        .pct_change(1)
+        out["close"].pct_change(1)
     )
 
     out["ret3"] = (
-        out["close"]
-        .pct_change(3)
+        out["close"].pct_change(3)
     )
 
     out["ret6"] = (
-        out["close"]
-        .pct_change(6)
+        out["close"].pct_change(6)
     )
 
     return out
@@ -1229,18 +1151,14 @@ def session_state():
     if hour < NIGHT_END_UTC:
         return "NIGHT"
 
-    if (
-        CORE_START_UTC
-        <= hour
-        < CORE_END_UTC
-    ):
+    if CORE_START_UTC <= hour < CORE_END_UTC:
         return "CORE"
 
     return "SHOULDER"
 
 
 # ============================================================
-# BTC REGIME
+# BTC
 # ============================================================
 
 btc_cache = {
@@ -1255,8 +1173,7 @@ def btc_regime():
 
     if (
         btc_cache["data"]
-        and
-        now - btc_cache["ts"] < 60
+        and now - btc_cache["ts"] < 60
     ):
         return btc_cache["data"]
 
@@ -1300,35 +1217,19 @@ def btc_regime():
 
         "impulse_up": bool(
             a["close"] > a["ema20"]
-            and
-            a["ema20"] >= a["ema50"]
+            and a["ema20"] >= a["ema50"]
         ),
 
         "impulse_down": bool(
             a["close"] < a["ema20"]
-            and
-            a["ema20"] <= a["ema50"]
+            and a["ema20"] <= a["ema50"]
         ),
 
-        "ret15": safe_float(
-            a["ret1"]
-        ),
-
-        "ret45": safe_float(
-            a["ret3"]
-        ),
-
-        "ret90": safe_float(
-            a["ret6"]
-        ),
-
-        "adx": safe_float(
-            a["adx"]
-        ),
-
-        "close": safe_float(
-            a["close"]
-        ),
+        "ret15": safe_float(a["ret1"]),
+        "ret45": safe_float(a["ret3"]),
+        "ret90": safe_float(a["ret6"]),
+        "adx": safe_float(a["adx"]),
+        "close": safe_float(a["close"]),
     }
 
     btc_cache["ts"] = now
@@ -1338,16 +1239,245 @@ def btc_regime():
 
 
 # ============================================================
+# IMPULSE MEMORY V6.9
+# ============================================================
+
+def analyse_impulse_memory(
+    df15,
+    current_price,
+    ema20,
+    atr,
+    side
+):
+
+    start = -(
+        IMPULSE_MEMORY_BARS + 2
+    )
+
+    recent = df15.iloc[
+        start:-2
+    ].copy()
+
+    bull_impulses = []
+    bear_impulses = []
+
+    for local_index, (_, row) in enumerate(
+        recent.iterrows()
+    ):
+
+        row_atr = safe_float(
+            row.get("atr"),
+            atr
+        )
+
+        if row_atr <= 0:
+            continue
+
+        o = safe_float(row["open"])
+        h = safe_float(row["high"])
+        l = safe_float(row["low"])
+        c = safe_float(row["close"])
+
+        body = abs(c - o)
+        rng = max(0.0, h - l)
+
+        if rng <= 0:
+            continue
+
+        close_location = (
+            (c - l) / rng
+        )
+
+        bull = (
+            c > o
+            and (
+                body
+                >=
+                IMPULSE_MEMORY_BODY_ATR
+                * row_atr
+
+                or (
+                    rng
+                    >=
+                    IMPULSE_MEMORY_RANGE_ATR
+                    * row_atr
+
+                    and close_location >= 0.72
+                )
+            )
+        )
+
+        bear = (
+            c < o
+            and (
+                body
+                >=
+                IMPULSE_MEMORY_BODY_ATR
+                * row_atr
+
+                or (
+                    rng
+                    >=
+                    IMPULSE_MEMORY_RANGE_ATR
+                    * row_atr
+
+                    and close_location <= 0.28
+                )
+            )
+        )
+
+        if bull:
+            bull_impulses.append(
+                {
+                    "i": local_index,
+                    "high": h,
+                    "low": l,
+                    "close": c,
+                }
+            )
+
+        if bear:
+            bear_impulses.append(
+                {
+                    "i": local_index,
+                    "high": h,
+                    "low": l,
+                    "close": c,
+                }
+            )
+
+    current = df15.iloc[-2]
+    previous = df15.iloc[-3]
+
+    recent_low_now = min(
+        safe_float(current["low"]),
+        safe_float(previous["low"])
+    )
+
+    recent_high_now = max(
+        safe_float(current["high"]),
+        safe_float(previous["high"])
+    )
+
+    if side == "long":
+
+        if not bull_impulses:
+            return {
+                "recent_impulse": False,
+                "bars_since": 999,
+                "reset": True,
+                "no_chase": False,
+                "reset_depth_atr": 0.0,
+            }
+
+        imp = bull_impulses[-1]
+
+        bars_since = (
+            len(recent)
+            - imp["i"]
+        )
+
+        impulse_high = max(
+            x["high"]
+            for x in bull_impulses[
+                max(0, len(bull_impulses) - 2):
+            ]
+        )
+
+        reset_depth = (
+            impulse_high
+            - recent_low_now
+        ) / atr
+
+        ema_distance_atr = (
+            current_price - ema20
+        ) / atr
+
+        reset = (
+            bars_since
+            >= IMPULSE_RESET_MIN_BARS
+            and
+            reset_depth
+            >= IMPULSE_RESET_ATR
+            and
+            current_price >= ema20 * 0.997
+            and
+            ema_distance_atr
+            <= RESET_MAX_EMA_ATR
+        )
+
+        return {
+            "recent_impulse": True,
+            "bars_since": bars_since,
+            "reset": reset,
+            "no_chase": not reset,
+            "reset_depth_atr": reset_depth,
+        }
+
+    if not bear_impulses:
+        return {
+            "recent_impulse": False,
+            "bars_since": 999,
+            "reset": True,
+            "no_chase": False,
+            "reset_depth_atr": 0.0,
+        }
+
+    imp = bear_impulses[-1]
+
+    bars_since = (
+        len(recent)
+        - imp["i"]
+    )
+
+    impulse_low = min(
+        x["low"]
+        for x in bear_impulses[
+            max(0, len(bear_impulses) - 2):
+        ]
+    )
+
+    reset_depth = (
+        recent_high_now
+        - impulse_low
+    ) / atr
+
+    ema_distance_atr = (
+        ema20 - current_price
+    ) / atr
+
+    reset = (
+        bars_since
+        >= IMPULSE_RESET_MIN_BARS
+        and
+        reset_depth
+        >= IMPULSE_RESET_ATR
+        and
+        current_price <= ema20 * 1.003
+        and
+        ema_distance_atr
+        <= RESET_MAX_EMA_ATR
+    )
+
+    return {
+        "recent_impulse": True,
+        "bars_since": bars_since,
+        "reset": reset,
+        "no_chase": not reset,
+        "reset_depth_atr": reset_depth,
+    }
+
+
+# ============================================================
 # LEARNING
 # ============================================================
 
 learning = {
-    "version": 2,
+    "version": 3,
     "trades": 0,
     "wins": 0,
     "losses": 0,
     "fingerprints": {},
-    "symbols": {},
 }
 
 
@@ -1361,26 +1491,29 @@ def load_learning():
         return
 
     try:
+
         with open(
             LEARNING_FILE,
             "r",
             encoding="utf-8"
         ) as f:
+
             data = json.load(f)
 
         if isinstance(data, dict):
             learning.update(data)
 
     except Exception as e:
+
         tg(
-            f"⚠️ Learning file ignored: "
-            f"{e}"
+            f"⚠️ Learning file ignored: {e}"
         )
 
 
 def save_learning():
 
     try:
+
         tmp = LEARNING_FILE + ".tmp"
 
         with open(
@@ -1388,6 +1521,7 @@ def save_learning():
             "w",
             encoding="utf-8"
         ) as f:
+
             json.dump(
                 learning,
                 f,
@@ -1410,40 +1544,24 @@ def fingerprint(signal):
     )
 
     if adx >= 40:
-        adx_bucket = "very_strong"
-
+        bucket = "very_strong"
     elif adx >= 30:
-        adx_bucket = "strong"
-
+        bucket = "strong"
     elif adx >= 22:
-        adx_bucket = "trend"
-
+        bucket = "trend"
     else:
-        adx_bucket = "weak"
-
-    structure = (
-        "sweep"
-        if signal.get("sweep")
-        else
-        "pullback"
-        if signal.get(
-            "pullback_quality",
-            0
-        ) >= 2
-        else
-        "continuation"
-    )
+        bucket = "weak"
 
     return "|".join(
         [
+            str(signal.get("side", "?")),
             str(
                 signal.get(
-                    "side",
-                    "?"
+                    "entry_type",
+                    "unknown"
                 )
             ),
-            adx_bucket,
-            structure,
+            bucket,
             str(
                 signal.get(
                     "btc_regime",
@@ -1472,10 +1590,7 @@ def learning_adjustment(signal):
 
     rec = (
         learning
-        .get(
-            "fingerprints",
-            {}
-        )
+        .get("fingerprints", {})
         .get(fp)
     )
 
@@ -1483,27 +1598,18 @@ def learning_adjustment(signal):
         return 0.0
 
     trades = int(
-        rec.get(
-            "trades",
-            0
-        )
+        rec.get("trades", 0)
     )
 
     if trades < 5:
         return 0.0
 
     wins = int(
-        rec.get(
-            "wins",
-            0
-        )
+        rec.get("wins", 0)
     )
 
     net = safe_float(
-        rec.get(
-            "net",
-            0
-        )
+        rec.get("net", 0)
     )
 
     wr = wins / trades
@@ -1562,6 +1668,7 @@ def adaptive_threshold(signal):
         and momentum >= 2
         and entry_quality >= 2
     ):
+
         threshold = min(
             threshold,
             STRONG_REGIME_MIN_SCORE
@@ -1572,6 +1679,7 @@ def adaptive_threshold(signal):
         and confirm >= 3
         and momentum >= 2
     ):
+
         threshold = max(
             HARD_MIN_SCORE,
             threshold - 2
@@ -1599,6 +1707,7 @@ def evaluate_symbol(symbol, btc):
         sess == "NIGHT"
         and symbol not in MAJORS
     ):
+
         return {
             "symbol": symbol,
             "side": None,
@@ -1612,6 +1721,7 @@ def evaluate_symbol(symbol, btc):
             "confirm_components": 0,
             "adx": 0,
             "rel": 0,
+            "entry_type": "NONE",
         }
 
     df15 = add_indicators(
@@ -1643,18 +1753,12 @@ def evaluate_symbol(symbol, btc):
 
     t = df1h.iloc[-2]
 
-    price = safe_float(
-        a["close"]
-    )
-
-    atr = safe_float(
-        a["atr"]
-    )
+    price = safe_float(a["close"])
+    atr = safe_float(a["atr"])
 
     if (
         price <= 0
-        or
-        not np.isfinite(atr)
+        or not np.isfinite(atr)
         or atr <= 0
     ):
         return None
@@ -1666,40 +1770,22 @@ def evaluate_symbol(symbol, btc):
         50
     )
 
-    adx = safe_float(
-        a["adx"]
+    adx = safe_float(a["adx"])
+    previous_adx = safe_float(
+        a_prev["adx"]
     )
 
     # --------------------------------------------------------
-    # MULTI-HORIZON RELATIVE STRENGTH
+    # RELATIVE STRENGTH
     # --------------------------------------------------------
 
-    coin_ret15 = safe_float(
-        a["ret1"]
-    )
+    coin_ret15 = safe_float(a["ret1"])
+    coin_ret45 = safe_float(a["ret3"])
+    coin_ret90 = safe_float(a["ret6"])
 
-    coin_ret45 = safe_float(
-        a["ret3"]
-    )
-
-    coin_ret90 = safe_float(
-        a["ret6"]
-    )
-
-    rel15 = (
-        coin_ret15
-        - btc["ret15"]
-    )
-
-    rel45 = (
-        coin_ret45
-        - btc["ret45"]
-    )
-
-    rel90 = (
-        coin_ret90
-        - btc["ret90"]
-    )
+    rel15 = coin_ret15 - btc["ret15"]
+    rel45 = coin_ret45 - btc["ret45"]
+    rel90 = coin_ret90 - btc["ret90"]
 
     rel = (
         rel15 * 0.50
@@ -1718,20 +1804,12 @@ def evaluate_symbol(symbol, btc):
     )
 
     # --------------------------------------------------------
-    # EMA
+    # EMA / TREND
     # --------------------------------------------------------
 
-    ema20_15 = safe_float(
-        a["ema20"]
-    )
-
-    ema50_15 = safe_float(
-        a["ema50"]
-    )
-
-    ema20_5 = safe_float(
-        c["ema20"]
-    )
+    ema20_15 = safe_float(a["ema20"])
+    ema50_15 = safe_float(a["ema50"])
+    ema20_5 = safe_float(c["ema20"])
 
     ema20_slope = safe_float(
         a["ema20_slope"]
@@ -1740,10 +1818,6 @@ def evaluate_symbol(symbol, btc):
     ema20_slope_pct = (
         ema20_slope / price
     )
-
-    # --------------------------------------------------------
-    # TREND
-    # --------------------------------------------------------
 
     stack_long = (
         t["ema20"]
@@ -1781,9 +1855,8 @@ def evaluate_symbol(symbol, btc):
 
     volume_ok = False
 
-    if pd.notna(
-        a["vol_sma20"]
-    ):
+    if pd.notna(a["vol_sma20"]):
+
         volume_ok = (
             a["volume"]
             >
@@ -1799,9 +1872,7 @@ def evaluate_symbol(symbol, btc):
         price - ema20_15
     ) / price
 
-    abs_dist_ema = abs(
-        dist_ema
-    )
+    abs_dist_ema = abs(dist_ema)
 
     near_ema = (
         abs_dist_ema
@@ -1841,27 +1912,48 @@ def evaluate_symbol(symbol, btc):
         or touched_ema_short
     )
 
+    pullback_quality_long = (
+        3
+        if near_ema
+        else
+        2
+        if touched_ema_long
+        else 0
+    )
+
+    pullback_quality_short = (
+        3
+        if near_ema
+        else
+        2
+        if touched_ema_short
+        else 0
+    )
+
     # --------------------------------------------------------
     # EXTENSION
     # --------------------------------------------------------
 
     ext_long = (
-        dist_ema
-        > MAX_EMA_EXT_PCT
+        dist_ema > MAX_EMA_EXT_PCT
     )
 
     ext_short = (
-        dist_ema
-        < -MAX_EMA_EXT_PCT
+        dist_ema < -MAX_EMA_EXT_PCT
     )
 
     # --------------------------------------------------------
-    # IMPULSE
+    # CURRENT IMPULSE
     # --------------------------------------------------------
 
     bar15_range = (
         safe_float(a["high"])
         - safe_float(a["low"])
+    )
+
+    bar15_body = abs(
+        safe_float(a["close"])
+        - safe_float(a["open"])
     )
 
     bar1h_range = (
@@ -1931,8 +2023,7 @@ def evaluate_symbol(symbol, btc):
         <
         recent_low
         - NEAR_SWEEP_ATR * atr
-        and
-        price > recent_low
+        and price > recent_low
     )
 
     sweep_short = (
@@ -1940,8 +2031,7 @@ def evaluate_symbol(symbol, btc):
         >
         recent_high
         + NEAR_SWEEP_ATR * atr
-        and
-        price < recent_high
+        and price < recent_high
     )
 
     structure_long = (
@@ -1986,28 +2076,24 @@ def evaluate_symbol(symbol, btc):
     confirm_long_components = 0
     confirm_short_components = 0
 
-    # EMA alignment
     if c["ema20"] > c["ema50"]:
         confirm_long_components += 1
 
     if c["ema20"] < c["ema50"]:
         confirm_short_components += 1
 
-    # Price relative to EMA
     if c["close"] > c["ema20"]:
         confirm_long_components += 1
 
     if c["close"] < c["ema20"]:
         confirm_short_components += 1
 
-    # Immediate momentum
     if c["close"] > c_prev["close"]:
         confirm_long_components += 1
 
     if c["close"] < c_prev["close"]:
         confirm_short_components += 1
 
-    # Pullback/rejection
     if bounce_5m:
         confirm_long_components += 1
 
@@ -2023,7 +2109,7 @@ def evaluate_symbol(symbol, btc):
     )
 
     # --------------------------------------------------------
-    # QUALITY / REGIME
+    # REGIME
     # --------------------------------------------------------
 
     atr_quality = (
@@ -2077,16 +2163,11 @@ def evaluate_symbol(symbol, btc):
     # RS
     # --------------------------------------------------------
 
-    rs_long = (
-        rel > RS_WEAK
-    )
+    rs_long = rel > RS_WEAK
+    rs_short = rel < -RS_WEAK
 
     rs_strong_long = (
         rel > RS_OVERRIDE
-    )
-
-    rs_short = (
-        rel < -RS_WEAK
     )
 
     rs_strong_short = (
@@ -2108,6 +2189,66 @@ def evaluate_symbol(symbol, btc):
     )
 
     # --------------------------------------------------------
+    # EARLY BREAKOUT V6.9
+    # --------------------------------------------------------
+
+    breakout_slice = df15.iloc[
+        -(
+            EARLY_BREAKOUT_LOOKBACK
+            + 2
+        ):
+        -2
+    ]
+
+    breakout_high = (
+        breakout_slice["high"].max()
+    )
+
+    breakout_low = (
+        breakout_slice["low"].min()
+    )
+
+    early_breakout_long = (
+        price > breakout_high
+    )
+
+    early_breakout_short = (
+        price < breakout_low
+    )
+
+    adx_rising = (
+        adx >= previous_adx - 1.0
+    )
+
+    current_candle_not_extreme = (
+        bar15_body
+        <= EARLY_MAX_BODY_ATR * atr
+        and
+        bar15_range
+        <= EARLY_MAX_RANGE_ATR * atr
+    )
+
+    # --------------------------------------------------------
+    # IMPULSE MEMORY V6.9
+    # --------------------------------------------------------
+
+    impulse_long = analyse_impulse_memory(
+        df15,
+        price,
+        ema20_15,
+        atr,
+        "long"
+    )
+
+    impulse_short = analyse_impulse_memory(
+        df15,
+        price,
+        ema20_15,
+        atr,
+        "short"
+    )
+
+    # --------------------------------------------------------
     # SCORE
     # --------------------------------------------------------
 
@@ -2117,7 +2258,6 @@ def evaluate_symbol(symbol, btc):
     long_tactics = 0
     short_tactics = 0
 
-    # 1H trend
     if stack_long:
         long_score += 16
         long_tactics += 1
@@ -2132,7 +2272,6 @@ def evaluate_symbol(symbol, btc):
     elif fast_short:
         short_score += 7
 
-    # 15m directional trend
     if trend_long:
         long_score += 12
         long_tactics += 1
@@ -2141,12 +2280,10 @@ def evaluate_symbol(symbol, btc):
         short_score += 12
         short_tactics += 1
 
-    # Volume = QUALITY ONLY
     if volume_ok:
         long_score += 6
         short_score += 6
 
-    # Structure
     if structure_long:
 
         long_score += (
@@ -2167,7 +2304,6 @@ def evaluate_symbol(symbol, btc):
 
         short_tactics += 1
 
-    # 5m directional confirmation
     if confirm_long:
 
         long_score += (
@@ -2188,12 +2324,10 @@ def evaluate_symbol(symbol, btc):
 
         short_tactics += 1
 
-    # ATR = QUALITY ONLY
     if atr_quality:
         long_score += 4
         short_score += 4
 
-    # ADX = quality/regime
     if trending:
         long_score += 5
         short_score += 5
@@ -2206,7 +2340,6 @@ def evaluate_symbol(symbol, btc):
         long_score += 3
         short_score += 3
 
-    # Directional momentum
     if momentum_quality_long >= 2:
         long_score += 4
         long_tactics += 1
@@ -2215,8 +2348,8 @@ def evaluate_symbol(symbol, btc):
         short_score += 4
         short_tactics += 1
 
-    # Persistent relative strength
     if rs_strong_long:
+
         long_score += 6
         long_tactics += 1
 
@@ -2224,10 +2357,12 @@ def evaluate_symbol(symbol, btc):
         rs_long
         and rs_persistent_long
     ):
+
         long_score += 3
         long_tactics += 1
 
     if rs_strong_short:
+
         short_score += 6
         short_tactics += 1
 
@@ -2235,10 +2370,10 @@ def evaluate_symbol(symbol, btc):
         rs_short
         and rs_persistent_short
     ):
+
         short_score += 3
         short_tactics += 1
 
-    # RS failure
     if rs_failure_short:
         short_score += 5
         short_tactics += 1
@@ -2254,7 +2389,7 @@ def evaluate_symbol(symbol, btc):
     if long_score >= short_score:
 
         side = "long"
-        score = long_score
+        base_score = long_score
         tactics = long_tactics
 
         confirm_components = (
@@ -2268,20 +2403,26 @@ def evaluate_symbol(symbol, btc):
         )
 
         pullback_quality = (
-            3
-            if near_ema
-            else
-            2
-            if touched_ema_long
-            else 0
+            pullback_quality_long
         )
 
         sweep = sweep_long
 
+        side_impulse = impulse_long
+
+        early_breakout = (
+            early_breakout_long
+        )
+
+        side_trend = trend_long
+        side_fast = fast_long
+
+        side_extended = ext_long
+
     else:
 
         side = "short"
-        score = short_score
+        base_score = short_score
         tactics = short_tactics
 
         confirm_components = (
@@ -2295,15 +2436,21 @@ def evaluate_symbol(symbol, btc):
         )
 
         pullback_quality = (
-            3
-            if near_ema
-            else
-            2
-            if touched_ema_short
-            else 0
+            pullback_quality_short
         )
 
         sweep = sweep_short
+
+        side_impulse = impulse_short
+
+        early_breakout = (
+            early_breakout_short
+        )
+
+        side_trend = trend_short
+        side_fast = fast_short
+
+        side_extended = ext_short
 
     # --------------------------------------------------------
     # ENTRY QUALITY
@@ -2316,12 +2463,6 @@ def evaluate_symbol(symbol, btc):
 
     elif pullback_quality >= 2:
         entry_quality += 1
-
-    side_extended = (
-        ext_long
-        if side == "long"
-        else ext_short
-    )
 
     if not side_extended:
         entry_quality += 1
@@ -2354,156 +2495,354 @@ def evaluate_symbol(symbol, btc):
     else:
         btc_regime_label = "BTC_NEUTRAL"
 
+    # ========================================================
+    # V6.9 ENTRY ROUTE 1: EARLY MOMENTUM
+    # ========================================================
+
+    early_ema_ok = (
+        abs_dist_ema
+        <= EARLY_MAX_EMA_EXT_PCT
+    )
+
+    if side == "long":
+
+        early_run_ok = (
+            run8 <= EARLY_MAX_RUN_PCT
+        )
+
+        early_rsi_ok = (
+            rsi < min(
+                RSI_LONG_MAX,
+                66
+            )
+        )
+
+        early_price_side_ok = (
+            price > ema20_15
+        )
+
+    else:
+
+        early_run_ok = (
+            run8 >= -EARLY_MAX_RUN_PCT
+        )
+
+        early_rsi_ok = (
+            rsi > max(
+                RSI_SHORT_MIN,
+                34
+            )
+        )
+
+        early_price_side_ok = (
+            price < ema20_15
+        )
+
+    early_candidate = (
+        side_trend
+        and side_fast
+        and early_breakout
+        and volume_ok
+        and confirm_components >= 3
+        and momentum_quality >= 2
+        and adx >= EARLY_ADX_MIN
+        and adx <= EARLY_ADX_MAX
+        and adx_rising
+        and early_ema_ok
+        and early_run_ok
+        and early_rsi_ok
+        and early_price_side_ok
+        and current_candle_not_extreme
+        and not impulse_15
+        and not side_impulse["no_chase"]
+        and atr_quality
+    )
+
+    early_score = (
+        base_score
+        + EARLY_SETUP_BONUS
+        if early_candidate
+        else base_score
+    )
+
+    # ========================================================
+    # V6.9 ENTRY ROUTE 2: PULLBACK
+    # ========================================================
+
+    pullback_candidate = (
+        structure
+        and pullback_quality >= 2
+        and confirm_components >= 3
+        and trending
+        and atr_quality
+        and not side_extended
+    )
+
+    # Important:
+    # if there was a large recent impulse,
+    # a real reset is REQUIRED.
+    if (
+        pullback_candidate
+        and side_impulse["recent_impulse"]
+        and not side_impulse["reset"]
+    ):
+        pullback_candidate = False
+
+    # --------------------------------------------------------
+    # SELECT ENTRY TYPE
+    # --------------------------------------------------------
+
+    if early_candidate:
+
+        entry_type = "EARLY_MOMENTUM"
+        score = early_score
+
+    elif pullback_candidate:
+
+        entry_type = "PULLBACK"
+        score = base_score
+
+    else:
+
+        entry_type = "NONE"
+        score = base_score
+
     preliminary = {
         "side": side,
         "adx": adx,
-        "confirm_components": confirm_components,
-        "momentum_quality": momentum_quality,
-        "entry_quality": entry_quality,
-        "pullback_quality": pullback_quality,
+        "confirm_components":
+            confirm_components,
+        "momentum_quality":
+            momentum_quality,
+        "entry_quality":
+            entry_quality,
+        "pullback_quality":
+            pullback_quality,
         "sweep": sweep,
-        "btc_regime": btc_regime_label,
+        "btc_regime":
+            btc_regime_label,
         "session": sess,
+        "entry_type": entry_type,
     }
 
-    threshold = adaptive_threshold(
-        preliminary
-    )
+    if entry_type == "EARLY_MOMENTUM":
 
-    skip_reasons = []
+        threshold = max(
+            HARD_MIN_SCORE,
+            EARLY_MIN_SCORE
+        )
 
-    # Shoulder = slightly harder
+    else:
+
+        threshold = adaptive_threshold(
+            preliminary
+        )
+
+    # Shoulder slightly harder
     if sess == "SHOULDER":
         score -= 4
 
+    skip_reasons = []
+
+    # --------------------------------------------------------
+    # ENTRY ROUTE CHECK
+    # --------------------------------------------------------
+
+    if entry_type == "NONE":
+
+        if side_impulse["no_chase"]:
+
+            skip_reasons.append(
+                "impulse-memory"
+            )
+
+        elif (
+            early_breakout
+            and not current_candle_not_extreme
+        ):
+
+            skip_reasons.append(
+                "breakout-too-large"
+            )
+
+        elif (
+            early_breakout
+            and not volume_ok
+        ):
+
+            skip_reasons.append(
+                "early-no-volume"
+            )
+
+        elif (
+            early_breakout
+            and not early_ema_ok
+        ):
+
+            skip_reasons.append(
+                "early-too-extended"
+            )
+
+        elif pullback_quality < 2:
+
+            skip_reasons.append(
+                "waiting-entry"
+            )
+
+        else:
+
+            skip_reasons.append(
+                "no-entry-route"
+            )
+
+    # --------------------------------------------------------
+    # ADX
+    # --------------------------------------------------------
+
     if choppy:
+
         skip_reasons.append(
             "adx-chop"
         )
 
-    # Also require the trend threshold.
-    if not trending:
-        skip_reasons.append(
-            f"adx-{adx:.0f}<{ADX_TREND:.0f}"
-        )
+    if entry_type == "EARLY_MOMENTUM":
 
+        if adx < EARLY_ADX_MIN:
+
+            skip_reasons.append(
+                f"early-adx-{adx:.0f}"
+                f"<{EARLY_ADX_MIN:.0f}"
+            )
+
+    else:
+
+        if not trending:
+
+            skip_reasons.append(
+                f"adx-{adx:.0f}"
+                f"<{ADX_TREND:.0f}"
+            )
+
+    # --------------------------------------------------------
     # RSI
+    # --------------------------------------------------------
+
     if (
         side == "long"
         and rsi >= RSI_LONG_MAX
     ):
-        if (
-            not very_strong_trend
-            or entry_quality < 2
-        ):
-            skip_reasons.append(
-                "rsi-overbought"
-            )
+
+        skip_reasons.append(
+            "rsi-overbought"
+        )
 
     if (
         side == "short"
         and rsi <= RSI_SHORT_MIN
     ):
-        if (
-            not very_strong_trend
-            or entry_quality < 2
-        ):
-            skip_reasons.append(
-                "rsi-oversold"
-            )
 
-    # Extension
-    if side == "long":
+        skip_reasons.append(
+            "rsi-oversold"
+        )
 
-        if (
-            ext_long
-            and not (
-                very_strong_trend
-                and
-                confirm_long_components >= 4
-                and
-                pullback_quality >= 2
-            )
-        ):
-            skip_reasons.append(
-                "extended-long"
-            )
+    # --------------------------------------------------------
+    # HARD NO CHASE
+    # --------------------------------------------------------
 
-    else:
+    if side_impulse["no_chase"]:
 
-        if (
-            ext_short
-            and not (
-                very_strong_trend
-                and
-                confirm_short_components >= 4
-                and
-                pullback_quality >= 2
-            )
-        ):
-            skip_reasons.append(
-                "extended-short"
-            )
+        # This is the key V6.9 protection.
+        # Strong ADX does NOT override it.
+        if entry_type != "EARLY_MOMENTUM":
 
-    # Impulse chase
+            if "impulse-memory" not in skip_reasons:
+                skip_reasons.append(
+                    "impulse-memory"
+                )
+
+    # --------------------------------------------------------
+    # CURRENT HUGE CANDLE
+    # --------------------------------------------------------
+
     if (
         impulse_15
-        or impulse_1h
+        and entry_type == "EARLY_MOMENTUM"
     ):
 
-        if not (
-            very_strong_trend
-            and
-            pullback_quality >= 2
-            and
-            confirm_components >= 3
-        ):
-            skip_reasons.append(
-                "impulse-chase"
-            )
+        skip_reasons.append(
+            "early-current-impulse"
+        )
 
-    # Extended run
+    # --------------------------------------------------------
+    # EXTENSION
+    # --------------------------------------------------------
+
+    if side_extended:
+
+        skip_reasons.append(
+            "extended-long"
+            if side == "long"
+            else "extended-short"
+        )
+
+    # --------------------------------------------------------
+    # RUN
+    # --------------------------------------------------------
+
     if (
         side == "long"
         and run8 > MAX_RUN_PCT
     ):
 
-        if not (
-            very_strong_trend
-            and pullback_quality >= 2
-        ):
-            skip_reasons.append(
-                "extended-run"
-            )
+        skip_reasons.append(
+            "extended-run"
+        )
 
     if (
         side == "short"
         and run8 < -MAX_RUN_PCT
     ):
 
-        if not (
-            very_strong_trend
-            and pullback_quality >= 2
-        ):
-            skip_reasons.append(
-                "extended-run"
-            )
+        skip_reasons.append(
+            "extended-run"
+        )
 
-    # BTC direction
+    # --------------------------------------------------------
+    # BTC DIRECTION
+    # --------------------------------------------------------
+
     if symbol not in MAJORS:
 
         if side == "long":
 
             if btc["impulse_down"]:
 
-                if not rs_failure_long:
+                # Early momentum against a BTC impulse
+                # requires actual positive RS.
+                if entry_type == "EARLY_MOMENTUM":
+
+                    if not rs_long:
+                        skip_reasons.append(
+                            "btc-against-early-long"
+                        )
+
+                elif not rs_failure_long:
+
                     skip_reasons.append(
                         "btc-against-long"
                     )
 
             elif btc["bear"]:
 
-                if not rs_strong_long:
+                if not (
+                    rs_strong_long
+                    or (
+                        entry_type
+                        == "EARLY_MOMENTUM"
+                        and rs_persistent_long
+                    )
+                ):
+
                     skip_reasons.append(
                         "btc-bear"
                     )
@@ -2512,7 +2851,15 @@ def evaluate_symbol(symbol, btc):
 
             if btc["impulse_up"]:
 
-                if not rs_failure_short:
+                if entry_type == "EARLY_MOMENTUM":
+
+                    if not rs_short:
+                        skip_reasons.append(
+                            "btc-against-early-short"
+                        )
+
+                elif not rs_failure_short:
+
                     skip_reasons.append(
                         "btc-against-short"
                     )
@@ -2522,108 +2869,110 @@ def evaluate_symbol(symbol, btc):
                 if not (
                     rs_strong_short
                     or rs_failure_short
+                    or (
+                        entry_type
+                        == "EARLY_MOMENTUM"
+                        and rs_persistent_short
+                    )
                 ):
+
                     skip_reasons.append(
                         "btc-bull-weak-short"
                     )
 
-    # 5m confirmation
+    # --------------------------------------------------------
+    # 5M
+    # --------------------------------------------------------
+
     if confirm_components < 3:
 
-        strong_override = (
-            very_strong_trend
-            and
-            momentum_quality >= 2
-            and
-            structure
-            and
-            pullback_quality >= 2
-            and
-            entry_quality >= 3
+        skip_reasons.append(
+            f"5m-{confirm_components}/4"
         )
 
-        if not strong_override:
-            skip_reasons.append(
-                f"5m-{confirm_components}/4"
-            )
+    # --------------------------------------------------------
+    # TACTICS
+    # --------------------------------------------------------
 
-    required_tactics = (
-        STRONG_MIN_TACTICS
-        if very_strong_trend
-        else MIN_TACTICS
-    )
+    if entry_type == "EARLY_MOMENTUM":
+
+        required_tactics = (
+            EARLY_MIN_TACTICS
+        )
+
+    else:
+
+        required_tactics = (
+            STRONG_MIN_TACTICS
+            if very_strong_trend
+            else MIN_TACTICS
+        )
 
     if tactics < required_tactics:
+
         skip_reasons.append(
-            f"tactics-"
-            f"{tactics}/"
+            f"tactics-{tactics}/"
             f"{required_tactics}"
         )
 
+    # --------------------------------------------------------
+    # SCORE
+    # --------------------------------------------------------
+
     if score < threshold:
+
         skip_reasons.append(
-            f"score-"
-            f"{score:.0f}<"
-            f"{threshold:.0f}"
+            f"score-{score:.0f}"
+            f"<{threshold:.0f}"
         )
 
     if not atr_quality:
+
         skip_reasons.append(
             "atr-band"
         )
 
     # --------------------------------------------------------
     # SECOND CHANCE
+    # Only applies to PULLBACK.
+    # Never overrides impulse memory.
     # --------------------------------------------------------
 
     second_chance = False
 
     if (
-        score >= HARD_MIN_SCORE
-        and
-        score < threshold
-        and
-        adx >= ADX_STRONG
-        and
-        momentum_quality >= 2
-        and
-        structure
-        and
-        confirm_components >= 3
-        and
-        entry_quality >= 3
-        and
-        pullback_quality >= 2
-        and
-        not impulse_15
+        entry_type == "PULLBACK"
+        and score >= HARD_MIN_SCORE
+        and score < threshold
+        and adx >= ADX_STRONG
+        and momentum_quality >= 2
+        and structure
+        and confirm_components >= 3
+        and entry_quality >= 3
+        and pullback_quality >= 2
+        and not impulse_15
+        and not side_impulse["no_chase"]
     ):
+
         second_chance = True
 
         skip_reasons = [
             x for x in skip_reasons
-            if not x.startswith(
-                "score-"
-            )
+            if not x.startswith("score-")
         ]
 
-    # Valid RS failures can override corresponding BTC conflict.
-    if (
-        side == "short"
-        and rs_failure_short
-    ):
-        skip_reasons = [
-            x for x in skip_reasons
-            if x != "btc-bull-weak-short"
-        ]
+    # --------------------------------------------------------
+    # DEDUPLICATE SKIPS
+    # --------------------------------------------------------
 
-    if (
-        side == "long"
-        and rs_failure_long
-    ):
-        skip_reasons = [
-            x for x in skip_reasons
-            if x != "btc-bear"
-        ]
+    unique_skips = []
+
+    for reason in skip_reasons:
+
+        if reason not in unique_skips:
+            unique_skips.append(reason)
+
+    skip_reasons = unique_skips
 
     final_skip = (
         skip_reasons[0]
@@ -2631,33 +2980,60 @@ def evaluate_symbol(symbol, btc):
         else None
     )
 
-    learning_bonus = (
-        learning_adjustment(
-            preliminary
-        )
-    )
-
     return {
         "symbol": symbol,
         "side": side,
-        "score": float(score),
-        "tactics": tactics,
-        "threshold": threshold,
-        "second_chance": second_chance,
-        "price": price,
-        "atr": atr,
-        "atr_pct": atr_pct,
-        "rsi": rsi,
-        "adx": adx,
 
-        "rel": rel,
-        "rel15": rel15,
-        "rel45": rel45,
-        "rel90": rel90,
+        "entry_type":
+            entry_type,
 
-        "confirm": (
-            confirm_components >= 3
-        ),
+        "score":
+            float(score),
+
+        "base_score":
+            float(base_score),
+
+        "tactics":
+            tactics,
+
+        "threshold":
+            threshold,
+
+        "second_chance":
+            second_chance,
+
+        "price":
+            price,
+
+        "atr":
+            atr,
+
+        "atr_pct":
+            atr_pct,
+
+        "rsi":
+            rsi,
+
+        "adx":
+            adx,
+
+        "previous_adx":
+            previous_adx,
+
+        "rel":
+            rel,
+
+        "rel15":
+            rel15,
+
+        "rel45":
+            rel45,
+
+        "rel90":
+            rel90,
+
+        "confirm":
+            confirm_components >= 3,
 
         "confirm_components":
             confirm_components,
@@ -2677,14 +3053,35 @@ def evaluate_symbol(symbol, btc):
         "sweep":
             bool(sweep),
 
-        "rs_failure": (
-            rs_failure_short
-            if side == "short"
-            else rs_failure_long
-        ),
+        "early_breakout":
+            bool(early_breakout),
 
-        "learning_bonus":
-            learning_bonus,
+        "recent_impulse":
+            side_impulse[
+                "recent_impulse"
+            ],
+
+        "impulse_bars_since":
+            side_impulse[
+                "bars_since"
+            ],
+
+        "impulse_reset":
+            side_impulse[
+                "reset"
+            ],
+
+        "reset_depth_atr":
+            side_impulse[
+                "reset_depth_atr"
+            ],
+
+        "rs_failure":
+            (
+                rs_failure_short
+                if side == "short"
+                else rs_failure_long
+            ),
 
         "skip":
             final_skip,
@@ -2738,7 +3135,8 @@ def calculate_trade_levels(
 
         raw_tp = (
             entry
-            + risk_distance * TP_R_MULT
+            + risk_distance
+            * TP_R_MULT
         )
 
     else:
@@ -2749,7 +3147,8 @@ def calculate_trade_levels(
 
         raw_tp = (
             entry
-            - risk_distance * TP_R_MULT
+            - risk_distance
+            * TP_R_MULT
         )
 
     sl = round_trade_price(
@@ -2780,27 +3179,18 @@ def calculate_trade_levels(
         ):
             return None
 
-    actual_risk_distance = abs(
-        entry - sl
-    )
-
     return (
         sl,
         tp,
-        actual_risk_distance,
+        abs(entry - sl),
     )
 
-
-# ============================================================
-# COST
-# ============================================================
 
 def roundtrip_cost(notional):
 
     return (
         notional
-        *
-        (
+        * (
             TAKER_FEE_RATE * 2
             + SLIPPAGE_RATE
         )
@@ -2834,10 +3224,7 @@ def calculate_contracts(
     )
 
     max_market_size = safe_float(
-        meta.get(
-            "maxMarketSize",
-            0
-        )
+        meta.get("maxMarketSize", 0)
     )
 
     if (
@@ -2846,13 +3233,11 @@ def calculate_contracts(
         or lot_size <= 0
     ):
         raise RuntimeError(
-            f"Bad contract metadata "
-            f"for {symbol}"
+            f"Bad contract metadata {symbol}"
         )
 
     stop_pct = (
-        abs(entry - sl)
-        / entry
+        abs(entry - sl) / entry
     )
 
     risk_budget = (
@@ -2926,8 +3311,7 @@ def calculate_contracts(
     )
 
     margin = (
-        notional
-        / LEVERAGE
+        notional / LEVERAGE
     )
 
     if (
@@ -2937,32 +3321,7 @@ def calculate_contracts(
         + 1e-9
     ):
 
-        contracts = floor_step(
-            (
-                max_affordable_margin
-                * LEVERAGE
-            )
-            /
-            (
-                contract_value
-                * entry
-            ),
-            lot_size
-        )
-
-        if contracts < min_size:
-            return None
-
-        notional = (
-            contracts
-            * contract_value
-            * entry
-        )
-
-        margin = (
-            notional
-            / LEVERAGE
-        )
+        return None
 
     if (
         margin
@@ -2971,32 +3330,7 @@ def calculate_contracts(
         + 1e-9
     ):
 
-        contracts = floor_step(
-            (
-                MAX_MARGIN_USDT
-                * LEVERAGE
-            )
-            /
-            (
-                contract_value
-                * entry
-            ),
-            lot_size
-        )
-
-        if contracts < min_size:
-            return None
-
-        notional = (
-            contracts
-            * contract_value
-            * entry
-        )
-
-        margin = (
-            notional
-            / LEVERAGE
-        )
+        return None
 
     expected_tp = (
         notional
@@ -3010,19 +3344,22 @@ def calculate_contracts(
 
     if (
         expected_tp - cost
-        <
-        MIN_NET_TP_USDT
+        < MIN_NET_TP_USDT
     ):
         return None
 
     return {
         "contracts": contracts,
-        "contract_value": contract_value,
-        "notional": notional,
-        "margin": margin,
+        "contract_value":
+            contract_value,
+        "notional":
+            notional,
+        "margin":
+            margin,
         "expected_tp_usdt":
             expected_tp,
-        "roundtrip_cost": cost,
+        "roundtrip_cost":
+            cost,
     }
 
 
@@ -3045,23 +3382,16 @@ def pending_tpsl(inst_id=None):
     )
 
     if not native_ok(resp):
+
         raise RuntimeError(
             f"TPSL lookup failed: "
             f"{response_error(resp)}"
         )
 
-    return (
-        resp.get("data")
-        or []
-    )
+    return resp.get("data") or []
 
 
 def has_live_protection(p):
-    """
-    V6.8 safety fix:
-    a position is protected ONLY if BOTH
-    TP and SL are present on the same live/effective TPSL.
-    """
 
     inst = p.get("instId")
 
@@ -3075,19 +3405,19 @@ def has_live_protection(p):
     pid = position_id(p)
 
     try:
+
         orders = pending_tpsl(
             inst
         )
+
     except Exception:
+
         return False, None
 
     for o in orders:
 
         state = str(
-            o.get(
-                "state",
-                ""
-            )
+            o.get("state", "")
         ).lower()
 
         if state not in (
@@ -3110,10 +3440,7 @@ def has_live_protection(p):
             continue
 
         opid = str(
-            o.get(
-                "positionId",
-                ""
-            )
+            o.get("positionId", "")
             or ""
         )
 
@@ -3126,17 +3453,13 @@ def has_live_protection(p):
 
         has_tp = (
             safe_float(
-                o.get(
-                    "tpTriggerPrice"
-                )
+                o.get("tpTriggerPrice")
             ) > 0
         )
 
         has_sl = (
             safe_float(
-                o.get(
-                    "slTriggerPrice"
-                )
+                o.get("slTriggerPrice")
             ) > 0
         )
 
@@ -3150,9 +3473,7 @@ def all_positions_protected():
 
     try:
 
-        positions = get_positions()
-
-        for p in positions:
+        for p in get_positions():
 
             protected, _ = (
                 has_live_protection(p)
@@ -3178,24 +3499,19 @@ def tpsl_prices_valid(
         return False
 
     if side == "long":
-        return (
-            sl < last < tp
-        )
+        return sl < last < tp
 
-    return (
-        tp < last < sl
-    )
+    return tp < last < sl
 
 
 def place_tpsl_for_position(
     p,
     sl,
     tp,
-    client_tag="v68"
+    client_tag="v69"
 ):
 
     inst = p["instId"]
-
     side = position_side(p)
 
     pside = str(
@@ -3221,11 +3537,12 @@ def place_tpsl_for_position(
         "positionSide":
             pside,
 
-        "side": (
-            "sell"
-            if side == "long"
-            else "buy"
-        ),
+        "side":
+            (
+                "sell"
+                if side == "long"
+                else "buy"
+            ),
 
         "tpTriggerPrice":
             str(tp),
@@ -3270,6 +3587,7 @@ def place_tpsl_for_position(
     )
 
     if not native_ok(resp):
+
         return (
             False,
             response_error(resp)
@@ -3282,6 +3600,7 @@ def place_tpsl_for_position(
     )
 
     if not ok:
+
         return (
             False,
             "TPSL accepted but "
@@ -3325,9 +3644,7 @@ def repair_one_position(p):
     tick = safe_float(
         get_instrument(
             symbol
-        ).get(
-            "tickSize"
-        ),
+        ).get("tickSize"),
         0.0001
     )
 
@@ -3361,7 +3678,7 @@ def repair_one_position(p):
         p,
         sl,
         tp,
-        client_tag="repair"
+        "repair69"
     )
 
     return ok
@@ -3375,9 +3692,8 @@ def repair_existing_positions():
         return True
 
     tg(
-        f"🛡️ V6.8 STARTUP\n"
-        f"Open positions: "
-        f"{len(positions)}\n"
+        f"🛡️ V6.9 STARTUP\n"
+        f"Open positions: {len(positions)}\n"
         f"Checking TP + SL..."
     )
 
@@ -3426,12 +3742,9 @@ def repair_existing_positions():
 
             tg(
                 f"🚨 PROTECTION ERROR "
-                f"{symbol}\n"
-                f"{e}"
+                f"{symbol}\n{e}"
             )
 
-    # Critical:
-    # verify ALL positions after repairs.
     return all_positions_protected()
 
 
@@ -3439,10 +3752,7 @@ def repair_existing_positions():
 # LEVERAGE
 # ============================================================
 
-def set_leverage(
-    symbol,
-    leverage
-):
+def set_leverage(symbol, leverage):
 
     payload = {
         "instId":
@@ -3455,14 +3765,13 @@ def set_leverage(
             MARGIN_MODE,
     }
 
-    # In one-way/net mode positionSide is not
-    # required for setting leverage.
     resp = native(
         "private_post_account_set_leverage",
         payload
     )
 
     if not native_ok(resp):
+
         return (
             False,
             response_error(resp)
@@ -3472,7 +3781,7 @@ def set_leverage(
 
 
 # ============================================================
-# POSITION FIND
+# FIND POSITION
 # ============================================================
 
 def find_new_position(
@@ -3482,8 +3791,7 @@ def find_new_position(
 ):
 
     deadline = (
-        time.time()
-        + timeout
+        time.time() + timeout
     )
 
     while time.time() < deadline:
@@ -3506,8 +3814,6 @@ def find_new_position(
                 ):
                     return p
 
-                # One-way mode may merge/return
-                # an empty positionId.
                 if not pid:
                     return p
 
@@ -3535,7 +3841,6 @@ symbol_loss_streak = {}
 seen_closed_history_ids = set()
 
 last_score_report = 0
-
 
 daily = {
     "date": None,
@@ -3569,10 +3874,7 @@ def reset_daily_if_needed(
     if daily["date"] != today:
 
         daily["date"] = today
-
-        daily["start_equity"] = (
-            current_equity
-        )
+        daily["start_equity"] = current_equity
 
         daily["trades"] = 0
         daily["wins"] = 0
@@ -3638,8 +3940,6 @@ def open_trade(signal):
     if available <= 0:
         return False
 
-    # Never open when another live position
-    # is known to be unprotected.
     if (
         not PAPER_TRADING
         and protection_lock
@@ -3649,9 +3949,7 @@ def open_trade(signal):
     tick = safe_float(
         get_instrument(
             symbol
-        ).get(
-            "tickSize"
-        ),
+        ).get("tickSize"),
         0.0001
     )
 
@@ -3680,8 +3978,8 @@ def open_trade(signal):
     ):
 
         tg(
-            f"⏭️ {symbol} "
-            f"LONG too late "
+            f"⏭️ {symbol} LONG "
+            f"too late "
             f"{slip * 100:.2f}%"
         )
 
@@ -3693,8 +3991,8 @@ def open_trade(signal):
     ):
 
         tg(
-            f"⏭️ {symbol} "
-            f"SHORT too late "
+            f"⏭️ {symbol} SHORT "
+            f"too late "
             f"{slip * 100:.2f}%"
         )
 
@@ -3719,9 +4017,6 @@ def open_trade(signal):
         / entry
     )
 
-    if stop_pct < MIN_STOP_PCT:
-        return False
-
     sizing = calculate_contracts(
         symbol,
         entry,
@@ -3733,23 +4028,11 @@ def open_trade(signal):
     if not sizing:
         return False
 
-    if (
-        sizing["margin"]
-        >
-        available
-        * AVAILABLE_MARGIN_BUFFER
-    ):
-        return False
-
     before_ids = {
         position_id(p)
         for p in get_positions()
         if position_id(p)
     }
-
-    # --------------------------------------------------------
-    # HARD LEVERAGE CHECK
-    # --------------------------------------------------------
 
     lev_ok, lev_result = (
         set_leverage(
@@ -3763,24 +4046,10 @@ def open_trade(signal):
         tg(
             f"⛔ LEVERAGE FAILED\n"
             f"{symbol}\n"
-            f"Requested: {LEVERAGE}x\n"
-            f"{lev_result}\n"
-            f"Trade skipped."
+            f"{lev_result}"
         )
 
         return False
-
-    # --------------------------------------------------------
-    # ORDER PAYLOAD
-    # --------------------------------------------------------
-    #
-    # IMPORTANT:
-    # SyntaxError from V6.7 is fixed here.
-    #
-    # Correct:
-    # f"v68{int(time.time() * 1000) % 1000000000}"
-    #
-    # ========================================================
 
     payload = {
         "instId":
@@ -3792,11 +4061,12 @@ def open_trade(signal):
         "positionSide":
             "net",
 
-        "side": (
-            "buy"
-            if side == "long"
-            else "sell"
-        ),
+        "side":
+            (
+                "buy"
+                if side == "long"
+                else "sell"
+            ),
 
         "orderType":
             "market",
@@ -3825,65 +4095,50 @@ def open_trade(signal):
             "mark",
 
         "clientOrderId":
-            f"v68{int(time.time() * 1000) % 1000000000}",
+            f"v69{int(time.time() * 1000) % 1000000000}",
     }
 
     if BROKER_ID:
         payload["brokerId"] = BROKER_ID
 
-    # --------------------------------------------------------
-    # PAPER
-    # --------------------------------------------------------
+    entry_type = signal.get(
+        "entry_type",
+        "UNKNOWN"
+    )
 
     if PAPER_TRADING:
 
         tg(
-            f"🧪 PAPER V6.8\n"
-            f"{symbol} "
-            f"{side.upper()}\n"
+            f"🧪 PAPER V6.9\n"
+            f"{symbol} {side.upper()}\n"
+            f"🚪 ENTRY: {entry_type}\n"
             f"Score "
             f"{signal['score']:.0f}/"
-            f"{signal['threshold']:.0f}"
-            f"{' ⚡SECOND' if signal.get('second_chance') else ''}\n"
-            f"Directional tactics "
+            f"{signal['threshold']:.0f}\n"
+            f"Tactics "
             f"{signal['tactics']}\n"
             f"5m "
             f"{signal['confirm_components']}/4\n"
             f"ADX "
             f"{signal['adx']:.0f}\n"
-            f"RS composite "
+            f"RS "
             f"{signal['rel'] * 100:+.2f}%\n"
-            f"RS15 "
-            f"{signal.get('rel15', 0) * 100:+.2f}%\n"
-            f"RS45 "
-            f"{signal.get('rel45', 0) * 100:+.2f}%\n"
-            f"RS90 "
-            f"{signal.get('rel90', 0) * 100:+.2f}%\n"
             f"RSI "
             f"{signal['rsi']:.0f}\n"
             f"Pullback "
             f"{signal['pullback_quality']}/3\n"
-            f"EntryQ "
-            f"{signal['entry_quality']}\n"
-            f"BTC "
-            f"{signal['btc_regime']}\n"
-            f"Entry "
-            f"{entry:.8g}\n"
-            f"SL "
-            f"{sl:.8g}\n"
-            f"TP "
-            f"{tp:.8g}\n"
+            f"Recent impulse: "
+            f"{signal.get('recent_impulse')}\n"
+            f"Reset: "
+            f"{signal.get('impulse_reset')}\n"
+            f"Entry {entry:.8g}\n"
+            f"SL {sl:.8g}\n"
+            f"TP {tp:.8g}\n"
             f"ExpTP "
-            f"${sizing['expected_tp_usdt']:.2f}\n"
-            f"Est. cost "
-            f"${sizing['roundtrip_cost']:.2f}"
+            f"${sizing['expected_tp_usdt']:.2f}"
         )
 
         return True
-
-    # --------------------------------------------------------
-    # LIVE
-    # --------------------------------------------------------
 
     resp = native(
         "private_post_trade_order",
@@ -3915,14 +4170,14 @@ def open_trade(signal):
         return False
 
     tg(
-        f"🟢 V6.8 LIVE ORDER\n"
-        f"{symbol} "
-        f"{side.upper()}\n"
+        f"🟢 V6.9 LIVE ORDER\n"
+        f"{symbol} {side.upper()}\n"
         f"━━━━━━━━━━━━\n"
+        f"🚪 ENTRY: {entry_type}\n"
         f"Score "
         f"{signal['score']:.0f}/"
         f"{signal['threshold']:.0f}"
-        f"{' ⚡ SECOND-CHANCE' if signal.get('second_chance') else ''}\n"
+        f"{' ⚡ SECOND' if signal.get('second_chance') else ''}\n"
         f"Directional tactics "
         f"{signal['tactics']}\n"
         f"5m "
@@ -3941,31 +4196,26 @@ def open_trade(signal):
         f"{signal['momentum_quality']}\n"
         f"BTC "
         f"{signal['btc_regime']}\n"
+        f"Recent impulse: "
+        f"{'YES' if signal.get('recent_impulse') else 'NO'}\n"
+        f"Impulse reset: "
+        f"{'YES' if signal.get('impulse_reset') else 'NO'}\n"
         f"━━━━━━━━━━━━\n"
-        f"Entry ~ "
-        f"{entry:.8g}\n"
-        f"SL "
-        f"{sl:.8g}\n"
-        f"TP "
-        f"{tp:.8g}\n"
+        f"Entry ~ {entry:.8g}\n"
+        f"SL {sl:.8g}\n"
+        f"TP {tp:.8g}\n"
         f"Stop "
         f"{stop_pct * 100:.2f}%\n"
         f"ExpTP "
         f"${sizing['expected_tp_usdt']:.2f}\n"
         f"Cost "
         f"${sizing['roundtrip_cost']:.2f}\n"
-        f"Contracts "
-        f"{sizing['contracts']}\n"
         f"Notional "
         f"${sizing['notional']:.2f}\n"
         f"Margin "
         f"${sizing['margin']:.2f}\n"
         f"{LEVERAGE}x"
     )
-
-    # --------------------------------------------------------
-    # POSITION CHECK
-    # --------------------------------------------------------
 
     new_pos = find_new_position(
         symbol,
@@ -3981,14 +4231,7 @@ def open_trade(signal):
             f"position not visible yet."
         )
 
-        # An accepted live order may have created exposure.
-        # Do not treat this as an execution failure and
-        # immediately try another candidate.
         return True
-
-    # --------------------------------------------------------
-    # PROTECTION
-    # --------------------------------------------------------
 
     if has_live_protection(
         new_pos
@@ -4021,7 +4264,7 @@ def open_trade(signal):
                 new_pos,
                 sl,
                 tp,
-                client_tag="fallback"
+                "fallback69"
             )
         )
 
@@ -4045,15 +4288,13 @@ def open_trade(signal):
 
         protection_lock = True
 
-        # The position already exists, so this is still
-        # considered an opened trade. Returning False here
-        # could make main() attempt another candidate.
         return True
 
     tg(
         f"🚨 {symbol}: "
-        f"position exists but fallback "
-        f"TP/SL cannot safely be placed.\n"
+        f"position exists but "
+        f"fallback TP/SL cannot "
+        f"safely be placed.\n"
         f"NEW TRADES PAUSED."
     )
 
@@ -4066,9 +4307,7 @@ def open_trade(signal):
 # HISTORY
 # ============================================================
 
-def closed_positions_history(
-    limit=100
-):
+def closed_positions_history(limit=100):
 
     merged = []
 
@@ -4091,8 +4330,7 @@ def closed_positions_history(
             if native_ok(resp):
 
                 merged.extend(
-                    resp.get("data")
-                    or []
+                    resp.get("data") or []
                 )
 
         except Exception:
@@ -4106,10 +4344,7 @@ def close_reason(record):
     raw = str(
         record.get(
             "closeType",
-            record.get(
-                "state",
-                ""
-            )
+            record.get("state", "")
         )
     ).lower()
 
@@ -4120,9 +4355,7 @@ def close_reason(record):
         "stop_loss": "STOP LOSS",
         "liquidated": "LIQUIDATION",
         "liquidation": "LIQUIDATION",
-        "partially_liquidated": "PARTIAL LIQ",
         "adl": "ADL",
-        "partially_closed": "PARTIAL CLOSE",
         "manual": "MANUAL",
         "mannual": "MANUAL",
         "close": "CLOSED",
@@ -4136,18 +4369,10 @@ def close_reason(record):
     )
 
 
-def fmt_duration(
-    start_ms,
-    end_ms
-):
+def fmt_duration(start_ms, end_ms):
 
-    start = safe_float(
-        start_ms
-    )
-
-    end = safe_float(
-        end_ms
-    )
+    start = safe_float(start_ms)
+    end = safe_float(end_ms)
 
     if (
         start <= 0
@@ -4157,8 +4382,7 @@ def fmt_duration(
         return "unknown"
 
     seconds = int(
-        (end - start)
-        / 1000
+        (end - start) / 1000
     )
 
     hours, rem = divmod(
@@ -4172,16 +4396,10 @@ def fmt_duration(
     )
 
     if hours:
-        return (
-            f"{hours}h "
-            f"{minutes}m"
-        )
+        return f"{hours}h {minutes}m"
 
     if minutes:
-        return (
-            f"{minutes}m "
-            f"{secs}s"
-        )
+        return f"{minutes}m {secs}s"
 
     return f"{secs}s"
 
@@ -4244,7 +4462,7 @@ def infer_side(record):
 
 
 # ============================================================
-# LEARNING UPDATE
+# LEARNING HISTORY
 # ============================================================
 
 def update_learning(
@@ -4256,9 +4474,6 @@ def update_learning(
 
     side = infer_side(record)
 
-    # Conservative history bucket.
-    # Full setup-context persistence can be added
-    # after the execution core has proven stable.
     fp = (
         f"{side}|history"
     )
@@ -4284,7 +4499,6 @@ def update_learning(
 
     if net_pnl >= 0:
         rec["wins"] += 1
-
     else:
         rec["losses"] += 1
 
@@ -4339,10 +4553,7 @@ def notify_closed_trade(record):
     reset_daily_if_needed()
 
     symbol = str(
-        record.get(
-            "instId",
-            ""
-        )
+        record.get("instId", "")
     ).replace(
         "-USDT",
         "/USDT:USDT"
@@ -4392,15 +4603,7 @@ def notify_closed_trade(record):
         record.get("updateTime")
     )
 
-    reason = close_reason(
-        record
-    )
-
-    size = safe_float(
-        record.get(
-            "closePositions"
-        )
-    )
+    reason = close_reason(record)
 
     daily["trades"] += 1
     daily["net"] += net_pnl
@@ -4428,6 +4631,7 @@ def notify_closed_trade(record):
     if net_pnl >= 0:
 
         daily["wins"] += 1
+
         consecutive_losses = 0
 
         symbol_last_result[
@@ -4441,6 +4645,7 @@ def notify_closed_trade(record):
     else:
 
         daily["losses"] += 1
+
         consecutive_losses += 1
 
         symbol_last_result[
@@ -4472,38 +4677,6 @@ def notify_closed_trade(record):
         net_pnl
     )
 
-    wr_long = (
-        daily["long_wins"]
-        /
-        daily["long_trades"]
-        * 100
-        if daily["long_trades"]
-        else 0
-    )
-
-    wr_short = (
-        daily["short_wins"]
-        /
-        daily["short_trades"]
-        * 100
-        if daily["short_trades"]
-        else 0
-    )
-
-    pause = ""
-
-    if (
-        consecutive_losses
-        >= MAX_CONSECUTIVE_LOSSES
-    ):
-
-        pause = (
-            f"\n⏸ "
-            f"{MAX_CONSECUTIVE_LOSSES} "
-            f"losses → pauze "
-            f"{LOSS_PAUSE_MIN} min"
-        )
-
     icon = (
         "🟢"
         if net_pnl >= 0
@@ -4511,48 +4684,35 @@ def notify_closed_trade(record):
     )
 
     tg(
-        f"{icon} POSITION CLOSED V6.8\n\n"
+        f"{icon} POSITION CLOSED V6.9\n\n"
         f"{symbol}\n"
         f"{side.upper()}\n"
         f"━━━━━━━━━━━━\n"
         f"Entry: {entry:.8g}\n"
-        f"Exit:  {exit_price:.8g}\n"
-        f"Size:  {size:g}\n\n"
+        f"Exit: {exit_price:.8g}\n"
         f"💰 Realized: "
-        f"{'+' if gross_pnl >= 0 else ''}"
-        f"${gross_pnl:.2f}\n"
+        f"{gross_pnl:+.2f}\n"
         f"📊 Ratio: "
         f"{pnl_ratio:+.2f}%\n"
         f"💸 Fee: "
         f"-${fee:.2f}\n"
         f"💵 Net: "
-        f"{'+' if net_pnl >= 0 else ''}"
-        f"${net_pnl:.2f}\n\n"
+        f"{net_pnl:+.2f}\n"
         f"🎯 {reason}\n"
         f"⏱ {duration}\n\n"
-        f"📅 TODAY Amsterdam\n"
-        f"All: "
-        f"{daily['trades']} | "
-        f"{daily['wins']}W "
-        f"{daily['losses']}L | "
-        f"{'+' if daily['net'] >= 0 else ''}"
-        f"${daily['net']:.2f}\n"
-        f"LONG: "
-        f"{daily['long_trades']} / "
-        f"{wr_long:.0f}% / "
-        f"{'+' if daily['long_net'] >= 0 else ''}"
-        f"${daily['long_net']:.2f}\n"
-        f"SHORT: "
-        f"{daily['short_trades']} / "
-        f"{wr_short:.0f}% / "
-        f"{'+' if daily['short_net'] >= 0 else ''}"
-        f"${daily['short_net']:.2f}"
-        f"{pause}"
+        f"📅 TODAY\n"
+        f"Trades: "
+        f"{daily['trades']}\n"
+        f"W/L: "
+        f"{daily['wins']}/"
+        f"{daily['losses']}\n"
+        f"Net: "
+        f"${daily['net']:+.2f}"
     )
 
 
 # ============================================================
-# HISTORY SEED
+# HISTORY SEED / CHECK
 # ============================================================
 
 def seed_closed_history():
@@ -4566,10 +4726,7 @@ def seed_closed_history():
         ):
 
             hid = str(
-                r.get(
-                    "historyId",
-                    ""
-                )
+                r.get("historyId", "")
             )
 
             if hid:
@@ -4578,7 +4735,7 @@ def seed_closed_history():
                 )
 
         tg(
-            f"📚 V6.8 PNL TRACKER READY\n"
+            f"📚 V6.9 PNL TRACKER READY\n"
             f"Known closes: "
             f"{len(seen_closed_history_ids)}\n"
             f"Learning trades: "
@@ -4593,10 +4750,6 @@ def seed_closed_history():
         )
 
 
-# ============================================================
-# CLOSED POSITION CHECK
-# ============================================================
-
 def check_for_closed_positions():
 
     records = closed_positions_history(
@@ -4608,16 +4761,12 @@ def check_for_closed_positions():
     for r in reversed(records):
 
         hid = str(
-            r.get(
-                "historyId",
-                ""
-            )
+            r.get("historyId", "")
         )
 
         if (
             not hid
-            or hid
-            in seen_closed_history_ids
+            or hid in seen_closed_history_ids
         ):
             continue
 
@@ -4629,28 +4778,6 @@ def check_for_closed_positions():
 
     for r in new_records:
         notify_closed_trade(r)
-
-    if (
-        len(
-            seen_closed_history_ids
-        ) > 2500
-    ):
-
-        seen_closed_history_ids.clear()
-
-        for r in records:
-
-            hid = str(
-                r.get(
-                    "historyId",
-                    ""
-                )
-            )
-
-            if hid:
-                seen_closed_history_ids.add(
-                    hid
-                )
 
 
 # ============================================================
@@ -4681,12 +4808,12 @@ def check_daily_risk(equity):
         dd
         >= DAILY_LOSS_LIMIT_PCT
     ):
+
         return (
             False,
             f"Daily risk stop "
             f"{dd:.2f}% "
-            f"vs start "
-            f"${start:.2f}"
+            f"vs ${start:.2f}"
         )
 
     return True, "OK"
@@ -4768,7 +4895,7 @@ def count_alt_sides(positions):
 
 
 # ============================================================
-# SCORE REPORT
+# REPORT
 # ============================================================
 
 def maybe_score_report(rows):
@@ -4800,14 +4927,11 @@ def maybe_score_report(rows):
 
     lines = [
         (
-            f"📡 V6.8 "
+            f"📡 V6.9 "
             f"{session_state()} "
             f"{now_utc().strftime('%H:%M')} UTC"
         )
     ]
-
-    if not ranked:
-        lines.append("geen scans")
 
     for r in ranked:
 
@@ -4819,10 +4943,24 @@ def maybe_score_report(rows):
             else f"⏭ {skip}"
         )
 
-        second = (
-            " ⚡"
+        entry_type = r.get(
+            "entry_type",
+            "NONE"
+        )
+
+        if entry_type == "EARLY_MOMENTUM":
+            route = "🚀EARLY"
+
+        elif entry_type == "PULLBACK":
+            route = "↩️PB"
+
+        else:
+            route = "WAIT"
+
+        impulse = (
+            "🔥"
             if r.get(
-                "second_chance"
+                "recent_impulse"
             )
             else ""
         )
@@ -4831,13 +4969,12 @@ def maybe_score_report(rows):
             f"{r['symbol'].split('/')[0]} "
             f"{str(r.get('side') or '-').upper()} "
             f"{r.get('score', 0):.0f}/"
-            f"{r.get('threshold', BASE_MIN_SCORE):.0f}"
-            f"{second} "
+            f"{r.get('threshold', BASE_MIN_SCORE):.0f} "
+            f"{route}{impulse} "
             f"t{r.get('tactics', 0)} "
             f"5m{r.get('confirm_components', 0)}/4 "
             f"ADX{r.get('adx', 0):.0f} "
             f"RS{r.get('rel', 0) * 100:+.1f}% "
-            f"EQ{r.get('entry_quality', 0)} "
             f"{mark}"
         )
 
@@ -4859,37 +4996,42 @@ def startup_diagnostics():
     )
 
     tg(
-        f"🚀 BLOFIN V6.8 STARTED\n"
+        f"🚀 BLOFIN V6.9 STARTED\n"
+        f"DUAL ENTRY ENGINE\n"
+        f"━━━━━━━━━━━━\n"
         f"Mode: "
         f"{'PAPER' if PAPER_TRADING else 'LIVE'}\n"
-        f"Position mode expected: NET / ONE-WAY\n"
         f"Equity: "
         f"${acc['total_equity']:.2f}\n"
         f"Available: "
         f"${acc['available']:.2f}\n"
-        f"Day start: "
-        f"${daily['start_equity']:.2f}\n"
+        f"━━━━━━━━━━━━\n"
+        f"🚀 EARLY MOMENTUM\n"
+        f"Min score: "
+        f"{EARLY_MIN_SCORE:.0f}\n"
+        f"ADX: "
+        f"{EARLY_ADX_MIN:.0f}-"
+        f"{EARLY_ADX_MAX:.0f}\n"
+        f"Max run: "
+        f"{EARLY_MAX_RUN_PCT * 100:.1f}%\n"
+        f"━━━━━━━━━━━━\n"
+        f"↩️ PULLBACK\n"
         f"Base score: "
         f"{BASE_MIN_SCORE:.0f}\n"
-        f"Hard floor: "
-        f"{HARD_MIN_SCORE:.0f}\n"
-        f"Strong regime: "
-        f"{STRONG_REGIME_MIN_SCORE:.0f}\n"
-        f"Directional tactics required: "
-        f"{MIN_TACTICS}\n"
         f"ADX trend: "
         f"{ADX_TREND:.0f}\n"
-        f"ADX strong: "
-        f"{ADX_STRONG:.0f}\n"
-        f"Alt cap "
-        f"L{MAX_ALT_LONGS}/"
-        f"S{MAX_ALT_SHORTS}\n"
+        f"━━━━━━━━━━━━\n"
+        f"🔥 Impulse memory: "
+        f"{IMPULSE_MEMORY_BARS} candles\n"
+        f"Reset depth: "
+        f"{IMPULSE_RESET_ATR:.2f} ATR\n"
+        f"Reset wait: "
+        f"{IMPULSE_RESET_MIN_BARS} candles\n"
+        f"━━━━━━━━━━━━\n"
         f"Max positions: "
         f"{MAX_ACTIVE_POSITIONS}\n"
-        f"Max execution attempts/scan: "
-        f"{MAX_EXECUTION_ATTEMPTS_PER_SCAN}\n"
-        f"Learning trades: "
-        f"{learning.get('trades', 0)}\n"
+        f"Risk/trade: "
+        f"{MAX_RISK_EQUITY_PCT * 100:.1f}%\n"
         f"Daily cap: "
         f"{DAILY_LOSS_LIMIT_PCT:.0f}%"
     )
@@ -4904,12 +5046,14 @@ def protection_watch():
     global protection_lock
 
     if PAPER_TRADING:
+
         protection_lock = False
         return
 
     positions = get_positions()
 
     if not positions:
+
         protection_lock = False
         return
 
@@ -4926,9 +5070,6 @@ def protection_watch():
                 if protected:
                     continue
 
-                symbol = position_symbol(p)
-                side = position_side(p)
-
                 repaired = (
                     repair_one_position(p)
                 )
@@ -4937,14 +5078,12 @@ def protection_watch():
 
                     tg(
                         f"🛡️ REPAIRED "
-                        f"{symbol} "
-                        f"{side.upper()}"
+                        f"{position_symbol(p)}"
                     )
 
             except Exception:
                 pass
 
-    # Re-fetch/re-check ALL positions.
     protection_lock = (
         not all_positions_protected()
     )
@@ -4987,9 +5126,9 @@ def main():
 
         try:
 
-            # ------------------------------------------------
+            # -----------------------------------------------
             # CLOSED TRADES
-            # ------------------------------------------------
+            # -----------------------------------------------
 
             if not PAPER_TRADING:
 
@@ -5003,14 +5142,16 @@ def main():
                         f"{e}"
                     )
 
-            # ------------------------------------------------
-            # ACCOUNT / DAILY RISK
-            # ------------------------------------------------
+            # -----------------------------------------------
+            # ACCOUNT
+            # -----------------------------------------------
 
             acc = futures_account()
 
-            ok, reason = check_daily_risk(
-                acc["total_equity"]
+            ok, reason = (
+                check_daily_risk(
+                    acc["total_equity"]
+                )
             )
 
             if not ok:
@@ -5022,9 +5163,9 @@ def main():
                 time.sleep(120)
                 continue
 
-            # ------------------------------------------------
+            # -----------------------------------------------
             # LOSS PAUSE
-            # ------------------------------------------------
+            # -----------------------------------------------
 
             if (
                 time.time()
@@ -5037,22 +5178,12 @@ def main():
 
                 continue
 
-            # ------------------------------------------------
-            # POSITIONS
-            # ------------------------------------------------
-
-            positions = get_positions()
-
-            # ------------------------------------------------
+            # -----------------------------------------------
             # PROTECTION
-            # ------------------------------------------------
+            # -----------------------------------------------
 
             if not PAPER_TRADING:
                 protection_watch()
-
-            # ------------------------------------------------
-            # POSITION / SAFETY LIMIT
-            # ------------------------------------------------
 
             positions = get_positions()
 
@@ -5078,11 +5209,12 @@ def main():
 
                 continue
 
-            # ------------------------------------------------
-            # BTC REGIME
-            # ------------------------------------------------
+            # -----------------------------------------------
+            # BTC
+            # -----------------------------------------------
 
             try:
+
                 btc = btc_regime()
 
             except Exception as e:
@@ -5098,9 +5230,9 @@ def main():
 
                 continue
 
-            # ------------------------------------------------
+            # -----------------------------------------------
             # SCAN
-            # ------------------------------------------------
+            # -----------------------------------------------
 
             scanned = []
             candidates = []
@@ -5114,9 +5246,11 @@ def main():
 
                 try:
 
-                    signal = evaluate_symbol(
-                        symbol,
-                        btc
+                    signal = (
+                        evaluate_symbol(
+                            symbol,
+                            btc
+                        )
                     )
 
                     if not signal:
@@ -5136,21 +5270,28 @@ def main():
                 except Exception:
                     continue
 
-            # ------------------------------------------------
-            # REPORT
-            # ------------------------------------------------
-
             maybe_score_report(
                 scanned
             )
 
-            # ------------------------------------------------
+            # -----------------------------------------------
             # RANKING
-            # ------------------------------------------------
+            #
+            # EARLY gets slight priority if quality equal,
+            # because its whole purpose is earlier execution.
+            # -----------------------------------------------
 
             candidates.sort(
                 key=lambda x: (
                     x["score"],
+                    (
+                        1
+                        if x.get(
+                            "entry_type"
+                        )
+                        == "EARLY_MOMENTUM"
+                        else 0
+                    ),
                     x["entry_quality"],
                     x["confirm_components"],
                     x["adx"],
@@ -5159,9 +5300,9 @@ def main():
                 reverse=True
             )
 
-            # ------------------------------------------------
-            # OPEN MAX ONE SUCCESSFUL TRADE PER SCAN
-            # ------------------------------------------------
+            # -----------------------------------------------
+            # EXECUTION
+            # -----------------------------------------------
 
             execution_attempts = 0
 
@@ -5201,8 +5342,7 @@ def main():
                         signal["side"]
                         == "long"
                         and
-                        alt_l
-                        >= MAX_ALT_LONGS
+                        alt_l >= MAX_ALT_LONGS
                     ):
                         continue
 
@@ -5210,8 +5350,7 @@ def main():
                         signal["side"]
                         == "short"
                         and
-                        alt_s
-                        >= MAX_ALT_SHORTS
+                        alt_s >= MAX_ALT_SHORTS
                     ):
                         continue
 
@@ -5230,22 +5369,12 @@ def main():
 
                 if opened:
 
-                    # Only successful/accepted trade
-                    # starts the cooldown.
                     symbol_last_trade[
                         signal["symbol"]
                     ] = time.time()
 
                     # Max one successful trade per scan.
                     break
-
-                # IMPORTANT:
-                # Failed execution does NOT break.
-                # Candidate #2/#3 may still be tried.
-
-            # ------------------------------------------------
-            # SLEEP
-            # ------------------------------------------------
 
             time.sleep(
                 SCAN_SECONDS
@@ -5254,7 +5383,7 @@ def main():
         except KeyboardInterrupt:
 
             tg(
-                "🛑 V6.8 stopped."
+                "🛑 V6.9 stopped."
             )
 
             raise
@@ -5272,7 +5401,7 @@ def main():
                 continue
 
             tg(
-                f"⚠️ V6.8 LOOP ERROR\n"
+                f"⚠️ V6.9 LOOP ERROR\n"
                 f"{msg}"
             )
 
