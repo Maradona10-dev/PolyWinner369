@@ -1,7 +1,7 @@
 import os
 import time
 import json
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from datetime import datetime, timezone, timedelta
 
 import ccxt
@@ -11,12 +11,21 @@ import requests
 
 
 # ============================================================
-# BLOFIN V6.7 ADAPTIVE MOMENTUM ENGINE
+# BLOFIN V6.8 ADAPTIVE MOMENTUM ENGINE
 # ============================================================
 #
-# V6.7
-#
-# Kern:
+# Verbeteringen t.o.v. V6.7:
+# - SyntaxError clientOrderId opgelost
+# - TP + SL moeten BEIDE aanwezig zijn
+# - Directionele tick rounding voor SL/TP
+# - Volume/ATR zijn quality factors, geen directional tactics
+# - Multi-horizon relative strength: 15m / 45m / 90m
+# - Persistent relative-strength tactic
+# - Hard leverage failure: geen order bij leverage-fout
+# - Protection-lock controleert ALLE posities opnieuw
+# - Mislukte execution veroorzaakt geen cooldown
+# - Maximaal 3 execution attempts per scan
+# - Eén SUCCESVOLLE nieuwe trade per scan
 # - Adaptive regime scoring
 # - Momentum continuation
 # - Gradual pullback scoring
@@ -24,20 +33,14 @@ import requests
 # - Relative-strength failure detection
 # - Entry-quality scoring
 # - Second-chance continuation
-# - Persistent setup statistics
-# - Conservative adaptive learning
+# - Conservative learning
 # - Broker-side TP/SL
 # - Existing-position repair
 # - Daily Amsterdam risk reset
 # - LONG / SHORT statistics
 # - Per-symbol loss streak
-# - Maximum active positions
-# - One new trade per scan
 #
-# Belangrijk:
-# De learning engine verandert NIET automatisch alle parameters.
-# Hij geeft alleen een beperkte bonus/penalty aan vergelijkbare
-# toekomstige setups.
+# Geschreven voor One-way / NET position mode.
 # ============================================================
 
 
@@ -52,11 +55,17 @@ API_PASSWORD = os.getenv("EXCHANGE_PASSWORD", "").strip()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-PAPER_TRADING = os.getenv("PAPER_TRADING", "false").lower() == "true"
+PAPER_TRADING = os.getenv(
+    "PAPER_TRADING",
+    "false"
+).lower() == "true"
 
 LIVE_CONFIRM = os.getenv("LIVE_CONFIRM", "")
 
-BROKER_ID = os.getenv("BLOFIN_BROKER_ID", "").strip()
+BROKER_ID = os.getenv(
+    "BLOFIN_BROKER_ID",
+    ""
+).strip()
 
 
 # ============================================================
@@ -69,20 +78,33 @@ TIMEFRAME_TREND = "1h"
 
 CANDLE_LIMIT = 240
 
-SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "45"))
+SCAN_SECONDS = int(
+    os.getenv("SCAN_SECONDS", "45")
+)
 
 
 # ============================================================
 # COOLDOWNS
 # ============================================================
 
-WIN_COOLDOWN_MIN = int(os.getenv("WIN_COOLDOWN_MIN", "20"))
-LOSS_COOLDOWN_MIN = int(os.getenv("LOSS_COOLDOWN_MIN", "60"))
-REPEAT_LOSS_COOLDOWN_MIN = int(
-    os.getenv("REPEAT_LOSS_COOLDOWN_MIN", "180")
+WIN_COOLDOWN_MIN = int(
+    os.getenv("WIN_COOLDOWN_MIN", "20")
 )
 
-LOSS_PAUSE_MIN = int(os.getenv("LOSS_PAUSE_MIN", "90"))
+LOSS_COOLDOWN_MIN = int(
+    os.getenv("LOSS_COOLDOWN_MIN", "60")
+)
+
+REPEAT_LOSS_COOLDOWN_MIN = int(
+    os.getenv(
+        "REPEAT_LOSS_COOLDOWN_MIN",
+        "180"
+    )
+)
+
+LOSS_PAUSE_MIN = int(
+    os.getenv("LOSS_PAUSE_MIN", "90")
+)
 
 
 # ============================================================
@@ -101,6 +123,13 @@ MAX_ALT_SHORTS = int(
     os.getenv("MAX_ALT_SHORTS", "1")
 )
 
+MAX_EXECUTION_ATTEMPTS_PER_SCAN = int(
+    os.getenv(
+        "MAX_EXECUTION_ATTEMPTS_PER_SCAN",
+        "3"
+    )
+)
+
 
 # ============================================================
 # ADAPTIVE SCORE
@@ -110,15 +139,15 @@ BASE_MIN_SCORE = float(
     os.getenv("MIN_SCORE", "68")
 )
 
-# absolute floor:
-# de bot mag nooit zomaar onder deze score komen
 HARD_MIN_SCORE = float(
     os.getenv("HARD_MIN_SCORE", "62")
 )
 
-# uitzonderlijk sterke setup kan tijdelijk lager
 STRONG_REGIME_MIN_SCORE = float(
-    os.getenv("STRONG_REGIME_MIN_SCORE", "64")
+    os.getenv(
+        "STRONG_REGIME_MIN_SCORE",
+        "64"
+    )
 )
 
 MIN_TACTICS = int(
@@ -152,15 +181,24 @@ MAX_MARGIN_USDT = float(
 )
 
 MAX_MARGIN_EQUITY_PCT = float(
-    os.getenv("MAX_MARGIN_EQUITY_PCT", "0.18")
+    os.getenv(
+        "MAX_MARGIN_EQUITY_PCT",
+        "0.18"
+    )
 )
 
 MAX_RISK_EQUITY_PCT = float(
-    os.getenv("MAX_RISK_EQUITY_PCT", "0.012")
+    os.getenv(
+        "MAX_RISK_EQUITY_PCT",
+        "0.012"
+    )
 )
 
 AVAILABLE_MARGIN_BUFFER = float(
-    os.getenv("AVAILABLE_MARGIN_BUFFER", "0.90")
+    os.getenv(
+        "AVAILABLE_MARGIN_BUFFER",
+        "0.90"
+    )
 )
 
 
@@ -189,15 +227,24 @@ MAX_STOP_PCT = float(
 )
 
 MIN_NET_TP_USDT = float(
-    os.getenv("MIN_NET_TP_USDT", "0.40")
+    os.getenv(
+        "MIN_NET_TP_USDT",
+        "0.40"
+    )
 )
 
 TAKER_FEE_RATE = float(
-    os.getenv("TAKER_FEE_RATE", "0.0006")
+    os.getenv(
+        "TAKER_FEE_RATE",
+        "0.0006"
+    )
 )
 
 SLIPPAGE_RATE = float(
-    os.getenv("SLIPPAGE_RATE", "0.0003")
+    os.getenv(
+        "SLIPPAGE_RATE",
+        "0.0003"
+    )
 )
 
 
@@ -210,7 +257,6 @@ VOLUME_MULT = float(
 )
 
 DONCHIAN_LOOKBACK = 12
-
 NEAR_SWEEP_ATR = 0.20
 
 ADX_TREND = float(
@@ -246,15 +292,10 @@ RS_WEAK = float(
 )
 
 MAX_EMA_EXT_PCT = 0.012
-
 PULLBACK_ATR = 0.45
-
 IMPULSE_15M_ATR = 1.30
-
 IMPULSE_1H_ATR = 1.60
-
 MAX_RUN_PCT = 0.035
-
 MAX_FILL_SLIP_PCT = 0.004
 
 
@@ -263,11 +304,17 @@ MAX_FILL_SLIP_PCT = 0.004
 # ============================================================
 
 DAILY_LOSS_LIMIT_PCT = float(
-    os.getenv("DAILY_LOSS_LIMIT_PCT", "5")
+    os.getenv(
+        "DAILY_LOSS_LIMIT_PCT",
+        "5"
+    )
 )
 
 MAX_CONSECUTIVE_LOSSES = int(
-    os.getenv("MAX_CONSECUTIVE_LOSSES", "3")
+    os.getenv(
+        "MAX_CONSECUTIVE_LOSSES",
+        "3"
+    )
 )
 
 MIN_EQUITY_USDT = float(
@@ -302,7 +349,7 @@ SCORE_REPORT_MIN = int(
 
 LEARNING_FILE = os.getenv(
     "LEARNING_FILE",
-    "v67_learning.json"
+    "v68_learning.json"
 )
 
 LEARNING_MIN_TRADES = int(
@@ -310,11 +357,17 @@ LEARNING_MIN_TRADES = int(
 )
 
 LEARNING_MAX_BONUS = float(
-    os.getenv("LEARNING_MAX_BONUS", "3.0")
+    os.getenv(
+        "LEARNING_MAX_BONUS",
+        "3.0"
+    )
 )
 
 LEARNING_MAX_PENALTY = float(
-    os.getenv("LEARNING_MAX_PENALTY", "-3.0")
+    os.getenv(
+        "LEARNING_MAX_PENALTY",
+        "-3.0"
+    )
 )
 
 
@@ -335,9 +388,8 @@ BTC_SYMBOL = "BTC/USDT:USDT"
 
 MAJORS = {
     "BTC/USDT:USDT",
-    "ETH/USDT:USDT"
+    "ETH/USDT:USDT",
 }
-
 
 SYMBOLS = [
     "BTC/USDT:USDT",
@@ -398,21 +450,24 @@ SYMBOLS = [
 
 
 # ============================================================
-# SAFETY CHECK
+# SAFETY
 # ============================================================
 
 if not API_KEY or not API_SECRET or not API_PASSWORD:
     raise RuntimeError(
-        "Missing EXCHANGE_API_KEY / EXCHANGE_SECRET / EXCHANGE_PASSWORD"
+        "Missing EXCHANGE_API_KEY / "
+        "EXCHANGE_SECRET / EXCHANGE_PASSWORD"
     )
 
 if (
     not PAPER_TRADING
-    and LIVE_CONFIRM != "YES_I_WANT_LIVE_TRADING"
+    and LIVE_CONFIRM
+    != "YES_I_WANT_LIVE_TRADING"
 ):
     raise RuntimeError(
         "LIVE TRADING BLOCKED. "
-        "Set LIVE_CONFIRM=YES_I_WANT_LIVE_TRADING"
+        "Set LIVE_CONFIRM="
+        "YES_I_WANT_LIVE_TRADING"
     )
 
 
@@ -458,7 +513,7 @@ def tg(message: str):
             f"{TELEGRAM_TOKEN}/sendMessage",
             json={
                 "chat_id": TELEGRAM_CHAT_ID,
-                "text": message
+                "text": message,
             },
             timeout=10,
         )
@@ -490,18 +545,9 @@ def amsterdam_today():
         ).date().isoformat()
 
 
-def fmt(x, n=4):
-
-    try:
-        return f"{float(x):.{n}f}"
-    except Exception:
-        return str(x)
-
-
 def safe_float(v, default=0.0):
 
     try:
-
         if v is None or v == "":
             return default
 
@@ -521,7 +567,8 @@ def native(method_name, params=None):
 
     if fn is None:
         raise RuntimeError(
-            f"CCXT implicit endpoint missing: {method_name}"
+            f"CCXT implicit endpoint missing: "
+            f"{method_name}"
         )
 
     return fn(params or {})
@@ -529,9 +576,10 @@ def native(method_name, params=None):
 
 def native_ok(resp):
 
-    return str(
-        resp.get("code")
-    ) == "0"
+    return (
+        isinstance(resp, dict)
+        and str(resp.get("code")) == "0"
+    )
 
 
 def response_error(resp):
@@ -557,7 +605,7 @@ def response_error(resp):
         if dcode not in (
             None,
             "",
-            "0"
+            "0",
         ):
             code = str(dcode)
 
@@ -568,26 +616,23 @@ def response_error(resp):
 
         for item in data:
 
-            if (
-                isinstance(item, dict)
-                and str(
-                    item.get("code")
-                ) not in (
-                    "0",
-                    "None",
-                    ""
-                )
+            if not isinstance(item, dict):
+                continue
+
+            item_code = str(
+                item.get("code")
+            )
+
+            if item_code not in (
+                "0",
+                "None",
+                "",
             ):
-
-                code = str(
-                    item.get("code")
-                )
-
+                code = item_code
                 msg = str(
                     item.get("msg")
                     or msg
                 )
-
                 break
 
     return f"{code} {msg}".strip()
@@ -595,7 +640,10 @@ def response_error(resp):
 
 def blofin_inst_id(symbol):
 
-    return symbol.split("/")[0] + "-USDT"
+    return (
+        symbol.split("/")[0]
+        + "-USDT"
+    )
 
 
 def floor_step(value, step):
@@ -615,7 +663,48 @@ def floor_step(value, step):
     )
 
 
-def round_price(price, tick):
+def ceil_step(value, step):
+
+    v = Decimal(str(value))
+    s = Decimal(str(step))
+
+    if s <= 0:
+        return float(v)
+
+    return float(
+        (
+            v / s
+        ).to_integral_value(
+            rounding=ROUND_UP
+        ) * s
+    )
+
+
+def round_trade_price(
+    price,
+    tick,
+    side,
+    kind
+):
+
+    if side == "long":
+
+        if kind == "sl":
+            return floor_step(
+                price,
+                tick
+            )
+
+        return ceil_step(
+            price,
+            tick
+        )
+
+    if kind == "sl":
+        return ceil_step(
+            price,
+            tick
+        )
 
     return floor_step(
         price,
@@ -639,7 +728,6 @@ def get_instrument(symbol):
     )
 
     if not native_ok(resp):
-
         raise RuntimeError(
             f"Instrument lookup failed "
             f"{inst}: {response_error(resp)}"
@@ -648,7 +736,6 @@ def get_instrument(symbol):
     data = resp.get("data") or []
 
     if not data:
-
         raise RuntimeError(
             f"No instrument metadata for {inst}"
         )
@@ -670,7 +757,6 @@ def futures_account():
     )
 
     if not native_ok(resp):
-
         raise RuntimeError(
             f"Balance API failed: "
             f"{response_error(resp)}"
@@ -689,7 +775,7 @@ def futures_account():
             d for d in details
             if d.get("currency") == "USDT"
         ),
-        {}
+        {},
     )
 
     balance = safe_float(
@@ -727,7 +813,6 @@ def get_positions():
     )
 
     if not native_ok(resp):
-
         raise RuntimeError(
             f"Positions API failed: "
             f"{response_error(resp)}"
@@ -772,10 +857,7 @@ def position_side(p):
         )
     ).lower()
 
-    if side in (
-        "long",
-        "short"
-    ):
+    if side in ("long", "short"):
         return side
 
     pos = safe_float(
@@ -792,21 +874,6 @@ def position_side(p):
         "long"
         if pos > 0
         else "short"
-    )
-
-
-def position_size(p):
-
-    return abs(
-        safe_float(
-            p.get(
-                "positions",
-                p.get(
-                    "position",
-                    p.get("size", 0)
-                )
-            )
-        )
     )
 
 
@@ -859,7 +926,6 @@ def ohlcv_df(symbol, timeframe):
     )
 
     if len(rows) < 60:
-
         raise RuntimeError(
             f"Not enough candles for "
             f"{symbol} {timeframe}"
@@ -873,7 +939,7 @@ def ohlcv_df(symbol, timeframe):
             "high",
             "low",
             "close",
-            "volume"
+            "volume",
         ]
     )
 
@@ -882,7 +948,7 @@ def ohlcv_df(symbol, timeframe):
         "high",
         "low",
         "close",
-        "volume"
+        "volume",
     ]:
 
         df[c] = pd.to_numeric(
@@ -1015,7 +1081,6 @@ def add_indicators(df):
 
     # ADX
     up_move = out["high"].diff()
-
     down_move = -out["low"].diff()
 
     plus_dm = np.where(
@@ -1130,14 +1195,24 @@ def add_indicators(df):
         .shift(1)
     )
 
-    out["ret15"] = (
+    # Generic candle returns.
+    # On 15m:
+    # ret1 = 15m
+    # ret3 = 45m
+    # ret6 = 90m
+    out["ret1"] = (
+        out["close"]
+        .pct_change(1)
+    )
+
+    out["ret3"] = (
         out["close"]
         .pct_change(3)
     )
 
-    out["ret5"] = (
+    out["ret6"] = (
         out["close"]
-        .pct_change(3)
+        .pct_change(6)
     )
 
     return out
@@ -1170,7 +1245,7 @@ def session_state():
 
 btc_cache = {
     "ts": 0,
-    "data": None
+    "data": None,
 }
 
 
@@ -1202,69 +1277,58 @@ def btc_regime():
     a = df15.iloc[-2]
     t = df1h.iloc[-2]
 
-    ret15 = (
-        float(a["ret15"])
-        if pd.notna(a["ret15"])
-        else 0.0
-    )
-
     data = {
+        "bull": bool(
+            t["ema20"] > t["ema50"]
+        ),
 
-        "bull":
-            bool(
-                t["ema20"]
-                > t["ema50"]
-            ),
+        "bear": bool(
+            t["ema20"] < t["ema50"]
+        ),
 
-        "bear":
-            bool(
-                t["ema20"]
-                < t["ema50"]
-            ),
+        "stack_long": bool(
+            t["ema20"]
+            > t["ema50"]
+            > t["ema200"]
+        ),
 
-        "stack_long":
-            bool(
-                t["ema20"]
-                > t["ema50"]
-                > t["ema200"]
-            ),
+        "stack_short": bool(
+            t["ema20"]
+            < t["ema50"]
+            < t["ema200"]
+        ),
 
-        "stack_short":
-            bool(
-                t["ema20"]
-                < t["ema50"]
-                < t["ema200"]
-            ),
+        "impulse_up": bool(
+            a["close"] > a["ema20"]
+            and
+            a["ema20"] >= a["ema50"]
+        ),
 
-        "impulse_up":
-            bool(
-                a["close"]
-                > a["ema20"]
-                and
-                a["ema20"]
-                >= a["ema50"]
-            ),
+        "impulse_down": bool(
+            a["close"] < a["ema20"]
+            and
+            a["ema20"] <= a["ema50"]
+        ),
 
-        "impulse_down":
-            bool(
-                a["close"]
-                < a["ema20"]
-                and
-                a["ema20"]
-                <= a["ema50"]
-            ),
+        "ret15": safe_float(
+            a["ret1"]
+        ),
 
-        "ret15": ret15,
+        "ret45": safe_float(
+            a["ret3"]
+        ),
 
-        "adx":
-            safe_float(
-                a["adx"]
-            ),
+        "ret90": safe_float(
+            a["ret6"]
+        ),
 
-        "close":
-            safe_float(
-                a["close"]
-            ),
+        "adx": safe_float(
+            a["adx"]
+        ),
+
+        "close": safe_float(
+            a["close"]
+        ),
     }
 
     btc_cache["ts"] = now
@@ -1274,11 +1338,11 @@ def btc_regime():
 
 
 # ============================================================
-# LEARNING STORAGE
+# LEARNING
 # ============================================================
 
 learning = {
-    "version": 1,
+    "version": 2,
     "trades": 0,
     "wins": 0,
     "losses": 0,
@@ -1297,33 +1361,26 @@ def load_learning():
         return
 
     try:
-
         with open(
             LEARNING_FILE,
             "r",
             encoding="utf-8"
         ) as f:
-
             data = json.load(f)
 
         if isinstance(data, dict):
-
-            learning.update(
-                data
-            )
+            learning.update(data)
 
     except Exception as e:
-
         tg(
-            f"⚠️ Learning file "
-            f"ignored: {e}"
+            f"⚠️ Learning file ignored: "
+            f"{e}"
         )
 
 
 def save_learning():
 
     try:
-
         tmp = LEARNING_FILE + ".tmp"
 
         with open(
@@ -1331,7 +1388,6 @@ def save_learning():
             "w",
             encoding="utf-8"
         ) as f:
-
             json.dump(
                 learning,
                 f,
@@ -1370,8 +1426,12 @@ def fingerprint(signal):
         if signal.get("sweep")
         else
         "pullback"
-        if signal.get("pullback_quality", 0) >= 2
-        else "continuation"
+        if signal.get(
+            "pullback_quality",
+            0
+        ) >= 2
+        else
+        "continuation"
     )
 
     return "|".join(
@@ -1402,16 +1462,20 @@ def fingerprint(signal):
 
 def learning_adjustment(signal):
 
-    if learning.get("trades", 0) < LEARNING_MIN_TRADES:
+    if (
+        learning.get("trades", 0)
+        < LEARNING_MIN_TRADES
+    ):
         return 0.0
 
-    fp = fingerprint(
-        signal
-    )
+    fp = fingerprint(signal)
 
     rec = (
         learning
-        .get("fingerprints", {})
+        .get(
+            "fingerprints",
+            {}
+        )
         .get(fp)
     )
 
@@ -1442,11 +1506,8 @@ def learning_adjustment(signal):
         )
     )
 
-    wr = (
-        wins / trades
-    )
+    wr = wins / trades
 
-    # zeer beperkte invloed
     if wr >= 0.70 and net > 0:
         return min(
             LEARNING_MAX_BONUS,
@@ -1463,7 +1524,7 @@ def learning_adjustment(signal):
 
 
 # ============================================================
-# ADAPTIVE SCORE THRESHOLD
+# ADAPTIVE THRESHOLD
 # ============================================================
 
 def adaptive_threshold(signal):
@@ -1495,17 +1556,12 @@ def adaptive_threshold(signal):
         )
     )
 
-    # --------------------------------------------------------
-    # sterke trend
-    # --------------------------------------------------------
-
     if (
         adx >= ADX_VERY_STRONG
         and confirm >= 2
         and momentum >= 2
         and entry_quality >= 2
     ):
-
         threshold = min(
             threshold,
             STRONG_REGIME_MIN_SCORE
@@ -1516,63 +1572,47 @@ def adaptive_threshold(signal):
         and confirm >= 3
         and momentum >= 2
     ):
-
         threshold = max(
             HARD_MIN_SCORE,
             threshold - 2
         )
 
-    # --------------------------------------------------------
-    # learning
-    # --------------------------------------------------------
-
-    adjustment = learning_adjustment(
+    threshold -= learning_adjustment(
         signal
     )
 
-    threshold -= adjustment
-
-    threshold = max(
+    return max(
         HARD_MIN_SCORE,
         threshold
     )
-
-    return threshold
 
 
 # ============================================================
 # EVALUATE SYMBOL
 # ============================================================
 
-def evaluate_symbol(
-    symbol,
-    btc
-):
+def evaluate_symbol(symbol, btc):
 
     sess = session_state()
-
-    # --------------------------------------------------------
-    # night mode
-    # --------------------------------------------------------
 
     if (
         sess == "NIGHT"
         and symbol not in MAJORS
     ):
-
         return {
             "symbol": symbol,
             "side": None,
             "score": 0,
             "tactics": 0,
+            "threshold": BASE_MIN_SCORE,
             "skip": "night-alts",
             "price": 0,
             "atr": 0,
+            "entry_quality": 0,
+            "confirm_components": 0,
+            "adx": 0,
+            "rel": 0,
         }
-
-    # --------------------------------------------------------
-    # data
-    # --------------------------------------------------------
 
     df15 = add_indicators(
         ohlcv_df(
@@ -1603,10 +1643,6 @@ def evaluate_symbol(
 
     t = df1h.iloc[-2]
 
-    # --------------------------------------------------------
-    # base
-    # --------------------------------------------------------
-
     price = safe_float(
         a["close"]
     )
@@ -1616,6 +1652,8 @@ def evaluate_symbol(
     )
 
     if (
+        price <= 0
+        or
         not np.isfinite(atr)
         or atr <= 0
     ):
@@ -1632,13 +1670,51 @@ def evaluate_symbol(
         a["adx"]
     )
 
-    coin_ret = safe_float(
-        a["ret15"]
+    # --------------------------------------------------------
+    # MULTI-HORIZON RELATIVE STRENGTH
+    # --------------------------------------------------------
+
+    coin_ret15 = safe_float(
+        a["ret1"]
+    )
+
+    coin_ret45 = safe_float(
+        a["ret3"]
+    )
+
+    coin_ret90 = safe_float(
+        a["ret6"]
+    )
+
+    rel15 = (
+        coin_ret15
+        - btc["ret15"]
+    )
+
+    rel45 = (
+        coin_ret45
+        - btc["ret45"]
+    )
+
+    rel90 = (
+        coin_ret90
+        - btc["ret90"]
     )
 
     rel = (
-        coin_ret
-        - btc["ret15"]
+        rel15 * 0.50
+        + rel45 * 0.30
+        + rel90 * 0.20
+    )
+
+    rs_persistent_long = (
+        rel15 > 0
+        and rel45 > 0
+    )
+
+    rs_persistent_short = (
+        rel15 < 0
+        and rel45 < 0
     )
 
     # --------------------------------------------------------
@@ -1657,68 +1733,50 @@ def evaluate_symbol(
         c["ema20"]
     )
 
-    ema50_5 = safe_float(
-        c["ema50"]
-    )
-
     ema20_slope = safe_float(
         a["ema20_slope"]
     )
 
-    ema50_slope = safe_float(
-        a["ema50_slope"]
-    )
-
     ema20_slope_pct = (
-        ema20_slope
-        /
-        price
+        ema20_slope / price
     )
 
     # --------------------------------------------------------
-    # trend
+    # TREND
     # --------------------------------------------------------
 
     stack_long = (
         t["ema20"]
         > t["ema50"]
-        >
-        t["ema200"]
+        > t["ema200"]
     )
 
     stack_short = (
         t["ema20"]
         < t["ema50"]
-        <
-        t["ema200"]
+        < t["ema200"]
     )
 
     fast_long = (
-        t["ema20"]
-        > t["ema50"]
+        t["ema20"] > t["ema50"]
     )
 
     fast_short = (
-        t["ema20"]
-        < t["ema50"]
+        t["ema20"] < t["ema50"]
     )
 
     trend_long = (
-        ema20_15
-        > ema50_15
-        and
-        ema20_slope > 0
+        ema20_15 > ema50_15
+        and ema20_slope > 0
     )
 
     trend_short = (
-        ema20_15
-        < ema50_15
-        and
-        ema20_slope < 0
+        ema20_15 < ema50_15
+        and ema20_slope < 0
     )
 
     # --------------------------------------------------------
-    # volume
+    # VOLUME
     # --------------------------------------------------------
 
     volume_ok = False
@@ -1726,7 +1784,6 @@ def evaluate_symbol(
     if pd.notna(
         a["vol_sma20"]
     ):
-
         volume_ok = (
             a["volume"]
             >
@@ -1735,27 +1792,24 @@ def evaluate_symbol(
         )
 
     # --------------------------------------------------------
-    # pullback quality
+    # PULLBACK
     # --------------------------------------------------------
 
     dist_ema = (
-        price
-        - ema20_15
+        price - ema20_15
     ) / price
 
     abs_dist_ema = abs(
         dist_ema
     )
 
-    near_long = (
+    near_ema = (
         abs_dist_ema
         <=
         PULLBACK_ATR
         * atr
         / price
     )
-
-    near_short = near_long
 
     touched_ema_long = (
         min(
@@ -1764,9 +1818,7 @@ def evaluate_symbol(
         )
         <=
         ema20_15
-        +
-        PULLBACK_ATR
-        * atr
+        + PULLBACK_ATR * atr
     )
 
     touched_ema_short = (
@@ -1776,53 +1828,45 @@ def evaluate_symbol(
         )
         >=
         ema20_15
-        -
-        PULLBACK_ATR
-        * atr
+        - PULLBACK_ATR * atr
     )
 
     pullback_long = (
-        near_long
-        or
-        touched_ema_long
+        near_ema
+        or touched_ema_long
     )
 
     pullback_short = (
-        near_short
-        or
-        touched_ema_short
+        near_ema
+        or touched_ema_short
     )
 
     # --------------------------------------------------------
-    # extension
+    # EXTENSION
     # --------------------------------------------------------
 
     ext_long = (
         dist_ema
-        >
-        MAX_EMA_EXT_PCT
+        > MAX_EMA_EXT_PCT
     )
 
     ext_short = (
         dist_ema
-        <
-        -MAX_EMA_EXT_PCT
+        < -MAX_EMA_EXT_PCT
     )
 
     # --------------------------------------------------------
-    # impulse
+    # IMPULSE
     # --------------------------------------------------------
 
     bar15_range = (
         safe_float(a["high"])
-        -
-        safe_float(a["low"])
+        - safe_float(a["low"])
     )
 
     bar1h_range = (
         safe_float(t["high"])
-        -
-        safe_float(t["low"])
+        - safe_float(t["low"])
     )
 
     atr1h = safe_float(
@@ -1833,19 +1877,17 @@ def evaluate_symbol(
     impulse_15 = (
         bar15_range
         >
-        IMPULSE_15M_ATR
-        * atr
+        IMPULSE_15M_ATR * atr
     )
 
     impulse_1h = (
         bar1h_range
         >
-        IMPULSE_1H_ATR
-        * atr1h
+        IMPULSE_1H_ATR * atr1h
     )
 
     # --------------------------------------------------------
-    # run
+    # RUN
     # --------------------------------------------------------
 
     run8 = 0.0
@@ -1857,16 +1899,13 @@ def evaluate_symbol(
         )
 
         if old_close > 0:
-
             run8 = (
-                price
-                /
-                old_close
+                price / old_close
                 - 1
             )
 
     # --------------------------------------------------------
-    # structure / sweep
+    # STRUCTURE
     # --------------------------------------------------------
 
     recent_low = (
@@ -1891,50 +1930,38 @@ def evaluate_symbol(
         safe_float(a_prev["low"])
         <
         recent_low
-        -
-        NEAR_SWEEP_ATR
-        * atr
+        - NEAR_SWEEP_ATR * atr
         and
-        price
-        >
-        recent_low
+        price > recent_low
     )
 
     sweep_short = (
         safe_float(a_prev["high"])
         >
         recent_high
-        +
-        NEAR_SWEEP_ATR
-        * atr
+        + NEAR_SWEEP_ATR * atr
         and
-        price
-        <
-        recent_high
+        price < recent_high
     )
 
     structure_long = (
         (
             pullback_long
-            and
-            trend_long
+            and trend_long
         )
-        or
-        sweep_long
+        or sweep_long
     )
 
     structure_short = (
         (
             pullback_short
-            and
-            trend_short
+            and trend_short
         )
-        or
-        sweep_short
+        or sweep_short
     )
 
     # --------------------------------------------------------
-    # 5m confirmation
+    # 5M CONFIRMATION
     # --------------------------------------------------------
 
     c_atr = safe_float(
@@ -1946,69 +1973,41 @@ def evaluate_symbol(
         safe_float(c["low"])
         <=
         ema20_5
-        +
-        0.35
-        * c_atr
+        + 0.35 * c_atr
     )
 
     reject_5m = (
         safe_float(c["high"])
         >=
         ema20_5
-        -
-        0.35
-        * c_atr
+        - 0.35 * c_atr
     )
 
     confirm_long_components = 0
     confirm_short_components = 0
 
-    # 1. EMA
-    if (
-        c["ema20"]
-        >
-        c["ema50"]
-    ):
+    # EMA alignment
+    if c["ema20"] > c["ema50"]:
         confirm_long_components += 1
 
-    if (
-        c["ema20"]
-        <
-        c["ema50"]
-    ):
+    if c["ema20"] < c["ema50"]:
         confirm_short_components += 1
 
-    # 2. price
-    if (
-        c["close"]
-        >
-        c["ema20"]
-    ):
+    # Price relative to EMA
+    if c["close"] > c["ema20"]:
         confirm_long_components += 1
 
-    if (
-        c["close"]
-        <
-        c["ema20"]
-    ):
+    if c["close"] < c["ema20"]:
         confirm_short_components += 1
 
-    # 3. momentum
-    if (
-        c["close"]
-        >
-        c_prev["close"]
-    ):
+    # Immediate momentum
+    if c["close"] > c_prev["close"]:
         confirm_long_components += 1
 
-    if (
-        c["close"]
-        <
-        c_prev["close"]
-    ):
+    if c["close"] < c_prev["close"]:
         confirm_short_components += 1
 
-    # 4. pullback/rejection
+    # Pullback/rejection
     if bounce_5m:
         confirm_long_components += 1
 
@@ -2024,7 +2023,7 @@ def evaluate_symbol(
     )
 
     # --------------------------------------------------------
-    # ATR quality
+    # QUALITY / REGIME
     # --------------------------------------------------------
 
     atr_quality = (
@@ -2032,10 +2031,6 @@ def evaluate_symbol(
         <= atr_pct
         <= 0.035
     )
-
-    # --------------------------------------------------------
-    # ADX regime
-    # --------------------------------------------------------
 
     trending = (
         adx >= ADX_TREND
@@ -2054,7 +2049,7 @@ def evaluate_symbol(
     )
 
     # --------------------------------------------------------
-    # momentum quality
+    # MOMENTUM
     # --------------------------------------------------------
 
     momentum_quality_long = 0
@@ -2066,18 +2061,10 @@ def evaluate_symbol(
     if ema20_slope_pct < -0.0003:
         momentum_quality_short += 1
 
-    if (
-        a["close"]
-        >
-        a_prev["close"]
-    ):
+    if a["close"] > a_prev["close"]:
         momentum_quality_long += 1
 
-    if (
-        a["close"]
-        <
-        a_prev["close"]
-    ):
+    if a["close"] < a_prev["close"]:
         momentum_quality_short += 1
 
     if btc["ret15"] > 0:
@@ -2087,7 +2074,7 @@ def evaluate_symbol(
         momentum_quality_short += 1
 
     # --------------------------------------------------------
-    # Relative strength
+    # RS
     # --------------------------------------------------------
 
     rs_long = (
@@ -2106,42 +2093,22 @@ def evaluate_symbol(
         rel < -RS_OVERRIDE
     )
 
-    # --------------------------------------------------------
-    # Relative-strength failure
-    # --------------------------------------------------------
-    #
-    # Nieuwe logica:
-    #
-    # Een coin mag SHORT ondanks RS+ wanneer:
-    # - 15m trend draait omlaag
-    # - 5m confirmation bearish is
-    # - RSI niet oversold is
-    #
-    # En omgekeerd voor LONG.
-    #
-
     rs_failure_short = (
         rel > 0
-        and
-        trend_short
-        and
-        confirm_short
-        and
-        rsi > RSI_SHORT_MIN
+        and trend_short
+        and confirm_short
+        and rsi > RSI_SHORT_MIN
     )
 
     rs_failure_long = (
         rel < 0
-        and
-        trend_long
-        and
-        confirm_long
-        and
-        rsi < RSI_LONG_MAX
+        and trend_long
+        and confirm_long
+        and rsi < RSI_LONG_MAX
     )
 
     # --------------------------------------------------------
-    # score
+    # SCORE
     # --------------------------------------------------------
 
     long_score = 0.0
@@ -2152,44 +2119,34 @@ def evaluate_symbol(
 
     # 1H trend
     if stack_long:
-
         long_score += 16
         long_tactics += 1
 
     elif fast_long:
-
         long_score += 7
 
     if stack_short:
-
         short_score += 16
         short_tactics += 1
 
     elif fast_short:
-
         short_score += 7
 
-    # 15m trend
+    # 15m directional trend
     if trend_long:
-
         long_score += 12
         long_tactics += 1
 
     if trend_short:
-
         short_score += 12
         short_tactics += 1
 
-    # volume
+    # Volume = QUALITY ONLY
     if volume_ok:
+        long_score += 6
+        short_score += 6
 
-        long_score += 8
-        short_score += 8
-
-        long_tactics += 1
-        short_tactics += 1
-
-    # structure
+    # Structure
     if structure_long:
 
         long_score += (
@@ -2210,7 +2167,7 @@ def evaluate_symbol(
 
         short_tactics += 1
 
-    # 5m
+    # 5m directional confirmation
     if confirm_long:
 
         long_score += (
@@ -2231,72 +2188,67 @@ def evaluate_symbol(
 
         short_tactics += 1
 
-    # ATR
+    # ATR = QUALITY ONLY
     if atr_quality:
+        long_score += 4
+        short_score += 4
 
-        long_score += 5
-        short_score += 5
-
-        long_tactics += 1
-        short_tactics += 1
-
-    # ADX
+    # ADX = quality/regime
     if trending:
-
         long_score += 5
         short_score += 5
 
     if strong_trend:
-
         long_score += 3
         short_score += 3
 
     if very_strong_trend:
-
         long_score += 3
         short_score += 3
 
-    # slope momentum
+    # Directional momentum
     if momentum_quality_long >= 2:
-
         long_score += 4
         long_tactics += 1
 
     if momentum_quality_short >= 2:
-
         short_score += 4
         short_tactics += 1
 
-    # relative strength
+    # Persistent relative strength
     if rs_strong_long:
-
         long_score += 6
+        long_tactics += 1
 
-    elif rs_long:
-
+    elif (
+        rs_long
+        and rs_persistent_long
+    ):
         long_score += 3
+        long_tactics += 1
 
     if rs_strong_short:
-
         short_score += 6
+        short_tactics += 1
 
-    elif rs_short:
-
+    elif (
+        rs_short
+        and rs_persistent_short
+    ):
         short_score += 3
+        short_tactics += 1
 
-    # RS failure bonus
+    # RS failure
     if rs_failure_short:
-
         short_score += 5
         short_tactics += 1
 
     if rs_failure_long:
-
         long_score += 5
         long_tactics += 1
 
     # --------------------------------------------------------
-    # determine side
+    # SIDE
     # --------------------------------------------------------
 
     if long_score >= short_score:
@@ -2316,9 +2268,11 @@ def evaluate_symbol(
         )
 
         pullback_quality = (
-            3 if near_long
+            3
+            if near_ema
             else
-            2 if touched_ema_long
+            2
+            if touched_ema_long
             else 0
         )
 
@@ -2341,9 +2295,11 @@ def evaluate_symbol(
         )
 
         pullback_quality = (
-            3 if near_short
+            3
+            if near_ema
             else
-            2 if touched_ema_short
+            2
+            if touched_ema_short
             else 0
         )
 
@@ -2361,11 +2317,13 @@ def evaluate_symbol(
     elif pullback_quality >= 2:
         entry_quality += 1
 
-    if not (
+    side_extended = (
         ext_long
         if side == "long"
         else ext_short
-    ):
+    )
+
+    if not side_extended:
         entry_quality += 1
 
     if not (
@@ -2378,7 +2336,7 @@ def evaluate_symbol(
         entry_quality += 1
 
     # --------------------------------------------------------
-    # BTC regime
+    # BTC LABEL
     # --------------------------------------------------------
 
     if btc["stack_long"]:
@@ -2396,10 +2354,6 @@ def evaluate_symbol(
     else:
         btc_regime_label = "BTC_NEUTRAL"
 
-    # --------------------------------------------------------
-    # adaptive threshold
-    # --------------------------------------------------------
-
     preliminary = {
         "side": side,
         "adx": adx,
@@ -2416,70 +2370,54 @@ def evaluate_symbol(
         preliminary
     )
 
-    # --------------------------------------------------------
-    # skips
-    # --------------------------------------------------------
-
     skip_reasons = []
 
-    # session
+    # Shoulder = slightly harder
     if sess == "SHOULDER":
         score -= 4
 
-    # chop
     if choppy:
         skip_reasons.append(
             "adx-chop"
         )
 
-    # --------------------------------------------------------
-    # RSI
-    # --------------------------------------------------------
+    # Also require the trend threshold.
+    if not trending:
+        skip_reasons.append(
+            f"adx-{adx:.0f}<{ADX_TREND:.0f}"
+        )
 
+    # RSI
     if (
         side == "long"
-        and
-        rsi >= RSI_LONG_MAX
+        and rsi >= RSI_LONG_MAX
     ):
-
-        # In a very strong trend RSI may stay high.
-        # Only block if also poor entry.
         if (
             not very_strong_trend
-            or
-            entry_quality < 2
+            or entry_quality < 2
         ):
-
             skip_reasons.append(
                 "rsi-overbought"
             )
 
     if (
         side == "short"
-        and
-        rsi <= RSI_SHORT_MIN
+        and rsi <= RSI_SHORT_MIN
     ):
-
         if (
             not very_strong_trend
-            or
-            entry_quality < 2
+            or entry_quality < 2
         ):
-
             skip_reasons.append(
                 "rsi-oversold"
             )
 
-    # --------------------------------------------------------
-    # extension
-    # --------------------------------------------------------
-
+    # Extension
     if side == "long":
 
         if (
             ext_long
-            and
-            not (
+            and not (
                 very_strong_trend
                 and
                 confirm_long_components >= 4
@@ -2487,7 +2425,6 @@ def evaluate_symbol(
                 pullback_quality >= 2
             )
         ):
-
             skip_reasons.append(
                 "extended-long"
             )
@@ -2496,8 +2433,7 @@ def evaluate_symbol(
 
         if (
             ext_short
-            and
-            not (
+            and not (
                 very_strong_trend
                 and
                 confirm_short_components >= 4
@@ -2505,23 +2441,16 @@ def evaluate_symbol(
                 pullback_quality >= 2
             )
         ):
-
             skip_reasons.append(
                 "extended-short"
             )
 
-    # --------------------------------------------------------
-    # impulse chase
-    # --------------------------------------------------------
-
+    # Impulse chase
     if (
         impulse_15
-        or
-        impulse_1h
+        or impulse_1h
     ):
 
-        # strong trend can survive an impulse only when
-        # entry is still close enough to EMA.
         if not (
             very_strong_trend
             and
@@ -2529,43 +2458,38 @@ def evaluate_symbol(
             and
             confirm_components >= 3
         ):
-
             skip_reasons.append(
                 "impulse-chase"
             )
 
-    # --------------------------------------------------------
-    # extended run
-    # --------------------------------------------------------
-
-    if side == "long" and run8 > MAX_RUN_PCT:
+    # Extended run
+    if (
+        side == "long"
+        and run8 > MAX_RUN_PCT
+    ):
 
         if not (
             very_strong_trend
-            and
-            pullback_quality >= 2
+            and pullback_quality >= 2
         ):
-
             skip_reasons.append(
                 "extended-run"
             )
 
-    if side == "short" and run8 < -MAX_RUN_PCT:
+    if (
+        side == "short"
+        and run8 < -MAX_RUN_PCT
+    ):
 
         if not (
             very_strong_trend
-            and
-            pullback_quality >= 2
+            and pullback_quality >= 2
         ):
-
             skip_reasons.append(
                 "extended-run"
             )
 
-    # --------------------------------------------------------
-    # BTC directional filter
-    # --------------------------------------------------------
-
+    # BTC direction
     if symbol not in MAJORS:
 
         if side == "long":
@@ -2595,29 +2519,15 @@ def evaluate_symbol(
 
             elif btc["bull"]:
 
-                # IMPORTANT:
-                # weak coin short blijft toegestaan
-                # wanneer relative strength zwak wordt.
                 if not (
                     rs_strong_short
-                    or
-                    rs_failure_short
+                    or rs_failure_short
                 ):
-
                     skip_reasons.append(
                         "btc-bull-weak-short"
                     )
 
-    # --------------------------------------------------------
     # 5m confirmation
-    # --------------------------------------------------------
-
-    # normale eis = 3/4
-    #
-    # uitzonderlijk sterke trend:
-    # 2/4 mag alleen wanneer structuur,
-    # momentum en ADX sterk zijn.
-
     if confirm_components < 3:
 
         strong_override = (
@@ -2633,14 +2543,9 @@ def evaluate_symbol(
         )
 
         if not strong_override:
-
             skip_reasons.append(
                 f"5m-{confirm_components}/4"
             )
-
-    # --------------------------------------------------------
-    # tactics
-    # --------------------------------------------------------
 
     required_tactics = (
         STRONG_MIN_TACTICS
@@ -2649,24 +2554,20 @@ def evaluate_symbol(
     )
 
     if tactics < required_tactics:
-
         skip_reasons.append(
-            f"tactics-{tactics}/{required_tactics}"
+            f"tactics-"
+            f"{tactics}/"
+            f"{required_tactics}"
         )
-
-    # --------------------------------------------------------
-    # score
-    # --------------------------------------------------------
 
     if score < threshold:
-
         skip_reasons.append(
-            f"score-{score:.0f}<{threshold:.0f}"
+            f"score-"
+            f"{score:.0f}<"
+            f"{threshold:.0f}"
         )
 
-    # ATR
     if not atr_quality:
-
         skip_reasons.append(
             "atr-band"
         )
@@ -2674,10 +2575,6 @@ def evaluate_symbol(
     # --------------------------------------------------------
     # SECOND CHANCE
     # --------------------------------------------------------
-    #
-    # Sterke trend + goede structuur + 5m momentum
-    # kan alsnog door wanneer score net onder threshold zit.
-    #
 
     second_chance = False
 
@@ -2700,42 +2597,33 @@ def evaluate_symbol(
         and
         not impulse_15
     ):
-
         second_chance = True
 
-        # remove score skip
         skip_reasons = [
             x for x in skip_reasons
-            if not x.startswith("score-")
-        ]
-
-    # --------------------------------------------------------
-    # remove soft RS conflicts when failure is valid
-    # --------------------------------------------------------
-
-    if side == "short" and rs_failure_short:
-
-        skip_reasons = [
-            x for x in skip_reasons
-            if x not in (
-                "strong-vs-btc",
-                "btc-bull-weak-short"
+            if not x.startswith(
+                "score-"
             )
         ]
 
-    if side == "long" and rs_failure_long:
-
+    # Valid RS failures can override corresponding BTC conflict.
+    if (
+        side == "short"
+        and rs_failure_short
+    ):
         skip_reasons = [
             x for x in skip_reasons
-            if x not in (
-                "weak-vs-btc",
-                "btc-bear"
-            )
+            if x != "btc-bull-weak-short"
         ]
 
-    # --------------------------------------------------------
-    # FINAL
-    # --------------------------------------------------------
+    if (
+        side == "long"
+        and rs_failure_long
+    ):
+        skip_reasons = [
+            x for x in skip_reasons
+            if x != "btc-bear"
+        ]
 
     final_skip = (
         skip_reasons[0]
@@ -2743,38 +2631,29 @@ def evaluate_symbol(
         else None
     )
 
-    learning_bonus = learning_adjustment(
-        {
-            **preliminary,
-            "btc_regime": btc_regime_label
-        }
+    learning_bonus = (
+        learning_adjustment(
+            preliminary
+        )
     )
 
     return {
-
         "symbol": symbol,
-
         "side": side,
-
         "score": float(score),
-
         "tactics": tactics,
-
         "threshold": threshold,
-
         "second_chance": second_chance,
-
         "price": price,
-
         "atr": atr,
-
         "atr_pct": atr_pct,
-
         "rsi": rsi,
-
         "adx": adx,
 
         "rel": rel,
+        "rel15": rel15,
+        "rel45": rel45,
+        "rel90": rel90,
 
         "confirm": (
             confirm_components >= 3
@@ -2783,9 +2662,8 @@ def evaluate_symbol(
         "confirm_components":
             confirm_components,
 
-        "structure": bool(
-            structure
-        ),
+        "structure":
+            bool(structure),
 
         "pullback_quality":
             pullback_quality,
@@ -2796,32 +2674,32 @@ def evaluate_symbol(
         "momentum_quality":
             momentum_quality,
 
-        "sweep": bool(
-            sweep
-        ),
+        "sweep":
+            bool(sweep),
 
-        "rs_failure":
-            (
-                rs_failure_short
-                if side == "short"
-                else
-                rs_failure_long
-            ),
+        "rs_failure": (
+            rs_failure_short
+            if side == "short"
+            else rs_failure_long
+        ),
 
         "learning_bonus":
             learning_bonus,
 
-        "skip": final_skip,
+        "skip":
+            final_skip,
 
         "skip_reasons":
             skip_reasons,
 
-        "session": sess,
+        "session":
+            sess,
 
         "btc_regime":
             btc_regime_label,
 
-        "run8": run8,
+        "run8":
+            run8,
 
         "volume_ok":
             bool(volume_ok),
@@ -2854,62 +2732,62 @@ def calculate_trade_levels(
 
     if side == "long":
 
-        sl = (
-            entry
-            - risk_distance
+        raw_sl = (
+            entry - risk_distance
         )
 
-        tp = (
+        raw_tp = (
             entry
-            + risk_distance
-            * TP_R_MULT
+            + risk_distance * TP_R_MULT
         )
 
     else:
 
-        sl = (
-            entry
-            + risk_distance
+        raw_sl = (
+            entry + risk_distance
         )
 
-        tp = (
+        raw_tp = (
             entry
-            - risk_distance
-            * TP_R_MULT
+            - risk_distance * TP_R_MULT
         )
 
-    sl = round_price(
-        sl,
-        tick
+    sl = round_trade_price(
+        raw_sl,
+        tick,
+        side,
+        "sl"
     )
 
-    tp = round_price(
-        tp,
-        tick
+    tp = round_trade_price(
+        raw_tp,
+        tick,
+        side,
+        "tp"
     )
 
     if side == "long":
 
         if not (
-            sl
-            < entry
-            < tp
+            sl < entry < tp
         ):
             return None
 
     else:
 
         if not (
-            tp
-            < entry
-            < sl
+            tp < entry < sl
         ):
             return None
+
+    actual_risk_distance = abs(
+        entry - sl
+    )
 
     return (
         sl,
         tp,
-        risk_distance
+        actual_risk_distance,
     )
 
 
@@ -2917,17 +2795,14 @@ def calculate_trade_levels(
 # COST
 # ============================================================
 
-def roundtrip_cost(
-    notional
-):
+def roundtrip_cost(notional):
 
     return (
         notional
         *
         (
             TAKER_FEE_RATE * 2
-            +
-            SLIPPAGE_RATE
+            + SLIPPAGE_RATE
         )
     )
 
@@ -2944,26 +2819,18 @@ def calculate_contracts(
     available
 ):
 
-    meta = get_instrument(
-        symbol
-    )
+    meta = get_instrument(symbol)
 
     contract_value = safe_float(
-        meta.get(
-            "contractValue"
-        )
+        meta.get("contractValue")
     )
 
     min_size = safe_float(
-        meta.get(
-            "minSize"
-        )
+        meta.get("minSize")
     )
 
     lot_size = safe_float(
-        meta.get(
-            "lotSize"
-        )
+        meta.get("lotSize")
     )
 
     max_market_size = safe_float(
@@ -2975,12 +2842,9 @@ def calculate_contracts(
 
     if (
         contract_value <= 0
-        or
-        min_size <= 0
-        or
-        lot_size <= 0
+        or min_size <= 0
+        or lot_size <= 0
     ):
-
         raise RuntimeError(
             f"Bad contract metadata "
             f"for {symbol}"
@@ -2988,20 +2852,16 @@ def calculate_contracts(
 
     stop_pct = (
         abs(entry - sl)
-        /
-        entry
+        / entry
     )
 
     risk_budget = (
         equity
-        *
-        MAX_RISK_EQUITY_PCT
+        * MAX_RISK_EQUITY_PCT
     )
 
     risk_notional = (
-        risk_budget
-        /
-        stop_pct
+        risk_budget / stop_pct
         if stop_pct > 0
         else 0
     )
@@ -3010,29 +2870,24 @@ def calculate_contracts(
         BASE_MARGIN_USDT,
         MAX_MARGIN_USDT,
         equity
-        *
-        MAX_MARGIN_EQUITY_PCT
+        * MAX_MARGIN_EQUITY_PCT
     )
 
     target_notional = min(
         risk_notional,
-        margin_cap
-        *
-        LEVERAGE
+        margin_cap * LEVERAGE
     )
 
     max_affordable_margin = max(
         0.0,
         available
-        *
-        AVAILABLE_MARGIN_BUFFER
+        * AVAILABLE_MARGIN_BUFFER
     )
 
     target_notional = min(
         target_notional,
         max_affordable_margin
-        *
-        LEVERAGE
+        * LEVERAGE
     )
 
     if target_notional <= 0:
@@ -3049,7 +2904,6 @@ def calculate_contracts(
     )
 
     if contracts < min_size:
-
         contracts = min_size
 
     if max_market_size > 0:
@@ -3067,16 +2921,13 @@ def calculate_contracts(
 
     notional = (
         contracts
-        *
-        contract_value
-        *
-        entry
+        * contract_value
+        * entry
     )
 
     margin = (
         notional
-        /
-        LEVERAGE
+        / LEVERAGE
     )
 
     if (
@@ -3089,8 +2940,7 @@ def calculate_contracts(
         contracts = floor_step(
             (
                 max_affordable_margin
-                *
-                LEVERAGE
+                * LEVERAGE
             )
             /
             (
@@ -3105,16 +2955,13 @@ def calculate_contracts(
 
         notional = (
             contracts
-            *
-            contract_value
-            *
-            entry
+            * contract_value
+            * entry
         )
 
         margin = (
             notional
-            /
-            LEVERAGE
+            / LEVERAGE
         )
 
     if (
@@ -3127,8 +2974,7 @@ def calculate_contracts(
         contracts = floor_step(
             (
                 MAX_MARGIN_USDT
-                *
-                LEVERAGE
+                * LEVERAGE
             )
             /
             (
@@ -3143,24 +2989,19 @@ def calculate_contracts(
 
         notional = (
             contracts
-            *
-            contract_value
-            *
-            entry
+            * contract_value
+            * entry
         )
 
         margin = (
             notional
-            /
-            LEVERAGE
+            / LEVERAGE
         )
 
     expected_tp = (
         notional
-        *
-        TP_R_MULT
-        *
-        stop_pct
+        * TP_R_MULT
+        * stop_pct
     )
 
     cost = roundtrip_cost(
@@ -3168,32 +3009,20 @@ def calculate_contracts(
     )
 
     if (
-        expected_tp
-        - cost
+        expected_tp - cost
         <
         MIN_NET_TP_USDT
     ):
         return None
 
     return {
-
-        "contracts":
-            contracts,
-
-        "contract_value":
-            contract_value,
-
-        "notional":
-            notional,
-
-        "margin":
-            margin,
-
+        "contracts": contracts,
+        "contract_value": contract_value,
+        "notional": notional,
+        "margin": margin,
         "expected_tp_usdt":
             expected_tp,
-
-        "roundtrip_cost":
-            cost,
+        "roundtrip_cost": cost,
     }
 
 
@@ -3201,9 +3030,7 @@ def calculate_contracts(
 # TPSL
 # ============================================================
 
-def pending_tpsl(
-    inst_id=None
-):
+def pending_tpsl(inst_id=None):
 
     params = {
         "limit": "100"
@@ -3218,22 +3045,25 @@ def pending_tpsl(
     )
 
     if not native_ok(resp):
-
         raise RuntimeError(
             f"TPSL lookup failed: "
             f"{response_error(resp)}"
         )
 
-    return resp.get(
-        "data"
-    ) or []
+    return (
+        resp.get("data")
+        or []
+    )
 
 
 def has_live_protection(p):
+    """
+    V6.8 safety fix:
+    a position is protected ONLY if BOTH
+    TP and SL are present on the same live/effective TPSL.
+    """
 
-    inst = p.get(
-        "instId"
-    )
+    inst = p.get("instId")
 
     pos_side = str(
         p.get(
@@ -3245,43 +3075,38 @@ def has_live_protection(p):
     pid = position_id(p)
 
     try:
-
         orders = pending_tpsl(
             inst
         )
-
     except Exception:
-
         return False, None
 
     for o in orders:
 
-        if (
-            str(
-                o.get(
-                    "state",
-                    ""
-                )
-            ).lower()
-            !=
-            "live"
+        state = str(
+            o.get(
+                "state",
+                ""
+            )
+        ).lower()
+
+        if state not in (
+            "live",
+            "effective",
         ):
             continue
 
-        if o.get(
-            "instId"
-        ) != inst:
+        if o.get("instId") != inst:
             continue
 
-        if (
-            str(
-                o.get(
-                    "positionSide",
-                    "net"
-                )
-            ).lower()
-            != pos_side
-        ):
+        order_side = str(
+            o.get(
+                "positionSide",
+                "net"
+            )
+        ).lower()
+
+        if order_side != pos_side:
             continue
 
         opid = str(
@@ -3299,23 +3124,47 @@ def has_live_protection(p):
         ):
             continue
 
-        if (
+        has_tp = (
             safe_float(
                 o.get(
                     "tpTriggerPrice"
                 )
             ) > 0
-            or
+        )
+
+        has_sl = (
             safe_float(
                 o.get(
                     "slTriggerPrice"
                 )
             ) > 0
-        ):
+        )
 
+        if has_tp and has_sl:
             return True, o
 
     return False, None
+
+
+def all_positions_protected():
+
+    try:
+
+        positions = get_positions()
+
+        for p in positions:
+
+            protected, _ = (
+                has_live_protection(p)
+            )
+
+            if not protected:
+                return False
+
+        return True
+
+    except Exception:
+        return False
 
 
 def tpsl_prices_valid(
@@ -3329,21 +3178,12 @@ def tpsl_prices_valid(
         return False
 
     if side == "long":
-
         return (
-            sl
-            <
-            last
-            <
-            tp
+            sl < last < tp
         )
 
     return (
-        tp
-        <
-        last
-        <
-        sl
+        tp < last < sl
     )
 
 
@@ -3351,14 +3191,12 @@ def place_tpsl_for_position(
     p,
     sl,
     tp,
-    client_tag="v67"
+    client_tag="v68"
 ):
 
     inst = p["instId"]
 
-    side = position_side(
-        p
-    )
+    side = position_side(p)
 
     pside = str(
         p.get(
@@ -3370,15 +3208,12 @@ def place_tpsl_for_position(
     if pside not in (
         "net",
         "long",
-        "short"
+        "short",
     ):
-
         pside = "net"
 
     payload = {
-
-        "instId":
-            inst,
+        "instId": inst,
 
         "marginMode":
             position_margin_mode(p),
@@ -3386,12 +3221,11 @@ def place_tpsl_for_position(
         "positionSide":
             pside,
 
-        "side":
-            (
-                "sell"
-                if side == "long"
-                else "buy"
-            ),
+        "side": (
+            "sell"
+            if side == "long"
+            else "buy"
+        ),
 
         "tpTriggerPrice":
             str(tp),
@@ -3419,7 +3253,7 @@ def place_tpsl_for_position(
 
         "clientOrderId":
             f"{client_tag}"
-            f"{int(time.time()) % 100000000}",
+            f"{int(time.time() * 1000) % 100000000}",
     }
 
     pid = position_id(p)
@@ -3436,7 +3270,6 @@ def place_tpsl_for_position(
     )
 
     if not native_ok(resp):
-
         return (
             False,
             response_error(resp)
@@ -3444,26 +3277,95 @@ def place_tpsl_for_position(
 
     time.sleep(0.8)
 
-    ok, found = has_live_protection(
-        p
+    ok, found = (
+        has_live_protection(p)
     )
 
     if not ok:
-
         return (
             False,
-            "TPSL accepted but not visible"
+            "TPSL accepted but "
+            "both TP+SL not visible"
         )
 
-    return (
-        True,
-        found
-    )
+    return True, found
 
 
 # ============================================================
 # REPAIR
 # ============================================================
+
+def repair_one_position(p):
+
+    symbol = position_symbol(p)
+    side = position_side(p)
+    entry = position_entry(p)
+
+    if entry <= 0:
+        return False
+
+    protected, _ = (
+        has_live_protection(p)
+    )
+
+    if protected:
+        return True
+
+    df = add_indicators(
+        ohlcv_df(
+            symbol,
+            TIMEFRAME_SIGNAL
+        )
+    )
+
+    atr = safe_float(
+        df.iloc[-2]["atr"]
+    )
+
+    tick = safe_float(
+        get_instrument(
+            symbol
+        ).get(
+            "tickSize"
+        ),
+        0.0001
+    )
+
+    levels = calculate_trade_levels(
+        entry,
+        atr,
+        side,
+        tick
+    )
+
+    if not levels:
+        return False
+
+    sl, tp, _ = levels
+
+    last = safe_float(
+        exchange.fetch_ticker(
+            symbol
+        ).get("last")
+    )
+
+    if not tpsl_prices_valid(
+        side,
+        sl,
+        tp,
+        last
+    ):
+        return False
+
+    ok, _ = place_tpsl_for_position(
+        p,
+        sl,
+        tp,
+        client_tag="repair"
+    )
+
+    return ok
+
 
 def repair_existing_positions():
 
@@ -3473,141 +3375,64 @@ def repair_existing_positions():
         return True
 
     tg(
-        f"🛡️ V6.7 STARTUP\n"
+        f"🛡️ V6.8 STARTUP\n"
         f"Open positions: "
         f"{len(positions)}\n"
-        f"Checking TP/SL..."
+        f"Checking TP + SL..."
     )
-
-    all_ok = True
 
     for p in positions:
 
-        symbol = position_symbol(
-            p
-        )
-
-        side = position_side(
-            p
-        )
-
-        entry = position_entry(
-            p
-        )
-
-        if not entry:
-            continue
-
-        protected, _ = has_live_protection(
-            p
-        )
-
-        if protected:
-
-            tg(
-                f"✅ {symbol} "
-                f"{side.upper()}: "
-                f"TP/SL confirmed."
-            )
-
-            continue
+        symbol = position_symbol(p)
+        side = position_side(p)
 
         try:
 
-            df = add_indicators(
-                ohlcv_df(
-                    symbol,
-                    TIMEFRAME_SIGNAL
-                )
+            protected, _ = (
+                has_live_protection(p)
             )
 
-            atr = safe_float(
-                df.iloc[-2]["atr"]
-            )
-
-            tick = safe_float(
-                get_instrument(
-                    symbol
-                ).get(
-                    "tickSize"
-                ),
-                0.0001
-            )
-
-            levels = calculate_trade_levels(
-                entry,
-                atr,
-                side,
-                tick
-            )
-
-            if not levels:
-
-                all_ok = False
-                continue
-
-            sl, tp, _ = levels
-
-            last = safe_float(
-                exchange.fetch_ticker(
-                    symbol
-                ).get("last")
-            )
-
-            if not tpsl_prices_valid(
-                side,
-                sl,
-                tp,
-                last
-            ):
+            if protected:
 
                 tg(
-                    f"⚠️ {symbol}: "
-                    f"prijs buiten SL/TP, "
-                    f"geen repair."
+                    f"✅ {symbol} "
+                    f"{side.upper()}: "
+                    f"TP + SL confirmed."
                 )
 
                 continue
 
-            ok, result = (
-                place_tpsl_for_position(
-                    p,
-                    sl,
-                    tp,
-                    client_tag="repair"
-                )
+            repaired = (
+                repair_one_position(p)
             )
 
-            if ok:
+            if repaired:
 
                 tg(
-                    f"🛡️ PROTECTED "
+                    f"🛡️ REPAIRED "
                     f"{symbol} "
-                    f"{side.upper()}\n"
-                    f"SL {sl}\n"
-                    f"TP {tp}"
+                    f"{side.upper()}"
                 )
 
             else:
 
                 tg(
-                    f"🚨 PROTECTION FAILED "
-                    f"{symbol}\n"
-                    f"{result}"
+                    f"🚨 UNPROTECTED "
+                    f"{symbol} "
+                    f"{side.upper()}"
                 )
-
-                all_ok = False
 
         except Exception as e:
 
             tg(
                 f"🚨 PROTECTION ERROR "
-                f"{symbol}\n{e}"
+                f"{symbol}\n"
+                f"{e}"
             )
 
-            all_ok = False
-
-    return all_ok
+    # Critical:
+    # verify ALL positions after repairs.
+    return all_positions_protected()
 
 
 # ============================================================
@@ -3616,12 +3441,10 @@ def repair_existing_positions():
 
 def set_leverage(
     symbol,
-    leverage,
-    position_side="net"
+    leverage
 ):
 
     payload = {
-
         "instId":
             blofin_inst_id(symbol),
 
@@ -3632,31 +3455,20 @@ def set_leverage(
             MARGIN_MODE,
     }
 
-    if position_side in (
-        "long",
-        "short"
-    ):
-
-        payload[
-            "positionSide"
-        ] = position_side
-
+    # In one-way/net mode positionSide is not
+    # required for setting leverage.
     resp = native(
         "private_post_account_set_leverage",
         payload
     )
 
     if not native_ok(resp):
-
         return (
             False,
             response_error(resp)
         )
 
-    return (
-        True,
-        resp
-    )
+    return True, resp
 
 
 # ============================================================
@@ -3674,11 +3486,7 @@ def find_new_position(
         + timeout
     )
 
-    while (
-        time.time()
-        <
-        deadline
-    ):
+    while time.time() < deadline:
 
         try:
 
@@ -3686,22 +3494,20 @@ def find_new_position(
 
                 if (
                     position_symbol(p)
-                    !=
-                    symbol
+                    != symbol
                 ):
                     continue
 
-                pid = position_id(
-                    p
-                )
+                pid = position_id(p)
 
                 if (
                     pid
-                    and
-                    pid not in before_ids
+                    and pid not in before_ids
                 ):
                     return p
 
+                # One-way mode may merge/return
+                # an empty positionId.
                 if not pid:
                     return p
 
@@ -3720,13 +3526,10 @@ def find_new_position(
 protection_lock = False
 
 loss_pause_until = 0
-
 consecutive_losses = 0
 
 symbol_last_trade = {}
-
 symbol_last_result = {}
-
 symbol_loss_streak = {}
 
 seen_closed_history_ids = set()
@@ -3735,29 +3538,20 @@ last_score_report = 0
 
 
 daily = {
-
     "date": None,
-
     "start_equity": None,
 
     "trades": 0,
-
     "wins": 0,
-
     "losses": 0,
-
     "net": 0.0,
 
     "long_trades": 0,
-
     "long_wins": 0,
-
     "long_net": 0.0,
 
     "short_trades": 0,
-
     "short_wins": 0,
-
     "short_net": 0.0,
 }
 
@@ -3783,7 +3577,6 @@ def reset_daily_if_needed(
         daily["trades"] = 0
         daily["wins"] = 0
         daily["losses"] = 0
-
         daily["net"] = 0.0
 
         daily["long_trades"] = 0
@@ -3797,13 +3590,9 @@ def reset_daily_if_needed(
         return True
 
     if (
-        daily["start_equity"]
-        is None
-        and
-        current_equity
-        is not None
+        daily["start_equity"] is None
+        and current_equity is not None
     ):
-
         daily["start_equity"] = (
             current_equity
         )
@@ -3815,9 +3604,7 @@ def reset_daily_if_needed(
 # OPEN TRADE
 # ============================================================
 
-def open_trade(
-    signal
-):
+def open_trade(signal):
 
     global protection_lock
 
@@ -3843,13 +3630,20 @@ def open_trade(
         tg(
             f"⛔ RISK STOP\n"
             f"Equity ${equity:.2f} "
-            f"< "
-            f"${MIN_EQUITY_USDT:.2f}"
+            f"< ${MIN_EQUITY_USDT:.2f}"
         )
 
         return False
 
     if available <= 0:
+        return False
+
+    # Never open when another live position
+    # is known to be unprotected.
+    if (
+        not PAPER_TRADING
+        and protection_lock
+    ):
         return False
 
     tick = safe_float(
@@ -3864,46 +3658,46 @@ def open_trade(
     live = safe_float(
         exchange.fetch_ticker(
             symbol
-        ).get(
-            "last"
-        ),
+        ).get("last"),
         signal["price"]
     )
 
-    signal_px = signal[
-        "price"
-    ]
+    signal_px = signal["price"]
 
-    if live <= 0:
+    if (
+        live <= 0
+        or signal_px <= 0
+    ):
         return False
 
     slip = (
-        live
-        - signal_px
+        live - signal_px
     ) / signal_px
 
     if (
         side == "long"
-        and
-        slip > MAX_FILL_SLIP_PCT
+        and slip > MAX_FILL_SLIP_PCT
     ):
+
         tg(
             f"⏭️ {symbol} "
             f"LONG too late "
-            f"{slip*100:.2f}%"
+            f"{slip * 100:.2f}%"
         )
+
         return False
 
     if (
         side == "short"
-        and
-        slip < -MAX_FILL_SLIP_PCT
+        and slip < -MAX_FILL_SLIP_PCT
     ):
+
         tg(
             f"⏭️ {symbol} "
             f"SHORT too late "
-            f"{slip*100:.2f}%"
+            f"{slip * 100:.2f}%"
         )
+
         return False
 
     entry = live
@@ -3922,8 +3716,7 @@ def open_trade(
 
     stop_pct = (
         abs(entry - sl)
-        /
-        entry
+        / entry
     )
 
     if stop_pct < MIN_STOP_PCT:
@@ -3944,8 +3737,7 @@ def open_trade(
         sizing["margin"]
         >
         available
-        *
-        AVAILABLE_MARGIN_BUFFER
+        * AVAILABLE_MARGIN_BUFFER
     ):
         return False
 
@@ -3955,28 +3747,42 @@ def open_trade(
         if position_id(p)
     }
 
-    lev_ok, lev_err = set_leverage(
-        symbol,
-        LEVERAGE,
-        "net"
+    # --------------------------------------------------------
+    # HARD LEVERAGE CHECK
+    # --------------------------------------------------------
+
+    lev_ok, lev_result = (
+        set_leverage(
+            symbol,
+            LEVERAGE
+        )
     )
 
-    if (
-        not lev_ok
-        and
-        "110006" not in lev_err
-        and
-        "110019" not in lev_err
-    ):
+    if not lev_ok:
 
         tg(
-            f"⚠️ Leverage warning "
-            f"{symbol}: "
-            f"{lev_err}"
+            f"⛔ LEVERAGE FAILED\n"
+            f"{symbol}\n"
+            f"Requested: {LEVERAGE}x\n"
+            f"{lev_result}\n"
+            f"Trade skipped."
         )
 
-    payload = {
+        return False
 
+    # --------------------------------------------------------
+    # ORDER PAYLOAD
+    # --------------------------------------------------------
+    #
+    # IMPORTANT:
+    # SyntaxError from V6.7 is fixed here.
+    #
+    # Correct:
+    # f"v68{int(time.time() * 1000) % 1000000000}"
+    #
+    # ========================================================
+
+    payload = {
         "instId":
             blofin_inst_id(symbol),
 
@@ -3986,21 +3792,18 @@ def open_trade(
         "positionSide":
             "net",
 
-        "side":
-            (
-                "buy"
-                if side == "long"
-                else "sell"
-            ),
+        "side": (
+            "buy"
+            if side == "long"
+            else "sell"
+        ),
 
         "orderType":
             "market",
 
         "size":
             str(
-                sizing[
-                    "contracts"
-                ]
+                sizing["contracts"]
             ),
 
         "tpTriggerPrice":
@@ -4022,16 +3825,11 @@ def open_trade(
             "mark",
 
         "clientOrderId":
-            f"v67"
-            f"{int(time.time()*1000)"
-            f"%1000000000}",
+            f"v68{int(time.time() * 1000) % 1000000000}",
     }
 
     if BROKER_ID:
-
-        payload[
-            "brokerId"
-        ] = BROKER_ID
+        payload["brokerId"] = BROKER_ID
 
     # --------------------------------------------------------
     # PAPER
@@ -4040,21 +3838,27 @@ def open_trade(
     if PAPER_TRADING:
 
         tg(
-            f"🧪 PAPER V6.7\n"
+            f"🧪 PAPER V6.8\n"
             f"{symbol} "
             f"{side.upper()}\n"
             f"Score "
             f"{signal['score']:.0f}/"
             f"{signal['threshold']:.0f}"
             f"{' ⚡SECOND' if signal.get('second_chance') else ''}\n"
-            f"Tactics "
+            f"Directional tactics "
             f"{signal['tactics']}\n"
             f"5m "
             f"{signal['confirm_components']}/4\n"
             f"ADX "
             f"{signal['adx']:.0f}\n"
-            f"RS "
-            f"{signal['rel']*100:+.2f}%\n"
+            f"RS composite "
+            f"{signal['rel'] * 100:+.2f}%\n"
+            f"RS15 "
+            f"{signal.get('rel15', 0) * 100:+.2f}%\n"
+            f"RS45 "
+            f"{signal.get('rel45', 0) * 100:+.2f}%\n"
+            f"RS90 "
+            f"{signal.get('rel90', 0) * 100:+.2f}%\n"
             f"RSI "
             f"{signal['rsi']:.0f}\n"
             f"Pullback "
@@ -4068,7 +3872,11 @@ def open_trade(
             f"SL "
             f"{sl:.8g}\n"
             f"TP "
-            f"{tp:.8g}"
+            f"{tp:.8g}\n"
+            f"ExpTP "
+            f"${sizing['expected_tp_usdt']:.2f}\n"
+            f"Est. cost "
+            f"${sizing['roundtrip_cost']:.2f}"
         )
 
         return True
@@ -4084,16 +3892,14 @@ def open_trade(
 
     if not native_ok(resp):
 
-        err = response_error(
-            resp
-        )
+        err = response_error(resp)
 
         if "152012" in err:
 
             protection_lock = True
 
             tg(
-                f"🛑 152012 lock\n"
+                f"🛑 152012 LOCK\n"
                 f"{err}"
             )
 
@@ -4109,7 +3915,7 @@ def open_trade(
         return False
 
     tg(
-        f"🟢 V6.7 LIVE ORDER\n"
+        f"🟢 V6.8 LIVE ORDER\n"
         f"{symbol} "
         f"{side.upper()}\n"
         f"━━━━━━━━━━━━\n"
@@ -4117,14 +3923,14 @@ def open_trade(
         f"{signal['score']:.0f}/"
         f"{signal['threshold']:.0f}"
         f"{' ⚡ SECOND-CHANCE' if signal.get('second_chance') else ''}\n"
-        f"Tactics "
+        f"Directional tactics "
         f"{signal['tactics']}\n"
         f"5m "
         f"{signal['confirm_components']}/4\n"
         f"ADX "
         f"{signal['adx']:.0f}\n"
         f"RS "
-        f"{signal['rel']*100:+.2f}%\n"
+        f"{signal['rel'] * 100:+.2f}%\n"
         f"RSI "
         f"{signal['rsi']:.0f}\n"
         f"Pullback "
@@ -4143,7 +3949,7 @@ def open_trade(
         f"TP "
         f"{tp:.8g}\n"
         f"Stop "
-        f"{stop_pct*100:.2f}%\n"
+        f"{stop_pct * 100:.2f}%\n"
         f"ExpTP "
         f"${sizing['expected_tp_usdt']:.2f}\n"
         f"Cost "
@@ -4171,10 +3977,13 @@ def open_trade(
 
         tg(
             f"⚠️ {symbol}: "
-            f"order ok, "
-            f"positie nog niet zichtbaar."
+            f"order accepted, "
+            f"position not visible yet."
         )
 
+        # An accepted live order may have created exposure.
+        # Do not treat this as an execution failure and
+        # immediately try another candidate.
         return True
 
     # --------------------------------------------------------
@@ -4189,8 +3998,7 @@ def open_trade(
             f"🛡️ PROTECTION CONFIRMED\n"
             f"{symbol} "
             f"{side.upper()}\n"
-            f"SL {sl:.8g}\n"
-            f"TP {tp:.8g}"
+            f"TP + SL visible."
         )
 
         return True
@@ -4221,7 +4029,7 @@ def open_trade(
 
             tg(
                 f"🛡️ FALLBACK "
-                f"PROTECTION CONFIRMED\n"
+                f"TP + SL CONFIRMED\n"
                 f"{symbol}"
             )
 
@@ -4237,17 +4045,21 @@ def open_trade(
 
         protection_lock = True
 
-        return False
+        # The position already exists, so this is still
+        # considered an opened trade. Returning False here
+        # could make main() attempt another candidate.
+        return True
 
     tg(
-        f"⚠️ {symbol}: "
-        f"geen fallback TPSL, "
-        f"prijs al buiten range."
+        f"🚨 {symbol}: "
+        f"position exists but fallback "
+        f"TP/SL cannot safely be placed.\n"
+        f"NEW TRADES PAUSED."
     )
 
     protection_lock = True
 
-    return False
+    return True
 
 
 # ============================================================
@@ -4263,7 +4075,7 @@ def closed_positions_history(
     for state in (
         "closed",
         "liquidated",
-        "adl"
+        "adl",
     ):
 
         try:
@@ -4271,20 +4083,15 @@ def closed_positions_history(
             resp = native(
                 "private_get_account_positions_history",
                 {
-                    "state":
-                        state,
-
-                    "limit":
-                        str(limit),
+                    "state": state,
+                    "limit": str(limit),
                 }
             )
 
             if native_ok(resp):
 
                 merged.extend(
-                    resp.get(
-                        "data"
-                    )
+                    resp.get("data")
                     or []
                 )
 
@@ -4294,9 +4101,7 @@ def closed_positions_history(
     return merged
 
 
-def close_reason(
-    record
-):
+def close_reason(record):
 
     raw = str(
         record.get(
@@ -4309,50 +4114,25 @@ def close_reason(
     ).lower()
 
     mapping = {
-
-        "tp":
-            "TAKE PROFIT",
-
-        "take_profit":
-            "TAKE PROFIT",
-
-        "sl":
-            "STOP LOSS",
-
-        "stop_loss":
-            "STOP LOSS",
-
-        "liquidated":
-            "LIQUIDATION",
-
-        "liquidation":
-            "LIQUIDATION",
-
-        "partially_liquidated":
-            "PARTIAL LIQ",
-
-        "adl":
-            "ADL",
-
-        "partially_closed":
-            "PARTIAL CLOSE",
-
-        "manual":
-            "MANUAL",
-
-        "mannual":
-            "MANUAL",
-
-        "close":
-            "CLOSED",
+        "tp": "TAKE PROFIT",
+        "take_profit": "TAKE PROFIT",
+        "sl": "STOP LOSS",
+        "stop_loss": "STOP LOSS",
+        "liquidated": "LIQUIDATION",
+        "liquidation": "LIQUIDATION",
+        "partially_liquidated": "PARTIAL LIQ",
+        "adl": "ADL",
+        "partially_closed": "PARTIAL CLOSE",
+        "manual": "MANUAL",
+        "mannual": "MANUAL",
+        "close": "CLOSED",
     }
 
     return mapping.get(
         raw,
         raw.upper()
         if raw
-        else
-        "CLOSED"
+        else "CLOSED"
     )
 
 
@@ -4371,18 +4151,14 @@ def fmt_duration(
 
     if (
         start <= 0
-        or
-        end <= 0
-        or
-        end < start
+        or end <= 0
+        or end < start
     ):
-
         return "unknown"
 
     seconds = int(
-        (
-            end - start
-        ) / 1000
+        (end - start)
+        / 1000
     )
 
     hours, rem = divmod(
@@ -4396,14 +4172,12 @@ def fmt_duration(
     )
 
     if hours:
-
         return (
             f"{hours}h "
             f"{minutes}m"
         )
 
     if minutes:
-
         return (
             f"{minutes}m "
             f"{secs}s"
@@ -4412,9 +4186,7 @@ def fmt_duration(
     return f"{secs}s"
 
 
-def infer_side(
-    record
-):
+def infer_side(record):
 
     side = str(
         record.get(
@@ -4425,9 +4197,8 @@ def infer_side(
 
     if side in (
         "long",
-        "short"
+        "short",
     ):
-
         return side
 
     entry = safe_float(
@@ -4454,24 +4225,20 @@ def infer_side(
             exit_p >= entry
         )
 
-        return (
-            "long"
-            if (
-                (
-                    moved_up
-                    and
-                    pnl >= 0
-                )
-                or
-                (
-                    not moved_up
-                    and
-                    pnl < 0
-                )
+        if (
+            (
+                moved_up
+                and pnl >= 0
             )
-            else
-            "short"
-        )
+            or
+            (
+                not moved_up
+                and pnl < 0
+            )
+        ):
+            return "long"
+
+        return "short"
 
     return "net"
 
@@ -4487,33 +4254,20 @@ def update_learning(
 
     global learning
 
-    side = infer_side(
-        record
-    )
+    side = infer_side(record)
 
-    entry = safe_float(
-        record.get(
-            "openAveragePrice"
-        )
-    )
-
-    exit_p = safe_float(
-        record.get(
-            "closeAveragePrice"
-        )
-    )
-
-    # We don't know the original full signal from history.
-    # Therefore use a conservative "history" fingerprint.
-    #
-    # This is deliberately NOT used as a strong learning signal.
+    # Conservative history bucket.
+    # Full setup-context persistence can be added
+    # after the execution core has proven stable.
     fp = (
         f"{side}|history"
     )
 
-    fingerprints = learning.setdefault(
-        "fingerprints",
-        {}
+    fingerprints = (
+        learning.setdefault(
+            "fingerprints",
+            {}
+        )
     )
 
     rec = fingerprints.setdefault(
@@ -4529,11 +4283,9 @@ def update_learning(
     rec["trades"] += 1
 
     if net_pnl >= 0:
-
         rec["wins"] += 1
 
     else:
-
         rec["losses"] += 1
 
     rec["net"] += net_pnl
@@ -4579,9 +4331,7 @@ def update_learning(
 # CLOSED TRADE
 # ============================================================
 
-def notify_closed_trade(
-    record
-):
+def notify_closed_trade(record):
 
     global consecutive_losses
     global loss_pause_until
@@ -4598,9 +4348,7 @@ def notify_closed_trade(
         "/USDT:USDT"
     )
 
-    side = infer_side(
-        record
-    )
+    side = infer_side(record)
 
     entry = safe_float(
         record.get(
@@ -4622,15 +4370,12 @@ def notify_closed_trade(
 
     fee = abs(
         safe_float(
-            record.get(
-                "fee"
-            )
+            record.get("fee")
         )
     )
 
     net_pnl = (
-        gross_pnl
-        - fee
+        gross_pnl - fee
     )
 
     pnl_ratio = (
@@ -4643,12 +4388,8 @@ def notify_closed_trade(
     )
 
     duration = fmt_duration(
-        record.get(
-            "createTime"
-        ),
-        record.get(
-            "updateTime"
-        )
+        record.get("createTime"),
+        record.get("updateTime")
     )
 
     reason = close_reason(
@@ -4661,46 +4402,32 @@ def notify_closed_trade(
         )
     )
 
-    # --------------------------------------------------------
-    # daily
-    # --------------------------------------------------------
-
     daily["trades"] += 1
-
     daily["net"] += net_pnl
 
     if side == "short":
 
         daily["short_trades"] += 1
-
         daily["short_net"] += net_pnl
 
         if net_pnl >= 0:
-
             daily["short_wins"] += 1
 
     else:
 
         daily["long_trades"] += 1
-
         daily["long_net"] += net_pnl
 
         if net_pnl >= 0:
-
             daily["long_wins"] += 1
 
     symbol_last_trade[
         symbol
     ] = time.time()
 
-    # --------------------------------------------------------
-    # win / loss
-    # --------------------------------------------------------
-
     if net_pnl >= 0:
 
         daily["wins"] += 1
-
         consecutive_losses = 0
 
         symbol_last_result[
@@ -4714,7 +4441,6 @@ def notify_closed_trade(
     else:
 
         daily["losses"] += 1
-
         consecutive_losses += 1
 
         symbol_last_result[
@@ -4733,33 +4459,24 @@ def notify_closed_trade(
 
         if (
             consecutive_losses
-            >=
-            MAX_CONSECUTIVE_LOSSES
+            >= MAX_CONSECUTIVE_LOSSES
         ):
 
             loss_pause_until = (
                 time.time()
-                +
-                LOSS_PAUSE_MIN
-                * 60
+                + LOSS_PAUSE_MIN * 60
             )
 
-    # learning
     update_learning(
         record,
         net_pnl
     )
 
-    # --------------------------------------------------------
-    # telegram
-    # --------------------------------------------------------
-
     wr_long = (
         daily["long_wins"]
         /
         daily["long_trades"]
-        *
-        100
+        * 100
         if daily["long_trades"]
         else 0
     )
@@ -4768,8 +4485,7 @@ def notify_closed_trade(
         daily["short_wins"]
         /
         daily["short_trades"]
-        *
-        100
+        * 100
         if daily["short_trades"]
         else 0
     )
@@ -4778,36 +4494,30 @@ def notify_closed_trade(
 
     if (
         consecutive_losses
-        >=
-        MAX_CONSECUTIVE_LOSSES
+        >= MAX_CONSECUTIVE_LOSSES
     ):
 
         pause = (
             f"\n⏸ "
             f"{MAX_CONSECUTIVE_LOSSES} "
-            f"losses → "
-            f"pauze "
+            f"losses → pauze "
             f"{LOSS_PAUSE_MIN} min"
         )
 
     icon = (
         "🟢"
         if net_pnl >= 0
-        else
-        "🔴"
+        else "🔴"
     )
 
     tg(
-        f"{icon} POSITION CLOSED V6.7\n\n"
+        f"{icon} POSITION CLOSED V6.8\n\n"
         f"{symbol}\n"
         f"{side.upper()}\n"
         f"━━━━━━━━━━━━\n"
-        f"Entry: "
-        f"{entry:.8g}\n"
-        f"Exit:  "
-        f"{exit_price:.8g}\n"
-        f"Size:  "
-        f"{size:g}\n\n"
+        f"Entry: {entry:.8g}\n"
+        f"Exit:  {exit_price:.8g}\n"
+        f"Size:  {size:g}\n\n"
         f"💰 Realized: "
         f"{'+' if gross_pnl >= 0 else ''}"
         f"${gross_pnl:.2f}\n"
@@ -4863,13 +4573,12 @@ def seed_closed_history():
             )
 
             if hid:
-
                 seen_closed_history_ids.add(
                     hid
                 )
 
         tg(
-            f"📚 V6.7 PNL TRACKER READY\n"
+            f"📚 V6.8 PNL TRACKER READY\n"
             f"Known closes: "
             f"{len(seen_closed_history_ids)}\n"
             f"Learning trades: "
@@ -4907,10 +4616,8 @@ def check_for_closed_positions():
 
         if (
             not hid
-            or
-            hid
-            in
-            seen_closed_history_ids
+            or hid
+            in seen_closed_history_ids
         ):
             continue
 
@@ -4918,22 +4625,15 @@ def check_for_closed_positions():
             hid
         )
 
-        new_records.append(
-            r
-        )
+        new_records.append(r)
 
     for r in new_records:
-
-        notify_closed_trade(
-            r
-        )
+        notify_closed_trade(r)
 
     if (
         len(
             seen_closed_history_ids
-        )
-        >
-        2500
+        ) > 2500
     ):
 
         seen_closed_history_ids.clear()
@@ -4948,7 +4648,6 @@ def check_for_closed_positions():
             )
 
             if hid:
-
                 seen_closed_history_ids.add(
                     hid
                 )
@@ -4958,9 +4657,7 @@ def check_for_closed_positions():
 # DAILY RISK
 # ============================================================
 
-def check_daily_risk(
-    equity
-):
+def check_daily_risk(equity):
 
     reset_daily_if_needed(
         equity
@@ -4972,23 +4669,18 @@ def check_daily_risk(
 
     if (
         not start
-        or
-        start <= 0
+        or start <= 0
     ):
-
         return True, "OK"
 
     dd = (
-        start
-        - equity
+        start - equity
     ) / start * 100
 
     if (
         dd
-        >=
-        DAILY_LOSS_LIMIT_PCT
+        >= DAILY_LOSS_LIMIT_PCT
     ):
-
         return (
             False,
             f"Daily risk stop "
@@ -5004,9 +4696,7 @@ def check_daily_risk(
 # COOLDOWN
 # ============================================================
 
-def cooldown_ok(
-    symbol
-):
+def cooldown_ok(symbol):
 
     last = symbol_last_trade.get(
         symbol,
@@ -5017,8 +4707,7 @@ def cooldown_ok(
         symbol_loss_streak.get(
             symbol,
             0
-        )
-        >= 2
+        ) >= 2
     ):
 
         needed = (
@@ -5029,8 +4718,7 @@ def cooldown_ok(
     elif (
         symbol_last_result.get(
             symbol
-        )
-        == "loss"
+        ) == "loss"
     ):
 
         needed = (
@@ -5046,18 +4734,15 @@ def cooldown_ok(
         )
 
     return (
-        time.time()
-        - last
+        time.time() - last
     ) >= needed
 
 
 # ============================================================
-# ALT POSITION COUNT
+# ALT COUNT
 # ============================================================
 
-def count_alt_sides(
-    positions
-):
+def count_alt_sides(positions):
 
     longs = 0
     shorts = 0
@@ -5074,26 +4759,19 @@ def count_alt_sides(
             position_side(p)
             == "short"
         ):
-
             shorts += 1
 
         else:
-
             longs += 1
 
-    return (
-        longs,
-        shorts
-    )
+    return longs, shorts
 
 
 # ============================================================
 # SCORE REPORT
 # ============================================================
 
-def maybe_score_report(
-    rows
-):
+def maybe_score_report(rows):
 
     global last_score_report
 
@@ -5101,8 +4779,7 @@ def maybe_score_report(
         time.time()
         - last_score_report
         <
-        SCORE_REPORT_MIN
-        * 60
+        SCORE_REPORT_MIN * 60
     ):
         return
 
@@ -5112,35 +4789,34 @@ def maybe_score_report(
         rows,
         key=lambda x: (
             x.get("score", 0),
-            x.get("entry_quality", 0),
-            x.get("adx", 0)
+            x.get(
+                "entry_quality",
+                0
+            ),
+            x.get("adx", 0),
         ),
         reverse=True
     )[:10]
 
     lines = [
-        f"📡 V6.7 "
-        f"{session_state()} "
-        f"{now_utc().strftime('%H:%M')} UTC"
+        (
+            f"📡 V6.8 "
+            f"{session_state()} "
+            f"{now_utc().strftime('%H:%M')} UTC"
+        )
     ]
 
     if not ranked:
-
-        lines.append(
-            "geen scans"
-        )
+        lines.append("geen scans")
 
     for r in ranked:
 
-        skip = r.get(
-            "skip"
-        )
+        skip = r.get("skip")
 
         mark = (
             "🟢 READY"
             if not skip
-            else
-            f"⏭ {skip}"
+            else f"⏭ {skip}"
         )
 
         second = (
@@ -5160,7 +4836,7 @@ def maybe_score_report(
             f"t{r.get('tactics', 0)} "
             f"5m{r.get('confirm_components', 0)}/4 "
             f"ADX{r.get('adx', 0):.0f} "
-            f"RS{r.get('rel', 0)*100:+.1f}% "
+            f"RS{r.get('rel', 0) * 100:+.1f}% "
             f"EQ{r.get('entry_quality', 0)} "
             f"{mark}"
         )
@@ -5183,9 +4859,10 @@ def startup_diagnostics():
     )
 
     tg(
-        f"🚀 BLOFIN V6.7 STARTED\n"
+        f"🚀 BLOFIN V6.8 STARTED\n"
         f"Mode: "
         f"{'PAPER' if PAPER_TRADING else 'LIVE'}\n"
+        f"Position mode expected: NET / ONE-WAY\n"
         f"Equity: "
         f"${acc['total_equity']:.2f}\n"
         f"Available: "
@@ -5198,21 +4875,78 @@ def startup_diagnostics():
         f"{HARD_MIN_SCORE:.0f}\n"
         f"Strong regime: "
         f"{STRONG_REGIME_MIN_SCORE:.0f}\n"
-        f"Tactics: "
-        f"{MIN_TACTICS}/6\n"
+        f"Directional tactics required: "
+        f"{MIN_TACTICS}\n"
+        f"ADX trend: "
+        f"{ADX_TREND:.0f}\n"
         f"ADX strong: "
         f"{ADX_STRONG:.0f}\n"
-        f"ADX very strong: "
-        f"{ADX_VERY_STRONG:.0f}\n"
         f"Alt cap "
         f"L{MAX_ALT_LONGS}/"
         f"S{MAX_ALT_SHORTS}\n"
-        f"Positions "
+        f"Max positions: "
         f"{MAX_ACTIVE_POSITIONS}\n"
+        f"Max execution attempts/scan: "
+        f"{MAX_EXECUTION_ATTEMPTS_PER_SCAN}\n"
         f"Learning trades: "
         f"{learning.get('trades', 0)}\n"
         f"Daily cap: "
         f"{DAILY_LOSS_LIMIT_PCT:.0f}%"
+    )
+
+
+# ============================================================
+# PROTECTION WATCH
+# ============================================================
+
+def protection_watch():
+
+    global protection_lock
+
+    if PAPER_TRADING:
+        protection_lock = False
+        return
+
+    positions = get_positions()
+
+    if not positions:
+        protection_lock = False
+        return
+
+    if REPAIR_EXISTING_POSITIONS:
+
+        for p in positions:
+
+            try:
+
+                protected, _ = (
+                    has_live_protection(p)
+                )
+
+                if protected:
+                    continue
+
+                symbol = position_symbol(p)
+                side = position_side(p)
+
+                repaired = (
+                    repair_one_position(p)
+                )
+
+                if repaired:
+
+                    tg(
+                        f"🛡️ REPAIRED "
+                        f"{symbol} "
+                        f"{side.upper()}"
+                    )
+
+            except Exception:
+                pass
+
+    # Re-fetch/re-check ALL positions.
+    protection_lock = (
+        not all_positions_protected()
     )
 
 
@@ -5260,7 +4994,6 @@ def main():
             if not PAPER_TRADING:
 
                 try:
-
                     check_for_closed_positions()
 
                 except Exception as e:
@@ -5271,15 +5004,13 @@ def main():
                     )
 
             # ------------------------------------------------
-            # ACCOUNT
+            # ACCOUNT / DAILY RISK
             # ------------------------------------------------
 
             acc = futures_account()
 
-            ok, reason = (
-                check_daily_risk(
-                    acc["total_equity"]
-                )
+            ok, reason = check_daily_risk(
+                acc["total_equity"]
             )
 
             if not ok:
@@ -5288,10 +5019,7 @@ def main():
                     f"🛑 {reason}"
                 )
 
-                time.sleep(
-                    120
-                )
-
+                time.sleep(120)
                 continue
 
             # ------------------------------------------------
@@ -5300,8 +5028,7 @@ def main():
 
             if (
                 time.time()
-                <
-                loss_pause_until
+                < loss_pause_until
             ):
 
                 time.sleep(
@@ -5317,128 +5044,32 @@ def main():
             positions = get_positions()
 
             # ------------------------------------------------
-            # PROTECTION WATCH
+            # PROTECTION
             # ------------------------------------------------
 
             if not PAPER_TRADING:
-
-                unprotected = False
-
-                for p in positions:
-
-                    if has_live_protection(
-                        p
-                    )[0]:
-
-                        continue
-
-                    unprotected = True
-
-                    if not REPAIR_EXISTING_POSITIONS:
-                        continue
-
-                    try:
-
-                        symbol = (
-                            position_symbol(p)
-                        )
-
-                        side = (
-                            position_side(p)
-                        )
-
-                        entry = (
-                            position_entry(p)
-                        )
-
-                        df = add_indicators(
-                            ohlcv_df(
-                                symbol,
-                                TIMEFRAME_SIGNAL
-                            )
-                        )
-
-                        atr = safe_float(
-                            df.iloc[-2]["atr"]
-                        )
-
-                        tick = safe_float(
-                            get_instrument(
-                                symbol
-                            ).get(
-                                "tickSize"
-                            ),
-                            0.0001
-                        )
-
-                        levels = (
-                            calculate_trade_levels(
-                                entry,
-                                atr,
-                                side,
-                                tick
-                            )
-                        )
-
-                        if not levels:
-                            continue
-
-                        sl, tp, _ = levels
-
-                        last = safe_float(
-                            exchange.fetch_ticker(
-                                symbol
-                            ).get("last")
-                        )
-
-                        if not tpsl_prices_valid(
-                            side,
-                            sl,
-                            tp,
-                            last
-                        ):
-                            continue
-
-                        repaired = (
-                            place_tpsl_for_position(
-                                p,
-                                sl,
-                                tp,
-                                client_tag="watch"
-                            )[0]
-                        )
-
-                        if repaired:
-
-                            unprotected = False
-
-                            tg(
-                                f"🛡️ REPAIRED "
-                                f"{symbol} "
-                                f"{side.upper()}"
-                            )
-
-                    except Exception:
-                        pass
-
-                protection_lock = (
-                    unprotected
-                )
+                protection_watch()
 
             # ------------------------------------------------
-            # POSITION LIMIT
+            # POSITION / SAFETY LIMIT
             # ------------------------------------------------
+
+            positions = get_positions()
 
             if (
                 len(positions)
-                >=
-                MAX_ACTIVE_POSITIONS
-                or
-                (
-                    protection_lock
-                    and
-                    not PAPER_TRADING
+                >= MAX_ACTIVE_POSITIONS
+            ):
+
+                time.sleep(
+                    SCAN_SECONDS
                 )
+
+                continue
+
+            if (
+                protection_lock
+                and not PAPER_TRADING
             ):
 
                 time.sleep(
@@ -5448,14 +5079,18 @@ def main():
                 continue
 
             # ------------------------------------------------
-            # BTC
+            # BTC REGIME
             # ------------------------------------------------
 
             try:
-
                 btc = btc_regime()
 
-            except Exception:
+            except Exception as e:
+
+                tg(
+                    f"⚠️ BTC REGIME ERROR\n"
+                    f"{e}"
+                )
 
                 time.sleep(
                     SCAN_SECONDS
@@ -5468,7 +5103,6 @@ def main():
             # ------------------------------------------------
 
             scanned = []
-
             candidates = []
 
             for symbol in SYMBOLS:
@@ -5495,7 +5129,6 @@ def main():
                     if not signal.get(
                         "skip"
                     ):
-
                         candidates.append(
                             signal
                         )
@@ -5514,11 +5147,6 @@ def main():
             # ------------------------------------------------
             # RANKING
             # ------------------------------------------------
-            #
-            # We don't just rank score.
-            #
-            # Entry quality and ADX get a small tie-breaker.
-            #
 
             candidates.sort(
                 key=lambda x: (
@@ -5526,14 +5154,16 @@ def main():
                     x["entry_quality"],
                     x["confirm_components"],
                     x["adx"],
-                    x["tactics"]
+                    x["tactics"],
                 ),
                 reverse=True
             )
 
             # ------------------------------------------------
-            # OPEN MAX ONE
+            # OPEN MAX ONE SUCCESSFUL TRADE PER SCAN
             # ------------------------------------------------
+
+            execution_attempts = 0
 
             for signal in candidates:
 
@@ -5541,8 +5171,7 @@ def main():
 
                 if (
                     len(current)
-                    >=
-                    MAX_ACTIVE_POSITIONS
+                    >= MAX_ACTIVE_POSITIONS
                 ):
                     break
 
@@ -5573,8 +5202,7 @@ def main():
                         == "long"
                         and
                         alt_l
-                        >=
-                        MAX_ALT_LONGS
+                        >= MAX_ALT_LONGS
                     ):
                         continue
 
@@ -5583,10 +5211,18 @@ def main():
                         == "short"
                         and
                         alt_s
-                        >=
-                        MAX_ALT_SHORTS
+                        >= MAX_ALT_SHORTS
                     ):
                         continue
+
+                if (
+                    execution_attempts
+                    >=
+                    MAX_EXECUTION_ATTEMPTS_PER_SCAN
+                ):
+                    break
+
+                execution_attempts += 1
 
                 opened = open_trade(
                     signal
@@ -5594,11 +5230,18 @@ def main():
 
                 if opened:
 
+                    # Only successful/accepted trade
+                    # starts the cooldown.
                     symbol_last_trade[
                         signal["symbol"]
                     ] = time.time()
 
-                break
+                    # Max one successful trade per scan.
+                    break
+
+                # IMPORTANT:
+                # Failed execution does NOT break.
+                # Candidate #2/#3 may still be tried.
 
             # ------------------------------------------------
             # SLEEP
@@ -5611,7 +5254,7 @@ def main():
         except KeyboardInterrupt:
 
             tg(
-                "🛑 V6.7 stopped."
+                "🛑 V6.8 stopped."
             )
 
             raise
@@ -5625,20 +5268,15 @@ def main():
 
             if "152002" in msg:
 
-                time.sleep(
-                    20
-                )
-
+                time.sleep(20)
                 continue
 
             tg(
-                f"⚠️ V6.7 LOOP ERROR\n"
+                f"⚠️ V6.8 LOOP ERROR\n"
                 f"{msg}"
             )
 
-            time.sleep(
-                30
-            )
+            time.sleep(30)
 
 
 # ============================================================
