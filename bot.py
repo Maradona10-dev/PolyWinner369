@@ -10,23 +10,22 @@ import pandas as pd
 import requests
 
 # ============================================================
-# BLOFIN V6.12 - FLOW OFFENSE + ADAPTIVE SIZING
+# BLOFIN V6.13 - MACRO FLOW + PULLBACK DISTINCTION
 # ============================================================
-# Gebouwd op V6.12. Nieuwe V6.12 FLOW-laag:
-# 1) Alle V6.12 EARLY/PULLBACK conflict- en protectionregels blijven actief.
-# 2) BTC-flow wordt expliciet gemeten: aligned en strong.
-# 3) Met sterke BTC-flow mag de score-drempel gecontroleerd 2 punten zakken,
-#    maar alleen met 5m >=3/4, momentum >=2 en EntryQ >=3.
-# 4) Kandidaten MET sterke BTC-flow krijgen ranking-prioriteit.
-# 5) Premium A-sizing blijft 2.4% risk / circa $2.50 netto target.
-#    EARLY A blijft streng; daarnaast kan een uitzonderlijk sterke PULLBACK
-#    met sterke BTC-flow A worden (5m 4/4, EntryQ>=4, momentum>=2, t>=5).
-# 6) Tegen BTC-flow in krijgt een trade NOOIT A-sizing.
-# 7) Normaal blijft max 1 alt per richting. Alleen bij sterke BTC-flow kan
-#    een tweede alt in dezelfde richting worden geopend, en alleen met 4/4,
-#    momentum>=2, EntryQ>=3 en ADX>=22. MAX_ACTIVE_POSITIONS blijft 2.
-# 8) Late-entryruimte blijft 0.40% normaal / 0.75% alleen voor A.
-# 9) Daily loss cap, broker TP+SL, protection lock en leverage-check blijven.
+# Gebouwd op V6.12. Nieuwe V6.13 BTC-contextlaag:
+# 1) BTC wordt niet meer alleen via 1h/15m beoordeeld. We lezen 1D + 4H
+#    (macro), 1H (regime) en 15m (trigger).
+# 2) Een korte 15m-daling binnen bullish 1D/4H + bullish 1H wordt herkend
+#    als BTC_BULL_PULLBACK, niet automatisch als een vol bearish conflict.
+# 3) Om zo'n macro-pullback te overrulen moet de alt zelf sterk zijn:
+#    5m >=3/4, momentum>=2, EntryQ>=3, ADX>=22, voldoende relatieve kracht
+#    en een 5m micro-break. Hard RS-conflict blijft altijd geblokkeerd.
+# 4) De nieuwe route heet MACRO FLOW. Deze krijgt NORMAL sizing, nooit A,
+#    omdat de korte BTC-trigger nog tegen de trade in kan staan.
+# 5) Echte BTC-tegenstroom (macro/regime dezelfde kant tegen de trade) blijft
+#    streng: 4/4 + rejection + micro-break zoals in V6.12.
+# 6) V6.12 FLOW offense, A-sizing, tweede flow-alt, protection, leverage-check
+#    en daily risk cap blijven intact.
 #
 # Geschreven voor One-way / NET position mode.
 # ============================================================
@@ -45,6 +44,8 @@ BROKER_ID = os.getenv("BLOFIN_BROKER_ID", "").strip()
 TIMEFRAME_SIGNAL = "15m"
 TIMEFRAME_CONFIRM = "5m"
 TIMEFRAME_TREND = "1h"
+TIMEFRAME_BTC_SWING = "4h"
+TIMEFRAME_BTC_MACRO = "1d"
 CANDLE_LIMIT = 240
 SCAN_SECONDS = int(os.getenv("SCAN_SECONDS", "45"))
 
@@ -69,6 +70,14 @@ FLOW_SECOND_ALT_MIN_MOMENTUM = int(os.getenv("FLOW_SECOND_ALT_MIN_MOMENTUM", "2"
 FLOW_SECOND_ALT_MIN_ENTRYQ = int(os.getenv("FLOW_SECOND_ALT_MIN_ENTRYQ", "3"))
 FLOW_SECOND_ALT_MIN_ADX = float(os.getenv("FLOW_SECOND_ALT_MIN_ADX", "22"))
 
+# ---------------- V6.13 MACRO BTC CONTEXT ----------------
+MACRO_THRESHOLD_BONUS = float(os.getenv("MACRO_THRESHOLD_BONUS", "2"))
+MACRO_PULLBACK_MIN_CONFIRM = int(os.getenv("MACRO_PULLBACK_MIN_CONFIRM", "3"))
+MACRO_PULLBACK_MIN_MOMENTUM = int(os.getenv("MACRO_PULLBACK_MIN_MOMENTUM", "2"))
+MACRO_PULLBACK_MIN_ENTRYQ = int(os.getenv("MACRO_PULLBACK_MIN_ENTRYQ", "3"))
+MACRO_PULLBACK_MIN_ADX = float(os.getenv("MACRO_PULLBACK_MIN_ADX", "22"))
+MACRO_PULLBACK_MIN_RS = float(os.getenv("MACRO_PULLBACK_MIN_RS", "0.004"))  # 0.40%
+
 # ---------------- SCORE ----------------
 BASE_MIN_SCORE = float(os.getenv("MIN_SCORE", "68"))
 HARD_MIN_SCORE = float(os.getenv("HARD_MIN_SCORE", "62"))
@@ -87,7 +96,7 @@ MARGIN_MODE = os.getenv("MARGIN_MODE", "isolated")
 BASE_MARGIN_USDT = float(os.getenv("BASE_MARGIN_USDT", "10"))
 MAX_MARGIN_USDT = float(os.getenv("MAX_MARGIN_USDT", "12"))
 MAX_MARGIN_EQUITY_PCT = float(os.getenv("MAX_MARGIN_EQUITY_PCT", "0.18"))
-# V6.12: setup-afhankelijke risk cap.
+# V6.13: setup-afhankelijke risk cap.
 NORMAL_RISK_EQUITY_PCT = float(os.getenv("NORMAL_RISK_EQUITY_PCT", "0.016"))
 A_SETUP_RISK_EQUITY_PCT = float(os.getenv("A_SETUP_RISK_EQUITY_PCT", "0.024"))
 NORMAL_TARGET_NET_TP_USDT = float(os.getenv("NORMAL_TARGET_NET_TP_USDT", "1.50"))
@@ -432,22 +441,68 @@ btc_cache = {"ts": 0, "data": None}
 
 
 def btc_regime():
+    """
+    V6.13 BTC hierarchy:
+      1D + 4H = macro direction
+      1H      = tradable regime
+      15m     = immediate trigger / pullback
+
+    This prevents a normal 15m pullback inside a larger uptrend from being
+    treated exactly like a fully bearish BTC market.
+    """
     now = time.time()
     if btc_cache["data"] and now - btc_cache["ts"] < 60:
         return btc_cache["data"]
+
     df15 = add_indicators(ohlcv_df(BTC_SYMBOL, TIMEFRAME_SIGNAL))
     df1h = add_indicators(ohlcv_df(BTC_SYMBOL, TIMEFRAME_TREND))
-    a, t = df15.iloc[-2], df1h.iloc[-2]
+    df4h = add_indicators(ohlcv_df(BTC_SYMBOL, TIMEFRAME_BTC_SWING))
+    df1d = add_indicators(ohlcv_df(BTC_SYMBOL, TIMEFRAME_BTC_MACRO))
+    a, t, h4, d1 = df15.iloc[-2], df1h.iloc[-2], df4h.iloc[-2], df1d.iloc[-2]
+
+    oneh_bull = bool(t["ema20"] > t["ema50"])
+    oneh_bear = bool(t["ema20"] < t["ema50"])
+    stack_long = bool(t["ema20"] > t["ema50"] > t["ema200"])
+    stack_short = bool(t["ema20"] < t["ema50"] < t["ema200"])
+
+    h4_bull = bool(h4["ema20"] > h4["ema50"])
+    h4_bear = bool(h4["ema20"] < h4["ema50"])
+    d1_bull = bool(d1["ema20"] > d1["ema50"])
+    d1_bear = bool(d1["ema20"] < d1["ema50"])
+    h4_stack_long = bool(h4["ema20"] > h4["ema50"] > h4["ema200"])
+    h4_stack_short = bool(h4["ema20"] < h4["ema50"] < h4["ema200"])
+    d1_stack_long = bool(d1["ema20"] > d1["ema50"] > d1["ema200"])
+    d1_stack_short = bool(d1["ema20"] < d1["ema50"] < d1["ema200"])
+
+    macro_bull = bool(d1_bull and h4_bull)
+    macro_bear = bool(d1_bear and h4_bear)
+    macro_strong_long = bool(macro_bull and (d1_stack_long or h4_stack_long))
+    macro_strong_short = bool(macro_bear and (d1_stack_short or h4_stack_short))
+
+    impulse_up = bool(a["close"] > a["ema20"] and a["ema20"] >= a["ema50"])
+    impulse_down = bool(a["close"] < a["ema20"] and a["ema20"] <= a["ema50"])
+    ret15 = safe_float(a["ret1"])
+    ret45 = safe_float(a["ret3"])
+
+    # Pullback = macro and 1h still agree, but 15m temporarily moves against them.
+    macro_pullback_long = bool(macro_bull and oneh_bull and (impulse_down or ret15 < 0))
+    macro_pullback_short = bool(macro_bear and oneh_bear and (impulse_up or ret15 > 0))
+
     data = {
-        "bull": bool(t["ema20"] > t["ema50"]),
-        "bear": bool(t["ema20"] < t["ema50"]),
-        "stack_long": bool(t["ema20"] > t["ema50"] > t["ema200"]),
-        "stack_short": bool(t["ema20"] < t["ema50"] < t["ema200"]),
-        "impulse_up": bool(a["close"] > a["ema20"] and a["ema20"] >= a["ema50"]),
-        "impulse_down": bool(a["close"] < a["ema20"] and a["ema20"] <= a["ema50"]),
-        "ret15": safe_float(a["ret1"]), "ret45": safe_float(a["ret3"]),
-        "ret90": safe_float(a["ret6"]), "adx": safe_float(a["adx"]),
-        "close": safe_float(a["close"]),
+        "bull": oneh_bull, "bear": oneh_bear,
+        "stack_long": stack_long, "stack_short": stack_short,
+        "impulse_up": impulse_up, "impulse_down": impulse_down,
+        "ret15": ret15, "ret45": ret45, "ret90": safe_float(a["ret6"]),
+        "adx": safe_float(a["adx"]), "close": safe_float(a["close"]),
+        "h4_bull": h4_bull, "h4_bear": h4_bear,
+        "d1_bull": d1_bull, "d1_bear": d1_bear,
+        "macro_bull": macro_bull, "macro_bear": macro_bear,
+        "macro_strong_long": macro_strong_long,
+        "macro_strong_short": macro_strong_short,
+        "macro_pullback_long": macro_pullback_long,
+        "macro_pullback_short": macro_pullback_short,
+        "adx1h": safe_float(t["adx"]),
+        "adx4h": safe_float(h4["adx"]),
     }
     btc_cache["ts"], btc_cache["data"] = now, data
     return data
@@ -516,11 +571,17 @@ def adaptive_threshold(signal):
         threshold = min(threshold, STRONG_REGIME_MIN_SCORE)
     elif adx >= ADX_STRONG and confirm >= 3 and momentum >= 2:
         threshold = max(HARD_MIN_SCORE, threshold - 2)
-    # V6.12: offensiever wanneer BTC en setup dezelfde kant op stromen.
+    # V6.13: offensiever wanneer BTC en setup dezelfde kant op stromen.
     # Niet blind: flow-bonus vereist nog steeds degelijke lokale bevestiging.
     if (signal.get("btc_flow_strong") and confirm >= 3
             and momentum >= 2 and entry_quality >= 3):
         threshold = max(HARD_MIN_SCORE, threshold - FLOW_THRESHOLD_BONUS)
+    # V6.13: macro-supportive BTC pullback may lower the threshold, but only
+    # for a locally healthy setup. This is context, not a blind dip-buy rule.
+    if (signal.get("btc_macro_pullback_support") and confirm >= MACRO_PULLBACK_MIN_CONFIRM
+            and momentum >= MACRO_PULLBACK_MIN_MOMENTUM
+            and entry_quality >= MACRO_PULLBACK_MIN_ENTRYQ):
+        threshold = max(HARD_MIN_SCORE, threshold - MACRO_THRESHOLD_BONUS)
     threshold -= learning_adjustment(signal)
     return max(HARD_MIN_SCORE, threshold)
 
@@ -570,9 +631,26 @@ def rs_conflict(side, rel):
 
 
 def btc_conflict(side, btc):
+    # Raw short-term conflict. V6.13 may later classify this as a macro pullback
+    # and allow a carefully verified continuation setup.
     if side == "long":
         return bool(btc["impulse_down"] or btc["bear"])
     return bool(btc["impulse_up"] or btc["bull"])
+
+
+def btc_macro_context(side, btc):
+    """Return macro support/opposition and whether BTC is in a healthy pullback."""
+    if side == "long":
+        supportive = bool(btc.get("macro_bull"))
+        opposed = bool(btc.get("macro_bear"))
+        pullback = bool(btc.get("macro_pullback_long"))
+        strong = bool(btc.get("macro_strong_long"))
+    else:
+        supportive = bool(btc.get("macro_bear"))
+        opposed = bool(btc.get("macro_bull"))
+        pullback = bool(btc.get("macro_pullback_short"))
+        strong = bool(btc.get("macro_strong_short"))
+    return supportive, opposed, pullback, strong
 
 
 def btc_flow_state(side, btc):
@@ -767,7 +845,12 @@ def evaluate_symbol(symbol, btc):
     if not (impulse_15 or impulse_1h): entry_quality += 1
     if abs_dist_ema < 0.008: entry_quality += 1
 
-    if btc["stack_long"]: btc_label = "BTC_BULL"
+    btc_macro_supportive, btc_macro_opposed, btc_macro_pullback, btc_macro_strong = btc_macro_context(side, btc)
+    if side == "long" and btc_macro_pullback:
+        btc_label = "BTC_BULL_PULLBACK"
+    elif side == "short" and btc_macro_pullback:
+        btc_label = "BTC_BEAR_RALLY"
+    elif btc["stack_long"]: btc_label = "BTC_BULL"
     elif btc["stack_short"]: btc_label = "BTC_BEAR"
     elif btc["bull"]: btc_label = "BTC_UP"
     elif btc["bear"]: btc_label = "BTC_DOWN"
@@ -783,6 +866,10 @@ def evaluate_symbol(symbol, btc):
         "btc_regime": btc_label, "session": sess, "entry_route": "WAIT",
         "btc_flow_aligned": btc_flow_aligned, "btc_flow_strong": btc_flow_strong,
         "flow_rs_supportive": flow_rs_supportive,
+        "btc_macro_supportive": btc_macro_supportive,
+        "btc_macro_opposed": btc_macro_opposed,
+        "btc_macro_pullback_support": btc_macro_pullback,
+        "btc_macro_strong": btc_macro_strong,
     }
     threshold = adaptive_threshold(preliminary)
     if sess == "SHOULDER":
@@ -855,8 +942,27 @@ def evaluate_symbol(symbol, btc):
     # Mild RS conflict can trade only if the reversal is extremely clear.
     mild_rs_block = rsx["mild"] and not conflict_confirmation_ok
 
-    # Against BTC direction: same strict requirement, plus no hard RS conflict.
-    btc_block = btc_against and (not conflict_confirmation_ok or hard_rs_block)
+    # V6.13 macro-pullback override. We only relax the short-term BTC conflict
+    # when the larger BTC trend supports the trade AND the alt itself is strong.
+    signed_rs_support = rel if side == "long" else -rel
+    macro_pullback_override_ok = bool(
+        btc_against
+        and btc_macro_pullback
+        and not btc_macro_opposed
+        and not hard_rs_block
+        and signed_rs_support >= MACRO_PULLBACK_MIN_RS
+        and confirm_components >= MACRO_PULLBACK_MIN_CONFIRM
+        and momentum_quality >= MACRO_PULLBACK_MIN_MOMENTUM
+        and entry_quality >= MACRO_PULLBACK_MIN_ENTRYQ
+        and adx >= MACRO_PULLBACK_MIN_ADX
+        and m_break
+        and not side_extended
+        and not impulse_15
+    )
+
+    # True BTC conflict stays strict. A healthy macro pullback may pass via the
+    # dedicated override above; otherwise V6.12's 4/4+rejection gate remains.
+    btc_block = btc_against and not macro_pullback_override_ok and (not conflict_confirmation_ok or hard_rs_block)
 
     # RSI / run safety remains.
     rsi_block = False
@@ -875,6 +981,11 @@ def evaluate_symbol(symbol, btc):
         entry_route = "EARLY"
     elif pullback_route:
         entry_route = "PULLBACK"
+
+    # Preserve the underlying EARLY/PULLBACK logic, but expose the reason why a
+    # short-term BTC conflict was allowed: larger-trend continuation.
+    if macro_pullback_override_ok and entry_route != "WAIT":
+        entry_route = "MACRO"
 
     skip_reasons = []
     if choppy: skip_reasons.append("adx-chop")
@@ -929,8 +1040,13 @@ def evaluate_symbol(symbol, btc):
         "recent_impulse": recent_impulse, "impulse_reset": impulse_reset,
         "rs_conflict_mild": rsx["mild"], "rs_conflict_hard": rsx["hard"],
         "btc_conflict": btc_against,
+        "btc_conflict_overridden": macro_pullback_override_ok,
         "btc_flow_aligned": btc_flow_aligned, "btc_flow_strong": btc_flow_strong,
         "flow_rs_supportive": flow_rs_supportive,
+        "btc_macro_supportive": btc_macro_supportive,
+        "btc_macro_opposed": btc_macro_opposed,
+        "btc_macro_pullback_support": btc_macro_pullback,
+        "btc_macro_strong": btc_macro_strong,
     }
 
 # ============================================================
@@ -956,7 +1072,7 @@ def roundtrip_cost(notional):
 
 def is_a_setup(signal):
     """
-    V6.12 premium A-sizing.
+    V6.13 premium A-sizing. MACRO route is deliberately NORMAL sizing.
 
     Route 1 - EARLY A:
       dezelfde strenge V6.12 voorwaarden: 4/4, rejection, micro-break,
@@ -967,6 +1083,9 @@ def is_a_setup(signal):
       relatief tegen die richting in loopt. Vereist 4/4, EntryQ>=4,
       momentum>=2, tactics>=5 en ADX>=25.
     """
+    if signal.get("entry_route") == "MACRO":
+        return False
+
     no_risk_conflict = bool(
         not signal.get("btc_conflict")
         and not signal.get("rs_conflict_hard")
@@ -1206,7 +1325,7 @@ def repair_one_position(p):
 def repair_existing_positions():
     positions = get_positions()
     if not positions: return True
-    tg(f"🛡️ V6.12 STARTUP\nOpen positions: {len(positions)}\nChecking TP + SL...")
+    tg(f"🛡️ V6.13 STARTUP\nOpen positions: {len(positions)}\nChecking TP + SL...")
     for p in positions:
         symbol, side = position_symbol(p), position_side(p)
         try:
@@ -1334,18 +1453,25 @@ def open_trade(signal):
         "size": str(sizing["contracts"]),
         "tpTriggerPrice": str(tp), "tpOrderPrice": "-1", "tpTriggerPriceType": "mark",
         "slTriggerPrice": str(sl), "slOrderPrice": "-1", "slTriggerPriceType": "mark",
-        "clientOrderId": f"v612{int(time.time() * 1000) % 1000000000}",
+        "clientOrderId": f"v613{int(time.time() * 1000) % 1000000000}",
     }
     if BROKER_ID: payload["brokerId"] = BROKER_ID
 
-    route_label = "🚀 EARLY REJECTION" if signal.get("entry_route") == "EARLY" else "🪵 PULLBACK"
+    route_label = (
+        "🚀 EARLY REJECTION" if signal.get("entry_route") == "EARLY"
+        else "🧭 MACRO FLOW" if signal.get("entry_route") == "MACRO"
+        else "🪵 PULLBACK"
+    )
     conflict_text = []
     if signal.get("rs_conflict_mild"): conflict_text.append("RS-CONFLICT VERIFIED")
-    if signal.get("btc_conflict"): conflict_text.append("BTC-CONFLICT VERIFIED")
+    if signal.get("btc_conflict_overridden"):
+        conflict_text.append("BTC PULLBACK OVERRIDDEN BY MACRO")
+    elif signal.get("btc_conflict"):
+        conflict_text.append("BTC-CONFLICT VERIFIED")
     conflict_line = ("\n" + " / ".join(conflict_text)) if conflict_text else ""
 
     message = (
-        f"{'🧪 PAPER V6.12' if PAPER_TRADING else '🟢 V6.12 LIVE ORDER'}\n"
+        f"{'🧪 PAPER V6.13' if PAPER_TRADING else '🟢 V6.13 LIVE ORDER'}\n"
         f"{symbol} {side.upper()}\n━━━━━━━━━━━━\nENTRY: {route_label}\n"
         f"Score {signal['score']:.0f}/{signal['threshold']:.0f}\n"
         f"Directional tactics {signal['tactics']}\n5m {signal['confirm_components']}/4\n"
@@ -1353,6 +1479,7 @@ def open_trade(signal):
         f"Pullback {signal['pullback_quality']}/3\nEntryQ {signal['entry_quality']}\n"
         f"Momentum {signal['momentum_quality']}\nBTC {signal['btc_regime']}\n"
         f"BTC flow: {'🌊 STRONG' if signal.get('btc_flow_strong') else '➡️ ALIGNED' if signal.get('btc_flow_aligned') else '↔️ NEUTRAL/AGAINST'}\n"
+        f"BTC macro: {'🧭 SUPPORT + PULLBACK' if signal.get('btc_macro_pullback_support') else '🧭 SUPPORT' if signal.get('btc_macro_supportive') else '⛔ OPPOSED' if signal.get('btc_macro_opposed') else '↔️ MIXED'}\n"
         f"5m rejection: {'YES' if signal.get('rejection') else 'NO'}\n"
         f"5m micro-break: {'YES' if signal.get('micro_break') else 'NO'}\n"
         f"Recent impulse: {'YES' if signal.get('recent_impulse') else 'NO'}\n"
@@ -1489,7 +1616,7 @@ def notify_closed_trade(record):
     pause = f"\n⏸ {MAX_CONSECUTIVE_LOSSES} losses → pauze {LOSS_PAUSE_MIN} min" if consecutive_losses >= MAX_CONSECUTIVE_LOSSES else ""
     icon = "🟢" if net_pnl >= 0 else "🔴"
     tg(
-        f"{icon} POSITION CLOSED V6.12\n\n{symbol}\n{side.upper()}\n━━━━━━━━━━━━\n"
+        f"{icon} POSITION CLOSED V6.13\n\n{symbol}\n{side.upper()}\n━━━━━━━━━━━━\n"
         f"Entry: {entry:.8g}\nExit: {exit_price:.8g}\nSize: {size:g}\n\n"
         f"💰 Realized: {'+' if gross_pnl >= 0 else ''}${gross_pnl:.2f}\n"
         f"📊 Ratio: {pnl_ratio:+.2f}%\n💸 Fee: -${fee:.2f}\n"
@@ -1506,7 +1633,7 @@ def seed_closed_history():
         for r in closed_positions_history(100):
             hid = str(r.get("historyId", ""))
             if hid: seen_closed_history_ids.add(hid)
-        tg(f"📚 V6.12 PNL TRACKER READY\nKnown closes: {len(seen_closed_history_ids)}\nLearning trades: {learning.get('trades', 0)}")
+        tg(f"📚 V6.13 PNL TRACKER READY\nKnown closes: {len(seen_closed_history_ids)}\nLearning trades: {learning.get('trades', 0)}")
     except Exception as e:
         tg(f"⚠️ PNL tracker warning\n{e}")
 
@@ -1560,19 +1687,20 @@ def maybe_score_report(rows):
     if time.time() - last_score_report < SCORE_REPORT_MIN * 60: return
     last_score_report = time.time()
     ranked = sorted(rows, key=lambda x: (x.get("score", 0), x.get("entry_quality", 0), x.get("adx", 0)), reverse=True)[:10]
-    lines = [f"📡 V6.12 {session_state()} {now_utc().strftime('%H:%M')} UTC"]
+    lines = [f"📡 V6.13 {session_state()} {now_utc().strftime('%H:%M')} UTC"]
     if not ranked: lines.append("geen scans")
     for r in ranked:
         route = r.get("entry_route", "WAIT")
-        route_tag = "🚀EARLY" if route == "EARLY" else "↩️PB" if route == "PULLBACK" else "WAIT"
+        route_tag = "🚀EARLY" if route == "EARLY" else "🧭MACRO" if route == "MACRO" else "↩️PB" if route == "PULLBACK" else "WAIT"
         mark = "🟢 READY" if not r.get("skip") else f"⏭ {r.get('skip')}"
         conflict = " ⚠️RS" if r.get("rs_conflict_mild") else ""
         flow = " 🌊" if r.get("btc_flow_strong") else " ➡️" if r.get("btc_flow_aligned") else ""
+        macro = " 🧭↩️" if r.get("btc_macro_pullback_support") else " 🧭" if r.get("btc_macro_supportive") else ""
         lines.append(
             f"{r['symbol'].split('/')[0]} {str(r.get('side') or '-').upper()} "
             f"{r.get('score', 0):.0f}/{r.get('threshold', BASE_MIN_SCORE):.0f} {route_tag} "
             f"t{r.get('tactics', 0)} 5m{r.get('confirm_components', 0)}/4 "
-            f"ADX{r.get('adx', 0):.0f} RS{r.get('rel', 0) * 100:+.1f}%{conflict}{flow} {mark}"
+            f"ADX{r.get('adx', 0):.0f} RS{r.get('rel', 0) * 100:+.1f}%{conflict}{flow}{macro} {mark}"
         )
     tg("\n".join(lines))
 
@@ -1580,7 +1708,7 @@ def maybe_score_report(rows):
 def startup_diagnostics():
     acc = futures_account(); reset_daily_if_needed(acc["total_equity"])
     tg(
-        f"🚀 BLOFIN V6.12 STARTED\nMode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
+        f"🚀 BLOFIN V6.13 STARTED\nMode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
         f"Position mode expected: NET / ONE-WAY\nEquity: ${acc['total_equity']:.2f}\nAvailable: ${acc['available']:.2f}\n"
         f"Day start: ${daily['start_equity']:.2f}\nBase score: {BASE_MIN_SCORE:.0f}\nHard floor: {HARD_MIN_SCORE:.0f}\n"
         f"EARLY score: {EARLY_MIN_SCORE:.0f}\n"
@@ -1591,6 +1719,8 @@ def startup_diagnostics():
         f"RS hard conflict: {RS_CONFLICT_HARD * 100:.2f}%\nConflict confirm: {CONFLICT_REQUIRE_CONFIRM}/4 + rejection\n"
         f"Max positions: {MAX_ACTIVE_POSITIONS}\nAlt cap normal L{MAX_ALT_LONGS}/S{MAX_ALT_SHORTS} | strong-flow cap {FLOW_SECOND_ALT_CAP}\n"
         f"Flow threshold bonus: -{FLOW_THRESHOLD_BONUS:.0f} pts | BTC ADX >= {FLOW_MIN_BTC_ADX:.0f}\n"
+        f"BTC hierarchy: 1D+4H macro | 1H regime | 15m trigger\n"
+        f"Macro PB gate: {MACRO_PULLBACK_MIN_CONFIRM}/4, M>={MACRO_PULLBACK_MIN_MOMENTUM}, EntryQ>={MACRO_PULLBACK_MIN_ENTRYQ}, ADX>={MACRO_PULLBACK_MIN_ADX:.0f}, RS>={MACRO_PULLBACK_MIN_RS*100:.1f}% + micro-break\n"
         f"2nd flow-alt requires {FLOW_SECOND_ALT_MIN_CONFIRM}/4, M>={FLOW_SECOND_ALT_MIN_MOMENTUM}, EntryQ>={FLOW_SECOND_ALT_MIN_ENTRYQ}, ADX>={FLOW_SECOND_ALT_MIN_ADX:.0f}\n"
         f"Max execution attempts/scan: {MAX_EXECUTION_ATTEMPTS_PER_SCAN}\nDaily cap: {DAILY_LOSS_LIMIT_PCT:.0f}%"
     )
@@ -1660,7 +1790,7 @@ def main():
                     signal = evaluate_symbol(symbol, btc)
                     if not signal: continue
                     scanned.append(signal)
-                    if not signal.get("skip") and signal.get("entry_route") in ("EARLY", "PULLBACK"):
+                    if not signal.get("skip") and signal.get("entry_route") in ("EARLY", "PULLBACK", "MACRO"):
                         candidates.append(signal)
                 except Exception:
                     continue
@@ -1671,8 +1801,9 @@ def main():
             # but score/quality still dominate inside the route.
             candidates.sort(key=lambda x: (
                 1 if x.get("btc_flow_strong") else 0,
+                1 if x.get("btc_macro_pullback_support") else 0,
                 1 if is_a_setup(x) else 0,
-                1 if x.get("entry_route") == "EARLY" else 0,
+                1 if x.get("entry_route") in ("EARLY", "MACRO") else 0,
                 x["score"], x["entry_quality"], x["confirm_components"], x["adx"], x["tactics"],
             ), reverse=True)
 
@@ -1706,13 +1837,13 @@ def main():
             time.sleep(SCAN_SECONDS)
 
         except KeyboardInterrupt:
-            tg("🛑 V6.12 stopped.")
+            tg("🛑 V6.13 stopped.")
             raise
         except Exception as e:
             msg = f"{type(e).__name__}: {e}"
             if "152002" in msg:
                 time.sleep(20); continue
-            tg(f"⚠️ V6.12 LOOP ERROR\n{msg}")
+            tg(f"⚠️ V6.13 LOOP ERROR\n{msg}")
             time.sleep(30)
 
 
