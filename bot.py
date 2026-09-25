@@ -51,7 +51,7 @@ REPEAT_LOSS_COOLDOWN_MIN = int(os.getenv("REPEAT_LOSS_COOLDOWN_MIN", "180"))
 LOSS_PAUSE_MIN = int(os.getenv("LOSS_PAUSE_MIN", "90"))
 
 # ---------------- POSITION LIMITS ----------------
-MAX_ACTIVE_POSITIONS = int(os.getenv("MAX_ACTIVE_POSITIONS", "2"))
+MAX_ACTIVE_POSITIONS = int(os.getenv("MAX_ACTIVE_POSITIONS", "4"))
 MAX_ALT_LONGS = int(os.getenv("MAX_ALT_LONGS", "1"))
 MAX_ALT_SHORTS = int(os.getenv("MAX_ALT_SHORTS", "1"))
 MAX_EXECUTION_ATTEMPTS_PER_SCAN = int(os.getenv("MAX_EXECUTION_ATTEMPTS_PER_SCAN", "3"))
