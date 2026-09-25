@@ -10,23 +10,19 @@ import pandas as pd
 import requests
 
 # ============================================================
-# BLOFIN V6.14 - MACRO FLOW + COIN LOCATION GUARD
+# BLOFIN PRECISION SNIPER v2.1 - BLOFIN EXECUTION EDITION
 # ============================================================
-# Gebouwd op V6.13. V6.14 voegt coin-locatie / anti-chase toe:
-# 1) BTC-context blijft multi-timeframe: 1D+4H macro, 1H regime, 15m trigger.
-# 2) Iedere coin krijgt nu óók een eigen 1H-locatiecheck over 2/4/6/10 uur.
-#    Een LONG wordt hard geblokkeerd als de coin al te ver omhoog is gerend;
-#    SHORT gespiegeld na een te grote daling. Dit kan NIET door score/ADX worden
-#    overruled.
-# 3) Extra top/bottom-locatiecheck: ver van 1H EMA20 + dicht bij recente 10h-high/low
-#    = niet meer achter de beweging aan springen.
-# 4) Als live execution zegt 'too late', krijgt dat symbool een persistent late-lock.
-#    Een volgende scan mag de meetlat dus niet simpelweg opnieuw leggen. De lock
-#    verdwijnt pas na een echte reset/pullback richting 15m EMA20.
-# 5) EARLY/PULLBACK/MACRO routes, A-sizing, BTC flow, protection, leverage-check
-#    en daily risk cap blijven verder intact.
+# Strategy engine: faithful Python translation of the supplied TradingView
+# Precision Sniper [WillyAlgoTrader] v2.1 defaults for a 15m chart.
 #
-# Geschreven voor One-way / NET position mode.
+# Execution shell: inherited from the proven BloFin V6.14 bot for account
+# handling, leverage, isolated margin, contract sizing, TP/SL verification,
+# Telegram, PnL tracking, cooldowns and daily risk protection. The old V6.14
+# EARLY/PULLBACK/MACRO signal engine remains below only as unused support code;
+# the active main loop calls ONLY the Precision Sniper engine defined near the
+# bottom of this file.
+#
+# Written for One-way / NET position mode.
 # ============================================================
 
 # ---------------- ENV ----------------
@@ -1854,8 +1850,558 @@ def protection_watch():
                 pass
     protection_lock = not all_positions_protected()
 
+
 # ============================================================
-# MAIN
+# PRECISION SNIPER V2.1 — LIVE TRANSLATION LAYER
+# ============================================================
+# This section replaces the V6.14 entry engine with the supplied TradingView
+# Precision Sniper v2.1 logic while retaining the battle-tested BloFin account,
+# sizing, leverage, TP/SL verification, PnL tracking and daily risk controls.
+#
+# Pine defaults translated for the bot's 15m chart:
+#   Auto preset -> Default: EMA 9/21/55, RSI 13, ATR 14, min evidence 5/10,
+#   SL 1.5 ATR, volume spike 1.2x, ADX trend 20, ATR/mean high-vol > 1.3.
+#   HTF is OFF because the Pine htfInput default is empty.
+#   Session is INFO ONLY / 24x7, so no night-alt block.
+#   VWAP Auto is ON for the Default preset; here it is UTC-day anchored VWAP.
+#   confirmWindow=0: the crossover's CLOSED 15m candle is the only candidate bar.
+#   TP1/TP2 are milestones (0% partial by default), TP3 closes the position.
+#   Step stop: TP1 -> entry, TP2 -> TP1, effective as soon as the bot observes it.
+# ============================================================
+
+SNIPER_VERSION = "2.1.0"
+SNIPER_TF = "15m"
+SNIPER_FAST = int(os.getenv("SNIPER_FAST", "9"))
+SNIPER_SLOW = int(os.getenv("SNIPER_SLOW", "21"))
+SNIPER_TREND = int(os.getenv("SNIPER_TREND", "55"))
+SNIPER_RSI_LEN = int(os.getenv("SNIPER_RSI_LEN", "13"))
+SNIPER_ATR_LEN = int(os.getenv("SNIPER_ATR_LEN", "14"))
+SNIPER_ATR_MEAN_LEN = int(os.getenv("SNIPER_ATR_MEAN_LEN", "42"))
+SNIPER_VOL_MEAN_LEN = int(os.getenv("SNIPER_VOL_MEAN_LEN", "20"))
+SNIPER_VOLUME_SPIKE = float(os.getenv("SNIPER_VOLUME_SPIKE", "1.20"))
+SNIPER_ADX_TREND = float(os.getenv("SNIPER_ADX_TREND", "20"))
+SNIPER_VOL_THRESHOLD = float(os.getenv("SNIPER_VOL_THRESHOLD", "1.30"))
+SNIPER_RSI_UPPER = float(os.getenv("SNIPER_RSI_UPPER", "75"))
+SNIPER_RSI_LOWER = float(os.getenv("SNIPER_RSI_LOWER", "25"))
+SNIPER_SL_MULT = float(os.getenv("SNIPER_SL_MULT", "1.50"))
+SNIPER_STRUCTURE_BUFFER = float(os.getenv("SNIPER_STRUCTURE_BUFFER", "0.20"))
+SNIPER_STRUCTURE_CAP = float(os.getenv("SNIPER_STRUCTURE_CAP", "1.50"))
+SNIPER_SWING_LOOKBACK = int(os.getenv("SNIPER_SWING_LOOKBACK", "10"))
+SNIPER_MIN_EVIDENCE_RATIO = float(os.getenv("SNIPER_MIN_EVIDENCE_RATIO", "0.50"))
+SNIPER_MAX_FILL_DRIFT = float(os.getenv("SNIPER_MAX_FILL_DRIFT", "0.004"))
+SNIPER_RISK_EQUITY_PCT = float(os.getenv("SNIPER_RISK_EQUITY_PCT", "0.016"))
+SNIPER_TARGET_NET_TP_USDT = float(os.getenv("SNIPER_TARGET_NET_TP_USDT", "1.50"))
+SNIPER_STEP_STOPS = os.getenv("SNIPER_STEP_STOPS", "true").lower() == "true"
+SNIPER_MIN_RISK_TICKS = int(os.getenv("SNIPER_MIN_RISK_TICKS", "2"))
+SNIPER_REPORT_MIN = int(os.getenv("SNIPER_REPORT_MIN", "15"))
+
+# TP3 is the live full-position take-profit, matching Pine defaults.
+TP_R_MULT = 3.0
+ATR_SL_MULT = SNIPER_SL_MULT
+
+sniper_last_report = 0
+sniper_last_signal_bar = {}
+sniper_step_notified = {}
+sniper_managed_positions = set()
+
+
+def _rma(series, length):
+    return series.ewm(alpha=1 / length, adjust=False).mean()
+
+
+def sniper_indicators(df):
+    out = df.copy()
+    out["ema_fast"] = out["close"].ewm(span=SNIPER_FAST, adjust=False).mean()
+    out["ema_slow"] = out["close"].ewm(span=SNIPER_SLOW, adjust=False).mean()
+    out["ema_trend"] = out["close"].ewm(span=SNIPER_TREND, adjust=False).mean()
+
+    prev_close = out["close"].shift(1)
+    tr = pd.concat([
+        out["high"] - out["low"],
+        (out["high"] - prev_close).abs(),
+        (out["low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    out["atr"] = _rma(tr, SNIPER_ATR_LEN)
+    out["atr_mean"] = out["atr"].rolling(SNIPER_ATR_MEAN_LEN).mean()
+
+    delta = out["close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    rs = _rma(gain, SNIPER_RSI_LEN) / _rma(loss, SNIPER_RSI_LEN).replace(0, np.nan)
+    out["sniper_rsi"] = 100 - 100 / (1 + rs)
+
+    ema12 = out["close"].ewm(span=12, adjust=False).mean()
+    ema26 = out["close"].ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    signal = macd.ewm(span=9, adjust=False).mean()
+    out["macd_hist"] = macd - signal
+
+    up_move = out["high"].diff()
+    down_move = -out["low"].diff()
+    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=out.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=out.index)
+    atr_w = _rma(tr, 14)
+    plus_di = 100 * _rma(plus_dm, 14) / atr_w.replace(0, np.nan)
+    minus_di = 100 * _rma(minus_dm, 14) / atr_w.replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    out["sniper_adx"] = _rma(dx, 14)
+    out["plus_di"] = plus_di
+    out["minus_di"] = minus_di
+    out["vol_mean"] = out["volume"].rolling(SNIPER_VOL_MEAN_LEN).mean()
+
+    # TradingView's intraday session VWAP is approximated with a UTC-day anchor,
+    # consistent with the Pine script's default Etc/UTC context.
+    utc_day = pd.to_datetime(out["ts"], unit="ms", utc=True).dt.floor("D")
+    typical = (out["high"] + out["low"] + out["close"]) / 3.0
+    pv = typical * out["volume"]
+    out["vwap"] = pv.groupby(utc_day).cumsum() / out["volume"].groupby(utc_day).cumsum().replace(0, np.nan)
+    return out
+
+
+def sniper_grade(ratio):
+    if ratio >= 0.80: return "A+"
+    if ratio >= 0.65: return "A"
+    if ratio >= 0.50: return "B"
+    return "C"
+
+
+def sniper_plan(df, side):
+    """Pine makePlan() translated for the last CLOSED 15m candle."""
+    a = df.iloc[-2]
+    entry = safe_float(a["close"])
+    atr = safe_float(a["atr"])
+    if entry <= 0 or atr <= 0:
+        return None
+    d = 1 if side == "long" else -1
+    atr_distance = atr * SNIPER_SL_MULT
+    # current closed bar + previous swingLookback bars = lookback + 1 bars.
+    window = df.iloc[-(SNIPER_SWING_LOOKBACK + 2):-1]
+    swing_low = safe_float(window["low"].min())
+    swing_high = safe_float(window["high"].max())
+    atr_stop = entry - d * atr_distance
+    struct_stop = swing_low - atr * SNIPER_STRUCTURE_BUFFER if d == 1 else swing_high + atr * SNIPER_STRUCTURE_BUFFER
+    raw_stop = min(atr_stop, struct_stop) if d == 1 else max(atr_stop, struct_stop)
+    capped = abs(entry - raw_stop) > atr_distance * SNIPER_STRUCTURE_CAP
+    bounded = entry - d * atr_distance * SNIPER_STRUCTURE_CAP if capped else raw_stop
+    risk = abs(entry - bounded)
+    return {
+        "signal_entry": entry,
+        "raw_stop": bounded,
+        "risk_distance": risk,
+        "capped": capped,
+        "origin": "ATR capped" if capped else ("Structure" if abs(raw_stop - atr_stop) > 1e-12 else "ATR"),
+        "atr": atr,
+    }
+
+
+def evaluate_symbol(symbol, btc=None):
+    """Precision Sniper v2.1 default 15m signal engine on CLOSED candles."""
+    df = sniper_indicators(ohlcv_df(symbol, SNIPER_TF))
+    warmup = max(SNIPER_TREND * 3, SNIPER_ATR_LEN + SNIPER_ATR_MEAN_LEN)
+    if len(df) < warmup + 2:
+        return None
+    a, p = df.iloc[-2], df.iloc[-3]
+    if any(pd.isna(a.get(k)) for k in ["atr", "atr_mean", "sniper_rsi", "macd_hist", "sniper_adx", "ema_fast", "ema_slow", "ema_trend"]):
+        return None
+
+    bull_cross = safe_float(a["ema_fast"]) > safe_float(a["ema_slow"]) and safe_float(p["ema_fast"]) <= safe_float(p["ema_slow"])
+    bear_cross = safe_float(a["ema_fast"]) < safe_float(a["ema_slow"]) and safe_float(p["ema_fast"]) >= safe_float(p["ema_slow"])
+    if not bull_cross and not bear_cross:
+        return {
+            "symbol": symbol, "side": None, "score": 0.0, "score_max": 7.0,
+            "grade": "-", "skip": "no-cross", "entry_route": "WAIT",
+            "price": safe_float(a["close"]), "atr": safe_float(a["atr"]),
+            "signal_bar_ts": int(a["ts"]), "adx": safe_float(a["sniper_adx"]),
+        }
+
+    side = "long" if bull_cross else "short"
+    d = 1 if side == "long" else -1
+    close = safe_float(a["close"])
+    rsi = safe_float(a["sniper_rsi"], 50)
+    hist = safe_float(a["macd_hist"])
+    hist_prev = safe_float(p["macd_hist"])
+    adx = safe_float(a["sniper_adx"])
+    plus_di = safe_float(a["plus_di"])
+    minus_di = safe_float(a["minus_di"])
+    atr = safe_float(a["atr"])
+    atr_mean = safe_float(a["atr_mean"])
+    vol_mean = safe_float(a["vol_mean"])
+    volume = safe_float(a["volume"])
+    vwap = safe_float(a["vwap"])
+
+    momentum = close > safe_float(a["ema_fast"]) and close > safe_float(a["ema_slow"]) if d == 1 else close < safe_float(a["ema_fast"]) and close < safe_float(a["ema_slow"])
+    vol_ratio = atr / atr_mean if atr_mean > 0 else 999.0
+    high_vol = vol_ratio > SNIPER_VOL_THRESHOLD
+    volume_above = vol_mean > 0 and volume > vol_mean * SNIPER_VOLUME_SPIKE
+    trending = adx >= SNIPER_ADX_TREND
+
+    # Pine default: has volume + VWAP Auto ON on 15m Default preset -> max 7.
+    score = 0.0
+    if (close > safe_float(a["ema_trend"])) if d == 1 else (close < safe_float(a["ema_trend"])): score += 1
+    if (50 < rsi < SNIPER_RSI_UPPER) if d == 1 else (SNIPER_RSI_LOWER < rsi < 50): score += 1
+    if (hist > 0) if d == 1 else (hist < 0): score += 1
+    if (hist > hist_prev) if d == 1 else (hist < hist_prev): score += 1
+    if trending and ((plus_di > minus_di) if d == 1 else (minus_di > plus_di)): score += 1
+    if volume_above: score += 1
+    if (close > vwap) if d == 1 else (close < vwap): score += 1
+    score_max = 7.0
+    ratio = score / score_max
+    grade = sniper_grade(ratio)
+    plan = sniper_plan(df, side)
+
+    skip = None
+    if high_vol:
+        skip = "high-vol"
+    elif not momentum:
+        skip = "price-momentum-lost"
+    elif (d == 1 and rsi >= SNIPER_RSI_UPPER) or (d == -1 and rsi <= SNIPER_RSI_LOWER):
+        skip = "rsi-extreme"
+    elif score + 1e-9 < SNIPER_MIN_EVIDENCE_RATIO * score_max:
+        skip = f"evidence-{score:.1f}/{score_max:.1f}"
+    elif not plan or plan["risk_distance"] <= 0:
+        skip = "invalid-plan"
+    else:
+        tick = safe_float(get_instrument(symbol).get("tickSize"), 0.0001)
+        if plan["risk_distance"] < SNIPER_MIN_RISK_TICKS * tick - tick * 1e-6:
+            skip = "risk-too-small"
+
+    return {
+        "symbol": symbol, "side": side, "score": score, "score_max": score_max,
+        "threshold": SNIPER_MIN_EVIDENCE_RATIO * score_max, "grade": grade,
+        "skip": skip, "entry_route": "SNIPER" if skip is None else "WAIT",
+        "price": close, "atr": atr, "adx": adx, "rsi": rsi,
+        "signal_bar_ts": int(a["ts"]), "vol_ratio": vol_ratio,
+        "volume_above": volume_above, "vwap": vwap, "risk_distance": plan["risk_distance"] if plan else 0,
+        "stop_origin": plan["origin"] if plan else "N/A", "structure_capped": bool(plan["capped"]) if plan else False,
+        # compatibility fields for generic infrastructure
+        "tactics": int(round(score)), "entry_quality": int(round(ratio * 5)),
+        "confirm_components": 4 if skip is None else 0, "momentum_quality": 2 if momentum else 0,
+        "pullback_quality": 0, "rel": 0.0, "btc_regime": "SNIPER-INDEPENDENT",
+    }
+
+
+def is_a_setup(signal):
+    # Pine grades are evidence labels, not risk-sizing tiers. Keep sizing neutral
+    # so we can evaluate the strategy rather than confounding it with bigger bets.
+    return False
+
+
+def sizing_profile(signal):
+    return {"name": "SNIPER", "risk_pct": SNIPER_RISK_EQUITY_PCT, "target_net_tp": SNIPER_TARGET_NET_TP_USDT}
+
+
+def allowed_fill_slip(signal):
+    return SNIPER_MAX_FILL_DRIFT
+
+
+def sniper_live_levels(signal, live, tick):
+    risk = safe_float(signal.get("risk_distance"))
+    if live <= 0 or risk <= 0:
+        return None
+    side = signal["side"]
+    d = 1 if side == "long" else -1
+    raw_sl = live - d * risk
+    raw_t1 = live + d * risk
+    raw_t2 = live + d * risk * 2.0
+    raw_t3 = live + d * risk * 3.0
+    sl = round_trade_price(raw_sl, tick, side, "sl")
+    t1 = round_trade_price(raw_t1, tick, side, "tp")
+    t2 = round_trade_price(raw_t2, tick, side, "tp")
+    t3 = round_trade_price(raw_t3, tick, side, "tp")
+    if side == "long" and not (sl < live < t1 < t2 < t3): return None
+    if side == "short" and not (t3 < t2 < t1 < live < sl): return None
+    return sl, t1, t2, t3, abs(live - sl)
+
+
+def open_trade(signal):
+    global protection_lock
+    symbol, side = signal["symbol"], signal["side"]
+    account = futures_account()
+    equity, available = account["total_equity"], account["available"]
+    reset_daily_if_needed(equity)
+    if equity < MIN_EQUITY_USDT:
+        tg(f"⛔ RISK STOP\nEquity ${equity:.2f} < ${MIN_EQUITY_USDT:.2f}")
+        return False
+    if available <= 0 or (not PAPER_TRADING and protection_lock):
+        return False
+
+    tick = safe_float(get_instrument(symbol).get("tickSize"), 0.0001)
+    live = safe_float(exchange.fetch_ticker(symbol).get("last"), signal["price"])
+    signal_px = safe_float(signal["price"])
+    if live <= 0 or signal_px <= 0:
+        return False
+    drift = (live - signal_px) / signal_px
+    if (side == "long" and drift > SNIPER_MAX_FILL_DRIFT) or (side == "short" and drift < -SNIPER_MAX_FILL_DRIFT):
+        tg(f"⏭️ {symbol} {side.upper()} SNIPER too late\nDrift {abs(drift)*100:.2f}% > {SNIPER_MAX_FILL_DRIFT*100:.2f}%")
+        return False
+
+    levels = sniper_live_levels(signal, live, tick)
+    if not levels:
+        return False
+    sl, tp1, tp2, tp3, risk = levels
+    stop_pct = risk / live
+    profile = sizing_profile(signal)
+    sizing = calculate_contracts(symbol, live, sl, equity, available, profile["risk_pct"], profile["target_net_tp"])
+    if not sizing:
+        return False
+
+    before_ids = {position_id(p) for p in get_positions() if position_id(p)}
+    lev_ok, lev_result = set_leverage(symbol, LEVERAGE)
+    if not lev_ok:
+        tg(f"⛔ LEVERAGE FAILED\n{symbol}\nRequested: {LEVERAGE}x\n{lev_result}\nTrade skipped.")
+        return False
+
+    payload = {
+        "instId": blofin_inst_id(symbol), "marginMode": MARGIN_MODE, "positionSide": "net",
+        "side": "buy" if side == "long" else "sell", "orderType": "market",
+        "size": str(sizing["contracts"]),
+        "tpTriggerPrice": str(tp3), "tpOrderPrice": "-1", "tpTriggerPriceType": "mark",
+        "slTriggerPrice": str(sl), "slOrderPrice": "-1", "slTriggerPriceType": "mark",
+        "clientOrderId": f"ps21{int(time.time()*1000)%1000000000}",
+    }
+    if BROKER_ID: payload["brokerId"] = BROKER_ID
+
+    msg = (
+        f"{'🧪 PAPER' if PAPER_TRADING else '🎯 PRECISION SNIPER LIVE'} v{SNIPER_VERSION}\n"
+        f"{symbol} {side.upper()} · Grade {signal['grade']}\n"
+        f"Evidence {signal['score']:.1f}/{signal['score_max']:.1f} ({signal['score']/signal['score_max']*100:.0f}%)\n"
+        f"ADX {signal['adx']:.1f} · RSI {signal['rsi']:.1f} · ATR/mean {signal['vol_ratio']:.2f}x\n"
+        f"Volume spike: {'YES' if signal['volume_above'] else 'NO'} · Stop: {signal['stop_origin']}\n"
+        f"Entry ~ {live:.8g}\nSL {sl:.8g}\nTP1 {tp1:.8g} → SL to entry\n"
+        f"TP2 {tp2:.8g} → SL to TP1\nTP3 {tp3:.8g} → full exit\n"
+        f"Initial risk {stop_pct*100:.2f}% · Risk cap {profile['risk_pct']*100:.1f}%\n"
+        f"Expected TP3 net ~${sizing['expected_net_tp_usdt']:.2f}\n"
+        f"Expected SL + cost ~${sizing['expected_net_sl_usdt']:.2f}\n"
+        f"Notional ${sizing['notional']:.2f} · Margin ${sizing['margin']:.2f} · {LEVERAGE}x\n"
+        f"Fill drift {abs(drift)*100:.2f}%/{SNIPER_MAX_FILL_DRIFT*100:.2f}%"
+    )
+    if PAPER_TRADING:
+        tg(msg)
+        return True
+
+    resp = native("private_post_trade_order", payload)
+    if not native_ok(resp):
+        err = response_error(resp)
+        if "152012" in err:
+            protection_lock = True
+        tg(f"❌ PRECISION SNIPER ORDER FAILED\n{symbol} {side.upper()}\n{err}")
+        return False
+
+    tg(msg)
+    new_pos = find_new_position(symbol, before_ids, timeout=8)
+    if new_pos is None:
+        tg(f"⚠️ {symbol}: order accepted, position not visible yet.")
+        return True
+    if has_live_protection(new_pos)[0]:
+        pid = position_id(new_pos)
+        if pid: sniper_managed_positions.add(pid)
+        tg(f"🛡️ SNIPER PROTECTION CONFIRMED\n{symbol} {side.upper()}\nTP3 + SL visible.")
+        return True
+
+    last = safe_float(exchange.fetch_ticker(symbol).get("last"))
+    if tpsl_prices_valid(side, sl, tp3, last):
+        ok, result = place_tpsl_for_position(new_pos, sl, tp3, client_tag="psfb")
+        if ok:
+            pid = position_id(new_pos)
+            if pid: sniper_managed_positions.add(pid)
+            tg(f"🛡️ SNIPER FALLBACK TP3 + SL CONFIRMED\n{symbol}")
+            return True
+        tg(f"🚨 CRITICAL SNIPER PROTECTION FAILURE\n{symbol}\n{result}\nNEW TRADES PAUSED.")
+        protection_lock = True
+        return True
+    tg(f"🚨 {symbol}: position exists but fallback protection cannot safely be placed.\nNEW TRADES PAUSED.")
+    protection_lock = True
+    return True
+
+
+def amend_tpsl_stop(p, new_sl):
+    ok, order = has_live_protection(p)
+    if not ok or not order:
+        return False, "No live TP/SL to amend"
+    tpsl_id = str(order.get("tpslId", order.get("algoId", "")) or "")
+    client_id = str(order.get("clientOrderId", "") or "")
+    if not tpsl_id and not client_id:
+        return False, "TP/SL id missing"
+    payload = {
+        "instId": p["instId"],
+        "requestId": f"psa{int(time.time()*1000)%1000000000}",
+        "newSlTriggerPrice": str(new_sl),
+        "newSlTriggerPriceType": "mark",
+        "newSlOrderPrice": "-1",
+    }
+    if tpsl_id: payload["tpslId"] = tpsl_id
+    else: payload["clientOrderId"] = client_id
+    resp = native("private_post_trade_amend_tpsl", payload)
+    if not native_ok(resp):
+        return False, response_error(resp)
+    time.sleep(0.5)
+    ok2, order2 = has_live_protection(p)
+    if not ok2:
+        return False, "Amend accepted but TP+SL not visible"
+    actual = safe_float(order2.get("slTriggerPrice"))
+    return (abs(actual - new_sl) <= max(abs(new_sl)*1e-8, 1e-12)), order2
+
+
+def sniper_recent_extreme(symbol, side):
+    """Catch TP milestone touches between 45s scans using the latest 1m candles."""
+    try:
+        rows = exchange.fetch_ohlcv(symbol, timeframe="1m", limit=3)
+        if rows:
+            if side == "long": return max(safe_float(r[2]) for r in rows)
+            return min(safe_float(r[3]) for r in rows)
+    except Exception:
+        pass
+    return safe_float(exchange.fetch_ticker(symbol).get("last"))
+
+
+def manage_sniper_step_stops():
+    """Pine default: TP1->entry, TP2->TP1, TP3 remains full-position TP."""
+    if PAPER_TRADING or not SNIPER_STEP_STOPS:
+        return
+    for p in get_positions():
+        symbol = position_symbol(p)
+        side = position_side(p)
+        entry = position_entry(p)
+        pid = position_id(p)
+        if symbol not in SYMBOLS or entry <= 0:
+            continue
+        # Never reinterpret an older V6.x position as a Sniper trade. During the
+        # same process we know exactly which positions this engine opened. After
+        # a process restart, only auto-adopt positions whose active TPSL carries
+        # our ps21/psfb client tag; otherwise leave their protection untouched.
+        if pid not in sniper_managed_positions:
+            try:
+                _, probe = has_live_protection(p)
+                cid = str((probe or {}).get("clientOrderId", "") or "")
+                if cid.startswith(("ps21", "psfb")):
+                    sniper_managed_positions.add(pid)
+                else:
+                    continue
+            except Exception:
+                continue
+        ok, order = has_live_protection(p)
+        if not ok or not order:
+            continue
+        tp3 = safe_float(order.get("tpTriggerPrice"))
+        current_sl = safe_float(order.get("slTriggerPrice"))
+        if tp3 <= 0 or current_sl <= 0:
+            continue
+        risk = abs(tp3 - entry) / 3.0
+        if risk <= 0:
+            continue
+        d = 1 if side == "long" else -1
+        tp1 = entry + d * risk
+        tp2 = entry + d * 2.0 * risk
+        tick = safe_float(get_instrument(symbol).get("tickSize"), 0.0001)
+        extreme = sniper_recent_extreme(symbol, side)
+        hit1 = extreme >= tp1 if side == "long" else extreme <= tp1
+        hit2 = extreme >= tp2 if side == "long" else extreme <= tp2
+        desired = None
+        stage = None
+        if hit2:
+            desired = round_trade_price(tp1, tick, side, "sl")
+            stage = "TP2"
+        elif hit1:
+            desired = round_trade_price(entry, tick, side, "sl")
+            stage = "TP1"
+        if desired is None:
+            continue
+        improves = desired > current_sl + tick*0.1 if side == "long" else desired < current_sl - tick*0.1
+        if not improves:
+            continue
+        ok_amend, result = amend_tpsl_stop(p, desired)
+        key = f"{position_id(p)}:{stage}:{desired}"
+        if ok_amend:
+            if not sniper_step_notified.get(key):
+                tg(f"🪜 SNIPER STEP STOP\n{symbol} {side.upper()}\n{stage} touched → SL moved to {desired:.8g}\nTP3 stays active.")
+                sniper_step_notified[key] = True
+        else:
+            tg(f"⚠️ SNIPER STEP AMEND FAILED\n{symbol} {side.upper()}\n{stage} → {desired:.8g}\n{result}")
+
+
+def repair_one_position(p):
+    """Emergency startup protection; uses 1.5 ATR / 3R if original plan is unavailable."""
+    symbol, side, entry = position_symbol(p), position_side(p), position_entry(p)
+    if entry <= 0:
+        return False
+    if has_live_protection(p)[0]:
+        return True
+    df = sniper_indicators(ohlcv_df(symbol, SNIPER_TF))
+    atr = safe_float(df.iloc[-2]["atr"])
+    tick = safe_float(get_instrument(symbol).get("tickSize"), 0.0001)
+    risk = atr * SNIPER_SL_MULT
+    if atr <= 0 or risk <= 0:
+        return False
+    d = 1 if side == "long" else -1
+    sl = round_trade_price(entry - d*risk, tick, side, "sl")
+    tp3 = round_trade_price(entry + d*risk*3.0, tick, side, "tp")
+    last = safe_float(exchange.fetch_ticker(symbol).get("last"))
+    if not tpsl_prices_valid(side, sl, tp3, last):
+        return False
+    return place_tpsl_for_position(p, sl, tp3, client_tag="psrepair")[0]
+
+
+def maybe_score_report(rows):
+    global sniper_last_report
+    now = time.time()
+    crosses = [r for r in rows if r.get("side")]
+    if not crosses or now - sniper_last_report < SNIPER_REPORT_MIN * 60:
+        return
+    sniper_last_report = now
+    lines = [f"🎯 PRECISION SNIPER v{SNIPER_VERSION} · crossover scan"]
+    for r in crosses[:10]:
+        state = "🟢 READY" if not r.get("skip") else f"⏭ {r.get('skip')}"
+        lines.append(
+            f"{r['symbol'].split('/')[0]} {r['side'].upper()} {r['grade']} "
+            f"{r['score']:.1f}/{r['score_max']:.1f} ADX{r['adx']:.0f} RSI{r['rsi']:.0f} "
+            f"ATRμ{r['vol_ratio']:.2f} {state}"
+        )
+    tg("\n".join(lines))
+
+
+def startup_diagnostics():
+    acc = futures_account()
+    reset_daily_if_needed(acc["total_equity"])
+    tg(
+        f"🎯 PRECISION SNIPER BOT STARTED v{SNIPER_VERSION}\n"
+        f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
+        f"Engine: supplied WillyAlgoTrader Precision Sniper translated to BloFin\n"
+        f"Signal: 15m CLOSED candle · EMA {SNIPER_FAST}/{SNIPER_SLOW}/{SNIPER_TREND}\n"
+        f"Mandatory trigger: EMA{SNIPER_FAST}/{SNIPER_SLOW} crossover + price momentum\n"
+        f"Evidence: trend/RSI/MACD/accel/ADX/volume/VWAP · need >= {SNIPER_MIN_EVIDENCE_RATIO*100:.0f}%\n"
+        f"High-vol block: ATR/mean > {SNIPER_VOL_THRESHOLD:.2f}x\n"
+        f"SL: {SNIPER_SL_MULT:.1f} ATR + structure, capped at {SNIPER_STRUCTURE_CAP:.1f}x ATR-stop\n"
+        f"TP ladder: 1R milestone → BE | 2R → lock 1R | 3R full exit\n"
+        f"Risk cap: {SNIPER_RISK_EQUITY_PCT*100:.1f}% · Max positions: {MAX_ACTIVE_POSITIONS}\n"
+        f"Equity: ${acc['total_equity']:.2f} · Available: ${acc['available']:.2f}\n"
+        f"Daily loss cap: {DAILY_LOSS_LIMIT_PCT:.0f}%"
+    )
+
+
+def protection_watch():
+    global protection_lock
+    if PAPER_TRADING:
+        protection_lock = False
+        return
+    positions = get_positions()
+    if not positions:
+        protection_lock = False
+        return
+    # Do not rewrite protection on positions inherited from another strategy.
+    # Only positions opened by this Sniper process may be auto-repaired.
+    for p in positions:
+        try:
+            if has_live_protection(p)[0]:
+                continue
+            pid = position_id(p)
+            if REPAIR_EXISTING_POSITIONS and pid in sniper_managed_positions and repair_one_position(p):
+                tg(f"🛡️ SNIPER REPAIRED {position_symbol(p)} {position_side(p).upper()}")
+        except Exception:
+            pass
+    protection_lock = not all_positions_protected()
+
+# ============================================================
+# MAIN — PRECISION SNIPER ONLY
 # ============================================================
 def main():
     global protection_lock
@@ -1864,98 +2410,102 @@ def main():
     if not PAPER_TRADING:
         seed_closed_history()
         try:
-            protection_lock = not repair_existing_positions()
+            inherited = get_positions()
+            if inherited:
+                # Safe strategy handover: leave V6.x/other-strategy TP/SL untouched.
+                # The Sniper engine starts managing step stops only for positions it opens itself.
+                protection_lock = not all_positions_protected()
+                tg(f"ℹ️ STRATEGY HANDOVER\n{len(inherited)} existing position(s) detected. Existing TP/SL left untouched." +
+                   ("\n⚠️ One or more positions are unprotected: new trades locked." if protection_lock else "\n✅ Existing protection verified."))
+            else:
+                protection_lock = False
         except Exception as e:
             protection_lock = True
-            tg(f"🚨 STARTUP PROTECTION FAILED\n{e}")
+            tg(f"🚨 STARTUP PROTECTION CHECK FAILED\n{e}")
 
     while True:
         try:
             if not PAPER_TRADING:
-                try: check_for_closed_positions()
-                except Exception as e: tg(f"⚠️ PNL TRACKER ERROR\n{e}")
+                try:
+                    check_for_closed_positions()
+                except Exception as e:
+                    tg(f"⚠️ PNL TRACKER ERROR\n{e}")
+                try:
+                    manage_sniper_step_stops()
+                except Exception as e:
+                    tg(f"⚠️ SNIPER STEP MANAGER ERROR\n{e}")
 
             acc = futures_account()
             ok, reason = check_daily_risk(acc["total_equity"])
             if not ok:
-                tg(f"🛑 {reason}"); time.sleep(120); continue
+                tg(f"🛑 {reason}")
+                time.sleep(120)
+                continue
             if time.time() < loss_pause_until:
-                time.sleep(SCAN_SECONDS); continue
+                time.sleep(SCAN_SECONDS)
+                continue
 
             positions = get_positions()
-            if not PAPER_TRADING: protection_watch()
-            positions = get_positions()
-            if len(positions) >= MAX_ACTIVE_POSITIONS:
-                time.sleep(SCAN_SECONDS); continue
+            if not PAPER_TRADING:
+                protection_watch()
+                positions = get_positions()
             if protection_lock and not PAPER_TRADING:
-                time.sleep(SCAN_SECONDS); continue
-
-            try:
-                btc = btc_regime()
-            except Exception as e:
-                tg(f"⚠️ BTC REGIME ERROR\n{e}"); time.sleep(SCAN_SECONDS); continue
+                time.sleep(SCAN_SECONDS)
+                continue
 
             scanned, candidates = [], []
+            existing_symbols = {position_symbol(p) for p in positions}
             for symbol in SYMBOLS:
-                if not cooldown_ok(symbol): continue
+                if not cooldown_ok(symbol):
+                    continue
                 try:
-                    signal = evaluate_symbol(symbol, btc)
-                    if not signal: continue
+                    signal = evaluate_symbol(symbol)
+                    if not signal:
+                        continue
                     scanned.append(signal)
-                    if not signal.get("skip") and signal.get("entry_route") in ("EARLY", "PULLBACK", "MACRO"):
+                    if signal.get("side") and not signal.get("skip") and signal.get("entry_route") == "SNIPER":
+                        # A closed crossover bar is a one-shot Precision Sniper event.
+                        key = int(signal.get("signal_bar_ts", 0))
+                        if sniper_last_signal_bar.get(symbol) == key:
+                            continue
+                        if symbol in existing_symbols:
+                            sniper_last_signal_bar[symbol] = key
+                            continue
                         candidates.append(signal)
                 except Exception:
                     continue
 
             maybe_score_report(scanned)
+            # Pine grades are descriptive. For simultaneous candidates, rank by
+            # evidence ratio, then ADX; no BTC-flow score is mixed into this test.
+            candidates.sort(key=lambda x: (x["score"] / max(x["score_max"], 1e-9), x["adx"]), reverse=True)
 
-            # EARLY gets a small ranking preference because its purpose is timing,
-            # but score/quality still dominate inside the route.
-            candidates.sort(key=lambda x: (
-                1 if x.get("btc_flow_strong") else 0,
-                1 if x.get("btc_macro_pullback_support") else 0,
-                1 if is_a_setup(x) else 0,
-                1 if x.get("entry_route") in ("EARLY", "MACRO") else 0,
-                x["score"], x["entry_quality"], x["confirm_components"], x["adx"], x["tactics"],
-            ), reverse=True)
-
-            execution_attempts = 0
+            attempts = 0
             for signal in candidates:
-                current = get_positions()
-                if len(current) >= MAX_ACTIVE_POSITIONS: break
-                existing_symbols = {position_symbol(p) for p in current}
-                if signal["symbol"] in existing_symbols: continue
-                alt_l, alt_s = count_alt_sides(current)
-                if signal["symbol"] not in MAJORS:
-                    # V6.12: normal cap remains 1 per alt direction. A second
-                    # same-direction alt is allowed only when BTC flow is strong
-                    # and this new signal itself passes the strict flow gate.
-                    long_cap = MAX_ALT_LONGS
-                    short_cap = MAX_ALT_SHORTS
-                    if flow_second_alt_ok(signal):
-                        if signal["side"] == "long":
-                            long_cap = max(long_cap, FLOW_SECOND_ALT_CAP)
-                        else:
-                            short_cap = max(short_cap, FLOW_SECOND_ALT_CAP)
-                    if signal["side"] == "long" and alt_l >= long_cap: continue
-                    if signal["side"] == "short" and alt_s >= short_cap: continue
-                if execution_attempts >= MAX_EXECUTION_ATTEMPTS_PER_SCAN: break
-                execution_attempts += 1
+                if len(get_positions()) >= MAX_ACTIVE_POSITIONS:
+                    break
+                if attempts >= MAX_EXECUTION_ATTEMPTS_PER_SCAN:
+                    break
+                attempts += 1
                 opened = open_trade(signal)
+                sniper_last_signal_bar[signal["symbol"]] = int(signal.get("signal_bar_ts", 0))
                 if opened:
                     symbol_last_trade[signal["symbol"]] = time.time()
+                    # Preserve the existing bot behavior: one successful new order
+                    # per 45s scan; a second candidate can enter on the next scan.
                     break
 
             time.sleep(SCAN_SECONDS)
 
         except KeyboardInterrupt:
-            tg("🛑 V6.14 stopped.")
+            tg("🛑 Precision Sniper bot stopped.")
             raise
         except Exception as e:
             msg = f"{type(e).__name__}: {e}"
             if "152002" in msg:
-                time.sleep(20); continue
-            tg(f"⚠️ V6.14 LOOP ERROR\n{msg}")
+                time.sleep(20)
+                continue
+            tg(f"⚠️ PRECISION SNIPER LOOP ERROR\n{msg}")
             time.sleep(30)
 
 
