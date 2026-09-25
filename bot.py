@@ -10,22 +10,21 @@ import pandas as pd
 import requests
 
 # ============================================================
-# BLOFIN V6.13 - MACRO FLOW + PULLBACK DISTINCTION
+# BLOFIN V6.14 - MACRO FLOW + COIN LOCATION GUARD
 # ============================================================
-# Gebouwd op V6.12. Nieuwe V6.13 BTC-contextlaag:
-# 1) BTC wordt niet meer alleen via 1h/15m beoordeeld. We lezen 1D + 4H
-#    (macro), 1H (regime) en 15m (trigger).
-# 2) Een korte 15m-daling binnen bullish 1D/4H + bullish 1H wordt herkend
-#    als BTC_BULL_PULLBACK, niet automatisch als een vol bearish conflict.
-# 3) Om zo'n macro-pullback te overrulen moet de alt zelf sterk zijn:
-#    5m >=3/4, momentum>=2, EntryQ>=3, ADX>=22, voldoende relatieve kracht
-#    en een 5m micro-break. Hard RS-conflict blijft altijd geblokkeerd.
-# 4) De nieuwe route heet MACRO FLOW. Deze krijgt NORMAL sizing, nooit A,
-#    omdat de korte BTC-trigger nog tegen de trade in kan staan.
-# 5) Echte BTC-tegenstroom (macro/regime dezelfde kant tegen de trade) blijft
-#    streng: 4/4 + rejection + micro-break zoals in V6.12.
-# 6) V6.12 FLOW offense, A-sizing, tweede flow-alt, protection, leverage-check
-#    en daily risk cap blijven intact.
+# Gebouwd op V6.13. V6.14 voegt coin-locatie / anti-chase toe:
+# 1) BTC-context blijft multi-timeframe: 1D+4H macro, 1H regime, 15m trigger.
+# 2) Iedere coin krijgt nu óók een eigen 1H-locatiecheck over 2/4/6/10 uur.
+#    Een LONG wordt hard geblokkeerd als de coin al te ver omhoog is gerend;
+#    SHORT gespiegeld na een te grote daling. Dit kan NIET door score/ADX worden
+#    overruled.
+# 3) Extra top/bottom-locatiecheck: ver van 1H EMA20 + dicht bij recente 10h-high/low
+#    = niet meer achter de beweging aan springen.
+# 4) Als live execution zegt 'too late', krijgt dat symbool een persistent late-lock.
+#    Een volgende scan mag de meetlat dus niet simpelweg opnieuw leggen. De lock
+#    verdwijnt pas na een echte reset/pullback richting 15m EMA20.
+# 5) EARLY/PULLBACK/MACRO routes, A-sizing, BTC flow, protection, leverage-check
+#    en daily risk cap blijven verder intact.
 #
 # Geschreven voor One-way / NET position mode.
 # ============================================================
@@ -70,13 +69,27 @@ FLOW_SECOND_ALT_MIN_MOMENTUM = int(os.getenv("FLOW_SECOND_ALT_MIN_MOMENTUM", "2"
 FLOW_SECOND_ALT_MIN_ENTRYQ = int(os.getenv("FLOW_SECOND_ALT_MIN_ENTRYQ", "3"))
 FLOW_SECOND_ALT_MIN_ADX = float(os.getenv("FLOW_SECOND_ALT_MIN_ADX", "22"))
 
-# ---------------- V6.13 MACRO BTC CONTEXT ----------------
+# ---------------- V6.14 MACRO BTC CONTEXT ----------------
 MACRO_THRESHOLD_BONUS = float(os.getenv("MACRO_THRESHOLD_BONUS", "2"))
 MACRO_PULLBACK_MIN_CONFIRM = int(os.getenv("MACRO_PULLBACK_MIN_CONFIRM", "3"))
 MACRO_PULLBACK_MIN_MOMENTUM = int(os.getenv("MACRO_PULLBACK_MIN_MOMENTUM", "2"))
 MACRO_PULLBACK_MIN_ENTRYQ = int(os.getenv("MACRO_PULLBACK_MIN_ENTRYQ", "3"))
 MACRO_PULLBACK_MIN_ADX = float(os.getenv("MACRO_PULLBACK_MIN_ADX", "22"))
 MACRO_PULLBACK_MIN_RS = float(os.getenv("MACRO_PULLBACK_MIN_RS", "0.004"))  # 0.40%
+
+# ---------------- V6.14 COIN LOCATION / ANTI-CHASE ----------------
+# Hard ceilings for an already extended move. These are intentionally stricter
+# than the old 8-bar filter because a fresh 5m signal must not reset the clock.
+COIN_RUN_2H_MAX = float(os.getenv("COIN_RUN_2H_MAX", "0.035"))    # 3.5%
+COIN_RUN_4H_MAX = float(os.getenv("COIN_RUN_4H_MAX", "0.050"))    # 5.0%
+COIN_RUN_6H_MAX = float(os.getenv("COIN_RUN_6H_MAX", "0.070"))    # 7.0%
+COIN_RUN_10H_MAX = float(os.getenv("COIN_RUN_10H_MAX", "0.090"))  # 9.0%
+COIN_1H_EMA_EXT_MAX = float(os.getenv("COIN_1H_EMA_EXT_MAX", "0.025"))  # 2.5%
+COIN_NEAR_10H_EXTREME = float(os.getenv("COIN_NEAR_10H_EXTREME", "0.015"))  # 1.5%
+COIN_LOCATION_MIN_2H_RUN = float(os.getenv("COIN_LOCATION_MIN_2H_RUN", "0.015"))  # 1.5%
+LATE_LOCK_MAX_MIN = int(os.getenv("LATE_LOCK_MAX_MIN", "180"))
+LATE_LOCK_RESET_ATR = float(os.getenv("LATE_LOCK_RESET_ATR", "0.65"))
+LATE_LOCK_MIN_RETRACE_ATR = float(os.getenv("LATE_LOCK_MIN_RETRACE_ATR", "0.75"))
 
 # ---------------- SCORE ----------------
 BASE_MIN_SCORE = float(os.getenv("MIN_SCORE", "68"))
@@ -96,7 +109,7 @@ MARGIN_MODE = os.getenv("MARGIN_MODE", "isolated")
 BASE_MARGIN_USDT = float(os.getenv("BASE_MARGIN_USDT", "10"))
 MAX_MARGIN_USDT = float(os.getenv("MAX_MARGIN_USDT", "12"))
 MAX_MARGIN_EQUITY_PCT = float(os.getenv("MAX_MARGIN_EQUITY_PCT", "0.18"))
-# V6.13: setup-afhankelijke risk cap.
+# V6.14: setup-afhankelijke risk cap.
 NORMAL_RISK_EQUITY_PCT = float(os.getenv("NORMAL_RISK_EQUITY_PCT", "0.016"))
 A_SETUP_RISK_EQUITY_PCT = float(os.getenv("A_SETUP_RISK_EQUITY_PCT", "0.024"))
 NORMAL_TARGET_NET_TP_USDT = float(os.getenv("NORMAL_TARGET_NET_TP_USDT", "1.50"))
@@ -442,7 +455,7 @@ btc_cache = {"ts": 0, "data": None}
 
 def btc_regime():
     """
-    V6.13 BTC hierarchy:
+    V6.14 BTC hierarchy:
       1D + 4H = macro direction
       1H      = tradable regime
       15m     = immediate trigger / pullback
@@ -571,12 +584,12 @@ def adaptive_threshold(signal):
         threshold = min(threshold, STRONG_REGIME_MIN_SCORE)
     elif adx >= ADX_STRONG and confirm >= 3 and momentum >= 2:
         threshold = max(HARD_MIN_SCORE, threshold - 2)
-    # V6.13: offensiever wanneer BTC en setup dezelfde kant op stromen.
+    # V6.14: offensiever wanneer BTC en setup dezelfde kant op stromen.
     # Niet blind: flow-bonus vereist nog steeds degelijke lokale bevestiging.
     if (signal.get("btc_flow_strong") and confirm >= 3
             and momentum >= 2 and entry_quality >= 3):
         threshold = max(HARD_MIN_SCORE, threshold - FLOW_THRESHOLD_BONUS)
-    # V6.13: macro-supportive BTC pullback may lower the threshold, but only
+    # V6.14: macro-supportive BTC pullback may lower the threshold, but only
     # for a locally healthy setup. This is context, not a blind dip-buy rule.
     if (signal.get("btc_macro_pullback_support") and confirm >= MACRO_PULLBACK_MIN_CONFIRM
             and momentum >= MACRO_PULLBACK_MIN_MOMENTUM
@@ -631,7 +644,7 @@ def rs_conflict(side, rel):
 
 
 def btc_conflict(side, btc):
-    # Raw short-term conflict. V6.13 may later classify this as a macro pullback
+    # Raw short-term conflict. V6.14 may later classify this as a macro pullback
     # and allow a carefully verified continuation setup.
     if side == "long":
         return bool(btc["impulse_down"] or btc["bear"])
@@ -700,6 +713,70 @@ def recent_impulse_state(df15, side, atr):
             return True
     return False
 
+def coin_run_metrics(df1h, price):
+    """Closed-candle 1H location metrics for 2/4/6/10 hour anti-chase logic."""
+    def ret_hours(hours):
+        idx = -(hours + 2)
+        if len(df1h) < hours + 3:
+            return 0.0
+        base = safe_float(df1h["close"].iloc[idx])
+        return price / base - 1.0 if base > 0 else 0.0
+
+    closed = df1h.iloc[-12:-1] if len(df1h) >= 13 else df1h.iloc[:-1]
+    high10 = safe_float(closed["high"].max(), price) if not closed.empty else price
+    low10 = safe_float(closed["low"].min(), price) if not closed.empty else price
+    ema20_1h = safe_float(df1h.iloc[-2]["ema20"], price)
+    ema_ext = price / ema20_1h - 1.0 if ema20_1h > 0 else 0.0
+    return {
+        "ret2h": ret_hours(2), "ret4h": ret_hours(4),
+        "ret6h": ret_hours(6), "ret10h": ret_hours(10),
+        "high10h": high10, "low10h": low10, "ema_ext_1h": ema_ext,
+    }
+
+
+def coin_location_block(side, metrics, price):
+    """Hard V6.14 chase guard. Strong score/ADX is NOT allowed to bypass it."""
+    r2, r4 = metrics["ret2h"], metrics["ret4h"]
+    r6, r10 = metrics["ret6h"], metrics["ret10h"]
+    ema_ext = metrics["ema_ext_1h"]
+    if side == "long":
+        hard_run = (r2 >= COIN_RUN_2H_MAX or r4 >= COIN_RUN_4H_MAX
+                    or r6 >= COIN_RUN_6H_MAX or r10 >= COIN_RUN_10H_MAX)
+        near_high = metrics["high10h"] > 0 and price >= metrics["high10h"] * (1.0 - COIN_NEAR_10H_EXTREME)
+        bad_location = ema_ext >= COIN_1H_EMA_EXT_MAX and near_high and r2 >= COIN_LOCATION_MIN_2H_RUN
+    else:
+        hard_run = (r2 <= -COIN_RUN_2H_MAX or r4 <= -COIN_RUN_4H_MAX
+                    or r6 <= -COIN_RUN_6H_MAX or r10 <= -COIN_RUN_10H_MAX)
+        near_low = metrics["low10h"] > 0 and price <= metrics["low10h"] * (1.0 + COIN_NEAR_10H_EXTREME)
+        bad_location = ema_ext <= -COIN_1H_EMA_EXT_MAX and near_low and r2 <= -COIN_LOCATION_MIN_2H_RUN
+    return bool(hard_run or bad_location), bool(hard_run), bool(bad_location)
+
+
+def late_lock_active(symbol, side, price, ema20_15, atr, pullback_quality, impulse_15):
+    """A failed too-late execution remains blocked until a real pullback/reset."""
+    rec = late_entry_locks.get(symbol)
+    if not rec or rec.get("side") != side:
+        return False
+    age = time.time() - safe_float(rec.get("ts"))
+    if age >= LATE_LOCK_MAX_MIN * 60:
+        late_entry_locks.pop(symbol, None)
+        return False
+    lock_price = safe_float(rec.get("price"), price)
+    if side == "long":
+        retraced = price <= lock_price - LATE_LOCK_MIN_RETRACE_ATR * atr
+    else:
+        retraced = price >= lock_price + LATE_LOCK_MIN_RETRACE_ATR * atr
+    reset = bool(
+        retraced
+        and pullback_quality >= 2
+        and abs(price - ema20_15) <= LATE_LOCK_RESET_ATR * atr
+        and not impulse_15
+    )
+    if reset:
+        late_entry_locks.pop(symbol, None)
+        return False
+    return True
+
 # ============================================================
 # EVALUATE SYMBOL
 # ============================================================
@@ -762,6 +839,7 @@ def evaluate_symbol(symbol, btc):
 
     old_close = safe_float(df15["close"].iloc[-10]) if len(df15) >= 10 else 0
     run8 = price / old_close - 1 if old_close > 0 else 0.0
+    coin_run = coin_run_metrics(df1h, price)
 
     recent_low = df15["low"].iloc[-DONCHIAN_LOOKBACK - 3:-3].min()
     recent_high = df15["high"].iloc[-DONCHIAN_LOOKBACK - 3:-3].max()
@@ -908,6 +986,13 @@ def evaluate_symbol(symbol, btc):
         and not impulse_15
     )
 
+    # V6.14: individual coin location. A fresh 5m setup does not erase a
+    # 2-10h run. This is a hard chase guard, unlike the older soft run8 rule.
+    htf_location_block, htf_hard_run, htf_bad_location = coin_location_block(side, coin_run, price)
+    late_lock = late_lock_active(
+        symbol, side, price, ema20_15, atr, pullback_quality, impulse_15
+    )
+
     # Normal PB route.
     required_tactics = STRONG_MIN_TACTICS if very_strong_trend else MIN_TACTICS
     pullback_route = bool(
@@ -942,7 +1027,7 @@ def evaluate_symbol(symbol, btc):
     # Mild RS conflict can trade only if the reversal is extremely clear.
     mild_rs_block = rsx["mild"] and not conflict_confirmation_ok
 
-    # V6.13 macro-pullback override. We only relax the short-term BTC conflict
+    # V6.14 macro-pullback override. We only relax the short-term BTC conflict
     # when the larger BTC trend supports the trade AND the alt itself is strong.
     signed_rs_support = rel if side == "long" else -rel
     macro_pullback_override_ok = bool(
@@ -995,6 +1080,12 @@ def evaluate_symbol(symbol, btc):
     if btc_block: skip_reasons.append("btc-conflict-needs-4/4-reject")
     if rsi_block: skip_reasons.append("rsi-overextended")
     if side_extended: skip_reasons.append("extended")
+    if htf_location_block:
+        if htf_hard_run:
+            skip_reasons.append("coin-2to10h-run")
+        else:
+            skip_reasons.append("coin-1h-bad-location")
+    if late_lock: skip_reasons.append("late-lock-wait-reset")
     if run_block: skip_reasons.append("extended-run")
     if impulse_15: skip_reasons.append("current-impulse-chase")
     if recent_impulse and not impulse_reset and not early_rejection:
@@ -1013,6 +1104,7 @@ def evaluate_symbol(symbol, btc):
     hard_gate_names = {
         "adx-chop", "hard-rs-conflict", "rs-conflict-needs-4/4-reject",
         "btc-conflict-needs-4/4-reject", "rsi-overextended", "extended",
+        "coin-2to10h-run", "coin-1h-bad-location", "late-lock-wait-reset",
         "extended-run", "current-impulse-chase", "atr-band",
     }
     if entry_route != "WAIT" and any(x in hard_gate_names for x in skip_reasons):
@@ -1035,6 +1127,11 @@ def evaluate_symbol(symbol, btc):
         "learning_bonus": learning_adjustment(preliminary), "skip": final_skip,
         "skip_reasons": skip_reasons, "session": sess, "btc_regime": btc_label,
         "run8": run8, "volume_ok": bool(volume_ok), "timestamp": time.time(),
+        "ret2h": coin_run["ret2h"], "ret4h": coin_run["ret4h"],
+        "ret6h": coin_run["ret6h"], "ret10h": coin_run["ret10h"],
+        "ema_ext_1h": coin_run["ema_ext_1h"],
+        "htf_location_block": htf_location_block,
+        "late_lock": late_lock,
         "entry_route": entry_route, "early_rejection": early_rejection,
         "rejection": rejection, "micro_break": m_break,
         "recent_impulse": recent_impulse, "impulse_reset": impulse_reset,
@@ -1072,7 +1169,7 @@ def roundtrip_cost(notional):
 
 def is_a_setup(signal):
     """
-    V6.13 premium A-sizing. MACRO route is deliberately NORMAL sizing.
+    V6.14 premium A-sizing. MACRO route is deliberately NORMAL sizing.
 
     Route 1 - EARLY A:
       dezelfde strenge V6.12 voorwaarden: 4/4, rejection, micro-break,
@@ -1325,7 +1422,7 @@ def repair_one_position(p):
 def repair_existing_positions():
     positions = get_positions()
     if not positions: return True
-    tg(f"🛡️ V6.13 STARTUP\nOpen positions: {len(positions)}\nChecking TP + SL...")
+    tg(f"🛡️ V6.14 STARTUP\nOpen positions: {len(positions)}\nChecking TP + SL...")
     for p in positions:
         symbol, side = position_symbol(p), position_side(p)
         try:
@@ -1369,6 +1466,7 @@ consecutive_losses = 0
 symbol_last_trade = {}
 symbol_last_result = {}
 symbol_loss_streak = {}
+late_entry_locks = {}
 seen_closed_history_ids = set()
 last_score_report = 0
 
@@ -1413,17 +1511,21 @@ def open_trade(signal):
     slip = (live - signal_px) / signal_px
     fill_limit = allowed_fill_slip(signal)
     if side == "long" and slip > fill_limit:
+        late_entry_locks[symbol] = {"side": side, "ts": time.time(), "price": live}
         tg(
             f"⏭️ {symbol} LONG too late {slip * 100:.2f}% "
             f"> {fill_limit * 100:.2f}% "
-            f"({'A' if is_a_setup(signal) else 'NORMAL'})"
+            f"({'A' if is_a_setup(signal) else 'NORMAL'})\n"
+            f"🔒 V6.14 late-lock until real pullback/reset"
         )
         return False
     if side == "short" and slip < -fill_limit:
+        late_entry_locks[symbol] = {"side": side, "ts": time.time(), "price": live}
         tg(
             f"⏭️ {symbol} SHORT too late {abs(slip) * 100:.2f}% "
             f"> {fill_limit * 100:.2f}% "
-            f"({'A' if is_a_setup(signal) else 'NORMAL'})"
+            f"({'A' if is_a_setup(signal) else 'NORMAL'})\n"
+            f"🔒 V6.14 late-lock until real pullback/reset"
         )
         return False
 
@@ -1453,7 +1555,7 @@ def open_trade(signal):
         "size": str(sizing["contracts"]),
         "tpTriggerPrice": str(tp), "tpOrderPrice": "-1", "tpTriggerPriceType": "mark",
         "slTriggerPrice": str(sl), "slOrderPrice": "-1", "slTriggerPriceType": "mark",
-        "clientOrderId": f"v613{int(time.time() * 1000) % 1000000000}",
+        "clientOrderId": f"v614{int(time.time() * 1000) % 1000000000}",
     }
     if BROKER_ID: payload["brokerId"] = BROKER_ID
 
@@ -1471,7 +1573,7 @@ def open_trade(signal):
     conflict_line = ("\n" + " / ".join(conflict_text)) if conflict_text else ""
 
     message = (
-        f"{'🧪 PAPER V6.13' if PAPER_TRADING else '🟢 V6.13 LIVE ORDER'}\n"
+        f"{'🧪 PAPER V6.14' if PAPER_TRADING else '🟢 V6.14 LIVE ORDER'}\n"
         f"{symbol} {side.upper()}\n━━━━━━━━━━━━\nENTRY: {route_label}\n"
         f"Score {signal['score']:.0f}/{signal['threshold']:.0f}\n"
         f"Directional tactics {signal['tactics']}\n5m {signal['confirm_components']}/4\n"
@@ -1480,6 +1582,8 @@ def open_trade(signal):
         f"Momentum {signal['momentum_quality']}\nBTC {signal['btc_regime']}\n"
         f"BTC flow: {'🌊 STRONG' if signal.get('btc_flow_strong') else '➡️ ALIGNED' if signal.get('btc_flow_aligned') else '↔️ NEUTRAL/AGAINST'}\n"
         f"BTC macro: {'🧭 SUPPORT + PULLBACK' if signal.get('btc_macro_pullback_support') else '🧭 SUPPORT' if signal.get('btc_macro_supportive') else '⛔ OPPOSED' if signal.get('btc_macro_opposed') else '↔️ MIXED'}\n"
+        f"Coin run: 2h {signal.get('ret2h',0)*100:+.2f}% | 4h {signal.get('ret4h',0)*100:+.2f}% | 6h {signal.get('ret6h',0)*100:+.2f}% | 10h {signal.get('ret10h',0)*100:+.2f}%\n"
+        f"1H EMA20 extension: {signal.get('ema_ext_1h',0)*100:+.2f}%\n"
         f"5m rejection: {'YES' if signal.get('rejection') else 'NO'}\n"
         f"5m micro-break: {'YES' if signal.get('micro_break') else 'NO'}\n"
         f"Recent impulse: {'YES' if signal.get('recent_impulse') else 'NO'}\n"
@@ -1616,7 +1720,7 @@ def notify_closed_trade(record):
     pause = f"\n⏸ {MAX_CONSECUTIVE_LOSSES} losses → pauze {LOSS_PAUSE_MIN} min" if consecutive_losses >= MAX_CONSECUTIVE_LOSSES else ""
     icon = "🟢" if net_pnl >= 0 else "🔴"
     tg(
-        f"{icon} POSITION CLOSED V6.13\n\n{symbol}\n{side.upper()}\n━━━━━━━━━━━━\n"
+        f"{icon} POSITION CLOSED V6.14\n\n{symbol}\n{side.upper()}\n━━━━━━━━━━━━\n"
         f"Entry: {entry:.8g}\nExit: {exit_price:.8g}\nSize: {size:g}\n\n"
         f"💰 Realized: {'+' if gross_pnl >= 0 else ''}${gross_pnl:.2f}\n"
         f"📊 Ratio: {pnl_ratio:+.2f}%\n💸 Fee: -${fee:.2f}\n"
@@ -1633,7 +1737,7 @@ def seed_closed_history():
         for r in closed_positions_history(100):
             hid = str(r.get("historyId", ""))
             if hid: seen_closed_history_ids.add(hid)
-        tg(f"📚 V6.13 PNL TRACKER READY\nKnown closes: {len(seen_closed_history_ids)}\nLearning trades: {learning.get('trades', 0)}")
+        tg(f"📚 V6.14 PNL TRACKER READY\nKnown closes: {len(seen_closed_history_ids)}\nLearning trades: {learning.get('trades', 0)}")
     except Exception as e:
         tg(f"⚠️ PNL tracker warning\n{e}")
 
@@ -1687,7 +1791,7 @@ def maybe_score_report(rows):
     if time.time() - last_score_report < SCORE_REPORT_MIN * 60: return
     last_score_report = time.time()
     ranked = sorted(rows, key=lambda x: (x.get("score", 0), x.get("entry_quality", 0), x.get("adx", 0)), reverse=True)[:10]
-    lines = [f"📡 V6.13 {session_state()} {now_utc().strftime('%H:%M')} UTC"]
+    lines = [f"📡 V6.14 {session_state()} {now_utc().strftime('%H:%M')} UTC"]
     if not ranked: lines.append("geen scans")
     for r in ranked:
         route = r.get("entry_route", "WAIT")
@@ -1696,11 +1800,16 @@ def maybe_score_report(rows):
         conflict = " ⚠️RS" if r.get("rs_conflict_mild") else ""
         flow = " 🌊" if r.get("btc_flow_strong") else " ➡️" if r.get("btc_flow_aligned") else ""
         macro = " 🧭↩️" if r.get("btc_macro_pullback_support") else " 🧭" if r.get("btc_macro_supportive") else ""
+        runloc = ""
+        if r.get("htf_location_block") or abs(safe_float(r.get("ret2h"))) >= 0.02:
+            runloc = f" 2h{safe_float(r.get('ret2h'))*100:+.1f}%/4h{safe_float(r.get('ret4h'))*100:+.1f}%"
+        if r.get("late_lock"):
+            runloc += " 🔒"
         lines.append(
             f"{r['symbol'].split('/')[0]} {str(r.get('side') or '-').upper()} "
             f"{r.get('score', 0):.0f}/{r.get('threshold', BASE_MIN_SCORE):.0f} {route_tag} "
             f"t{r.get('tactics', 0)} 5m{r.get('confirm_components', 0)}/4 "
-            f"ADX{r.get('adx', 0):.0f} RS{r.get('rel', 0) * 100:+.1f}%{conflict}{flow}{macro} {mark}"
+            f"ADX{r.get('adx', 0):.0f} RS{r.get('rel', 0) * 100:+.1f}%{conflict}{flow}{macro}{runloc} {mark}"
         )
     tg("\n".join(lines))
 
@@ -1708,7 +1817,7 @@ def maybe_score_report(rows):
 def startup_diagnostics():
     acc = futures_account(); reset_daily_if_needed(acc["total_equity"])
     tg(
-        f"🚀 BLOFIN V6.13 STARTED\nMode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
+        f"🚀 BLOFIN V6.14 STARTED\nMode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
         f"Position mode expected: NET / ONE-WAY\nEquity: ${acc['total_equity']:.2f}\nAvailable: ${acc['available']:.2f}\n"
         f"Day start: ${daily['start_equity']:.2f}\nBase score: {BASE_MIN_SCORE:.0f}\nHard floor: {HARD_MIN_SCORE:.0f}\n"
         f"EARLY score: {EARLY_MIN_SCORE:.0f}\n"
@@ -1721,6 +1830,9 @@ def startup_diagnostics():
         f"Flow threshold bonus: -{FLOW_THRESHOLD_BONUS:.0f} pts | BTC ADX >= {FLOW_MIN_BTC_ADX:.0f}\n"
         f"BTC hierarchy: 1D+4H macro | 1H regime | 15m trigger\n"
         f"Macro PB gate: {MACRO_PULLBACK_MIN_CONFIRM}/4, M>={MACRO_PULLBACK_MIN_MOMENTUM}, EntryQ>={MACRO_PULLBACK_MIN_ENTRYQ}, ADX>={MACRO_PULLBACK_MIN_ADX:.0f}, RS>={MACRO_PULLBACK_MIN_RS*100:.1f}% + micro-break\n"
+        f"Coin chase guard: 2h {COIN_RUN_2H_MAX*100:.1f}% | 4h {COIN_RUN_4H_MAX*100:.1f}% | 6h {COIN_RUN_6H_MAX*100:.1f}% | 10h {COIN_RUN_10H_MAX*100:.1f}%\n"
+        f"1H location: EMA20 ext {COIN_1H_EMA_EXT_MAX*100:.1f}% + within {COIN_NEAR_10H_EXTREME*100:.1f}% of 10h extreme | late-lock {LATE_LOCK_MAX_MIN}m max\n"
+        f"Late-lock reset: >= {LATE_LOCK_MIN_RETRACE_ATR:.2f} ATR retrace + back near 15m EMA20\n"
         f"2nd flow-alt requires {FLOW_SECOND_ALT_MIN_CONFIRM}/4, M>={FLOW_SECOND_ALT_MIN_MOMENTUM}, EntryQ>={FLOW_SECOND_ALT_MIN_ENTRYQ}, ADX>={FLOW_SECOND_ALT_MIN_ADX:.0f}\n"
         f"Max execution attempts/scan: {MAX_EXECUTION_ATTEMPTS_PER_SCAN}\nDaily cap: {DAILY_LOSS_LIMIT_PCT:.0f}%"
     )
@@ -1837,13 +1949,13 @@ def main():
             time.sleep(SCAN_SECONDS)
 
         except KeyboardInterrupt:
-            tg("🛑 V6.13 stopped.")
+            tg("🛑 V6.14 stopped.")
             raise
         except Exception as e:
             msg = f"{type(e).__name__}: {e}"
             if "152002" in msg:
                 time.sleep(20); continue
-            tg(f"⚠️ V6.13 LOOP ERROR\n{msg}")
+            tg(f"⚠️ V6.14 LOOP ERROR\n{msg}")
             time.sleep(30)
 
 
