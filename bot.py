@@ -10,26 +10,23 @@ import pandas as pd
 import requests
 
 # ============================================================
-# BLOFIN V6.11 - SMART EARLY ENTRY + ADAPTIVE SIZING
+# BLOFIN V6.12 - FLOW OFFENSE + ADAPTIVE SIZING
 # ============================================================
-# Gerichte wijzigingen t.o.v. V6.10:
-# 0) V6.10 entry/conflict-logica blijft intact.
-# 1) EARLY_PULLBACK_FAILURE: eerder instappen bij echte 5m rejection
-#    + micro-break, in plaats van wachten op meerdere candles.
-# 2) Mild tegen relative strength (RS): alleen met 5m 4/4 + rejection.
-# 3) Sterk tegen RS: trade blokkeren.
-# 4) Tegen BTC-richting: alleen 5m 4/4 + rejection en geen sterke RS-conflict.
-# 5) PULLBACK blijft bestaan; normale goede setups worden niet losser gemaakt.
-# 6) Impulse-memory blijft late chase entries blokkeren, maar een geldige reset
-#    kan daarna weer een pullback-entry toestaan.
-# 7) Broker-side TP + SL en protection lock blijven behouden.
-# 8) Premium EARLY entries mogen gecontroleerd tot 0.75% fill-drift; overige routes 0.40%.
-# 9) Setup-afhankelijke risk sizing: NORMAL 1.6%, A-setup 2.4% van equity.
-# 10) A-sizing is strenger: momentum >= 2 en GEEN BTC-conflict.
-#     Een EARLY trade tegen BTC kan nog steeds NORMAL zijn als de bestaande
-#     conflict-gates hem toelaten, maar krijgt nooit de grote A-inzet.
-# 11) A-setups mikken op circa $2.50 netto TP als risk/margin caps dat toelaten.
-# 12) Normale setups mikken op circa $1.50 netto TP, zonder caps te omzeilen.
+# Gebouwd op V6.12. Nieuwe V6.12 FLOW-laag:
+# 1) Alle V6.12 EARLY/PULLBACK conflict- en protectionregels blijven actief.
+# 2) BTC-flow wordt expliciet gemeten: aligned en strong.
+# 3) Met sterke BTC-flow mag de score-drempel gecontroleerd 2 punten zakken,
+#    maar alleen met 5m >=3/4, momentum >=2 en EntryQ >=3.
+# 4) Kandidaten MET sterke BTC-flow krijgen ranking-prioriteit.
+# 5) Premium A-sizing blijft 2.4% risk / circa $2.50 netto target.
+#    EARLY A blijft streng; daarnaast kan een uitzonderlijk sterke PULLBACK
+#    met sterke BTC-flow A worden (5m 4/4, EntryQ>=4, momentum>=2, t>=5).
+# 6) Tegen BTC-flow in krijgt een trade NOOIT A-sizing.
+# 7) Normaal blijft max 1 alt per richting. Alleen bij sterke BTC-flow kan
+#    een tweede alt in dezelfde richting worden geopend, en alleen met 4/4,
+#    momentum>=2, EntryQ>=3 en ADX>=22. MAX_ACTIVE_POSITIONS blijft 2.
+# 8) Late-entryruimte blijft 0.40% normaal / 0.75% alleen voor A.
+# 9) Daily loss cap, broker TP+SL, protection lock en leverage-check blijven.
 #
 # Geschreven voor One-way / NET position mode.
 # ============================================================
@@ -63,6 +60,15 @@ MAX_ALT_LONGS = int(os.getenv("MAX_ALT_LONGS", "1"))
 MAX_ALT_SHORTS = int(os.getenv("MAX_ALT_SHORTS", "1"))
 MAX_EXECUTION_ATTEMPTS_PER_SCAN = int(os.getenv("MAX_EXECUTION_ATTEMPTS_PER_SCAN", "3"))
 
+# ---------------- V6.12 FLOW OFFENSE ----------------
+FLOW_THRESHOLD_BONUS = float(os.getenv("FLOW_THRESHOLD_BONUS", "2"))
+FLOW_MIN_BTC_ADX = float(os.getenv("FLOW_MIN_BTC_ADX", "20"))
+FLOW_SECOND_ALT_CAP = int(os.getenv("FLOW_SECOND_ALT_CAP", "2"))
+FLOW_SECOND_ALT_MIN_CONFIRM = int(os.getenv("FLOW_SECOND_ALT_MIN_CONFIRM", "4"))
+FLOW_SECOND_ALT_MIN_MOMENTUM = int(os.getenv("FLOW_SECOND_ALT_MIN_MOMENTUM", "2"))
+FLOW_SECOND_ALT_MIN_ENTRYQ = int(os.getenv("FLOW_SECOND_ALT_MIN_ENTRYQ", "3"))
+FLOW_SECOND_ALT_MIN_ADX = float(os.getenv("FLOW_SECOND_ALT_MIN_ADX", "22"))
+
 # ---------------- SCORE ----------------
 BASE_MIN_SCORE = float(os.getenv("MIN_SCORE", "68"))
 HARD_MIN_SCORE = float(os.getenv("HARD_MIN_SCORE", "62"))
@@ -81,7 +87,7 @@ MARGIN_MODE = os.getenv("MARGIN_MODE", "isolated")
 BASE_MARGIN_USDT = float(os.getenv("BASE_MARGIN_USDT", "10"))
 MAX_MARGIN_USDT = float(os.getenv("MAX_MARGIN_USDT", "12"))
 MAX_MARGIN_EQUITY_PCT = float(os.getenv("MAX_MARGIN_EQUITY_PCT", "0.18"))
-# V6.11: setup-afhankelijke risk cap.
+# V6.12: setup-afhankelijke risk cap.
 NORMAL_RISK_EQUITY_PCT = float(os.getenv("NORMAL_RISK_EQUITY_PCT", "0.016"))
 A_SETUP_RISK_EQUITY_PCT = float(os.getenv("A_SETUP_RISK_EQUITY_PCT", "0.024"))
 NORMAL_TARGET_NET_TP_USDT = float(os.getenv("NORMAL_TARGET_NET_TP_USDT", "1.50"))
@@ -510,11 +516,16 @@ def adaptive_threshold(signal):
         threshold = min(threshold, STRONG_REGIME_MIN_SCORE)
     elif adx >= ADX_STRONG and confirm >= 3 and momentum >= 2:
         threshold = max(HARD_MIN_SCORE, threshold - 2)
+    # V6.12: offensiever wanneer BTC en setup dezelfde kant op stromen.
+    # Niet blind: flow-bonus vereist nog steeds degelijke lokale bevestiging.
+    if (signal.get("btc_flow_strong") and confirm >= 3
+            and momentum >= 2 and entry_quality >= 3):
+        threshold = max(HARD_MIN_SCORE, threshold - FLOW_THRESHOLD_BONUS)
     threshold -= learning_adjustment(signal)
     return max(HARD_MIN_SCORE, threshold)
 
 # ============================================================
-# ENTRY HELPERS - V6.11 TARGETED CHANGES
+# ENTRY HELPERS - V6.12 TARGETED CHANGES
 # ============================================================
 def candle_rejection(row, side):
     """True only for a meaningful wick/rejection candle, not every red/green bar."""
@@ -562,6 +573,34 @@ def btc_conflict(side, btc):
     if side == "long":
         return bool(btc["impulse_down"] or btc["bear"])
     return bool(btc["impulse_up"] or btc["bull"])
+
+
+def btc_flow_state(side, btc):
+    """
+    V6.12: onderscheid tussen simpelweg niet-tegen-BTC en echt MET BTC mee.
+    strong vraagt trend + korte impuls/stack + 45m richting + voldoende BTC ADX.
+    """
+    btc_adx = safe_float(btc.get("adx"))
+    ret45 = safe_float(btc.get("ret45"))
+    if side == "long":
+        aligned = bool((btc.get("bull") or btc.get("stack_long") or btc.get("impulse_up"))
+                       and not btc.get("impulse_down"))
+        strong = bool(
+            aligned
+            and (btc.get("stack_long") or (btc.get("bull") and btc.get("impulse_up")))
+            and ret45 > 0
+            and btc_adx >= FLOW_MIN_BTC_ADX
+        )
+    else:
+        aligned = bool((btc.get("bear") or btc.get("stack_short") or btc.get("impulse_down"))
+                       and not btc.get("impulse_up"))
+        strong = bool(
+            aligned
+            and (btc.get("stack_short") or (btc.get("bear") and btc.get("impulse_down")))
+            and ret45 < 0
+            and btc_adx >= FLOW_MIN_BTC_ADX
+        )
+    return aligned, strong
 
 
 def recent_impulse_state(df15, side, atr):
@@ -734,18 +773,23 @@ def evaluate_symbol(symbol, btc):
     elif btc["bear"]: btc_label = "BTC_DOWN"
     else: btc_label = "BTC_NEUTRAL"
 
+    btc_flow_aligned, btc_flow_strong = btc_flow_state(side, btc)
+    flow_rs_supportive = bool(rel >= 0) if side == "long" else bool(rel <= 0)
+
     preliminary = {
         "side": side, "adx": adx, "confirm_components": confirm_components,
         "momentum_quality": momentum_quality, "entry_quality": entry_quality,
         "pullback_quality": pullback_quality, "sweep": sweep,
         "btc_regime": btc_label, "session": sess, "entry_route": "WAIT",
+        "btc_flow_aligned": btc_flow_aligned, "btc_flow_strong": btc_flow_strong,
+        "flow_rs_supportive": flow_rs_supportive,
     }
     threshold = adaptive_threshold(preliminary)
     if sess == "SHOULDER":
         score -= 4
 
     # --------------------------------------------------------
-    # V6.11: EARLY PULLBACK FAILURE
+    # V6.12: EARLY PULLBACK FAILURE
     # --------------------------------------------------------
     rejection = candle_rejection(c, side)
     m_break = micro_break(df5, side)
@@ -793,7 +837,7 @@ def evaluate_symbol(symbol, btc):
     )
 
     # --------------------------------------------------------
-    # V6.11: CONFLICT GATES
+    # V6.12: CONFLICT GATES
     # --------------------------------------------------------
     rsx = rs_conflict(side, rel)
     btc_against = symbol not in MAJORS and btc_conflict(side, btc)
@@ -885,6 +929,8 @@ def evaluate_symbol(symbol, btc):
         "recent_impulse": recent_impulse, "impulse_reset": impulse_reset,
         "rs_conflict_mild": rsx["mild"], "rs_conflict_hard": rsx["hard"],
         "btc_conflict": btc_against,
+        "btc_flow_aligned": btc_flow_aligned, "btc_flow_strong": btc_flow_strong,
+        "flow_rs_supportive": flow_rs_supportive,
     }
 
 # ============================================================
@@ -910,29 +956,65 @@ def roundtrip_cost(notional):
 
 def is_a_setup(signal):
     """
-    V6.11 A-setup: alleen premium EARLY rejection setups krijgen de
-    grote 2.4% risk-cap en het $2.50 netto TP-doel.
+    V6.12 premium A-sizing.
 
-    Belangrijk na de XLM-evaluatie:
-    - Momentum moet minimaal 2 zijn.
-    - Een setup tegen de actuele BTC-richting krijgt NOOIT A-sizing.
-    - Zo'n BTC-conflict kan nog wel als NORMAL trade doorgaan wanneer de
-      bestaande 4/4 + rejection + micro-break conflict-gate hem toestaat.
+    Route 1 - EARLY A:
+      dezelfde strenge V6.12 voorwaarden: 4/4, rejection, micro-break,
+      momentum >=2, EntryQ>=3, geen BTC-conflict.
+
+    Route 2 - FLOW PULLBACK A:
+      alleen wanneer BTC sterk dezelfde kant op stroomt én de alt zelf niet
+      relatief tegen die richting in loopt. Vereist 4/4, EntryQ>=4,
+      momentum>=2, tactics>=5 en ADX>=25.
     """
-    return bool(
+    no_risk_conflict = bool(
+        not signal.get("btc_conflict")
+        and not signal.get("rs_conflict_hard")
+        and not (bool(signal.get("recent_impulse")) and not bool(signal.get("impulse_reset")))
+    )
+    if not no_risk_conflict:
+        return False
+
+    common_4of4 = bool(
+        int(signal.get("confirm_components", 0)) >= 4
+        and int(signal.get("momentum_quality", 0)) >= 2
+        and int(signal.get("tactics", 0)) >= 4
+    )
+
+    early_a = bool(
         signal.get("entry_route") == "EARLY"
-        and int(signal.get("confirm_components", 0)) >= 4
+        and common_4of4
         and bool(signal.get("rejection"))
         and bool(signal.get("micro_break"))
         and int(signal.get("entry_quality", 0)) >= 3
-        and int(signal.get("momentum_quality", 0)) >= 2
-        and int(signal.get("tactics", 0)) >= 4
         and safe_float(signal.get("adx")) >= max(EARLY_MIN_ADX, 22.0)
-        and not bool(signal.get("btc_conflict"))
-        and not bool(signal.get("rs_conflict_hard"))
-        and not (bool(signal.get("recent_impulse")) and not bool(signal.get("impulse_reset")))
     )
 
+    flow_pullback_a = bool(
+        signal.get("entry_route") == "PULLBACK"
+        and signal.get("btc_flow_strong")
+        and signal.get("flow_rs_supportive")
+        and common_4of4
+        and int(signal.get("entry_quality", 0)) >= 4
+        and int(signal.get("tactics", 0)) >= 5
+        and safe_float(signal.get("adx")) >= 25.0
+    )
+
+    return early_a or flow_pullback_a
+
+
+def flow_second_alt_ok(signal):
+    """Only the second correlated alt may use the offensive flow exception."""
+    return bool(
+        signal.get("btc_flow_strong")
+        and signal.get("flow_rs_supportive")
+        and not signal.get("btc_conflict")
+        and not signal.get("rs_conflict_hard")
+        and int(signal.get("confirm_components", 0)) >= FLOW_SECOND_ALT_MIN_CONFIRM
+        and int(signal.get("momentum_quality", 0)) >= FLOW_SECOND_ALT_MIN_MOMENTUM
+        and int(signal.get("entry_quality", 0)) >= FLOW_SECOND_ALT_MIN_ENTRYQ
+        and safe_float(signal.get("adx")) >= FLOW_SECOND_ALT_MIN_ADX
+    )
 
 def sizing_profile(signal):
     if is_a_setup(signal):
@@ -1124,7 +1206,7 @@ def repair_one_position(p):
 def repair_existing_positions():
     positions = get_positions()
     if not positions: return True
-    tg(f"🛡️ V6.11 STARTUP\nOpen positions: {len(positions)}\nChecking TP + SL...")
+    tg(f"🛡️ V6.12 STARTUP\nOpen positions: {len(positions)}\nChecking TP + SL...")
     for p in positions:
         symbol, side = position_symbol(p), position_side(p)
         try:
@@ -1215,14 +1297,14 @@ def open_trade(signal):
         tg(
             f"⏭️ {symbol} LONG too late {slip * 100:.2f}% "
             f"> {fill_limit * 100:.2f}% "
-            f"({'A-EARLY' if is_a_setup(signal) else 'NORMAL'})"
+            f"({'A' if is_a_setup(signal) else 'NORMAL'})"
         )
         return False
     if side == "short" and slip < -fill_limit:
         tg(
             f"⏭️ {symbol} SHORT too late {abs(slip) * 100:.2f}% "
             f"> {fill_limit * 100:.2f}% "
-            f"({'A-EARLY' if is_a_setup(signal) else 'NORMAL'})"
+            f"({'A' if is_a_setup(signal) else 'NORMAL'})"
         )
         return False
 
@@ -1252,7 +1334,7 @@ def open_trade(signal):
         "size": str(sizing["contracts"]),
         "tpTriggerPrice": str(tp), "tpOrderPrice": "-1", "tpTriggerPriceType": "mark",
         "slTriggerPrice": str(sl), "slOrderPrice": "-1", "slTriggerPriceType": "mark",
-        "clientOrderId": f"v611{int(time.time() * 1000) % 1000000000}",
+        "clientOrderId": f"v612{int(time.time() * 1000) % 1000000000}",
     }
     if BROKER_ID: payload["brokerId"] = BROKER_ID
 
@@ -1263,13 +1345,14 @@ def open_trade(signal):
     conflict_line = ("\n" + " / ".join(conflict_text)) if conflict_text else ""
 
     message = (
-        f"{'🧪 PAPER V6.11' if PAPER_TRADING else '🟢 V6.11 LIVE ORDER'}\n"
+        f"{'🧪 PAPER V6.12' if PAPER_TRADING else '🟢 V6.12 LIVE ORDER'}\n"
         f"{symbol} {side.upper()}\n━━━━━━━━━━━━\nENTRY: {route_label}\n"
         f"Score {signal['score']:.0f}/{signal['threshold']:.0f}\n"
         f"Directional tactics {signal['tactics']}\n5m {signal['confirm_components']}/4\n"
         f"ADX {signal['adx']:.0f}\nRS {signal['rel'] * 100:+.2f}%\nRSI {signal['rsi']:.0f}\n"
         f"Pullback {signal['pullback_quality']}/3\nEntryQ {signal['entry_quality']}\n"
         f"Momentum {signal['momentum_quality']}\nBTC {signal['btc_regime']}\n"
+        f"BTC flow: {'🌊 STRONG' if signal.get('btc_flow_strong') else '➡️ ALIGNED' if signal.get('btc_flow_aligned') else '↔️ NEUTRAL/AGAINST'}\n"
         f"5m rejection: {'YES' if signal.get('rejection') else 'NO'}\n"
         f"5m micro-break: {'YES' if signal.get('micro_break') else 'NO'}\n"
         f"Recent impulse: {'YES' if signal.get('recent_impulse') else 'NO'}\n"
@@ -1406,7 +1489,7 @@ def notify_closed_trade(record):
     pause = f"\n⏸ {MAX_CONSECUTIVE_LOSSES} losses → pauze {LOSS_PAUSE_MIN} min" if consecutive_losses >= MAX_CONSECUTIVE_LOSSES else ""
     icon = "🟢" if net_pnl >= 0 else "🔴"
     tg(
-        f"{icon} POSITION CLOSED V6.11\n\n{symbol}\n{side.upper()}\n━━━━━━━━━━━━\n"
+        f"{icon} POSITION CLOSED V6.12\n\n{symbol}\n{side.upper()}\n━━━━━━━━━━━━\n"
         f"Entry: {entry:.8g}\nExit: {exit_price:.8g}\nSize: {size:g}\n\n"
         f"💰 Realized: {'+' if gross_pnl >= 0 else ''}${gross_pnl:.2f}\n"
         f"📊 Ratio: {pnl_ratio:+.2f}%\n💸 Fee: -${fee:.2f}\n"
@@ -1423,7 +1506,7 @@ def seed_closed_history():
         for r in closed_positions_history(100):
             hid = str(r.get("historyId", ""))
             if hid: seen_closed_history_ids.add(hid)
-        tg(f"📚 V6.11 PNL TRACKER READY\nKnown closes: {len(seen_closed_history_ids)}\nLearning trades: {learning.get('trades', 0)}")
+        tg(f"📚 V6.12 PNL TRACKER READY\nKnown closes: {len(seen_closed_history_ids)}\nLearning trades: {learning.get('trades', 0)}")
     except Exception as e:
         tg(f"⚠️ PNL tracker warning\n{e}")
 
@@ -1477,18 +1560,19 @@ def maybe_score_report(rows):
     if time.time() - last_score_report < SCORE_REPORT_MIN * 60: return
     last_score_report = time.time()
     ranked = sorted(rows, key=lambda x: (x.get("score", 0), x.get("entry_quality", 0), x.get("adx", 0)), reverse=True)[:10]
-    lines = [f"📡 V6.11 {session_state()} {now_utc().strftime('%H:%M')} UTC"]
+    lines = [f"📡 V6.12 {session_state()} {now_utc().strftime('%H:%M')} UTC"]
     if not ranked: lines.append("geen scans")
     for r in ranked:
         route = r.get("entry_route", "WAIT")
         route_tag = "🚀EARLY" if route == "EARLY" else "↩️PB" if route == "PULLBACK" else "WAIT"
         mark = "🟢 READY" if not r.get("skip") else f"⏭ {r.get('skip')}"
         conflict = " ⚠️RS" if r.get("rs_conflict_mild") else ""
+        flow = " 🌊" if r.get("btc_flow_strong") else " ➡️" if r.get("btc_flow_aligned") else ""
         lines.append(
             f"{r['symbol'].split('/')[0]} {str(r.get('side') or '-').upper()} "
             f"{r.get('score', 0):.0f}/{r.get('threshold', BASE_MIN_SCORE):.0f} {route_tag} "
             f"t{r.get('tactics', 0)} 5m{r.get('confirm_components', 0)}/4 "
-            f"ADX{r.get('adx', 0):.0f} RS{r.get('rel', 0) * 100:+.1f}%{conflict} {mark}"
+            f"ADX{r.get('adx', 0):.0f} RS{r.get('rel', 0) * 100:+.1f}%{conflict}{flow} {mark}"
         )
     tg("\n".join(lines))
 
@@ -1496,7 +1580,7 @@ def maybe_score_report(rows):
 def startup_diagnostics():
     acc = futures_account(); reset_daily_if_needed(acc["total_equity"])
     tg(
-        f"🚀 BLOFIN V6.11 STARTED\nMode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
+        f"🚀 BLOFIN V6.12 STARTED\nMode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
         f"Position mode expected: NET / ONE-WAY\nEquity: ${acc['total_equity']:.2f}\nAvailable: ${acc['available']:.2f}\n"
         f"Day start: ${daily['start_equity']:.2f}\nBase score: {BASE_MIN_SCORE:.0f}\nHard floor: {HARD_MIN_SCORE:.0f}\n"
         f"EARLY score: {EARLY_MIN_SCORE:.0f}\n"
@@ -1505,7 +1589,9 @@ def startup_diagnostics():
         f"Target net normal/A: ${NORMAL_TARGET_NET_TP_USDT:.2f}/${A_SETUP_TARGET_NET_TP_USDT:.2f}\n"
         f"RS mild conflict: {RS_CONFLICT_MILD * 100:.2f}%\n"
         f"RS hard conflict: {RS_CONFLICT_HARD * 100:.2f}%\nConflict confirm: {CONFLICT_REQUIRE_CONFIRM}/4 + rejection\n"
-        f"Max positions: {MAX_ACTIVE_POSITIONS}\nAlt cap L{MAX_ALT_LONGS}/S{MAX_ALT_SHORTS}\n"
+        f"Max positions: {MAX_ACTIVE_POSITIONS}\nAlt cap normal L{MAX_ALT_LONGS}/S{MAX_ALT_SHORTS} | strong-flow cap {FLOW_SECOND_ALT_CAP}\n"
+        f"Flow threshold bonus: -{FLOW_THRESHOLD_BONUS:.0f} pts | BTC ADX >= {FLOW_MIN_BTC_ADX:.0f}\n"
+        f"2nd flow-alt requires {FLOW_SECOND_ALT_MIN_CONFIRM}/4, M>={FLOW_SECOND_ALT_MIN_MOMENTUM}, EntryQ>={FLOW_SECOND_ALT_MIN_ENTRYQ}, ADX>={FLOW_SECOND_ALT_MIN_ADX:.0f}\n"
         f"Max execution attempts/scan: {MAX_EXECUTION_ATTEMPTS_PER_SCAN}\nDaily cap: {DAILY_LOSS_LIMIT_PCT:.0f}%"
     )
 
@@ -1584,6 +1670,8 @@ def main():
             # EARLY gets a small ranking preference because its purpose is timing,
             # but score/quality still dominate inside the route.
             candidates.sort(key=lambda x: (
+                1 if x.get("btc_flow_strong") else 0,
+                1 if is_a_setup(x) else 0,
                 1 if x.get("entry_route") == "EARLY" else 0,
                 x["score"], x["entry_quality"], x["confirm_components"], x["adx"], x["tactics"],
             ), reverse=True)
@@ -1596,8 +1684,18 @@ def main():
                 if signal["symbol"] in existing_symbols: continue
                 alt_l, alt_s = count_alt_sides(current)
                 if signal["symbol"] not in MAJORS:
-                    if signal["side"] == "long" and alt_l >= MAX_ALT_LONGS: continue
-                    if signal["side"] == "short" and alt_s >= MAX_ALT_SHORTS: continue
+                    # V6.12: normal cap remains 1 per alt direction. A second
+                    # same-direction alt is allowed only when BTC flow is strong
+                    # and this new signal itself passes the strict flow gate.
+                    long_cap = MAX_ALT_LONGS
+                    short_cap = MAX_ALT_SHORTS
+                    if flow_second_alt_ok(signal):
+                        if signal["side"] == "long":
+                            long_cap = max(long_cap, FLOW_SECOND_ALT_CAP)
+                        else:
+                            short_cap = max(short_cap, FLOW_SECOND_ALT_CAP)
+                    if signal["side"] == "long" and alt_l >= long_cap: continue
+                    if signal["side"] == "short" and alt_s >= short_cap: continue
                 if execution_attempts >= MAX_EXECUTION_ATTEMPTS_PER_SCAN: break
                 execution_attempts += 1
                 opened = open_trade(signal)
@@ -1608,13 +1706,13 @@ def main():
             time.sleep(SCAN_SECONDS)
 
         except KeyboardInterrupt:
-            tg("🛑 V6.11 stopped.")
+            tg("🛑 V6.12 stopped.")
             raise
         except Exception as e:
             msg = f"{type(e).__name__}: {e}"
             if "152002" in msg:
                 time.sleep(20); continue
-            tg(f"⚠️ V6.11 LOOP ERROR\n{msg}")
+            tg(f"⚠️ V6.12 LOOP ERROR\n{msg}")
             time.sleep(30)
 
 
