@@ -10,7 +10,7 @@ import pandas as pd
 import requests
 
 # ============================================================
-# BLOFIN PRECISION SNIPER v2.1 - BLOFIN EXECUTION EDITION
+# BLOFIN PRECISION SNIPER v2.2 SMART CONTEXT - BLOFIN EXECUTION EDITION
 # ============================================================
 # Strategy engine: faithful Python translation of the supplied TradingView
 # Precision Sniper [WillyAlgoTrader] v2.1 defaults for a 15m chart.
@@ -1686,7 +1686,7 @@ def update_learning(record, net_pnl):
 
 
 def notify_closed_trade(record):
-    global consecutive_losses, loss_pause_until
+    global consecutive_losses, loss_pause_until, sniper_side_loss_streak
     reset_daily_if_needed()
     symbol = str(record.get("instId", "")).replace("-USDT", "/USDT:USDT")
     side = infer_side(record)
@@ -1702,9 +1702,11 @@ def notify_closed_trade(record):
     daily[f"{bucket}_trades"] += 1; daily[f"{bucket}_net"] += net_pnl
     if net_pnl >= 0:
         daily["wins"] += 1; daily[f"{bucket}_wins"] += 1; consecutive_losses = 0
+        sniper_side_loss_streak[bucket] = 0
         symbol_last_result[symbol] = "win"; symbol_loss_streak[symbol] = 0
     else:
         daily["losses"] += 1; consecutive_losses += 1
+        sniper_side_loss_streak[bucket] = sniper_side_loss_streak.get(bucket, 0) + 1
         symbol_last_result[symbol] = "loss"; symbol_loss_streak[symbol] = symbol_loss_streak.get(symbol, 0) + 1
         if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
             loss_pause_until = time.time() + LOSS_PAUSE_MIN * 60
@@ -1716,14 +1718,15 @@ def notify_closed_trade(record):
     pause = f"\n⏸ {MAX_CONSECUTIVE_LOSSES} losses → pauze {LOSS_PAUSE_MIN} min" if consecutive_losses >= MAX_CONSECUTIVE_LOSSES else ""
     icon = "🟢" if net_pnl >= 0 else "🔴"
     tg(
-        f"{icon} POSITION CLOSED V6.14\n\n{symbol}\n{side.upper()}\n━━━━━━━━━━━━\n"
+        f"{icon} PRECISION SNIPER CLOSED\n\n{symbol}\n{side.upper()}\n━━━━━━━━━━━━\n"
         f"Entry: {entry:.8g}\nExit: {exit_price:.8g}\nSize: {size:g}\n\n"
         f"💰 Realized: {'+' if gross_pnl >= 0 else ''}${gross_pnl:.2f}\n"
         f"📊 Ratio: {pnl_ratio:+.2f}%\n💸 Fee: -${fee:.2f}\n"
         f"💵 Net: {'+' if net_pnl >= 0 else ''}${net_pnl:.2f}\n\n🎯 {reason}\n⏱ {duration}\n\n"
         f"📅 TODAY Amsterdam\nTrades: {daily['trades']} | W/L {daily['wins']}/{daily['losses']} | Net ${daily['net']:.2f}\n"
         f"LONG: {daily['long_trades']} / {wr_long:.0f}% / ${daily['long_net']:.2f}\n"
-        f"SHORT: {daily['short_trades']} / {wr_short:.0f}% / ${daily['short_net']:.2f}{pause}"
+        f"SHORT: {daily['short_trades']} / {wr_short:.0f}% / ${daily['short_net']:.2f}\n"
+        f"Side streak L/S: {sniper_side_loss_streak.get('long',0)}/{sniper_side_loss_streak.get('short',0)}{pause}"
     )
 
 
@@ -1733,7 +1736,7 @@ def seed_closed_history():
         for r in closed_positions_history(100):
             hid = str(r.get("historyId", ""))
             if hid: seen_closed_history_ids.add(hid)
-        tg(f"📚 V6.14 PNL TRACKER READY\nKnown closes: {len(seen_closed_history_ids)}\nLearning trades: {learning.get('trades', 0)}")
+        tg(f"📚 PRECISION SNIPER PNL TRACKER READY\nKnown closes: {len(seen_closed_history_ids)}\nLearning trades: {learning.get('trades', 0)}")
     except Exception as e:
         tg(f"⚠️ PNL tracker warning\n{e}")
 
@@ -1782,6 +1785,30 @@ def count_alt_sides(positions):
 # ============================================================
 # REPORTING
 # ============================================================
+def sniper_portfolio_allows(signal, positions):
+    """Diversification/quality gate while still allowing up to MAX_ACTIVE_POSITIONS."""
+    side = signal.get("side")
+    if side not in ("long", "short"):
+        return False, "no-side"
+    same_side = sum(1 for p in positions if position_side(p) == side)
+    ratio = safe_float(signal.get("score")) / max(safe_float(signal.get("score_max"), 1.0), 1e-9)
+    htf_aligned = signal.get("htf_state") == "ALIGNED"
+
+    # The fourth same-direction position is allowed only when it is genuinely
+    # premium and supported by the 1h trend. This prevents four correlated B
+    # trades from behaving like one oversized market bet.
+    if same_side >= SNIPER_MAX_SAME_SIDE:
+        if not (ratio >= SNIPER_FOURTH_SAME_SIDE_MIN_RATIO and htf_aligned):
+            return False, "same-side-4th-needs-A+-1h"
+
+    # After repeated losses in one direction, do not keep firing ordinary
+    # signals into the same regime. Premium aligned setups can still trade.
+    if sniper_side_loss_streak.get(side, 0) >= SNIPER_SIDE_LOSS_TIGHTEN_AFTER:
+        if not (ratio >= 0.80 and htf_aligned and safe_float(signal.get("adx")) >= 20):
+            return False, f"{side}-loss-streak-needs-A+-1h"
+    return True, "OK"
+
+
 def maybe_score_report(rows):
     global last_score_report
     if time.time() - last_score_report < SCORE_REPORT_MIN * 60: return
@@ -1869,7 +1896,7 @@ def protection_watch():
 #   Step stop: TP1 -> entry, TP2 -> TP1, effective as soon as the bot observes it.
 # ============================================================
 
-SNIPER_VERSION = "2.1.0"
+SNIPER_VERSION = "2.2.0"
 SNIPER_TF = "15m"
 SNIPER_FAST = int(os.getenv("SNIPER_FAST", "9"))
 SNIPER_SLOW = int(os.getenv("SNIPER_SLOW", "21"))
@@ -1895,6 +1922,23 @@ SNIPER_STEP_STOPS = os.getenv("SNIPER_STEP_STOPS", "true").lower() == "true"
 SNIPER_MIN_RISK_TICKS = int(os.getenv("SNIPER_MIN_RISK_TICKS", "2"))
 SNIPER_REPORT_MIN = int(os.getenv("SNIPER_REPORT_MIN", "15"))
 
+# ---------------- V2.2 SMART CONTEXT ----------------
+# Keep the original crossover/evidence engine, but improve WHERE and WHEN we enter.
+SNIPER_HTF_TF = os.getenv("SNIPER_HTF_TF", "1h")
+SNIPER_HTF_NEUTRAL_MIN_RATIO = float(os.getenv("SNIPER_HTF_NEUTRAL_MIN_RATIO", "0.65"))  # A
+SNIPER_COUNTER_MIN_RATIO = float(os.getenv("SNIPER_COUNTER_MIN_RATIO", "0.80"))          # A+
+SNIPER_COUNTER_MIN_ADX = float(os.getenv("SNIPER_COUNTER_MIN_ADX", "20"))
+SNIPER_COUNTER_MIN_BODY_ATR = float(os.getenv("SNIPER_COUNTER_MIN_BODY_ATR", "0.30"))
+SNIPER_MIN_CROSS_SLOPE_ATR = float(os.getenv("SNIPER_MIN_CROSS_SLOPE_ATR", "0.025"))
+SNIPER_MAX_ENTRY_EXTENSION_ATR = float(os.getenv("SNIPER_MAX_ENTRY_EXTENSION_ATR", "0.70"))
+SNIPER_RETEST_TRIGGER_ATR = float(os.getenv("SNIPER_RETEST_TRIGGER_ATR", "0.35"))
+SNIPER_RETEST_MAX_BARS = int(os.getenv("SNIPER_RETEST_MAX_BARS", "3"))
+SNIPER_RETEST_MIN_RATIO = float(os.getenv("SNIPER_RETEST_MIN_RATIO", "0.65"))
+SNIPER_RETEST_MIN_ADX = float(os.getenv("SNIPER_RETEST_MIN_ADX", "15"))
+SNIPER_MAX_SAME_SIDE = int(os.getenv("SNIPER_MAX_SAME_SIDE", "3"))
+SNIPER_FOURTH_SAME_SIDE_MIN_RATIO = float(os.getenv("SNIPER_FOURTH_SAME_SIDE_MIN_RATIO", "0.80"))
+SNIPER_SIDE_LOSS_TIGHTEN_AFTER = int(os.getenv("SNIPER_SIDE_LOSS_TIGHTEN_AFTER", "2"))
+
 # TP3 is the live full-position take-profit, matching Pine defaults.
 TP_R_MULT = 3.0
 ATR_SL_MULT = SNIPER_SL_MULT
@@ -1903,6 +1947,10 @@ sniper_last_report = 0
 sniper_last_signal_bar = {}
 sniper_step_notified = {}
 sniper_managed_positions = set()
+# Extended crossover setups wait for a controlled retest instead of being chased.
+sniper_retest_pending = {}
+# Direction-specific loss memory: after repeated losses, same-side entries must be premium.
+sniper_side_loss_streak = {"long": 0, "short": 0}
 
 
 def _rma(series, length):
@@ -1994,27 +2042,28 @@ def sniper_plan(df, side):
     }
 
 
-def evaluate_symbol(symbol, btc=None):
-    """Precision Sniper v2.1 default 15m signal engine on CLOSED candles."""
-    df = sniper_indicators(ohlcv_df(symbol, SNIPER_TF))
-    warmup = max(SNIPER_TREND * 3, SNIPER_ATR_LEN + SNIPER_ATR_MEAN_LEN)
-    if len(df) < warmup + 2:
-        return None
-    a, p = df.iloc[-2], df.iloc[-3]
-    if any(pd.isna(a.get(k)) for k in ["atr", "atr_mean", "sniper_rsi", "macd_hist", "sniper_adx", "ema_fast", "ema_slow", "ema_trend"]):
-        return None
-
-    bull_cross = safe_float(a["ema_fast"]) > safe_float(a["ema_slow"]) and safe_float(p["ema_fast"]) <= safe_float(p["ema_slow"])
-    bear_cross = safe_float(a["ema_fast"]) < safe_float(a["ema_slow"]) and safe_float(p["ema_fast"]) >= safe_float(p["ema_slow"])
-    if not bull_cross and not bear_cross:
+def sniper_htf_context(symbol):
+    """Last CLOSED 1h regime. It is context, not a prediction."""
+    try:
+        hdf = sniper_indicators(ohlcv_df(symbol, SNIPER_HTF_TF))
+        if len(hdf) < max(SNIPER_TREND * 3, 80) + 2:
+            return {"dir": 0, "adx": 0.0, "rsi": 50.0, "close": 0.0, "ema_trend": 0.0}
+        h = hdf.iloc[-2]
+        close = safe_float(h["close"])
+        ef, es, et = safe_float(h["ema_fast"]), safe_float(h["ema_slow"]), safe_float(h["ema_trend"])
+        direction = 1 if ef > es and close > et else -1 if ef < es and close < et else 0
         return {
-            "symbol": symbol, "side": None, "score": 0.0, "score_max": 7.0,
-            "grade": "-", "skip": "no-cross", "entry_route": "WAIT",
-            "price": safe_float(a["close"]), "atr": safe_float(a["atr"]),
-            "signal_bar_ts": int(a["ts"]), "adx": safe_float(a["sniper_adx"]),
+            "dir": direction,
+            "adx": safe_float(h["sniper_adx"]),
+            "rsi": safe_float(h["sniper_rsi"], 50),
+            "close": close,
+            "ema_trend": et,
         }
+    except Exception:
+        return {"dir": 0, "adx": 0.0, "rsi": 50.0, "close": 0.0, "ema_trend": 0.0}
 
-    side = "long" if bull_cross else "short"
+
+def sniper_evidence(a, p, side):
     d = 1 if side == "long" else -1
     close = safe_float(a["close"])
     rsi = safe_float(a["sniper_rsi"], 50)
@@ -2028,14 +2077,8 @@ def evaluate_symbol(symbol, btc=None):
     vol_mean = safe_float(a["vol_mean"])
     volume = safe_float(a["volume"])
     vwap = safe_float(a["vwap"])
-
-    momentum = close > safe_float(a["ema_fast"]) and close > safe_float(a["ema_slow"]) if d == 1 else close < safe_float(a["ema_fast"]) and close < safe_float(a["ema_slow"])
-    vol_ratio = atr / atr_mean if atr_mean > 0 else 999.0
-    high_vol = vol_ratio > SNIPER_VOL_THRESHOLD
     volume_above = vol_mean > 0 and volume > vol_mean * SNIPER_VOLUME_SPIKE
     trending = adx >= SNIPER_ADX_TREND
-
-    # Pine default: has volume + VWAP Auto ON on 15m Default preset -> max 7.
     score = 0.0
     if (close > safe_float(a["ema_trend"])) if d == 1 else (close < safe_float(a["ema_trend"])): score += 1
     if (50 < rsi < SNIPER_RSI_UPPER) if d == 1 else (SNIPER_RSI_LOWER < rsi < 50): score += 1
@@ -2044,10 +2087,68 @@ def evaluate_symbol(symbol, btc=None):
     if trending and ((plus_di > minus_di) if d == 1 else (minus_di > plus_di)): score += 1
     if volume_above: score += 1
     if (close > vwap) if d == 1 else (close < vwap): score += 1
-    score_max = 7.0
+    return score, 7.0, rsi, adx, atr, (atr / atr_mean if atr_mean > 0 else 999.0), volume_above
+
+
+def evaluate_symbol(symbol, btc=None):
+    """Precision Sniper v2.2: crossover + smart 1h context + anti-chase retest."""
+    df = sniper_indicators(ohlcv_df(symbol, SNIPER_TF))
+    warmup = max(SNIPER_TREND * 3, SNIPER_ATR_LEN + SNIPER_ATR_MEAN_LEN)
+    if len(df) < warmup + 3:
+        return None
+    a, p = df.iloc[-2], df.iloc[-3]
+    if any(pd.isna(a.get(k)) for k in ["atr", "atr_mean", "sniper_rsi", "macd_hist", "sniper_adx", "ema_fast", "ema_slow", "ema_trend"]):
+        return None
+
+    bull_cross = safe_float(a["ema_fast"]) > safe_float(a["ema_slow"]) and safe_float(p["ema_fast"]) <= safe_float(p["ema_slow"])
+    bear_cross = safe_float(a["ema_fast"]) < safe_float(a["ema_slow"]) and safe_float(p["ema_fast"]) >= safe_float(p["ema_slow"])
+    cross_side = "long" if bull_cross else "short" if bear_cross else None
+    signal_ts = int(a["ts"])
+
+    # If a crossover candle was already extended, wait up to N closed 15m bars
+    # for price to revisit EMA9 and reclaim/reject it instead of chasing the cross.
+    pending = sniper_retest_pending.get(symbol)
+    route = "CROSS"
+    side = cross_side
+    if side is None and pending:
+        bars_since = max(0, int((signal_ts - int(pending["ts"])) / (15 * 60 * 1000)))
+        pd_side = pending["side"]
+        d0 = 1 if pd_side == "long" else -1
+        alignment = safe_float(a["ema_fast"]) > safe_float(a["ema_slow"]) if d0 == 1 else safe_float(a["ema_fast"]) < safe_float(a["ema_slow"])
+        atr0 = safe_float(a["atr"])
+        near_fast = abs(safe_float(a["close"]) - safe_float(a["ema_fast"])) <= SNIPER_RETEST_TRIGGER_ATR * atr0
+        touched = safe_float(a["low"]) <= safe_float(a["ema_fast"]) + 0.10 * atr0 if d0 == 1 else safe_float(a["high"]) >= safe_float(a["ema_fast"]) - 0.10 * atr0
+        reclaim = safe_float(a["close"]) > safe_float(a["ema_fast"]) and safe_float(a["close"]) > safe_float(a["open"]) if d0 == 1 else safe_float(a["close"]) < safe_float(a["ema_fast"]) and safe_float(a["close"]) < safe_float(a["open"])
+        if bars_since > SNIPER_RETEST_MAX_BARS or not alignment:
+            sniper_retest_pending.pop(symbol, None)
+        elif bars_since >= 1 and near_fast and touched and reclaim:
+            side = pd_side
+            route = "RETEST"
+
+    if side is None:
+        return {
+            "symbol": symbol, "side": None, "score": 0.0, "score_max": 7.0,
+            "grade": "-", "skip": "no-cross", "entry_route": "WAIT",
+            "price": safe_float(a["close"]), "atr": safe_float(a["atr"]),
+            "signal_bar_ts": signal_ts, "adx": safe_float(a["sniper_adx"]),
+        }
+
+    d = 1 if side == "long" else -1
+    close = safe_float(a["close"])
+    score, score_max, rsi, adx, atr, vol_ratio, volume_above = sniper_evidence(a, p, side)
     ratio = score / score_max
     grade = sniper_grade(ratio)
     plan = sniper_plan(df, side)
+    htf = sniper_htf_context(symbol)
+    htf_aligned = htf["dir"] == d
+    htf_opposed = htf["dir"] == -d
+    htf_state = "ALIGNED" if htf_aligned else "AGAINST" if htf_opposed else "NEUTRAL"
+
+    momentum = close > safe_float(a["ema_fast"]) and close > safe_float(a["ema_slow"]) if d == 1 else close < safe_float(a["ema_fast"]) and close < safe_float(a["ema_slow"])
+    high_vol = vol_ratio > SNIPER_VOL_THRESHOLD
+    body_atr = d * (close - safe_float(a["open"])) / atr if atr > 0 else 0.0
+    slope_atr = d * (safe_float(a["ema_fast"]) - safe_float(p["ema_fast"])) / atr if atr > 0 else 0.0
+    extension_atr = d * (close - safe_float(a["ema_fast"])) / atr if atr > 0 else 999.0
 
     skip = None
     if high_vol:
@@ -2056,7 +2157,18 @@ def evaluate_symbol(symbol, btc=None):
         skip = "price-momentum-lost"
     elif (d == 1 and rsi >= SNIPER_RSI_UPPER) or (d == -1 and rsi <= SNIPER_RSI_LOWER):
         skip = "rsi-extreme"
-    elif score + 1e-9 < SNIPER_MIN_EVIDENCE_RATIO * score_max:
+    elif slope_atr < SNIPER_MIN_CROSS_SLOPE_ATR:
+        skip = f"weak-cross-slope-{slope_atr:.2f}ATR"
+    elif route == "CROSS" and extension_atr > SNIPER_MAX_ENTRY_EXTENSION_ATR:
+        sniper_retest_pending[symbol] = {"side": side, "ts": signal_ts}
+        skip = f"wait-retest-ext-{extension_atr:.2f}ATR"
+    elif route == "RETEST" and (ratio < SNIPER_RETEST_MIN_RATIO or (adx < SNIPER_RETEST_MIN_ADX and not volume_above)):
+        skip = "retest-quality"
+    elif htf_opposed and not (ratio >= SNIPER_COUNTER_MIN_RATIO and volume_above and adx >= SNIPER_COUNTER_MIN_ADX and body_atr >= SNIPER_COUNTER_MIN_BODY_ATR):
+        skip = "1h-against-needs-A+-vol"
+    elif not htf_aligned and not htf_opposed and ratio < SNIPER_HTF_NEUTRAL_MIN_RATIO:
+        skip = "1h-neutral-needs-A"
+    elif ratio + 1e-9 < SNIPER_MIN_EVIDENCE_RATIO:
         skip = f"evidence-{score:.1f}/{score_max:.1f}"
     elif not plan or plan["risk_distance"] <= 0:
         skip = "invalid-plan"
@@ -2065,20 +2177,28 @@ def evaluate_symbol(symbol, btc=None):
         if plan["risk_distance"] < SNIPER_MIN_RISK_TICKS * tick - tick * 1e-6:
             skip = "risk-too-small"
 
+    # A successful retest consumes the pending setup. A new valid non-extended
+    # cross also supersedes any older pending setup.
+    if route == "RETEST" and skip is None:
+        sniper_retest_pending.pop(symbol, None)
+    elif route == "CROSS" and skip != f"wait-retest-ext-{extension_atr:.2f}ATR":
+        sniper_retest_pending.pop(symbol, None)
+
     return {
         "symbol": symbol, "side": side, "score": score, "score_max": score_max,
         "threshold": SNIPER_MIN_EVIDENCE_RATIO * score_max, "grade": grade,
-        "skip": skip, "entry_route": "SNIPER" if skip is None else "WAIT",
+        "skip": skip, "entry_route": route if skip is None else "WAIT",
         "price": close, "atr": atr, "adx": adx, "rsi": rsi,
-        "signal_bar_ts": int(a["ts"]), "vol_ratio": vol_ratio,
-        "volume_above": volume_above, "vwap": vwap, "risk_distance": plan["risk_distance"] if plan else 0,
+        "signal_bar_ts": signal_ts, "vol_ratio": vol_ratio,
+        "volume_above": volume_above, "vwap": safe_float(a["vwap"]),
+        "risk_distance": plan["risk_distance"] if plan else 0,
         "stop_origin": plan["origin"] if plan else "N/A", "structure_capped": bool(plan["capped"]) if plan else False,
-        # compatibility fields for generic infrastructure
+        "htf_dir": htf["dir"], "htf_state": htf_state, "htf_adx": htf["adx"],
+        "body_atr": body_atr, "slope_atr": slope_atr, "extension_atr": extension_atr,
         "tactics": int(round(score)), "entry_quality": int(round(ratio * 5)),
         "confirm_components": 4 if skip is None else 0, "momentum_quality": 2 if momentum else 0,
-        "pullback_quality": 0, "rel": 0.0, "btc_regime": "SNIPER-INDEPENDENT",
+        "pullback_quality": 0, "rel": 0.0, "btc_regime": "SNIPER-SMART-CONTEXT",
     }
-
 
 def is_a_setup(signal):
     # Pine grades are evidence labels, not risk-sizing tiers. Keep sizing neutral
@@ -2131,8 +2251,10 @@ def open_trade(signal):
     if live <= 0 or signal_px <= 0:
         return False
     drift = (live - signal_px) / signal_px
-    if (side == "long" and drift > SNIPER_MAX_FILL_DRIFT) or (side == "short" and drift < -SNIPER_MAX_FILL_DRIFT):
-        tg(f"⏭️ {symbol} {side.upper()} SNIPER too late\nDrift {abs(drift)*100:.2f}% > {SNIPER_MAX_FILL_DRIFT*100:.2f}%")
+    d = 1 if side == "long" else -1
+    adverse_drift = d * drift
+    if adverse_drift > SNIPER_MAX_FILL_DRIFT:
+        tg(f"⏭️ {symbol} {side.upper()} SNIPER too late\nAdverse drift {adverse_drift*100:.2f}% > {SNIPER_MAX_FILL_DRIFT*100:.2f}%")
         return False
 
     levels = sniper_live_levels(signal, live, tick)
@@ -2163,17 +2285,19 @@ def open_trade(signal):
 
     msg = (
         f"{'🧪 PAPER' if PAPER_TRADING else '🎯 PRECISION SNIPER LIVE'} v{SNIPER_VERSION}\n"
-        f"{symbol} {side.upper()} · Grade {signal['grade']}\n"
+        f"{symbol} {side.upper()} · Grade {signal['grade']} · {signal.get('entry_route','CROSS')}\n"
         f"Evidence {signal['score']:.1f}/{signal['score_max']:.1f} ({signal['score']/signal['score_max']*100:.0f}%)\n"
         f"ADX {signal['adx']:.1f} · RSI {signal['rsi']:.1f} · ATR/mean {signal['vol_ratio']:.2f}x\n"
-        f"Volume spike: {'YES' if signal['volume_above'] else 'NO'} · Stop: {signal['stop_origin']}\n"
+        f"1H: {signal.get('htf_state','N/A')} ADX{signal.get('htf_adx',0):.0f} · Vol spike: {'YES' if signal['volume_above'] else 'NO'}\n"
+        f"Cross slope {signal.get('slope_atr',0):.2f} ATR · Extension {signal.get('extension_atr',0):.2f} ATR · Body {signal.get('body_atr',0):.2f} ATR\n"
+        f"Stop: {signal['stop_origin']}\n"
         f"Entry ~ {live:.8g}\nSL {sl:.8g}\nTP1 {tp1:.8g} → SL to entry\n"
         f"TP2 {tp2:.8g} → SL to TP1\nTP3 {tp3:.8g} → full exit\n"
         f"Initial risk {stop_pct*100:.2f}% · Risk cap {profile['risk_pct']*100:.1f}%\n"
         f"Expected TP3 net ~${sizing['expected_net_tp_usdt']:.2f}\n"
         f"Expected SL + cost ~${sizing['expected_net_sl_usdt']:.2f}\n"
         f"Notional ${sizing['notional']:.2f} · Margin ${sizing['margin']:.2f} · {LEVERAGE}x\n"
-        f"Fill drift {abs(drift)*100:.2f}%/{SNIPER_MAX_FILL_DRIFT*100:.2f}%"
+        f"Fill drift signed {drift*100:+.2f}% · adverse {max(0.0, adverse_drift)*100:.2f}%/{SNIPER_MAX_FILL_DRIFT*100:.2f}%"
     )
     if PAPER_TRADING:
         tg(msg)
@@ -2354,7 +2478,7 @@ def maybe_score_report(rows):
         lines.append(
             f"{r['symbol'].split('/')[0]} {r['side'].upper()} {r['grade']} "
             f"{r['score']:.1f}/{r['score_max']:.1f} ADX{r['adx']:.0f} RSI{r['rsi']:.0f} "
-            f"ATRμ{r['vol_ratio']:.2f} {state}"
+            f"1H:{r.get('htf_state','-')} Ext{r.get('extension_atr',0):.2f} ATRμ{r['vol_ratio']:.2f} {state}"
         )
     tg("\n".join(lines))
 
@@ -2365,14 +2489,16 @@ def startup_diagnostics():
     tg(
         f"🎯 PRECISION SNIPER BOT STARTED v{SNIPER_VERSION}\n"
         f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
-        f"Engine: supplied WillyAlgoTrader Precision Sniper translated to BloFin\n"
+        f"Engine: Precision Sniper + v2.2 Smart Context\n"
         f"Signal: 15m CLOSED candle · EMA {SNIPER_FAST}/{SNIPER_SLOW}/{SNIPER_TREND}\n"
         f"Mandatory trigger: EMA{SNIPER_FAST}/{SNIPER_SLOW} crossover + price momentum\n"
-        f"Evidence: trend/RSI/MACD/accel/ADX/volume/VWAP · need >= {SNIPER_MIN_EVIDENCE_RATIO*100:.0f}%\n"
+        f"Evidence: trend/RSI/MACD/accel/ADX/volume/VWAP · base >= {SNIPER_MIN_EVIDENCE_RATIO*100:.0f}%\n"
+        f"Smart 1H gate: neutral >=A | countertrend only A+ + volume + ADX{SNIPER_COUNTER_MIN_ADX:.0f}\n"
+        f"Anti-chase: >{SNIPER_MAX_ENTRY_EXTENSION_ATR:.2f} ATR waits for EMA9 retest up to {SNIPER_RETEST_MAX_BARS} bars\n"
         f"High-vol block: ATR/mean > {SNIPER_VOL_THRESHOLD:.2f}x\n"
         f"SL: {SNIPER_SL_MULT:.1f} ATR + structure, capped at {SNIPER_STRUCTURE_CAP:.1f}x ATR-stop\n"
         f"TP ladder: 1R milestone → BE | 2R → lock 1R | 3R full exit\n"
-        f"Risk cap: {SNIPER_RISK_EQUITY_PCT*100:.1f}% · Max positions: {MAX_ACTIVE_POSITIONS}\n"
+        f"Risk cap: {SNIPER_RISK_EQUITY_PCT*100:.1f}% · Max positions: {MAX_ACTIVE_POSITIONS} · same-side soft cap {SNIPER_MAX_SAME_SIDE}\n"
         f"Equity: ${acc['total_equity']:.2f} · Available: ${acc['available']:.2f}\n"
         f"Daily loss cap: {DAILY_LOSS_LIMIT_PCT:.0f}%"
     )
@@ -2463,7 +2589,7 @@ def main():
                     if not signal:
                         continue
                     scanned.append(signal)
-                    if signal.get("side") and not signal.get("skip") and signal.get("entry_route") == "SNIPER":
+                    if signal.get("side") and not signal.get("skip") and signal.get("entry_route") in ("CROSS", "RETEST"):
                         # A closed crossover bar is a one-shot Precision Sniper event.
                         key = int(signal.get("signal_bar_ts", 0))
                         if sniper_last_signal_bar.get(symbol) == key:
@@ -2478,7 +2604,13 @@ def main():
             maybe_score_report(scanned)
             # Pine grades are descriptive. For simultaneous candidates, rank by
             # evidence ratio, then ADX; no BTC-flow score is mixed into this test.
-            candidates.sort(key=lambda x: (x["score"] / max(x["score_max"], 1e-9), x["adx"]), reverse=True)
+            candidates.sort(key=lambda x: (
+                1 if x.get("htf_state") == "ALIGNED" else 0,
+                1 if x.get("entry_route") == "RETEST" else 0,
+                x["score"] / max(x["score_max"], 1e-9),
+                1 if x.get("volume_above") else 0,
+                x["adx"],
+            ), reverse=True)
 
             attempts = 0
             for signal in candidates:
@@ -2486,6 +2618,12 @@ def main():
                     break
                 if attempts >= MAX_EXECUTION_ATTEMPTS_PER_SCAN:
                     break
+                current_positions = get_positions()
+                allowed, why = sniper_portfolio_allows(signal, current_positions)
+                if not allowed:
+                    sniper_last_signal_bar[signal["symbol"]] = int(signal.get("signal_bar_ts", 0))
+                    tg(f"⏭️ {signal['symbol']} {signal['side'].upper()} SMART PORTFOLIO\n{why}")
+                    continue
                 attempts += 1
                 opened = open_trade(signal)
                 sniper_last_signal_bar[signal["symbol"]] = int(signal.get("signal_bar_ts", 0))
