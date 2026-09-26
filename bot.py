@@ -2647,5 +2647,297 @@ def main():
             time.sleep(30)
 
 
+# ============================================================
+# PRECISION SNIPER V3.0 — REGIME-FIRST EXECUTION ENGINE
+# ============================================================
+# V3 deliberately stops treating every EMA9/21 cross as a trade candidate.
+# A cross is now only a TRIGGER inside a confirmed multi-timeframe regime.
+# Core order/protection/risk infrastructure from v2.2 is retained.
+
+SNIPER_VERSION = "3.0.0"
+SNIPER_V3_MIN_RATIO = float(os.getenv("SNIPER_V3_MIN_RATIO", "0.71"))          # >= 5/7 (A)
+SNIPER_V3_ELITE_RATIO = float(os.getenv("SNIPER_V3_ELITE_RATIO", "0.85"))      # >= 6/7 (A+)
+SNIPER_V3_MIN_SLOPE_ATR = float(os.getenv("SNIPER_V3_MIN_SLOPE_ATR", "0.08"))
+SNIPER_V3_MIN_BODY_ATR = float(os.getenv("SNIPER_V3_MIN_BODY_ATR", "0.20"))
+SNIPER_V3_MAX_CROSS_EXT_ATR = float(os.getenv("SNIPER_V3_MAX_CROSS_EXT_ATR", "0.55"))
+SNIPER_V3_MIN_ADX = float(os.getenv("SNIPER_V3_MIN_ADX", "18"))
+SNIPER_V3_STRONG_HTF_ADX = float(os.getenv("SNIPER_V3_STRONG_HTF_ADX", "25"))
+SNIPER_V3_LONG_RSI_MIN = float(os.getenv("SNIPER_V3_LONG_RSI_MIN", "53"))
+SNIPER_V3_LONG_RSI_MAX = float(os.getenv("SNIPER_V3_LONG_RSI_MAX", "68"))
+SNIPER_V3_SHORT_RSI_MIN = float(os.getenv("SNIPER_V3_SHORT_RSI_MIN", "32"))
+SNIPER_V3_SHORT_RSI_MAX = float(os.getenv("SNIPER_V3_SHORT_RSI_MAX", "47"))
+SNIPER_V3_RUN2_MAX_ATR = float(os.getenv("SNIPER_V3_RUN2_MAX_ATR", "3.0"))
+SNIPER_V3_RUN4_MAX_ATR = float(os.getenv("SNIPER_V3_RUN4_MAX_ATR", "4.5"))
+SNIPER_V3_RETEST_MIN_RATIO = float(os.getenv("SNIPER_V3_RETEST_MIN_RATIO", "0.71"))
+SNIPER_V3_MAX_SAME_SIDE = int(os.getenv("SNIPER_V3_MAX_SAME_SIDE", "2"))
+SNIPER_V3_THIRD_SIDE_RATIO = float(os.getenv("SNIPER_V3_THIRD_SIDE_RATIO", "0.85"))
+SNIPER_V3_BTC_GATE = os.getenv("SNIPER_V3_BTC_GATE", "true").lower() == "true"
+SNIPER_V3_BTC_SYMBOL = os.getenv("SNIPER_V3_BTC_SYMBOL", "BTC/USDT:USDT")
+
+_sniper_btc_cache = {"ts": 0.0, "data": None}
+
+
+def _sniper_tf_state(df):
+    if df is None or len(df) < max(SNIPER_TREND * 3, 80) + 2:
+        return {"dir": 0, "adx": 0.0, "rsi": 50.0, "close": 0.0, "ema_trend": 0.0}
+    h = df.iloc[-2]
+    c = safe_float(h["close"])
+    ef, es, et = safe_float(h["ema_fast"]), safe_float(h["ema_slow"]), safe_float(h["ema_trend"])
+    # Stronger than v2.2: the full EMA stack must agree, not just fast/slow + price/EMA55.
+    direction = 1 if ef > es > et and c > ef else -1 if ef < es < et and c < ef else 0
+    return {
+        "dir": direction,
+        "adx": safe_float(h["sniper_adx"]),
+        "rsi": safe_float(h["sniper_rsi"], 50),
+        "close": c,
+        "ema_trend": et,
+    }
+
+
+def sniper_v3_context(symbol):
+    try:
+        h1 = _sniper_tf_state(sniper_indicators(ohlcv_df(symbol, "1h")))
+        h4 = _sniper_tf_state(sniper_indicators(ohlcv_df(symbol, "4h")))
+        return h1, h4
+    except Exception:
+        return ({"dir": 0, "adx": 0.0, "rsi": 50.0, "close": 0.0, "ema_trend": 0.0},
+                {"dir": 0, "adx": 0.0, "rsi": 50.0, "close": 0.0, "ema_trend": 0.0})
+
+
+def sniper_v3_btc_context():
+    now = time.time()
+    if _sniper_btc_cache.get("data") is not None and now - _sniper_btc_cache.get("ts", 0) < 60:
+        return _sniper_btc_cache["data"]
+    h1, h4 = sniper_v3_context(SNIPER_V3_BTC_SYMBOL)
+    data = {"h1": h1, "h4": h4}
+    _sniper_btc_cache.update({"ts": now, "data": data})
+    return data
+
+
+def _sniper_v3_btc_gate(symbol, d, ratio, volume_above):
+    if not SNIPER_V3_BTC_GATE or symbol == SNIPER_V3_BTC_SYMBOL:
+        return True, "BTC-self/off"
+    btc = sniper_v3_btc_context()
+    b1, b4 = btc["h1"]["dir"], btc["h4"]["dir"]
+    # If both BTC layers point against the alt trade, do not fight the market.
+    if b1 == -d and b4 == -d:
+        return False, "btc-1h+4h-against"
+    # One opposing BTC layer is tolerated only for an elite, volume-confirmed setup.
+    if b1 == -d or b4 == -d:
+        if ratio < SNIPER_V3_ELITE_RATIO or not volume_above:
+            return False, "btc-partly-against-needs-A+-vol"
+    return True, f"BTC1H{b1:+d}/4H{b4:+d}"
+
+
+def evaluate_symbol(symbol, btc=None):
+    """V3: regime first -> location -> trigger. No neutral/countertrend 1H entries."""
+    df = sniper_indicators(ohlcv_df(symbol, SNIPER_TF))
+    warmup = max(SNIPER_TREND * 3, SNIPER_ATR_LEN + SNIPER_ATR_MEAN_LEN)
+    if len(df) < warmup + 20:
+        return None
+    a, p = df.iloc[-2], df.iloc[-3]
+    if any(pd.isna(a.get(k)) for k in ["atr", "atr_mean", "sniper_rsi", "macd_hist", "sniper_adx", "ema_fast", "ema_slow", "ema_trend"]):
+        return None
+
+    bull_cross = safe_float(a["ema_fast"]) > safe_float(a["ema_slow"]) and safe_float(p["ema_fast"]) <= safe_float(p["ema_slow"])
+    bear_cross = safe_float(a["ema_fast"]) < safe_float(a["ema_slow"]) and safe_float(p["ema_fast"]) >= safe_float(p["ema_slow"])
+    cross_side = "long" if bull_cross else "short" if bear_cross else None
+    signal_ts = int(a["ts"])
+
+    pending = sniper_retest_pending.get(symbol)
+    route = "CROSS"
+    side = cross_side
+    if side is None and pending:
+        bars_since = max(0, int((signal_ts - int(pending["ts"])) / (15 * 60 * 1000)))
+        pd_side = pending["side"]
+        d0 = 1 if pd_side == "long" else -1
+        alignment = safe_float(a["ema_fast"]) > safe_float(a["ema_slow"]) if d0 == 1 else safe_float(a["ema_fast"]) < safe_float(a["ema_slow"])
+        atr0 = safe_float(a["atr"])
+        touched = safe_float(a["low"]) <= safe_float(a["ema_fast"]) + 0.10 * atr0 if d0 == 1 else safe_float(a["high"]) >= safe_float(a["ema_fast"]) - 0.10 * atr0
+        reclaim = (safe_float(a["close"]) > safe_float(a["ema_fast"]) and safe_float(a["close"]) > safe_float(a["open"])) if d0 == 1 else (safe_float(a["close"]) < safe_float(a["ema_fast"]) and safe_float(a["close"]) < safe_float(a["open"]))
+        if bars_since > SNIPER_RETEST_MAX_BARS or not alignment:
+            sniper_retest_pending.pop(symbol, None)
+        elif bars_since >= 1 and touched and reclaim:
+            side = pd_side
+            route = "RETEST"
+
+    if side is None:
+        return {
+            "symbol": symbol, "side": None, "score": 0.0, "score_max": 7.0, "grade": "-",
+            "skip": "no-cross", "entry_route": "WAIT", "price": safe_float(a["close"]),
+            "atr": safe_float(a["atr"]), "signal_bar_ts": signal_ts, "adx": safe_float(a["sniper_adx"]),
+        }
+
+    d = 1 if side == "long" else -1
+    close = safe_float(a["close"])
+    score, score_max, rsi, adx, atr, vol_ratio, volume_above = sniper_evidence(a, p, side)
+    ratio = score / max(score_max, 1e-9)
+    grade = sniper_grade(ratio)
+    plan = sniper_plan(df, side)
+    h1, h4 = sniper_v3_context(symbol)
+    h1_state = "ALIGNED" if h1["dir"] == d else "AGAINST" if h1["dir"] == -d else "NEUTRAL"
+    h4_state = "ALIGNED" if h4["dir"] == d else "AGAINST" if h4["dir"] == -d else "NEUTRAL"
+
+    ef, es, et = safe_float(a["ema_fast"]), safe_float(a["ema_slow"]), safe_float(a["ema_trend"])
+    hist, hist_prev = safe_float(a["macd_hist"]), safe_float(p["macd_hist"])
+    momentum = (close > ef > es) if d == 1 else (close < ef < es)
+    trend55 = close > et if d == 1 else close < et
+    macd_sign = hist > 0 if d == 1 else hist < 0
+    macd_accel = hist > hist_prev if d == 1 else hist < hist_prev
+    body_atr = d * (close - safe_float(a["open"])) / atr if atr > 0 else 0.0
+    slope_atr = d * (ef - safe_float(p["ema_fast"])) / atr if atr > 0 else 0.0
+    extension_atr = d * (close - ef) / atr if atr > 0 else 999.0
+    high_vol = vol_ratio > SNIPER_VOL_THRESHOLD
+
+    # Location memory: how far this coin already travelled before the trigger.
+    close_2h = safe_float(df.iloc[-10]["close"]) if len(df) >= 10 else close
+    close_4h = safe_float(df.iloc[-18]["close"]) if len(df) >= 18 else close
+    run2_atr = d * (close - close_2h) / atr if atr > 0 else 0.0
+    run4_atr = d * (close - close_4h) / atr if atr > 0 else 0.0
+
+    rsi_ok = (SNIPER_V3_LONG_RSI_MIN <= rsi <= SNIPER_V3_LONG_RSI_MAX) if d == 1 else (SNIPER_V3_SHORT_RSI_MIN <= rsi <= SNIPER_V3_SHORT_RSI_MAX)
+    adx_ok = adx >= SNIPER_V3_MIN_ADX or (volume_above and h1["adx"] >= SNIPER_V3_STRONG_HTF_ADX)
+    btc_ok, btc_note = _sniper_v3_btc_gate(symbol, d, ratio, volume_above)
+
+    skip = None
+    wait_retest = False
+    if high_vol:
+        skip = "high-vol"
+    elif not momentum or not trend55:
+        skip = "15m-trend-not-clean"
+    elif not (macd_sign and macd_accel):
+        skip = "macd-not-confirmed"
+    elif not rsi_ok:
+        skip = f"rsi-quality-{rsi:.0f}"
+    elif h1["dir"] != d:
+        skip = f"1h-{h1_state.lower()}-blocked"
+    elif h4["dir"] == -d:
+        skip = "4h-against-blocked"
+    elif h4["dir"] == 0 and ratio < SNIPER_V3_ELITE_RATIO:
+        skip = "4h-neutral-needs-A+"
+    elif ratio + 1e-9 < SNIPER_V3_MIN_RATIO:
+        skip = f"needs-A-{score:.1f}/{score_max:.1f}"
+    elif not adx_ok:
+        skip = f"weak-trend-adx{adx:.0f}"
+    elif slope_atr < SNIPER_V3_MIN_SLOPE_ATR:
+        skip = f"weak-cross-slope-{slope_atr:.2f}ATR"
+    elif body_atr < SNIPER_V3_MIN_BODY_ATR:
+        skip = f"weak-trigger-body-{body_atr:.2f}ATR"
+    elif not btc_ok:
+        skip = btc_note
+    elif route == "CROSS" and (extension_atr > SNIPER_V3_MAX_CROSS_EXT_ATR or run2_atr > SNIPER_V3_RUN2_MAX_ATR or run4_atr > SNIPER_V3_RUN4_MAX_ATR):
+        sniper_retest_pending[symbol] = {"side": side, "ts": signal_ts}
+        skip = f"wait-retest-loc-ext{extension_atr:.2f}-run2{run2_atr:.1f}R"
+        wait_retest = True
+    elif route == "RETEST" and ratio < SNIPER_V3_RETEST_MIN_RATIO:
+        skip = "retest-needs-A"
+    elif not plan or plan["risk_distance"] <= 0:
+        skip = "invalid-plan"
+    else:
+        tick = safe_float(get_instrument(symbol).get("tickSize"), 0.0001)
+        if plan["risk_distance"] < SNIPER_MIN_RISK_TICKS * tick - tick * 1e-6:
+            skip = "risk-too-small"
+
+    if route == "RETEST" and skip is None:
+        sniper_retest_pending.pop(symbol, None)
+    elif route == "CROSS" and not wait_retest:
+        sniper_retest_pending.pop(symbol, None)
+
+    quality = (
+        ratio * 100
+        + (12 if h4["dir"] == d else 0)
+        + (8 if volume_above else 0)
+        + min(adx, 35) * 0.35
+        + min(h1["adx"], 40) * 0.20
+        - max(0.0, extension_atr - 0.35) * 12
+        - max(0.0, run2_atr - 1.5) * 3
+    )
+
+    return {
+        "symbol": symbol, "side": side, "score": score, "score_max": score_max,
+        "threshold": SNIPER_V3_MIN_RATIO * score_max, "grade": grade,
+        "skip": skip, "entry_route": route if skip is None else "WAIT",
+        "price": close, "atr": atr, "adx": adx, "rsi": rsi, "signal_bar_ts": signal_ts,
+        "vol_ratio": vol_ratio, "volume_above": volume_above, "vwap": safe_float(a["vwap"]),
+        "risk_distance": plan["risk_distance"] if plan else 0,
+        "stop_origin": plan["origin"] if plan else "N/A", "structure_capped": bool(plan["capped"]) if plan else False,
+        "htf_dir": h1["dir"], "htf_state": h1_state, "htf_adx": h1["adx"],
+        "h4_dir": h4["dir"], "h4_state": h4_state, "h4_adx": h4["adx"],
+        "body_atr": body_atr, "slope_atr": slope_atr, "extension_atr": extension_atr,
+        "run2_atr": run2_atr, "run4_atr": run4_atr, "btc_note": btc_note,
+        "quality": quality, "tactics": int(round(score)), "entry_quality": int(round(ratio * 5)),
+        "confirm_components": 4 if skip is None else 0, "momentum_quality": 2 if momentum else 0,
+        "pullback_quality": 0, "rel": 0.0, "btc_regime": "SNIPER-V3-REGIME",
+    }
+
+
+def sizing_profile(signal):
+    # Keep risk controlled but let the cleanest A+ aligned setups use the existing 1.6% cap.
+    ratio = safe_float(signal.get("score")) / max(safe_float(signal.get("score_max"), 1.0), 1e-9)
+    elite = ratio >= SNIPER_V3_ELITE_RATIO and signal.get("h4_state") == "ALIGNED"
+    risk_pct = SNIPER_RISK_EQUITY_PCT if elite else min(SNIPER_RISK_EQUITY_PCT, 0.014)
+    target = SNIPER_TARGET_NET_TP_USDT if elite else min(SNIPER_TARGET_NET_TP_USDT, 1.25)
+    return {"name": "V3-ELITE" if elite else "V3-A", "risk_pct": risk_pct, "target_net_tp": target}
+
+
+def sniper_portfolio_allows(signal, positions):
+    side = signal.get("side")
+    if side not in ("long", "short"):
+        return False, "no-side"
+    same_side = sum(1 for p in positions if position_side(p) == side)
+    ratio = safe_float(signal.get("score")) / max(safe_float(signal.get("score_max"), 1.0), 1e-9)
+    # Normal portfolio: max two correlated positions in one direction.
+    # A third is possible only for elite 1H+4H alignment. Four total positions remain allowed.
+    if same_side >= SNIPER_V3_MAX_SAME_SIDE:
+        if not (ratio >= SNIPER_V3_THIRD_SIDE_RATIO and signal.get("htf_state") == "ALIGNED" and signal.get("h4_state") == "ALIGNED" and signal.get("volume_above")):
+            return False, "same-side>=2-needs-elite-1h4h-vol"
+    if same_side >= 3:
+        return False, "max-3-same-direction"
+    if sniper_side_loss_streak.get(side, 0) >= 2:
+        if not (ratio >= SNIPER_V3_ELITE_RATIO and signal.get("h4_state") == "ALIGNED" and signal.get("volume_above") and safe_float(signal.get("adx")) >= SNIPER_V3_MIN_ADX):
+            return False, f"{side}-loss-streak-elite-only"
+    return True, "OK"
+
+
+def maybe_score_report(rows):
+    global sniper_last_report
+    now = time.time()
+    crosses = [r for r in rows if r.get("side")]
+    if not crosses or now - sniper_last_report < SNIPER_REPORT_MIN * 60:
+        return
+    sniper_last_report = now
+    lines = [f"🎯 PRECISION SNIPER v{SNIPER_VERSION} · REGIME-FIRST"]
+    ranked = sorted(crosses, key=lambda r: safe_float(r.get("quality")), reverse=True)
+    for r in ranked[:10]:
+        state = "🟢 READY" if not r.get("skip") else f"⏭ {r.get('skip')}"
+        lines.append(
+            f"{r['symbol'].split('/')[0]} {r['side'].upper()} {r['grade']} {r['score']:.1f}/{r['score_max']:.1f} "
+            f"ADX{r['adx']:.0f} RSI{r['rsi']:.0f} 1H:{r.get('htf_state','-')} 4H:{r.get('h4_state','-')} "
+            f"Ext{r.get('extension_atr',0):.2f} Run2{r.get('run2_atr',0):.1f}ATR {state}"
+        )
+    tg("\n".join(lines))
+
+
+def startup_diagnostics():
+    acc = futures_account()
+    reset_daily_if_needed(acc["total_equity"])
+    tg(
+        f"🎯 PRECISION SNIPER BOT STARTED v{SNIPER_VERSION}\n"
+        f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
+        f"Engine: REGIME-FIRST — 1H/4H context → 15m location → EMA9/21 trigger\n"
+        f"Base quality: Grade A >= {SNIPER_V3_MIN_RATIO*100:.0f}% · A+ >= {SNIPER_V3_ELITE_RATIO*100:.0f}%\n"
+        f"1H: MUST align · 4H: never against; neutral requires A+\n"
+        f"Trigger: MACD sign+accel · RSI quality · slope >= {SNIPER_V3_MIN_SLOPE_ATR:.2f} ATR · body >= {SNIPER_V3_MIN_BODY_ATR:.2f} ATR\n"
+        f"Trend quality: ADX >= {SNIPER_V3_MIN_ADX:.0f} OR volume spike + strong 1H ADX\n"
+        f"Anti-chase: cross extension > {SNIPER_V3_MAX_CROSS_EXT_ATR:.2f} ATR or large 2h/4h run → RETEST only\n"
+        f"BTC gate: {'ON' if SNIPER_V3_BTC_GATE else 'OFF'} · both 1H+4H against = blocked\n"
+        f"TP ladder: 1R→BE · 2R→lock 1R · 3R full exit\n"
+        f"Risk: A 1.4% max · elite A+ {SNIPER_RISK_EQUITY_PCT*100:.1f}% max · Max positions {MAX_ACTIVE_POSITIONS}\n"
+        f"Portfolio: normal max 2 same-side; 3rd only elite 1H+4H+volume\n"
+        f"Equity: ${acc['total_equity']:.2f} · Available: ${acc['available']:.2f}\n"
+        f"Daily loss cap: {DAILY_LOSS_LIMIT_PCT:.0f}%"
+    )
+
+
 if __name__ == "__main__":
     main()
