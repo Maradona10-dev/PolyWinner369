@@ -10,7 +10,7 @@ import pandas as pd
 import requests
 
 # ============================================================
-# BLOFIN PRECISION SNIPER v2.2 SMART CONTEXT - BLOFIN EXECUTION EDITION
+# BLOFIN PRECISION SNIPER v5.0 ADAPTIVE REGIME ROUTER - BLOFIN EXECUTION EDITION
 # ============================================================
 # Strategy engine: faithful Python translation of the supplied TradingView
 # Precision Sniper [WillyAlgoTrader] v2.1 defaults for a 15m chart.
@@ -3377,6 +3377,571 @@ def startup_diagnostics():
         f"Risk: normal {V4_NORMAL_RISK_PCT*100:.1f}% · elite {V4_ELITE_RISK_PCT*100:.1f}% · max positions {MAX_ACTIVE_POSITIONS}\n"
         f"Equity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}"
     )
+
+
+# ============================================================
+# PRECISION SNIPER V5.0 — ADAPTIVE REGIME ROUTER
+# ============================================================
+# V5 stops predicting from EMA crosses altogether.
+# It routes each market into one of two playbooks:
+#   TREND  -> 4H/1H aligned trend, 15m pullback, 5m continuation trigger.
+#   RANGE  -> low/mixed HTF trend, 15m liquidity sweep, 5m rejection trigger.
+# Mixed/noisy regimes are skipped. Crossovers are informational only.
+
+SNIPER_VERSION = "5.0.0"
+V5_TREND_MIN_ADX = float(os.getenv("V5_TREND_MIN_ADX", "18"))
+V5_RANGE_MAX_ADX = float(os.getenv("V5_RANGE_MAX_ADX", "22"))
+V5_MIN_5M_CONFIRM = int(os.getenv("V5_MIN_5M_CONFIRM", "2"))
+V5_TREND_MIN_QUALITY = float(os.getenv("V5_TREND_MIN_QUALITY", "74"))
+V5_SWEEP_MIN_QUALITY = float(os.getenv("V5_SWEEP_MIN_QUALITY", "76"))
+V5_MAX_VOL_RATIO = float(os.getenv("V5_MAX_VOL_RATIO", "1.55"))
+V5_TREND_MAX_EXT_ATR = float(os.getenv("V5_TREND_MAX_EXT_ATR", "0.60"))
+V5_PULLBACK_LOOKBACK = int(os.getenv("V5_PULLBACK_LOOKBACK", "4"))
+V5_SWEEP_LOOKBACK = int(os.getenv("V5_SWEEP_LOOKBACK", "12"))
+V5_TREND_STOP_ATR = float(os.getenv("V5_TREND_STOP_ATR", "1.10"))
+V5_SWEEP_STOP_ATR = float(os.getenv("V5_SWEEP_STOP_ATR", "0.95"))
+V5_TREND_FINAL_R = float(os.getenv("V5_TREND_FINAL_R", "2.50"))
+V5_SWEEP_FINAL_R = float(os.getenv("V5_SWEEP_FINAL_R", "1.60"))
+V5_TREND_TP1_R = float(os.getenv("V5_TREND_TP1_R", "0.85"))
+V5_TREND_TP2_R = float(os.getenv("V5_TREND_TP2_R", "1.50"))
+V5_SWEEP_TP1_R = float(os.getenv("V5_SWEEP_TP1_R", "0.65"))
+V5_SWEEP_TP2_R = float(os.getenv("V5_SWEEP_TP2_R", "1.05"))
+V5_TREND_LOCK_R = float(os.getenv("V5_TREND_LOCK_R", "0.55"))
+V5_SWEEP_LOCK_R = float(os.getenv("V5_SWEEP_LOCK_R", "0.30"))
+V5_TREND_RISK_PCT = float(os.getenv("V5_TREND_RISK_PCT", "0.014"))
+V5_SWEEP_RISK_PCT = float(os.getenv("V5_SWEEP_RISK_PCT", "0.012"))
+V5_ELITE_RISK_PCT = float(os.getenv("V5_ELITE_RISK_PCT", "0.016"))
+V5_TREND_TARGET_NET = float(os.getenv("V5_TREND_TARGET_NET", "1.50"))
+V5_SWEEP_TARGET_NET = float(os.getenv("V5_SWEEP_TARGET_NET", "1.10"))
+V5_TREND_SOFT_EXIT_MIN = int(os.getenv("V5_TREND_SOFT_EXIT_MIN", "240"))
+V5_TREND_HARD_EXIT_MIN = int(os.getenv("V5_TREND_HARD_EXIT_MIN", "480"))
+V5_SWEEP_SOFT_EXIT_MIN = int(os.getenv("V5_SWEEP_SOFT_EXIT_MIN", "90"))
+V5_SWEEP_HARD_EXIT_MIN = int(os.getenv("V5_SWEEP_HARD_EXIT_MIN", "210"))
+V5_MAX_SAME_SIDE = int(os.getenv("V5_MAX_SAME_SIDE", "2"))
+V5_BTC_GATE = os.getenv("V5_BTC_GATE", "true").lower() == "true"
+
+_v5_position_meta = {}
+_v5_last_report = 0.0
+
+
+def _v5_tf_detail(symbol, tf):
+    try:
+        df = sniper_indicators(ohlcv_df(symbol, tf))
+        if len(df) < 80:
+            return {"dir":0,"adx":0.0,"rsi":50.0,"close":0.0,"atr":0.0,"ef":0.0,"es":0.0,"et":0.0,"hist":0.0}
+        a, p = df.iloc[-2], df.iloc[-3]
+        c = safe_float(a["close"]); ef=safe_float(a["ema_fast"]); es=safe_float(a["ema_slow"]); et=safe_float(a["ema_trend"])
+        d = 1 if ef > es > et and c > es else -1 if ef < es < et and c < es else 0
+        return {"dir":d,"adx":safe_float(a["sniper_adx"]),"rsi":safe_float(a["sniper_rsi"],50),
+                "close":c,"atr":safe_float(a["atr"]),"ef":ef,"es":es,"et":et,
+                "hist":safe_float(a["macd_hist"]),"hist_prev":safe_float(p["macd_hist"])}
+    except Exception:
+        return {"dir":0,"adx":0.0,"rsi":50.0,"close":0.0,"atr":0.0,"ef":0.0,"es":0.0,"et":0.0,"hist":0.0,"hist_prev":0.0}
+
+
+def _v5_regime(symbol):
+    h1 = _v5_tf_detail(symbol, "1h")
+    h4 = _v5_tf_detail(symbol, "4h")
+    aligned = h1["dir"] != 0 and h1["dir"] == h4["dir"]
+    strong = aligned and (h1["adx"] >= V5_TREND_MIN_ADX or h4["adx"] >= V5_TREND_MIN_ADX)
+    if strong:
+        return "TREND", h1["dir"], h1, h4
+    # Range is deliberately conservative: no clean aligned HTF stack and low-ish 1H ADX.
+    if not aligned and h1["adx"] <= V5_RANGE_MAX_ADX:
+        return "RANGE", 0, h1, h4
+    return "MIXED", 0, h1, h4
+
+
+def _v5_btc_gate(symbol, d):
+    if not V5_BTC_GATE or symbol == SNIPER_V3_BTC_SYMBOL:
+        return True, "BTC-self/off"
+    btc = sniper_v3_btc_context()
+    b1, b4 = btc["h1"]["dir"], btc["h4"]["dir"]
+    # Do not take an alt directly against a fully aligned BTC macro impulse.
+    if b1 == -d and b4 == -d:
+        return False, f"BTC1H{b1:+d}/4H{b4:+d}-against"
+    return True, f"BTC1H{b1:+d}/4H{b4:+d}"
+
+
+def _v5_5m_confirm(symbol, d):
+    try:
+        f = sniper_indicators(ohlcv_df(symbol, "5m"))
+        if len(f) < 40: return 0, {}
+        a,p = f.iloc[-2],f.iloc[-3]
+        c,o = safe_float(a["close"]),safe_float(a["open"])
+        ef,es = safe_float(a["ema_fast"]),safe_float(a["ema_slow"])
+        directional = (c>o and c>ef) if d==1 else (c<o and c<ef)
+        stack = (ef>es) if d==1 else (ef<es)
+        micro = c>safe_float(p["high"]) if d==1 else c<safe_float(p["low"])
+        hist = safe_float(a["macd_hist"])>safe_float(p["macd_hist"]) if d==1 else safe_float(a["macd_hist"])<safe_float(p["macd_hist"])
+        # Four components; 2 is acceptable, 3+ is preferred.
+        n=int(directional)+int(stack)+int(micro)+int(hist)
+        return n,{"directional":directional,"stack":stack,"micro":micro,"hist":hist}
+    except Exception:
+        return 0,{}
+
+
+def _v5_plan(df, side, mode):
+    a=df.iloc[-2]; d=1 if side=="long" else -1
+    entry=safe_float(a["close"]); atr=safe_float(a["atr"])
+    if entry<=0 or atr<=0: return None
+    if mode=="TREND":
+        recent=df.iloc[-9:-1]
+        structure=safe_float(recent["low"].min())-0.10*atr if d==1 else safe_float(recent["high"].max())+0.10*atr
+        atr_stop=entry-d*V5_TREND_STOP_ATR*atr
+        raw=min(atr_stop,structure) if d==1 else max(atr_stop,structure)
+        risk=min(abs(entry-raw),1.55*atr); risk=max(risk,0.78*atr)
+        final_r=V5_TREND_FINAL_R
+    else:
+        # Sweep stop belongs just beyond the rejection extreme, but never absurdly tight/wide.
+        extreme=safe_float(a["low"])-0.10*atr if d==1 else safe_float(a["high"])+0.10*atr
+        atr_stop=entry-d*V5_SWEEP_STOP_ATR*atr
+        raw=min(atr_stop,extreme) if d==1 else max(atr_stop,extreme)
+        risk=min(abs(entry-raw),1.25*atr); risk=max(risk,0.60*atr)
+        final_r=V5_SWEEP_FINAL_R
+    return {"risk_distance":risk,"atr":atr,"origin":f"V5 {mode.lower()} structure","final_r":final_r}
+
+
+def _v5_trend_candidate(symbol, df, h1, h4, d):
+    a,p=df.iloc[-2],df.iloc[-3]
+    side="long" if d==1 else "short"
+    atr=safe_float(a["atr"]); atr_mean=safe_float(a["atr_mean"])
+    if atr<=0: return None
+    c,o,h,l=safe_float(a["close"]),safe_float(a["open"]),safe_float(a["high"]),safe_float(a["low"])
+    ef,es,et=safe_float(a["ema_fast"]),safe_float(a["ema_slow"]),safe_float(a["ema_trend"])
+    rsi=safe_float(a["sniper_rsi"],50); adx=safe_float(a["sniper_adx"])
+    hist=safe_float(a["macd_hist"]); histp=safe_float(p["macd_hist"])
+    volm=safe_float(a["vol_mean"]); vol=safe_float(a["volume"]); vol_spike=volm>0 and vol>=volm*1.10
+    vol_ratio=atr/atr_mean if atr_mean>0 else 99
+    recent=df.iloc[-(V5_PULLBACK_LOOKBACK+2):-1]
+    # Pullback must have interacted with EMA21/EMA9 zone recently, then current closed candle reclaims direction.
+    if d==1:
+        touched=(recent["low"] <= recent["ema_slow"] + 0.12*recent["atr"]).any()
+        reclaim=c>ef and c>es and c>o
+        trend15=ef>es>et and c>et
+        rsi_ok=50<=rsi<=69
+        macd_turn=hist>histp
+    else:
+        touched=(recent["high"] >= recent["ema_slow"] - 0.12*recent["atr"]).any()
+        reclaim=c<ef and c<es and c<o
+        trend15=ef<es<et and c<et
+        rsi_ok=31<=rsi<=50
+        macd_turn=hist<histp
+    body=d*(c-o)/atr
+    extension=d*(c-es)/atr
+    five_n,_=_v5_5m_confirm(symbol,d)
+    btc_ok,btc_note=_v5_btc_gate(symbol,d)
+    q=0.0
+    q+=22 if touched else 0
+    q+=18 if reclaim else 0
+    q+=14 if trend15 else 0
+    q+=12 if macd_turn else 0
+    q+=10 if rsi_ok else 0
+    q+=10 if five_n>=V5_MIN_5M_CONFIRM else 0
+    q+=6 if five_n>=3 else 0
+    q+=4 if vol_spike else 0
+    q+=min(4,max(0,(h1["adx"]-V5_TREND_MIN_ADX)*0.4))
+    skip=None
+    if not touched: skip="no-15m-pullback"
+    elif not reclaim: skip="pullback-not-reclaimed"
+    elif not trend15: skip="15m-stack-not-restored"
+    elif not macd_turn: skip="15m-macd-not-turning"
+    elif not rsi_ok: skip=f"rsi-{rsi:.0f}-not-reset"
+    elif five_n<V5_MIN_5M_CONFIRM: skip=f"5m-confirm-{five_n}/4"
+    elif vol_ratio>V5_MAX_VOL_RATIO: skip=f"volatility-{vol_ratio:.2f}x"
+    elif extension>V5_TREND_MAX_EXT_ATR: skip=f"trend-entry-chased-{extension:.2f}ATR"
+    elif body<0.10: skip=f"weak-reclaim-body-{body:.2f}ATR"
+    elif not btc_ok: skip=btc_note
+    elif q<V5_TREND_MIN_QUALITY: skip=f"quality-{q:.0f}<{V5_TREND_MIN_QUALITY:.0f}"
+    plan=_v5_plan(df,side,"TREND")
+    if not plan: skip="invalid-plan"
+    return {"symbol":symbol,"side":side,"score":q,"score_max":100.0,"threshold":V5_TREND_MIN_QUALITY,
+            "grade":"A+" if q>=88 else "A" if q>=V5_TREND_MIN_QUALITY else "C","skip":skip,
+            "entry_route":"TREND-PULLBACK" if skip is None else "WAIT","strategy":"TREND",
+            "price":c,"atr":atr,"adx":adx,"rsi":rsi,"signal_bar_ts":int(a["ts"]),
+            "vol_ratio":vol_ratio,"volume_above":vol_spike,"risk_distance":plan["risk_distance"] if plan else 0,
+            "stop_origin":plan["origin"] if plan else "N/A","final_r":V5_TREND_FINAL_R,
+            "htf_state":"ALIGNED","h4_state":"ALIGNED","htf_adx":h1["adx"],"h4_adx":h4["adx"],
+            "five_confirm":five_n,"extension_atr":extension,"body_atr":body,"btc_note":btc_note,
+            "quality":q + min(h1["adx"],35)*0.25 + min(h4["adx"],35)*0.20}
+
+
+def _v5_sweep_candidate(symbol, df, h1, h4):
+    a,p=df.iloc[-2],df.iloc[-3]
+    atr=safe_float(a["atr"]); atr_mean=safe_float(a["atr_mean"])
+    if atr<=0:return None
+    c,o,h,l=safe_float(a["close"]),safe_float(a["open"]),safe_float(a["high"]),safe_float(a["low"])
+    prior=df.iloc[-(V5_SWEEP_LOOKBACK+2):-2]
+    prior_hi=safe_float(prior["high"].max()); prior_lo=safe_float(prior["low"].min())
+    bull_sweep=l<prior_lo-0.03*atr and c>prior_lo
+    bear_sweep=h>prior_hi+0.03*atr and c<prior_hi
+    if not bull_sweep and not bear_sweep:
+        return {"symbol":symbol,"side":None,"score":0,"score_max":100,"grade":"-","skip":"range-no-liquidity-sweep",
+                "entry_route":"WAIT","strategy":"RANGE","price":c,"atr":atr,"adx":safe_float(a["sniper_adx"]),"signal_bar_ts":int(a["ts"])}
+    d=1 if bull_sweep else -1; side="long" if d==1 else "short"
+    rng=max(h-l,1e-12); lower=min(o,c)-l; upper=h-max(o,c)
+    wick=(lower/rng) if d==1 else (upper/rng)
+    body=d*(c-o)/atr
+    rsi=safe_float(a["sniper_rsi"],50); adx=safe_float(a["sniper_adx"])
+    hist=safe_float(a["macd_hist"]); histp=safe_float(p["macd_hist"])
+    macd_turn=hist>histp if d==1 else hist<histp
+    rsi_ok=rsi>=38 if d==1 else rsi<=62
+    volm=safe_float(a["vol_mean"]); vol=safe_float(a["volume"]); vol_spike=volm>0 and vol>=volm*1.05
+    vol_ratio=atr/atr_mean if atr_mean>0 else 99
+    five_n,_=_v5_5m_confirm(symbol,d)
+    btc_ok,btc_note=_v5_btc_gate(symbol,d)
+    reclaim_depth=(c-prior_lo)/atr if d==1 else (prior_hi-c)/atr
+    q=38.0
+    q+=16 if wick>=0.32 else 8 if wick>=0.22 else 0
+    q+=12 if body>=0.12 else 5 if body>0 else 0
+    q+=10 if macd_turn else 0
+    q+=8 if rsi_ok else 0
+    q+=10 if five_n>=V5_MIN_5M_CONFIRM else 0
+    q+=4 if five_n>=3 else 0
+    q+=4 if vol_spike else 0
+    skip=None
+    if wick<0.22: skip=f"sweep-wick-{wick:.2f}"
+    elif body<=0: skip="sweep-no-rejection-body"
+    elif not macd_turn: skip="sweep-macd-not-turning"
+    elif five_n<V5_MIN_5M_CONFIRM: skip=f"5m-confirm-{five_n}/4"
+    elif vol_ratio>V5_MAX_VOL_RATIO: skip=f"volatility-{vol_ratio:.2f}x"
+    elif not btc_ok: skip=btc_note
+    elif q<V5_SWEEP_MIN_QUALITY: skip=f"quality-{q:.0f}<{V5_SWEEP_MIN_QUALITY:.0f}"
+    plan=_v5_plan(df,side,"SWEEP")
+    if not plan: skip="invalid-plan"
+    return {"symbol":symbol,"side":side,"score":q,"score_max":100.0,"threshold":V5_SWEEP_MIN_QUALITY,
+            "grade":"A+" if q>=90 else "A" if q>=V5_SWEEP_MIN_QUALITY else "C","skip":skip,
+            "entry_route":"RANGE-SWEEP" if skip is None else "WAIT","strategy":"SWEEP",
+            "price":c,"atr":atr,"adx":adx,"rsi":rsi,"signal_bar_ts":int(a["ts"]),
+            "vol_ratio":vol_ratio,"volume_above":vol_spike,"risk_distance":plan["risk_distance"] if plan else 0,
+            "stop_origin":plan["origin"] if plan else "N/A","final_r":V5_SWEEP_FINAL_R,
+            "htf_state":"RANGE","h4_state":"RANGE","htf_adx":h1["adx"],"h4_adx":h4["adx"],
+            "five_confirm":five_n,"wick_ratio":wick,"reclaim_depth":reclaim_depth,"body_atr":body,
+            "btc_note":btc_note,"quality":q}
+
+
+def evaluate_symbol(symbol, btc=None):
+    df=sniper_indicators(ohlcv_df(symbol,SNIPER_TF))
+    if len(df)<max(SNIPER_TREND*3,190): return None
+    regime,d,h1,h4=_v5_regime(symbol)
+    a=df.iloc[-2]
+    if regime=="TREND": return _v5_trend_candidate(symbol,df,h1,h4,d)
+    if regime=="RANGE": return _v5_sweep_candidate(symbol,df,h1,h4)
+    return {"symbol":symbol,"side":None,"score":0,"score_max":100,"grade":"-","skip":"mixed-regime-no-trade",
+            "entry_route":"WAIT","strategy":"MIXED","price":safe_float(a["close"]),"atr":safe_float(a["atr"]),
+            "adx":safe_float(a["sniper_adx"]),"signal_bar_ts":int(a["ts"]),"htf_adx":h1["adx"],"h4_adx":h4["adx"]}
+
+
+def sizing_profile(signal):
+    mode=signal.get("strategy","TREND")
+    elite=safe_float(signal.get("score"))>=90 and int(signal.get("five_confirm",0))>=3
+    if elite: return {"name":"V5-ELITE","risk_pct":V5_ELITE_RISK_PCT,"target_net_tp":V5_TREND_TARGET_NET if mode=="TREND" else V5_SWEEP_TARGET_NET}
+    if mode=="SWEEP": return {"name":"V5-SWEEP","risk_pct":V5_SWEEP_RISK_PCT,"target_net_tp":V5_SWEEP_TARGET_NET}
+    return {"name":"V5-TREND","risk_pct":V5_TREND_RISK_PCT,"target_net_tp":V5_TREND_TARGET_NET}
+
+
+def calculate_contracts_v5(symbol,entry,sl,equity,available,risk_pct,target_net_tp,tp_r):
+    meta=get_instrument(symbol); cv=safe_float(meta.get("contractValue")); min_size=safe_float(meta.get("minSize")); lot=safe_float(meta.get("lotSize")); max_market=safe_float(meta.get("maxMarketSize",0))
+    if cv<=0 or min_size<=0 or lot<=0:return None
+    stop_pct=abs(entry-sl)/entry
+    if stop_pct<=0:return None
+    risk_budget=equity*risk_pct; risk_notional_cap=risk_budget/stop_pct
+    margin_cap=min(BASE_MARGIN_USDT,MAX_MARGIN_USDT,equity*MAX_MARGIN_EQUITY_PCT,max(0.0,available*AVAILABLE_MARGIN_BUFFER))
+    margin_notional_cap=margin_cap*LEVERAGE
+    cost_rate=TAKER_FEE_RATE*2+SLIPPAGE_RATE; net_tp_rate=tp_r*stop_pct-cost_rate
+    if net_tp_rate<=0:return None
+    desired_notional=target_net_tp/net_tp_rate
+    target_notional=min(desired_notional,risk_notional_cap,margin_notional_cap)
+    contracts=floor_step(target_notional/(cv*entry),lot)
+    if contracts<min_size:contracts=min_size
+    if max_market>0:contracts=min(contracts,floor_step(max_market,lot))
+    if contracts<min_size:return None
+    notional=contracts*cv*entry; margin=notional/LEVERAGE
+    if notional*stop_pct>risk_budget+1e-9 or margin>margin_cap+1e-9:return None
+    cost=roundtrip_cost(notional); expected_tp=notional*tp_r*stop_pct
+    if expected_tp-cost<MIN_NET_TP_USDT:return None
+    return {"contracts":contracts,"notional":notional,"margin":margin,"expected_net_tp_usdt":expected_tp-cost,
+            "expected_net_sl_usdt":notional*stop_pct+cost,"risk_budget":risk_budget}
+
+
+def _v5_levels(signal,live,tick):
+    side=signal["side"]; d=1 if side=="long" else -1; risk=safe_float(signal.get("risk_distance")); mode=signal.get("strategy")
+    if live<=0 or risk<=0:return None
+    if mode=="SWEEP": tp1r,tp2r,finalr=V5_SWEEP_TP1_R,V5_SWEEP_TP2_R,V5_SWEEP_FINAL_R
+    else: tp1r,tp2r,finalr=V5_TREND_TP1_R,V5_TREND_TP2_R,V5_TREND_FINAL_R
+    sl=round_trade_price(live-d*risk,tick,side,"sl"); t1=round_trade_price(live+d*risk*tp1r,tick,side,"tp"); t2=round_trade_price(live+d*risk*tp2r,tick,side,"tp"); t3=round_trade_price(live+d*risk*finalr,tick,side,"tp")
+    return sl,t1,t2,t3,risk,finalr
+
+
+def sniper_portfolio_allows(signal,positions):
+    side=signal.get("side"); same=sum(1 for p in positions if position_side(p)==side)
+    if same>=V5_MAX_SAME_SIDE:return False,f"max-{V5_MAX_SAME_SIDE}-same-side"
+    # After two losses on one side, require an elite setup rather than banning the direction.
+    if sniper_side_loss_streak.get(side,0)>=2 and safe_float(signal.get("score"))<90:
+        return False,f"{side}-loss-streak-needs-elite"
+    return True,"OK"
+
+
+def open_trade(signal):
+    global protection_lock
+    symbol,side=signal["symbol"],signal["side"]; mode=signal.get("strategy","TREND")
+    acc=futures_account(); equity,available=acc["total_equity"],acc["available"]; reset_daily_if_needed(equity)
+    if equity<MIN_EQUITY_USDT or available<=0 or (not PAPER_TRADING and protection_lock):return False
+    tick=safe_float(get_instrument(symbol).get("tickSize"),0.0001); live=safe_float(exchange.fetch_ticker(symbol).get("last"),signal["price"]); sig=safe_float(signal["price"])
+    if live<=0 or sig<=0:return False
+    d=1 if side=="long" else -1; adverse=d*((live-sig)/sig)
+    if adverse>SNIPER_MAX_FILL_DRIFT:
+        tg(f"⏭️ {symbol} {side.upper()} V5 too late\nAdverse drift {adverse*100:.2f}% > {SNIPER_MAX_FILL_DRIFT*100:.2f}%");return False
+    levels=_v5_levels(signal,live,tick)
+    if not levels:return False
+    sl,t1,t2,t3,risk,finalr=levels; profile=sizing_profile(signal)
+    sizing=calculate_contracts_v5(symbol,live,sl,equity,available,profile["risk_pct"],profile["target_net_tp"],finalr)
+    if not sizing or sizing["margin"]>available*AVAILABLE_MARGIN_BUFFER:return False
+    before_ids={position_id(p) for p in get_positions() if position_id(p)}
+    oklev,levres=set_leverage(symbol,LEVERAGE)
+    if not oklev:tg(f"⛔ LEVERAGE FAILED\n{symbol}\n{levres}");return False
+    tag="ps5t" if mode=="TREND" else "ps5s"
+    payload={"instId":blofin_inst_id(symbol),"marginMode":MARGIN_MODE,"positionSide":"net","side":"buy" if side=="long" else "sell","orderType":"market","size":str(sizing["contracts"]),"tpTriggerPrice":str(t3),"tpOrderPrice":"-1","tpTriggerPriceType":"mark","slTriggerPrice":str(sl),"slOrderPrice":"-1","slTriggerPriceType":"mark","clientOrderId":f"{tag}{int(time.time()*1000)%1000000000}"}
+    if BROKER_ID:payload["brokerId"]=BROKER_ID
+    msg=(f"{'🧪 PAPER' if PAPER_TRADING else '🧠 V5 ADAPTIVE ENTRY'} v{SNIPER_VERSION}\n{symbol} {side.upper()} · {mode} · {signal['grade']} {signal['score']:.0f}/100\n"
+         f"5m confirm {signal.get('five_confirm',0)}/4 · 1H ADX {signal.get('htf_adx',0):.1f} · 4H ADX {signal.get('h4_adx',0):.1f}\nBTC {signal.get('btc_note','-')}\n"
+         f"Entry ~ {live:.8g}\nSL {sl:.8g}\nTP1 {t1:.8g}\nTP2 {t2:.8g}\nTP final {t3:.8g} ({finalr:.2f}R)\n"
+         f"Risk cap {profile['risk_pct']*100:.1f}% · expected TP net ~${sizing['expected_net_tp_usdt']:.2f} · SL+cost ~${sizing['expected_net_sl_usdt']:.2f}\n"
+         f"Notional ${sizing['notional']:.2f} · Margin ${sizing['margin']:.2f} · {LEVERAGE}x\nAdverse drift {max(0,adverse)*100:.2f}%/{SNIPER_MAX_FILL_DRIFT*100:.2f}%")
+    if PAPER_TRADING:tg(msg);return True
+    resp=native("private_post_trade_order",payload)
+    if not native_ok(resp):
+        err=response_error(resp)
+        if "152012" in err:protection_lock=True
+        tg(f"❌ V5 ORDER FAILED\n{symbol} {side.upper()}\n{err}");return False
+    tg(msg); new_pos=find_new_position(symbol,before_ids,timeout=8)
+    if new_pos is None:tg(f"⚠️ {symbol}: V5 order accepted, position not visible yet.");return True
+    pid=position_id(new_pos)
+    if pid:
+        sniper_managed_positions.add(pid); _v5_position_meta[pid]={"mode":mode,"risk":risk,"final_r":finalr,"tp1":t1,"tp2":t2,"opened":time.time()}
+    if has_live_protection(new_pos)[0]:tg(f"🛡️ V5 PROTECTION CONFIRMED\n{symbol} {side.upper()} · {mode}\nTP final + SL visible.");return True
+    last=safe_float(exchange.fetch_ticker(symbol).get("last"))
+    if tpsl_prices_valid(side,sl,t3,last):
+        ok,res=place_tpsl_for_position(new_pos,sl,t3,client_tag=tag)
+        if ok:tg(f"🛡️ V5 FALLBACK PROTECTION CONFIRMED\n{symbol}");return True
+        protection_lock=True;tg(f"🚨 V5 PROTECTION FAILURE\n{symbol}\n{res}\nNEW TRADES PAUSED.");return True
+    protection_lock=True;tg(f"🚨 {symbol}: V5 position exists but safe fallback protection failed.\nNEW TRADES PAUSED.");return True
+
+
+def _v5_managed(p):
+    pid=position_id(p)
+    if pid in sniper_managed_positions or pid in _v5_position_meta:return True
+    try:
+        ok,probe=has_live_protection(p); cid=str((probe or {}).get("clientOrderId","") or "")
+        if cid.startswith(("ps5t","ps5s")):
+            if pid:sniper_managed_positions.add(pid)
+            return True
+    except Exception:pass
+    return False
+
+
+def _v5_close_position(p,reason):
+    payload={"instId":p["instId"],"marginMode":position_margin_mode(p),"positionSide":str(p.get("positionSide","net") or "net"),"clientOrderId":f"ps5x{int(time.time()*1000)%1000000000}"}
+    pid=position_id(p)
+    if pid:payload["positionId"]=pid
+    if BROKER_ID:payload["brokerId"]=BROKER_ID
+    resp=native("private_post_trade_close_position",payload)
+    if native_ok(resp):tg(f"⚡ V5 ACTIVE EXIT\n{position_symbol(p)} {position_side(p).upper()}\n{reason}\nClosed at market.");return True
+    tg(f"⚠️ V5 ACTIVE EXIT FAILED\n{position_symbol(p)}\n{response_error(resp)}");return False
+
+
+def manage_sniper_step_stops():
+    if PAPER_TRADING:return
+    now=time.time()
+    for p in get_positions():
+        if not _v5_managed(p):continue
+        symbol,side,entry=position_symbol(p),position_side(p),position_entry(p); pid=position_id(p)
+        if entry<=0:continue
+        ok,order=has_live_protection(p)
+        if not ok or not order:continue
+        tp=safe_float(order.get("tpTriggerPrice")); current_sl=safe_float(order.get("slTriggerPrice"))
+        if tp<=0 or current_sl<=0:continue
+        meta=_v5_position_meta.get(pid,{})
+        mode=meta.get("mode")
+        if not mode:
+            # Best-effort restart adoption only while the original stop is still intact.
+            base_risk=abs(entry-current_sl); rr=abs(tp-entry)/base_risk if base_risk>0 else 0
+            mode="SWEEP" if 1.35<=rr<=1.85 else "TREND" if 2.15<=rr<=2.85 else None
+            if not mode:continue
+            meta={"mode":mode,"risk":base_risk,"final_r":V5_SWEEP_FINAL_R if mode=="SWEEP" else V5_TREND_FINAL_R,"opened":safe_float(p.get("createTime"))/1000.0}; _v5_position_meta[pid]=meta
+        risk=safe_float(meta.get("risk")); d=1 if side=="long" else -1
+        if risk<=0:continue
+        current=safe_float(exchange.fetch_ticker(symbol).get("last"),entry); current_r=d*(current-entry)/risk
+        extreme=sniper_recent_extreme(symbol,side); tick=safe_float(get_instrument(symbol).get("tickSize"),0.0001)
+        if mode=="SWEEP":tp1r,tp2r,lockr=V5_SWEEP_TP1_R,V5_SWEEP_TP2_R,V5_SWEEP_LOCK_R; soft,hard=V5_SWEEP_SOFT_EXIT_MIN,V5_SWEEP_HARD_EXIT_MIN
+        else:tp1r,tp2r,lockr=V5_TREND_TP1_R,V5_TREND_TP2_R,V5_TREND_LOCK_R; soft,hard=V5_TREND_SOFT_EXIT_MIN,V5_TREND_HARD_EXIT_MIN
+        hit1=extreme>=entry+d*risk*tp1r if d==1 else extreme<=entry+d*risk*tp1r
+        hit2=extreme>=entry+d*risk*tp2r if d==1 else extreme<=entry+d*risk*tp2r
+        desired=None;stage=None
+        if hit2:desired=round_trade_price(entry+d*risk*lockr,tick,side,"sl");stage="TP2"
+        elif hit1:desired=round_trade_price(entry,tick,side,"sl");stage="TP1"
+        # Trend positions get an EMA21/ATR ratchet after TP2; this lets winners run without giving the trend back.
+        if mode=="TREND" and hit2:
+            try:
+                df=sniper_indicators(ohlcv_df(symbol,"15m")); a=df.iloc[-2]; atr=safe_float(a["atr"]); es=safe_float(a["ema_slow"])
+                trail=es-d*0.25*atr
+                trail=round_trade_price(trail,tick,side,"sl")
+                if d==1:desired=max(desired,trail)
+                else:desired=min(desired,trail)
+                stage="TP2+EMA21"
+            except Exception:pass
+        if desired is not None:
+            improves=desired>current_sl+tick*0.1 if d==1 else desired<current_sl-tick*0.1
+            if improves:
+                ok2,res=amend_tpsl_stop(p,desired); key=f"{pid}:{stage}:{desired}"
+                if ok2 and not sniper_step_notified.get(key):tg(f"🪜 V5 STEP STOP\n{symbol} {side.upper()} · {mode}\n{stage} → SL {desired:.8g}");sniper_step_notified[key]=True
+        opened=safe_float(meta.get("opened")) or safe_float(p.get("createTime"))/1000.0
+        age=(now-opened)/60 if opened>0 else 0
+        # Thesis invalidation: trend setup loses 15m EMA55 with MACD turning against it.
+        if mode=="TREND" and age>=30:
+            try:
+                df=sniper_indicators(ohlcv_df(symbol,"15m")); a,pr=df.iloc[-2],df.iloc[-3]; c=safe_float(a["close"]); et=safe_float(a["ema_trend"]); hist=safe_float(a["macd_hist"]); hp=safe_float(pr["macd_hist"])
+                invalid=(c<et and hist<hp) if d==1 else (c>et and hist>hp)
+                if invalid and current_r<0.35:_v5_close_position(p,f"TREND thesis invalidated after {age:.0f}m ({current_r:+.2f}R).");continue
+            except Exception:pass
+        if age>=hard:_v5_close_position(p,f"{mode} hard time exit {age:.0f}m ({current_r:+.2f}R).");continue
+        soft_floor=0.20 if mode=="SWEEP" else 0.25
+        if age>=soft and current_r<soft_floor:_v5_close_position(p,f"{mode} no follow-through after {age:.0f}m ({current_r:+.2f}R).");continue
+
+
+
+def repair_one_position(p):
+    """V5 emergency protection repair. Preserve the V5 strategy's own final-R profile."""
+    symbol,side,entry=position_symbol(p),position_side(p),position_entry(p)
+    if entry<=0:return False
+    if has_live_protection(p)[0]:return True
+    pid=position_id(p); meta=_v5_position_meta.get(pid,{})
+    mode=meta.get("mode","TREND"); risk=safe_float(meta.get("risk"))
+    if risk<=0:
+        try:
+            df=sniper_indicators(ohlcv_df(symbol,SNIPER_TF)); atr=safe_float(df.iloc[-2]["atr"]); risk=(V5_SWEEP_STOP_ATR if mode=="SWEEP" else V5_TREND_STOP_ATR)*atr
+        except Exception:return False
+    if risk<=0:return False
+    finalr=V5_SWEEP_FINAL_R if mode=="SWEEP" else V5_TREND_FINAL_R; d=1 if side=="long" else -1
+    tick=safe_float(get_instrument(symbol).get("tickSize"),0.0001)
+    sl=round_trade_price(entry-d*risk,tick,side,"sl"); tp=round_trade_price(entry+d*risk*finalr,tick,side,"tp")
+    last=safe_float(exchange.fetch_ticker(symbol).get("last"))
+    if not tpsl_prices_valid(side,sl,tp,last):return False
+    tag="ps5s" if mode=="SWEEP" else "ps5t"
+    return place_tpsl_for_position(p,sl,tp,client_tag=tag)[0]
+
+def seed_closed_history_v5():
+    """Rebuild today's dashboard on restart instead of pretending the day starts at bot boot."""
+    global consecutive_losses
+    reset_daily_if_needed()
+    records=closed_positions_history(100)
+    today=amsterdam_today(); todays=[]
+    try:
+        from zoneinfo import ZoneInfo
+        tz=ZoneInfo("Europe/Amsterdam")
+    except Exception:tz=timezone(timedelta(hours=2))
+    for r in records:
+        hid=str(r.get("historyId",""))
+        if hid:seen_closed_history_ids.add(hid)
+        ts=safe_float(r.get("updateTime"))/1000.0
+        if ts<=0:continue
+        if datetime.fromtimestamp(ts,tz).date().isoformat()==today:todays.append(r)
+    # Rebuild counters in chronological order.
+    daily.update({"trades":0,"wins":0,"losses":0,"net":0.0,"long_trades":0,"long_wins":0,"long_net":0.0,"short_trades":0,"short_wins":0,"short_net":0.0})
+    consecutive_losses=0; sniper_side_loss_streak["long"]=0; sniper_side_loss_streak["short"]=0
+    for r in sorted(todays,key=lambda x:safe_float(x.get("updateTime"))):
+        side=infer_side(r); bucket="short" if side=="short" else "long"; gross=safe_float(r.get("realizedPnl")); fee=abs(safe_float(r.get("fee"))); net=gross-fee
+        daily["trades"]+=1;daily["net"]+=net;daily[f"{bucket}_trades"]+=1;daily[f"{bucket}_net"]+=net
+        if net>=0:daily["wins"]+=1;daily[f"{bucket}_wins"]+=1;consecutive_losses=0;sniper_side_loss_streak[bucket]=0
+        else:daily["losses"]+=1;consecutive_losses+=1;sniper_side_loss_streak[bucket]=sniper_side_loss_streak.get(bucket,0)+1
+    try:
+        current_equity=futures_account()["total_equity"]
+        daily["start_equity"]=current_equity-daily["net"]
+    except Exception:
+        pass
+    tg(f"📚 V5 PNL TRACKER READY\nKnown closes: {len(seen_closed_history_ids)}\nToday's closes rebuilt: {daily['trades']} · W/L {daily['wins']}/{daily['losses']} · Net ${daily['net']:.2f}")
+
+
+def maybe_score_report(rows):
+    global _v5_last_report
+    now=time.time()
+    interesting=[r for r in rows if r and (r.get("side") or r.get("strategy") in ("TREND","RANGE"))]
+    if not interesting or now-_v5_last_report<SNIPER_REPORT_MIN*60:return
+    _v5_last_report=now
+    ranked=sorted(interesting,key=lambda r:safe_float(r.get("quality",r.get("score",0))),reverse=True)[:10]
+    lines=[f"🧠 PRECISION SNIPER v{SNIPER_VERSION} · ADAPTIVE REGIME ROUTER"]
+    for r in ranked:
+        state="🟢 READY" if r.get("side") and not r.get("skip") else f"⏭ {r.get('skip','wait')}"
+        lines.append(f"{r['symbol'].split('/')[0]} {str(r.get('side') or '-').upper()} {r.get('strategy','-')} Q{safe_float(r.get('score')):.0f} 5m{r.get('five_confirm','-')} ADX{safe_float(r.get('adx')):.0f} {state}")
+    tg("\n".join(lines))
+
+
+def startup_diagnostics():
+    acc=futures_account();reset_daily_if_needed(acc["total_equity"])
+    tg(f"🧠 PRECISION SNIPER BOT STARTED v{SNIPER_VERSION}\nMode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
+       f"NEW ENGINE: ADAPTIVE REGIME ROUTER — NO crossover entries, NO blind reversal\n"
+       f"TREND: 4H+1H aligned → 15m pullback/reclaim → >= {V5_MIN_5M_CONFIRM}/4 5m confirm · Q>={V5_TREND_MIN_QUALITY:.0f}\n"
+       f"RANGE: low/mixed HTF → 15m liquidity sweep/rejection → >= {V5_MIN_5M_CONFIRM}/4 5m confirm · Q>={V5_SWEEP_MIN_QUALITY:.0f}\n"
+       f"MIXED regime = NO TRADE\nBTC macro gate: {'ON' if V5_BTC_GATE else 'OFF'}\n"
+       f"TREND exit: {V5_TREND_TP1_R:.2f}R→BE · {V5_TREND_TP2_R:.2f}R→lock/trail · {V5_TREND_FINAL_R:.2f}R final · hard {V5_TREND_HARD_EXIT_MIN}m\n"
+       f"SWEEP exit: {V5_SWEEP_TP1_R:.2f}R→BE · {V5_SWEEP_TP2_R:.2f}R→lock · {V5_SWEEP_FINAL_R:.2f}R final · hard {V5_SWEEP_HARD_EXIT_MIN}m\n"
+       f"Risk caps: trend {V5_TREND_RISK_PCT*100:.1f}% · sweep {V5_SWEEP_RISK_PCT*100:.1f}% · elite {V5_ELITE_RISK_PCT*100:.1f}% · max positions {MAX_ACTIVE_POSITIONS}\n"
+       f"Equity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}")
+
+
+def main():
+    global protection_lock
+    load_learning();startup_diagnostics()
+    if not PAPER_TRADING:
+        try:seed_closed_history_v5()
+        except Exception as e:tg(f"⚠️ V5 PNL seed warning\n{e}")
+        try:
+            inherited=get_positions();protection_lock=not all_positions_protected() if inherited else False
+            if inherited:tg(f"ℹ️ V5 HANDOVER\n{len(inherited)} existing position(s). Existing protection left untouched."+("\n⚠️ Unprotected position detected: entries locked." if protection_lock else "\n✅ Protection verified."))
+        except Exception as e:protection_lock=True;tg(f"🚨 STARTUP PROTECTION CHECK FAILED\n{e}")
+    while True:
+        try:
+            if not PAPER_TRADING:
+                try:check_for_closed_positions()
+                except Exception as e:tg(f"⚠️ PNL TRACKER ERROR\n{e}")
+                try:manage_sniper_step_stops()
+                except Exception as e:tg(f"⚠️ V5 MANAGER ERROR\n{e}")
+            acc=futures_account();ok,reason=check_daily_risk(acc["total_equity"])
+            if not ok:tg(f"🛑 {reason}");time.sleep(120);continue
+            if time.time()<loss_pause_until:time.sleep(SCAN_SECONDS);continue
+            positions=get_positions()
+            if not PAPER_TRADING:protection_watch();positions=get_positions()
+            if protection_lock and not PAPER_TRADING:time.sleep(SCAN_SECONDS);continue
+            scanned=[];candidates=[];existing={position_symbol(p) for p in positions}
+            for symbol in SYMBOLS:
+                if not cooldown_ok(symbol):continue
+                try:
+                    s=evaluate_symbol(symbol)
+                    if not s:continue
+                    scanned.append(s)
+                    if s.get("side") and not s.get("skip") and s.get("entry_route") in ("TREND-PULLBACK","RANGE-SWEEP"):
+                        key=int(s.get("signal_bar_ts",0))
+                        if sniper_last_signal_bar.get(symbol)==key:continue
+                        if symbol in existing:sniper_last_signal_bar[symbol]=key;continue
+                        candidates.append(s)
+                except Exception:continue
+            maybe_score_report(scanned)
+            candidates.sort(key=lambda x:(safe_float(x.get("quality")),1 if x.get("strategy")=="TREND" else 0,int(x.get("five_confirm",0))),reverse=True)
+            attempts=0
+            for s in candidates:
+                if len(get_positions())>=MAX_ACTIVE_POSITIONS or attempts>=MAX_EXECUTION_ATTEMPTS_PER_SCAN:break
+                allowed,why=sniper_portfolio_allows(s,get_positions())
+                if not allowed:
+                    sniper_last_signal_bar[s["symbol"]]=int(s.get("signal_bar_ts",0));tg(f"⏭️ {s['symbol']} {s['side'].upper()} V5 PORTFOLIO\n{why}");continue
+                attempts+=1;opened=open_trade(s);sniper_last_signal_bar[s["symbol"]]=int(s.get("signal_bar_ts",0))
+                if opened:symbol_last_trade[s["symbol"]]=time.time();break
+            time.sleep(SCAN_SECONDS)
+        except KeyboardInterrupt:tg("🛑 Precision Sniper V5 stopped.");raise
+        except Exception as e:
+            msg=f"{type(e).__name__}: {e}"
+            if "152002" in msg:time.sleep(20);continue
+            tg(f"⚠️ PRECISION SNIPER V5 LOOP ERROR\n{msg}");time.sleep(30)
+
 
 if __name__ == "__main__":
     main()
