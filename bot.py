@@ -10,7 +10,7 @@ import pandas as pd
 import requests
 
 # ============================================================
-# BLOFIN PRECISION STRUCTURE FUSION v6.0 - 4H + 15M EXECUTION EDITION
+# BLOFIN PRECISION STRUCTURE FUSION v6.2 - 4H + 15M LOCATION-FIRST EDITION
 # ============================================================
 # Strategy engine: faithful Python translation of the supplied TradingView
 # Precision Sniper [WillyAlgoTrader] v2.1 defaults for a 15m chart.
@@ -1490,7 +1490,7 @@ def reset_daily_if_needed(current_equity=None):
 # OPEN TRADE
 # ============================================================
 def open_trade(signal):
-    global protection_lock
+    global protection_lock, _v62_last_entry_time
     symbol, side = signal["symbol"], signal["side"]
     account = futures_account()
     equity, available = account["total_equity"], account["available"]
@@ -1718,7 +1718,7 @@ def notify_closed_trade(record):
     pause = f"\n⏸ {MAX_CONSECUTIVE_LOSSES} losses → pauze {LOSS_PAUSE_MIN} min" if consecutive_losses >= MAX_CONSECUTIVE_LOSSES else ""
     icon = "🟢" if net_pnl >= 0 else "🔴"
     tg(
-        f"{icon} PRECISION SNIPER CLOSED\n\n{symbol}\n{side.upper()}\n━━━━━━━━━━━━\n"
+        f"{icon} STRUCTURE FUSION CLOSED\n\n{symbol}\n{side.upper()}\n━━━━━━━━━━━━\n"
         f"Entry: {entry:.8g}\nExit: {exit_price:.8g}\nSize: {size:g}\n\n"
         f"💰 Realized: {'+' if gross_pnl >= 0 else ''}${gross_pnl:.2f}\n"
         f"📊 Ratio: {pnl_ratio:+.2f}%\n💸 Fee: -${fee:.2f}\n"
@@ -3708,7 +3708,8 @@ def open_trade(signal):
          f"Entry ~ {live:.8g}\nSL {sl:.8g}\nTP1 {t1:.8g}\nTP2 {t2:.8g}\nTP final {t3:.8g} ({finalr:.2f}R)\n"
          f"Risk cap {profile['risk_pct']*100:.1f}% · expected TP net ~${sizing['expected_net_tp_usdt']:.2f} · SL+cost ~${sizing['expected_net_sl_usdt']:.2f}\n"
          f"Notional ${sizing['notional']:.2f} · Margin ${sizing['margin']:.2f} · {LEVERAGE}x\nAdverse drift {max(0,adverse)*100:.2f}%/{SNIPER_MAX_FILL_DRIFT*100:.2f}%")
-    if PAPER_TRADING:tg(msg);return True
+    if PAPER_TRADING:
+        tg(msg);_v62_last_entry_time=time.time();return True
     resp=native("private_post_trade_order",payload)
     if not native_ok(resp):
         err=response_error(resp)
@@ -3831,14 +3832,14 @@ def repair_one_position(p):
     return place_tpsl_for_position(p,sl,tp,client_tag=tag)[0]
 
 def seed_closed_history_v5():
-    """V6.1: rebuild risk/PnL only from the intentional V6 risk epoch onward.
+    """V6.2: rebuild risk/PnL only from the intentional V6 risk epoch onward.
 
     Old V2-V5 closes earlier today remain known (so they are not re-notified), but they
     no longer count against the fresh Structure Fusion daily risk budget. The epoch is
     a fixed timestamp, so ordinary process restarts cannot repeatedly erase losses.
     On later Amsterdam dates, the normal start-of-day boundary is used.
     """
-    global consecutive_losses
+    global consecutive_losses, loss_pause_until
     reset_daily_if_needed()
     records=closed_positions_history(100)
     today=amsterdam_today(); scoped=[]
@@ -3876,23 +3877,29 @@ def seed_closed_history_v5():
                   "long_trades":0,"long_wins":0,"long_net":0.0,
                   "short_trades":0,"short_wins":0,"short_net":0.0})
     consecutive_losses=0; sniper_side_loss_streak["long"]=0; sniper_side_loss_streak["short"]=0
+    last_loss_ts=0.0
     for r in sorted(scoped,key=lambda x:safe_float(x.get("updateTime"))):
         side=infer_side(r); bucket="short" if side=="short" else "long"
         gross=safe_float(r.get("realizedPnl")); fee=abs(safe_float(r.get("fee"))); net=gross-fee
         daily["trades"]+=1; daily["net"]+=net; daily[f"{bucket}_trades"]+=1; daily[f"{bucket}_net"]+=net
         if net>=0:
-            daily["wins"]+=1; daily[f"{bucket}_wins"]+=1; consecutive_losses=0; sniper_side_loss_streak[bucket]=0
+            daily["wins"]+=1; daily[f"{bucket}_wins"]+=1; consecutive_losses=0; sniper_side_loss_streak[bucket]=0; last_loss_ts=0.0
         else:
             daily["losses"]+=1; consecutive_losses+=1; sniper_side_loss_streak[bucket]=sniper_side_loss_streak.get(bucket,0)+1
+            last_loss_ts=safe_float(r.get("updateTime"))/1000.0
+    # A process restart must never erase an already-active consecutive-loss pause.
+    loss_pause_until=0.0
+    if consecutive_losses>=MAX_CONSECUTIVE_LOSSES and last_loss_ts>0:
+        loss_pause_until=max(0.0,last_loss_ts+LOSS_PAUSE_MIN*60)
     try:
         current_equity=futures_account()["total_equity"]
         # If no closes occurred since the reset this is exactly current equity: 0.00% DD.
         daily["start_equity"]=current_equity-daily["net"]
     except Exception:
         pass
-    tg(f"📚 V6.1 RISK BASELINE READY\nRisk window starts: {risk_start.strftime('%Y-%m-%d %H:%M')} Amsterdam\n"
+    tg(f"📚 V6.2 RISK BASELINE READY\nRisk window starts: {risk_start.strftime('%Y-%m-%d %H:%M')} Amsterdam\n"
        f"Closes since reset: {daily['trades']} · W/L {daily['wins']}/{daily['losses']} · Net ${daily['net']:.2f}\n"
-       f"Risk baseline: ${safe_float(daily.get('start_equity')):.2f}")
+       f"Risk baseline: ${safe_float(daily.get('start_equity')):.2f}" + (f"\nLoss pause remains active until {datetime.fromtimestamp(loss_pause_until,tz).strftime('%H:%M')}" if loss_pause_until>time.time() else ""))
 
 
 def maybe_score_report(rows):
@@ -3978,7 +3985,7 @@ def main():
 
 
 # ============================================================
-# PRECISION STRUCTURE FUSION V6.0 — 4H + 15M ONLY
+# PRECISION STRUCTURE FUSION V6.2 — 4H + 15M LOCATION-FIRST
 # ============================================================
 # Design rules translated from the supplied chart examples:
 #   1) 4H decides directional regime; it never times the entry.
@@ -3989,7 +3996,7 @@ def main():
 #   5) Final target is 3R; stop is structural and never widened after entry.
 # No 1H and no 5M data are used by the active V6 engine.
 
-SNIPER_VERSION = "6.1.0"
+SNIPER_VERSION = "6.2.0"
 
 # V6.1 risk baseline: intentional reset when Structure Fusion became the active strategy.
 # This timestamp is persistent across process restarts, so a restart does NOT reset risk again.
@@ -4011,7 +4018,17 @@ V6_ZONE_TOL_ATR = float(os.getenv("V6_ZONE_TOL_ATR", "0.22"))
 V6_STOP_BUFFER_ATR = float(os.getenv("V6_STOP_BUFFER_ATR", "0.12"))
 V6_MIN_STOP_ATR = float(os.getenv("V6_MIN_STOP_ATR", "0.65"))
 V6_MAX_STOP_ATR = float(os.getenv("V6_MAX_STOP_ATR", "1.60"))
-V6_MAX_ENTRY_EXTENSION_ATR = float(os.getenv("V6_MAX_ENTRY_EXTENSION_ATR", "0.75"))
+V6_MAX_ENTRY_EXTENSION_ATR = float(os.getenv("V6_MAX_ENTRY_EXTENSION_ATR", "0.45"))
+# V6.2 LOCATION-FIRST: do not buy the top / sell the bottom of an already mature 4H impulse.
+V62_MAX_4H_EMA21_EXT_ATR = float(os.getenv("V62_MAX_4H_EMA21_EXT_ATR", "1.05"))
+V62_EDGE_4H_RANGE_POS = float(os.getenv("V62_EDGE_4H_RANGE_POS", "0.88"))
+V62_EDGE_MIN_EXT_ATR = float(os.getenv("V62_EDGE_MIN_EXT_ATR", "0.55"))
+V62_MAX_4H_IMPULSE3_ATR = float(os.getenv("V62_MAX_4H_IMPULSE3_ATR", "1.75"))
+V62_EMA21_RESET_LOOKBACK = int(os.getenv("V62_EMA21_RESET_LOOKBACK", "6"))
+V62_EMA21_RESET_TOL_ATR = float(os.getenv("V62_EMA21_RESET_TOL_ATR", "0.18"))
+V62_MAX_ADVERSE_DRIFT = float(os.getenv("V62_MAX_ADVERSE_DRIFT", "0.0015"))  # 0.15%
+V62_GLOBAL_ENTRY_GAP_MIN = int(os.getenv("V62_GLOBAL_ENTRY_GAP_MIN", "8"))
+_v62_last_entry_time = 0.0
 V6_FINAL_R = float(os.getenv("V6_FINAL_R", "3.0"))
 V6_TP1_R = float(os.getenv("V6_TP1_R", "1.0"))
 V6_TP2_R = float(os.getenv("V6_TP2_R", "2.0"))
@@ -4058,12 +4075,18 @@ def _v6_4h_context(symbol):
         df = _v6_df(symbol, "4h")
         cdf = _v6_closed(df)
         if len(cdf) < 210:
-            return {"dir":0,"score":0,"adx":0.0,"close":0.0,"ema21":0.0,"ema55":0.0,"ema200":0.0,"structure":0}
+            return {"dir":0,"score":0,"adx":0.0,"close":0.0,"ema21":0.0,"ema55":0.0,"ema200":0.0,"structure":0,"atr":0.0,"range20_high":0.0,"range20_low":0.0,"range_pos20":0.5,"close3":0.0}
         a, p = cdf.iloc[-1], cdf.iloc[-2]
         c = safe_float(a["close"]); e21=safe_float(a["ema_slow"]); e55=safe_float(a["ema_trend"]); e200=safe_float(a["ema200"])
         slope21 = e21 - safe_float(cdf.iloc[-4]["ema_slow"])
         hist = safe_float(a["macd_hist"]); histp=safe_float(p["macd_hist"])
         adx = safe_float(a["sniper_adx"])
+        atr4 = max(safe_float(a["atr"]), 1e-12)
+        recent20 = cdf.iloc[-20:]
+        hi20 = safe_float(recent20["high"].max()); lo20 = safe_float(recent20["low"].min())
+        span20 = max(hi20-lo20, 1e-12)
+        range_pos20 = max(0.0, min(1.0, (c-lo20)/span20))
+        close3 = safe_float(cdf.iloc[-4]["close"]) if len(cdf) >= 4 else c
         recent = cdf.iloc[-70:]
         ph, pl = _v6_pivots(recent,2,2)
         structure=0
@@ -4075,10 +4098,54 @@ def _v6_4h_context(symbol):
         bear = int(c<e21) + int(e21<e55) + int(e55<e200) + int(slope21<0) + int(hist<=histp) + int(structure==-1)
         d = 1 if bull>=4 and bull>bear else -1 if bear>=4 and bear>bull else 0
         strength=max(bull,bear)
-        return {"dir":d,"score":strength,"bull":bull,"bear":bear,"adx":adx,"close":c,"ema21":e21,"ema55":e55,"ema200":e200,"structure":structure}
+        return {"dir":d,"score":strength,"bull":bull,"bear":bear,"adx":adx,"close":c,"ema21":e21,"ema55":e55,"ema200":e200,"structure":structure,
+                "atr":atr4,"range20_high":hi20,"range20_low":lo20,"range_pos20":range_pos20,"close3":close3}
     except Exception:
-        return {"dir":0,"score":0,"adx":0.0,"close":0.0,"ema21":0.0,"ema55":0.0,"ema200":0.0,"structure":0}
+        return {"dir":0,"score":0,"adx":0.0,"close":0.0,"ema21":0.0,"ema55":0.0,"ema200":0.0,"structure":0,"atr":0.0,"range20_high":0.0,"range20_low":0.0,"range_pos20":0.5,"close3":0.0}
 
+
+def _v62_4h_location(h4, d, live_price=None):
+    """Return (ok, reason, metrics). Directional 4H location gate.
+
+    It deliberately rejects mature impulses even when trend and 15M confirmations look good.
+    This is the fix for entries such as buying RENDER near a 4H local high after the move
+    has already travelled far from the 4H EMA21.
+    """
+    atr=max(safe_float(h4.get("atr")),1e-12)
+    px=safe_float(live_price) if safe_float(live_price)>0 else safe_float(h4.get("close"))
+    e21=safe_float(h4.get("ema21")); hi=safe_float(h4.get("range20_high")); lo=safe_float(h4.get("range20_low"))
+    close3=safe_float(h4.get("close3"),px)
+    if px<=0 or e21<=0 or hi<=lo:
+        return False,"4H-location-unavailable",{}
+    ext=d*(px-e21)/atr
+    pos=max(0.0,min(1.0,(px-lo)/max(hi-lo,1e-12)))
+    edge=pos if d==1 else 1.0-pos
+    impulse3=d*(px-close3)/atr
+    metrics={"h4_ext_atr":ext,"h4_range_pos":pos,"h4_edge":edge,"h4_impulse3_atr":impulse3}
+    if ext>V62_MAX_4H_EMA21_EXT_ATR:
+        return False,f"4H-too-far-from-EMA21-{ext:.2f}ATR",metrics
+    if edge>V62_EDGE_4H_RANGE_POS and ext>V62_EDGE_MIN_EXT_ATR:
+        return False,f"4H-at-range-edge-{edge:.0%}-ext{ext:.2f}ATR",metrics
+    if impulse3>V62_MAX_4H_IMPULSE3_ATR and ext>0.40:
+        return False,f"4H-impulse-already-ran-{impulse3:.2f}ATR",metrics
+    return True,"4H-location-OK",metrics
+
+def _v62_recent_ema21_reset(cdf,d,atr):
+    """Require a recent 15M reset toward EMA21 before entering with the 4H trend."""
+    n=max(2,V62_EMA21_RESET_LOOKBACK)
+    recent=cdf.iloc[-(n+1):-1] if len(cdf)>n+1 else cdf.iloc[:-1]
+    if recent.empty:return False
+    tol=V62_EMA21_RESET_TOL_ATR*atr
+    if d==1:
+        return bool((recent["low"] <= recent["ema_slow"] + tol).any())
+    return bool((recent["high"] >= recent["ema_slow"] - tol).any())
+
+def _v62_live_location_ok(symbol,side,live):
+    d=1 if side=="long" else -1
+    h4=_v6_4h_context(symbol)
+    if h4.get("dir")!=d:
+        return False,"4H-direction-changed",{}
+    return _v62_4h_location(h4,d,live)
 
 def _v6_btc_gate(symbol, d):
     if not V6_BTC_CONTEXT or symbol == V6_BTC_SYMBOL:
@@ -4234,6 +4301,8 @@ def _v6_candidate(symbol):
     e21=safe_float(a["ema_slow"]); e21p=safe_float(cdf.iloc[-4]["ema_slow"])
     ema_ok=(c>e21 and e21>e21p) if d==1 else (c<e21 and e21<e21p)
     extension=d*(c-e21)/atr
+    location_ok,location_note,location_metrics=_v62_4h_location(h4,d)
+    ema21_reset=_v62_recent_ema21_reset(cdf,d,atr)
     role,role_level=_v6_role_reversal(cdf,d,atr)
     sweep,sweep_level,sweep_depth=_v6_liquidity_sweep(cdf,d,atr)
     fvg,fvg_lo,fvg_hi=_v6_fvg(cdf,d,atr)
@@ -4274,7 +4343,9 @@ def _v6_candidate(symbol):
 
     skip=None
     if h4.get("adx",0)<V6_4H_MIN_ADX and h4.get("score",0)<5:skip=f"4H-weak-ADX-{h4.get('adx',0):.0f}"
+    elif not location_ok:skip=location_note
     elif not ema_ok:skip="15M-EMA21-filter"
+    elif not ema21_reset:skip="15M-no-recent-EMA21-reset"
     elif not primary:skip="no-key-structure"
     elif confirmations<V6_MIN_CONFIRMATIONS:skip=f"confirmations-{confirmations}<{V6_MIN_CONFIRMATIONS}"
     elif not macd_ok:skip="15M-momentum-not-confirmed"
@@ -4291,6 +4362,9 @@ def _v6_candidate(symbol):
             "stop_origin":plan["origin"] if plan else "N/A","final_r":V6_FINAL_R,"h4_score":h4.get("score",0),"h4_adx":h4.get("adx",0),
             "confirmations":confirmations,"role":role,"sweep":sweep,"fvg":fvg,"hns":hns,"candle":candle_name if candle else "-",
             "macd_ok":macd_ok,"volume_above":vol_ok,"extension_atr":extension,"btc_note":btc_note,
+            "ema21_reset":ema21_reset,"location_note":location_note,
+            "h4_ext_atr":safe_float(location_metrics.get("h4_ext_atr")),"h4_range_pos":safe_float(location_metrics.get("h4_range_pos")),
+            "h4_impulse3_atr":safe_float(location_metrics.get("h4_impulse3_atr")),
             "zone_level":level,"fvg_zone":(fvg_lo,fvg_hi) if fvg else None,"sweep_depth":sweep_depth}
 
 
@@ -4326,12 +4400,17 @@ def open_trade(signal):
     symbol,side=signal["symbol"],signal["side"]
     acc=futures_account();equity,available=acc["total_equity"],acc["available"];reset_daily_if_needed(equity)
     if equity<MIN_EQUITY_USDT or available<=0 or (not PAPER_TRADING and protection_lock):return False
+    if time.time()-_v62_last_entry_time < V62_GLOBAL_ENTRY_GAP_MIN*60:
+        return False
     tick=safe_float(get_instrument(symbol).get("tickSize"),0.0001)
     live=safe_float(exchange.fetch_ticker(symbol).get("last"),signal["price"]);sig=safe_float(signal["price"])
     if live<=0 or sig<=0:return False
     d=1 if side=="long" else -1;adverse=d*((live-sig)/sig)
-    if adverse>SNIPER_MAX_FILL_DRIFT:
-        tg(f"⏭️ {symbol} {side.upper()} V6 too late\nAdverse drift {adverse*100:.2f}% > {SNIPER_MAX_FILL_DRIFT*100:.2f}%");return False
+    if adverse>V62_MAX_ADVERSE_DRIFT:
+        tg(f"⏭️ {symbol} {side.upper()} V6.2 TOO LATE\nAdverse drift {adverse*100:.2f}% > {V62_MAX_ADVERSE_DRIFT*100:.2f}%");return False
+    live_loc_ok,live_loc_note,live_loc=_v62_live_location_ok(symbol,side,live)
+    if not live_loc_ok:
+        tg(f"⏭️ {symbol} {side.upper()} V6.2 LOCATION BLOCK\n{live_loc_note}\nNo chase at 4H extreme.");return False
     levels=_v6_levels(signal,live,tick)
     if not levels:return False
     sl,t1,t2,t3,risk=levels;profile=sizing_profile(signal)
@@ -4350,7 +4429,8 @@ def open_trade(signal):
         if signal.get(k):flags.append(label)
     if signal.get("candle") not in (None,"-","none"):flags.append(str(signal.get("candle")))
     msg=(f"{'🧪 PAPER' if PAPER_TRADING else '🧠 V6 STRUCTURE ENTRY'} v{SNIPER_VERSION}\n{symbol} {side.upper()} · {signal.get('entry_route')} · {signal['grade']} {signal['score']:.0f}/100\n"
-         f"4H score {signal.get('h4_score',0)}/6 · ADX {signal.get('h4_adx',0):.1f}\n15M confirmations {signal.get('confirmations',0)} · {' + '.join(flags) if flags else '-'}\n"
+         f"4H score {signal.get('h4_score',0)}/6 · ADX {signal.get('h4_adx',0):.1f} · EMA21 ext {signal.get('h4_ext_atr',0):.2f}ATR · range {signal.get('h4_range_pos',0)*100:.0f}%\n"
+         f"15M confirmations {signal.get('confirmations',0)} · EMA21 reset {'YES' if signal.get('ema21_reset') else 'NO'} · {' + '.join(flags) if flags else '-'}\n"
          f"BTC {signal.get('btc_note','-')}\nEntry ~ {live:.8g}\nSL {sl:.8g}\nTP1 {t1:.8g} (1R)\nTP2 {t2:.8g} (2R)\nTP3 {t3:.8g} (3R)\n"
          f"Risk cap {profile['risk_pct']*100:.1f}% · expected TP net ~${sizing['expected_net_tp_usdt']:.2f} · SL+cost ~${sizing['expected_net_sl_usdt']:.2f}\n"
          f"Notional ${sizing['notional']:.2f} · Margin ${sizing['margin']:.2f} · {LEVERAGE}x\nAdverse drift {max(0,adverse)*100:.2f}%/{SNIPER_MAX_FILL_DRIFT*100:.2f}%")
@@ -4360,7 +4440,7 @@ def open_trade(signal):
         err=response_error(resp)
         if "152012" in err:protection_lock=True
         tg(f"❌ V6 ORDER FAILED\n{symbol} {side.upper()}\n{err}");return False
-    tg(msg);new_pos=find_new_position(symbol,before_ids,timeout=8)
+    _v62_last_entry_time=time.time();tg(msg);new_pos=find_new_position(symbol,before_ids,timeout=8)
     if new_pos is None:tg(f"⚠️ {symbol}: V6 order accepted, position not visible yet.");return True
     pid=position_id(new_pos)
     if pid:
@@ -4475,8 +4555,9 @@ def startup_diagnostics():
     acc=futures_account();reset_daily_if_needed(acc["total_equity"])
     tg(f"🧠 PRECISION STRUCTURE FUSION STARTED v{SNIPER_VERSION}\nMode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
        f"TIMEFRAMES: 4H + 15M ONLY — no 1H, no 5M\n"
-       f"4H: EMA21/55/200 + structure + MACD/ADX regime\n"
-       f"15M: EMA21 direction + key-zone role reversal + liquidity sweep + FVG + H&S + candle rejection\n"
+       f"4H: EMA21/55/200 + structure + MACD/ADX + LOCATION gate (no buying tops / selling bottoms)\n"
+       f"15M: recent EMA21 reset required + role reversal + liquidity sweep + FVG + H&S + candle rejection\n"
+       f"Anti-chase: 15M ext <= {V6_MAX_ENTRY_EXTENSION_ATR:.2f} ATR · 4H EMA21 ext <= {V62_MAX_4H_EMA21_EXT_ATR:.2f} ATR · live adverse drift <= {V62_MAX_ADVERSE_DRIFT*100:.2f}%\n"
        f"Entry requires primary market structure + >= {V6_MIN_CONFIRMATIONS} confirmations + Q >= {V6_MIN_QUALITY:.0f}\n"
        f"TP model: 1R→BE · 2R→lock +1R · 3R final\n"
        f"Risk caps: normal {V6_RISK_PCT*100:.1f}% · elite {V6_ELITE_RISK_PCT*100:.1f}% · max positions {MAX_ACTIVE_POSITIONS} · max same side {V6_MAX_SAME_SIDE}\n"
