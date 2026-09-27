@@ -2589,7 +2589,7 @@ def main():
                     if not signal:
                         continue
                     scanned.append(signal)
-                    if signal.get("side") and not signal.get("skip") and signal.get("entry_route") in ("CROSS", "RETEST"):
+                    if signal.get("side") and not signal.get("skip") and signal.get("entry_route") in ("CROSS", "RETEST", "FAILED-CROSS"):
                         # A closed crossover bar is a one-shot Precision Sniper event.
                         key = int(signal.get("signal_bar_ts", 0))
                         if sniper_last_signal_bar.get(symbol) == key:
@@ -2938,6 +2938,445 @@ def startup_diagnostics():
         f"Daily loss cap: {DAILY_LOSS_LIMIT_PCT:.0f}%"
     )
 
+
+
+# ============================================================
+# PRECISION SNIPER V4.0 — FAILED-CROSS REVERSAL ENGINE
+# ============================================================
+# Radical change from V2/V3:
+#   - EMA9/21 crossover is NOT an entry anymore.
+#   - A crossover becomes a trap candidate.
+#   - We only trade the OPPOSITE direction after the cross demonstrably fails.
+#   - 5m must confirm the reversal.
+#   - 1H/4H may support the reversal, but both may never strongly support the failed side.
+#   - Mean-reversion exits are faster: 0.75R -> BE, 1.25R -> +0.50R, 2R final.
+#   - Stale trades are actively closed; no more 48-hour dead positions.
+# This is not a blind signal inversion. It waits for evidence that the original
+# crossover has trapped late entrants before taking the other side.
+
+SNIPER_VERSION = "4.0.0"
+V4_CROSS_LOOKBACK_BARS = int(os.getenv("V4_CROSS_LOOKBACK_BARS", "4"))
+V4_MIN_TRAP_SCORE = float(os.getenv("V4_MIN_TRAP_SCORE", "6.0"))
+V4_ELITE_TRAP_SCORE = float(os.getenv("V4_ELITE_TRAP_SCORE", "8.0"))
+V4_MIN_5M_CONFIRM = int(os.getenv("V4_MIN_5M_CONFIRM", "2"))
+V4_MAX_EXTENSION_ATR = float(os.getenv("V4_MAX_EXTENSION_ATR", "0.65"))
+V4_MAX_VOL_RATIO = float(os.getenv("V4_MAX_VOL_RATIO", "1.60"))
+V4_MIN_BODY_ATR = float(os.getenv("V4_MIN_BODY_ATR", "0.22"))
+V4_STRONG_BODY_ATR = float(os.getenv("V4_STRONG_BODY_ATR", "0.38"))
+V4_STOP_ATR = float(os.getenv("V4_STOP_ATR", "1.20"))
+V4_STOP_CAP_ATR = float(os.getenv("V4_STOP_CAP_ATR", "1.65"))
+V4_TP_FINAL_R = float(os.getenv("V4_TP_FINAL_R", "2.0"))
+V4_TP1_R = float(os.getenv("V4_TP1_R", "0.75"))
+V4_TP2_R = float(os.getenv("V4_TP2_R", "1.25"))
+V4_LOCK_R = float(os.getenv("V4_LOCK_R", "0.50"))
+V4_NORMAL_RISK_PCT = float(os.getenv("V4_NORMAL_RISK_PCT", "0.014"))
+V4_ELITE_RISK_PCT = float(os.getenv("V4_ELITE_RISK_PCT", "0.016"))
+V4_NORMAL_TARGET_NET = float(os.getenv("V4_NORMAL_TARGET_NET", "1.25"))
+V4_ELITE_TARGET_NET = float(os.getenv("V4_ELITE_TARGET_NET", "1.50"))
+V4_SOFT_TIME_EXIT_MIN = int(os.getenv("V4_SOFT_TIME_EXIT_MIN", "180"))
+V4_HARD_TIME_EXIT_MIN = int(os.getenv("V4_HARD_TIME_EXIT_MIN", "360"))
+V4_SOFT_EXIT_MAX_R = float(os.getenv("V4_SOFT_EXIT_MAX_R", "0.35"))
+V4_MAX_SAME_SIDE = int(os.getenv("V4_MAX_SAME_SIDE", "2"))
+# calculate_contracts() uses this global; V4 final target is 2R, not the old 3R.
+TP_R_MULT = V4_TP_FINAL_R
+
+
+def _v4_closed_cross(df):
+    """Most recent EMA9/21 cross 1..N closed 15m bars ago; current bar cannot be the cross."""
+    closed = df.iloc[:-1]
+    if len(closed) < V4_CROSS_LOOKBACK_BARS + 4:
+        return None
+    last_i = len(closed) - 1
+    for age in range(1, V4_CROSS_LOOKBACK_BARS + 1):
+        i = last_i - age
+        cur, prev = closed.iloc[i], closed.iloc[i-1]
+        ef, es = safe_float(cur["ema_fast"]), safe_float(cur["ema_slow"])
+        pef, pes = safe_float(prev["ema_fast"]), safe_float(prev["ema_slow"])
+        bull = ef > es and pef <= pes
+        bear = ef < es and pef >= pes
+        if bull or bear:
+            return {"age": age, "dir": 1 if bull else -1, "bar": cur, "index": i}
+    return None
+
+
+def _v4_5m_confirm(symbol, d):
+    """Three simple closed-5m reversal components; require >=2."""
+    try:
+        f = sniper_indicators(ohlcv_df(symbol, "5m"))
+        if len(f) < 30:
+            return 0, False, False, False
+        a, p = f.iloc[-2], f.iloc[-3]
+        c, o = safe_float(a["close"]), safe_float(a["open"])
+        ef = safe_float(a["ema_fast"])
+        directional = c > o and c > ef if d == 1 else c < o and c < ef
+        micro = c > safe_float(p["high"]) if d == 1 else c < safe_float(p["low"])
+        hist_turn = safe_float(a["macd_hist"]) > safe_float(p["macd_hist"]) if d == 1 else safe_float(a["macd_hist"]) < safe_float(p["macd_hist"])
+        n = int(directional) + int(micro) + int(hist_turn)
+        return n, directional, micro, hist_turn
+    except Exception:
+        return 0, False, False, False
+
+
+def _v4_reversal_plan(df, side):
+    a = df.iloc[-2]
+    d = 1 if side == "long" else -1
+    entry = safe_float(a["close"])
+    atr = safe_float(a["atr"])
+    if entry <= 0 or atr <= 0:
+        return None
+    recent = df.iloc[-7:-1]  # 6 closed 15m bars
+    structural = (safe_float(recent["low"].min()) - 0.12*atr) if d == 1 else (safe_float(recent["high"].max()) + 0.12*atr)
+    atr_stop = entry - d * V4_STOP_ATR * atr
+    raw = min(atr_stop, structural) if d == 1 else max(atr_stop, structural)
+    max_risk = V4_STOP_CAP_ATR * atr
+    risk = min(abs(entry - raw), max_risk)
+    risk = max(risk, 0.80 * atr)
+    return {"risk_distance": risk, "origin": "V4 trap structure", "atr": atr}
+
+
+def evaluate_symbol(symbol, btc=None):
+    """V4: find a recent cross, prove it failed, then trade the opposite side."""
+    df = sniper_indicators(ohlcv_df(symbol, SNIPER_TF))
+    if len(df) < max(SNIPER_TREND * 3, 190):
+        return None
+    a, p = df.iloc[-2], df.iloc[-3]
+    cross = _v4_closed_cross(df)
+    signal_ts = int(a["ts"])
+    if not cross:
+        return {"symbol": symbol, "side": None, "score": 0.0, "score_max": 10.0,
+                "grade": "-", "skip": "no-failed-cross", "entry_route": "WAIT",
+                "price": safe_float(a["close"]), "atr": safe_float(a["atr"]),
+                "signal_bar_ts": signal_ts, "adx": safe_float(a["sniper_adx"])}
+
+    failed_dir = int(cross["dir"])          # direction of original crossover
+    d = -failed_dir                         # V4 trades opposite direction
+    side = "long" if d == 1 else "short"
+    close, open_ = safe_float(a["close"]), safe_float(a["open"])
+    high, low = safe_float(a["high"]), safe_float(a["low"])
+    atr = safe_float(a["atr"])
+    atr_mean = safe_float(a["atr_mean"])
+    ef, es = safe_float(a["ema_fast"]), safe_float(a["ema_slow"])
+    hist, hist_prev = safe_float(a["macd_hist"]), safe_float(p["macd_hist"])
+    rsi, adx = safe_float(a["sniper_rsi"], 50), safe_float(a["sniper_adx"])
+    vol_mean, volume = safe_float(a["vol_mean"]), safe_float(a["volume"])
+    volume_above = vol_mean > 0 and volume > vol_mean * SNIPER_VOLUME_SPIKE
+    vol_ratio = atr / atr_mean if atr_mean > 0 else 99.0
+    if atr <= 0:
+        return None
+
+    # Failure evidence: price has lost the fast EMA and preferably the slow EMA,
+    # candle body points in reversal direction, MACD rolls with us, RSI crosses midline.
+    lost_fast = close > ef if d == 1 else close < ef
+    lost_slow = close > es if d == 1 else close < es
+    body_atr = d * (close - open_) / atr
+    macd_turn = hist > hist_prev if d == 1 else hist < hist_prev
+    macd_side = hist > 0 if d == 1 else hist < 0
+    rsi_turn = rsi >= 50 if d == 1 else rsi <= 50
+    candle_range = max(high - low, 1e-12)
+    upper_wick = high - max(open_, close)
+    lower_wick = min(open_, close) - low
+    reject_wick = lower_wick / candle_range >= 0.28 if d == 1 else upper_wick / candle_range >= 0.28
+    extension_atr = d * (close - ef) / atr
+
+    # 1H/4H are veto/context layers, not entry triggers.
+    h1, h4 = sniper_v3_context(symbol)
+    both_back_failed_cross = h1["dir"] == failed_dir and h4["dir"] == failed_dir
+    reversal_htf = h1["dir"] == d or h4["dir"] == d
+    five_n, five_dir, five_micro, five_hist = _v4_5m_confirm(symbol, d)
+
+    # How far the original crossover travelled before failing. A small failed move is
+    # better than fading a mature trend that is still structurally intact.
+    cb = cross["bar"]
+    cross_close = safe_float(cb["close"])
+    post = df.iloc[cross["index"]:len(df)-1]
+    if failed_dir == 1:
+        excursion = max(0.0, safe_float(post["high"].max()) - cross_close) / atr
+    else:
+        excursion = max(0.0, cross_close - safe_float(post["low"].min())) / atr
+
+    score = 0.0
+    score += 1.0 if lost_fast else 0.0
+    score += 2.0 if lost_slow else 0.0
+    score += 1.0 if body_atr >= V4_MIN_BODY_ATR else 0.0
+    score += 1.0 if macd_turn else 0.0
+    score += 0.5 if macd_side else 0.0
+    score += 1.0 if rsi_turn else 0.0
+    score += 0.5 if reject_wick else 0.0
+    score += 0.5 if volume_above else 0.0
+    score += 1.5 if five_n >= V4_MIN_5M_CONFIRM else 0.0
+    score += 1.0 if reversal_htf else 0.0
+    score_max = 10.0
+    grade = "A+" if score >= 8 else "A" if score >= 7 else "B" if score >= 6 else "C"
+
+    plan = _v4_reversal_plan(df, side)
+    skip = None
+    if both_back_failed_cross:
+        skip = "1h+4h-still-support-failed-side"
+    elif not lost_fast:
+        skip = "cross-not-failed-yet"
+    elif not (lost_slow or body_atr >= V4_STRONG_BODY_ATR):
+        skip = "failure-not-deep-enough"
+    elif body_atr < V4_MIN_BODY_ATR:
+        skip = f"weak-reversal-body-{body_atr:.2f}ATR"
+    elif not macd_turn:
+        skip = "macd-not-turning"
+    elif five_n < V4_MIN_5M_CONFIRM:
+        skip = f"5m-confirm-{five_n}/3"
+    elif vol_ratio > V4_MAX_VOL_RATIO:
+        skip = f"volatility-{vol_ratio:.2f}x"
+    elif extension_atr > V4_MAX_EXTENSION_ATR:
+        skip = f"reversal-already-ran-{extension_atr:.2f}ATR"
+    elif score < V4_MIN_TRAP_SCORE:
+        skip = f"trap-score-{score:.1f}<{V4_MIN_TRAP_SCORE:.1f}"
+    elif not plan or plan["risk_distance"] <= 0:
+        skip = "invalid-trap-plan"
+
+    quality = score*10 + min(adx, 35)*0.25 + (6 if reversal_htf else 0) + (4 if volume_above else 0) - max(0, excursion-1.0)*3
+    return {
+        "symbol": symbol, "side": side, "score": score, "score_max": score_max,
+        "threshold": V4_MIN_TRAP_SCORE, "grade": grade, "skip": skip,
+        "entry_route": "FAILED-CROSS" if skip is None else "WAIT",
+        "price": close, "atr": atr, "adx": adx, "rsi": rsi, "signal_bar_ts": int(cross["bar"]["ts"]),
+        "vol_ratio": vol_ratio, "volume_above": volume_above, "vwap": safe_float(a["vwap"]),
+        "risk_distance": plan["risk_distance"] if plan else 0.0,
+        "stop_origin": plan["origin"] if plan else "N/A", "structure_capped": False,
+        "htf_dir": h1["dir"], "htf_state": "ALIGNED" if h1["dir"]==d else "AGAINST" if h1["dir"]==-d else "NEUTRAL",
+        "htf_adx": h1["adx"], "h4_dir": h4["dir"],
+        "h4_state": "ALIGNED" if h4["dir"]==d else "AGAINST" if h4["dir"]==-d else "NEUTRAL",
+        "h4_adx": h4["adx"], "body_atr": body_atr, "slope_atr": 0.0,
+        "extension_atr": extension_atr, "cross_age": cross["age"], "failed_dir": failed_dir,
+        "excursion_atr": excursion, "five_confirm": five_n, "five_micro": five_micro,
+        "five_directional": five_dir, "five_hist": five_hist, "quality": quality,
+        "tactics": int(round(score)), "entry_quality": five_n,
+        "confirm_components": five_n, "momentum_quality": 2 if lost_fast and macd_turn else 0,
+        "pullback_quality": 0, "rel": 0.0, "btc_regime": "V4-FAILED-CROSS",
+    }
+
+
+def sizing_profile(signal):
+    elite = safe_float(signal.get("score")) >= V4_ELITE_TRAP_SCORE and int(signal.get("five_confirm", 0)) == 3
+    return {
+        "name": "V4-ELITE" if elite else "V4-TRAP",
+        "risk_pct": V4_ELITE_RISK_PCT if elite else V4_NORMAL_RISK_PCT,
+        "target_net_tp": V4_ELITE_TARGET_NET if elite else V4_NORMAL_TARGET_NET,
+    }
+
+
+def sniper_live_levels(signal, live, tick):
+    risk = safe_float(signal.get("risk_distance"))
+    if live <= 0 or risk <= 0:
+        return None
+    side = signal["side"]
+    d = 1 if side == "long" else -1
+    sl = round_trade_price(live - d*risk, tick, side, "sl")
+    t1 = round_trade_price(live + d*risk*V4_TP1_R, tick, side, "tp")
+    t2 = round_trade_price(live + d*risk*V4_TP2_R, tick, side, "tp")
+    t3 = round_trade_price(live + d*risk*V4_TP_FINAL_R, tick, side, "tp")
+    if side == "long" and not (sl < live < t1 < t2 < t3): return None
+    if side == "short" and not (t3 < t2 < t1 < live < sl): return None
+    return sl, t1, t2, t3, abs(live-sl)
+
+
+def sniper_portfolio_allows(signal, positions):
+    side = signal.get("side")
+    if side not in ("long", "short"):
+        return False, "no-side"
+    same = sum(1 for p in positions if position_side(p) == side)
+    elite = safe_float(signal.get("score")) >= V4_ELITE_TRAP_SCORE and int(signal.get("five_confirm",0)) == 3
+    if same >= V4_MAX_SAME_SIDE and not elite:
+        return False, "same-side>=2-needs-elite-trap"
+    if same >= 3:
+        return False, "max-3-same-direction"
+    return True, "OK"
+
+
+def open_trade(signal):
+    global protection_lock
+    symbol, side = signal["symbol"], signal["side"]
+    account = futures_account(); equity, available = account["total_equity"], account["available"]
+    reset_daily_if_needed(equity)
+    if equity < MIN_EQUITY_USDT or available <= 0 or (not PAPER_TRADING and protection_lock):
+        return False
+    tick = safe_float(get_instrument(symbol).get("tickSize"), 0.0001)
+    live = safe_float(exchange.fetch_ticker(symbol).get("last"), signal["price"])
+    signal_px = safe_float(signal["price"])
+    if live <= 0 or signal_px <= 0: return False
+    d = 1 if side == "long" else -1
+    drift = (live-signal_px)/signal_px
+    adverse = d*drift
+    if adverse > SNIPER_MAX_FILL_DRIFT:
+        tg(f"⏭️ {symbol} {side.upper()} V4 too late\nAdverse drift {adverse*100:.2f}% > {SNIPER_MAX_FILL_DRIFT*100:.2f}%")
+        return False
+    levels = sniper_live_levels(signal, live, tick)
+    if not levels: return False
+    sl,t1,t2,t3,risk = levels
+    profile = sizing_profile(signal)
+    sizing = calculate_contracts(symbol, live, sl, equity, available, profile["risk_pct"], profile["target_net_tp"])
+    if not sizing or sizing["margin"] > available*AVAILABLE_MARGIN_BUFFER: return False
+    before_ids={position_id(p) for p in get_positions() if position_id(p)}
+    oklev, levres = set_leverage(symbol, LEVERAGE)
+    if not oklev:
+        tg(f"⛔ LEVERAGE FAILED\n{symbol}\n{levres}"); return False
+    payload={
+        "instId":blofin_inst_id(symbol),"marginMode":MARGIN_MODE,"positionSide":"net",
+        "side":"buy" if side=="long" else "sell","orderType":"market","size":str(sizing["contracts"]),
+        "tpTriggerPrice":str(t3),"tpOrderPrice":"-1","tpTriggerPriceType":"mark",
+        "slTriggerPrice":str(sl),"slOrderPrice":"-1","slTriggerPriceType":"mark",
+        "clientOrderId":f"ps40{int(time.time()*1000)%1000000000}",
+    }
+    if BROKER_ID: payload["brokerId"]=BROKER_ID
+    failed_name="BULL CROSS" if signal.get("failed_dir")==1 else "BEAR CROSS"
+    msg=(
+        f"{'🧪 PAPER' if PAPER_TRADING else '🔄 PRECISION REVERSAL LIVE'} v{SNIPER_VERSION}\n"
+        f"{symbol} {side.upper()} · {signal['grade']} · FAILED-CROSS\n"
+        f"Original signal FAILED: {failed_name} · {signal.get('cross_age',0)} bar(s) ago\n"
+        f"Trap score {signal['score']:.1f}/10 · 5m {signal.get('five_confirm',0)}/3\n"
+        f"1H {signal.get('htf_state')} · 4H {signal.get('h4_state')} · ADX {signal['adx']:.1f} · RSI {signal['rsi']:.1f}\n"
+        f"Failure body {signal.get('body_atr',0):.2f} ATR · excursion {signal.get('excursion_atr',0):.2f} ATR\n"
+        f"Entry ~ {live:.8g}\nSL {sl:.8g}\nTP1 {t1:.8g} → BE\nTP2 {t2:.8g} → lock {V4_LOCK_R:.2f}R\nTP final {t3:.8g} → full exit\n"
+        f"Risk {risk/live*100:.2f}% · sizing {profile['name']} {profile['risk_pct']*100:.1f}% equity cap\n"
+        f"Expected final TP net ~${sizing['expected_net_tp_usdt']:.2f} · SL+cost ~${sizing['expected_net_sl_usdt']:.2f}\n"
+        f"Notional ${sizing['notional']:.2f} · Margin ${sizing['margin']:.2f} · {LEVERAGE}x\n"
+        f"Adverse drift {max(0,adverse)*100:.2f}%/{SNIPER_MAX_FILL_DRIFT*100:.2f}%"
+    )
+    if PAPER_TRADING:
+        tg(msg); return True
+    resp=native("private_post_trade_order",payload)
+    if not native_ok(resp):
+        err=response_error(resp)
+        if "152012" in err: protection_lock=True
+        tg(f"❌ V4 ORDER FAILED\n{symbol} {side.upper()}\n{err}"); return False
+    tg(msg)
+    new_pos=find_new_position(symbol,before_ids,timeout=8)
+    if new_pos is None:
+        tg(f"⚠️ {symbol}: order accepted, position not visible yet."); return True
+    pid=position_id(new_pos)
+    if pid: sniper_managed_positions.add(pid)
+    if has_live_protection(new_pos)[0]:
+        tg(f"🛡️ V4 PROTECTION CONFIRMED\n{symbol} {side.upper()}\nTP final + SL visible."); return True
+    last=safe_float(exchange.fetch_ticker(symbol).get("last"))
+    if tpsl_prices_valid(side,sl,t3,last):
+        ok,res=place_tpsl_for_position(new_pos,sl,t3,client_tag="ps40")
+        if ok:
+            tg(f"🛡️ V4 FALLBACK PROTECTION CONFIRMED\n{symbol}"); return True
+        protection_lock=True; tg(f"🚨 V4 PROTECTION FAILURE\n{symbol}\n{res}\nNEW TRADES PAUSED."); return True
+    protection_lock=True; tg(f"🚨 {symbol}: V4 position exists but safe fallback protection failed.\nNEW TRADES PAUSED."); return True
+
+
+def _v4_managed(p):
+    pid=position_id(p)
+    if pid in sniper_managed_positions: return True
+    try:
+        _,probe=has_live_protection(p)
+        cid=str((probe or {}).get("clientOrderId","") or "")
+        if cid.startswith(("ps40",)):
+            if pid: sniper_managed_positions.add(pid)
+            return True
+        # Restart-safe adoption: V4 positions have final TP at ~2R from entry.
+        # Older Precision Sniper versions used 3R, so this avoids taking over them.
+        entry = position_entry(p)
+        tp = safe_float((probe or {}).get("tpTriggerPrice"))
+        sl = safe_float((probe or {}).get("slTriggerPrice"))
+        risk = abs(entry - sl)
+        rr = abs(tp - entry) / risk if entry > 0 and risk > 0 and tp > 0 else 0.0
+        if 1.80 <= rr <= 2.20:
+            if pid: sniper_managed_positions.add(pid)
+            return True
+    except Exception: pass
+    return False
+
+
+def _v4_close_position(p, reason):
+    payload={
+        "instId":p["instId"], "marginMode":position_margin_mode(p),
+        "positionSide":str(p.get("positionSide","net") or "net"),
+        "clientOrderId":f"ps40x{int(time.time()*1000)%1000000000}",
+    }
+    pid=position_id(p)
+    if pid: payload["positionId"]=pid
+    if BROKER_ID: payload["brokerId"]=BROKER_ID
+    resp=native("private_post_trade_close_position",payload)
+    if native_ok(resp):
+        tg(f"⏱️ V4 ACTIVE EXIT\n{position_symbol(p)} {position_side(p).upper()}\n{reason}\nClosed at market.")
+        return True
+    tg(f"⚠️ V4 ACTIVE EXIT FAILED\n{position_symbol(p)}\n{response_error(resp)}")
+    return False
+
+
+def manage_sniper_step_stops():
+    """V4: faster mean-reversion management plus a real stale-trade exit."""
+    if PAPER_TRADING: return
+    now_ms=int(time.time()*1000)
+    for p in get_positions():
+        if not _v4_managed(p): continue
+        symbol,side,entry=position_symbol(p),position_side(p),position_entry(p)
+        if entry<=0: continue
+        ok,order=has_live_protection(p)
+        if not ok or not order: continue
+        tp=safe_float(order.get("tpTriggerPrice")); current_sl=safe_float(order.get("slTriggerPrice"))
+        if tp<=0 or current_sl<=0: continue
+        risk=abs(tp-entry)/V4_TP_FINAL_R
+        if risk<=0: continue
+        d=1 if side=="long" else -1
+        extreme=sniper_recent_extreme(symbol,side)
+        current=safe_float(exchange.fetch_ticker(symbol).get("last"),entry)
+        current_r=d*(current-entry)/risk
+        hit1=extreme>=entry+d*risk*V4_TP1_R if d==1 else extreme<=entry+d*risk*V4_TP1_R
+        hit2=extreme>=entry+d*risk*V4_TP2_R if d==1 else extreme<=entry+d*risk*V4_TP2_R
+        tick=safe_float(get_instrument(symbol).get("tickSize"),0.0001)
+        desired=None; stage=None
+        if hit2:
+            desired=round_trade_price(entry+d*risk*V4_LOCK_R,tick,side,"sl"); stage="TP2"
+        elif hit1:
+            desired=round_trade_price(entry,tick,side,"sl"); stage="TP1"
+        if desired is not None:
+            improves=desired>current_sl+tick*0.1 if d==1 else desired<current_sl-tick*0.1
+            if improves:
+                ok2,res=amend_tpsl_stop(p,desired)
+                key=f"{position_id(p)}:{stage}:{desired}"
+                if ok2 and not sniper_step_notified.get(key):
+                    tg(f"🪜 V4 STEP STOP\n{symbol} {side.upper()}\n{stage} → SL {desired:.8g}\nFinal TP remains active.")
+                    sniper_step_notified[key]=True
+        created=safe_float(p.get("createTime",p.get("cTime",0)))
+        if created>0:
+            age_min=(now_ms-created)/60000.0
+            if age_min>=V4_HARD_TIME_EXIT_MIN:
+                _v4_close_position(p,f"Hard time exit {age_min:.0f}m — V4 does not hold dead reversals.")
+                continue
+            if age_min>=V4_SOFT_TIME_EXIT_MIN and current_r<V4_SOFT_EXIT_MAX_R:
+                _v4_close_position(p,f"Soft time exit {age_min:.0f}m · only {current_r:+.2f}R progress.")
+                continue
+
+
+def maybe_score_report(rows):
+    global sniper_last_report
+    now=time.time(); active=[r for r in rows if r.get("side")]
+    if not active or now-sniper_last_report<SNIPER_REPORT_MIN*60: return
+    sniper_last_report=now
+    ranked=sorted(active,key=lambda r:safe_float(r.get("quality")),reverse=True)[:10]
+    lines=[f"🔄 PRECISION SNIPER v{SNIPER_VERSION} · FAILED-CROSS REVERSAL"]
+    for r in ranked:
+        state="🟢 REVERSE" if not r.get("skip") else f"⏭ {r.get('skip')}"
+        orig="BULL" if r.get("failed_dir")==1 else "BEAR"
+        lines.append(f"{r['symbol'].split('/')[0]} {r['side'].upper()} {r['grade']} trap {r['score']:.1f}/10 5m{r.get('five_confirm',0)}/3 orig:{orig} age{r.get('cross_age',0)} 1H:{r.get('htf_state','-')} 4H:{r.get('h4_state','-')} {state}")
+    tg("\n".join(lines))
+
+
+def startup_diagnostics():
+    acc=futures_account(); reset_daily_if_needed(acc["total_equity"])
+    tg(
+        f"🔄 PRECISION SNIPER BOT STARTED v{SNIPER_VERSION}\n"
+        f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
+        f"ENGINE FLIPPED: crossover = trap candidate, NEVER direct entry\n"
+        f"Entry: opposite side only after 15m cross failure + >= {V4_MIN_5M_CONFIRM}/3 closed-5m reversal confirmation\n"
+        f"Trap score >= {V4_MIN_TRAP_SCORE:.1f}/10 · elite >= {V4_ELITE_TRAP_SCORE:.1f}/10\n"
+        f"1H+4H both still support original cross = BLOCK\n"
+        f"Anti-chase reversal extension <= {V4_MAX_EXTENSION_ATR:.2f} ATR\n"
+        f"Exit: {V4_TP1_R:.2f}R→BE · {V4_TP2_R:.2f}R→lock {V4_LOCK_R:.2f}R · {V4_TP_FINAL_R:.2f}R full TP\n"
+        f"Time exit: {V4_SOFT_TIME_EXIT_MIN}m if <{V4_SOFT_EXIT_MAX_R:.2f}R progress · hard {V4_HARD_TIME_EXIT_MIN}m\n"
+        f"Risk: normal {V4_NORMAL_RISK_PCT*100:.1f}% · elite {V4_ELITE_RISK_PCT*100:.1f}% · max positions {MAX_ACTIVE_POSITIONS}\n"
+        f"Equity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}"
+    )
 
 if __name__ == "__main__":
     main()
