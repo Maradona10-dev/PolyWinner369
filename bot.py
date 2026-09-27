@@ -10,7 +10,7 @@ import pandas as pd
 import requests
 
 # ============================================================
-# BLOFIN PRECISION SNIPER v5.0 ADAPTIVE REGIME ROUTER - BLOFIN EXECUTION EDITION
+# BLOFIN PRECISION STRUCTURE FUSION v6.0 - 4H + 15M EXECUTION EDITION
 # ============================================================
 # Strategy engine: faithful Python translation of the supplied TradingView
 # Precision Sniper [WillyAlgoTrader] v2.1 defaults for a 15m chart.
@@ -3941,6 +3941,560 @@ def main():
             msg=f"{type(e).__name__}: {e}"
             if "152002" in msg:time.sleep(20);continue
             tg(f"⚠️ PRECISION SNIPER V5 LOOP ERROR\n{msg}");time.sleep(30)
+
+
+
+# ============================================================
+# PRECISION STRUCTURE FUSION V6.0 — 4H + 15M ONLY
+# ============================================================
+# Design rules translated from the supplied chart examples:
+#   1) 4H decides directional regime; it never times the entry.
+#   2) 15M maps key support/resistance and uses EMA21 as directional filter.
+#   3) Entries require price-action structure: role reversal, liquidity sweep,
+#      FVG interaction, or H&S / inverse-H&S neckline break.
+#   4) At least three independent confirmations must agree.
+#   5) Final target is 3R; stop is structural and never widened after entry.
+# No 1H and no 5M data are used by the active V6 engine.
+
+SNIPER_VERSION = "6.0.0"
+V6_MIN_QUALITY = float(os.getenv("V6_MIN_QUALITY", "78"))
+V6_ELITE_QUALITY = float(os.getenv("V6_ELITE_QUALITY", "90"))
+V6_MIN_CONFIRMATIONS = int(os.getenv("V6_MIN_CONFIRMATIONS", "3"))
+V6_4H_MIN_ADX = float(os.getenv("V6_4H_MIN_ADX", "16"))
+V6_MAX_VOL_RATIO = float(os.getenv("V6_MAX_VOL_RATIO", "1.60"))
+V6_ZONE_LOOKBACK = int(os.getenv("V6_ZONE_LOOKBACK", "64"))
+V6_SWEEP_LOOKBACK = int(os.getenv("V6_SWEEP_LOOKBACK", "20"))
+V6_FVG_LOOKBACK = int(os.getenv("V6_FVG_LOOKBACK", "14"))
+V6_HNS_LOOKBACK = int(os.getenv("V6_HNS_LOOKBACK", "80"))
+V6_ZONE_TOL_ATR = float(os.getenv("V6_ZONE_TOL_ATR", "0.22"))
+V6_STOP_BUFFER_ATR = float(os.getenv("V6_STOP_BUFFER_ATR", "0.12"))
+V6_MIN_STOP_ATR = float(os.getenv("V6_MIN_STOP_ATR", "0.65"))
+V6_MAX_STOP_ATR = float(os.getenv("V6_MAX_STOP_ATR", "1.60"))
+V6_MAX_ENTRY_EXTENSION_ATR = float(os.getenv("V6_MAX_ENTRY_EXTENSION_ATR", "0.75"))
+V6_FINAL_R = float(os.getenv("V6_FINAL_R", "3.0"))
+V6_TP1_R = float(os.getenv("V6_TP1_R", "1.0"))
+V6_TP2_R = float(os.getenv("V6_TP2_R", "2.0"))
+V6_LOCK_R = float(os.getenv("V6_LOCK_R", "1.0"))
+V6_RISK_PCT = float(os.getenv("V6_RISK_PCT", "0.012"))
+V6_ELITE_RISK_PCT = float(os.getenv("V6_ELITE_RISK_PCT", "0.015"))
+V6_TARGET_NET = float(os.getenv("V6_TARGET_NET", "1.50"))
+V6_MAX_SAME_SIDE = int(os.getenv("V6_MAX_SAME_SIDE", "2"))
+V6_BTC_CONTEXT = os.getenv("V6_BTC_CONTEXT", "true").lower() == "true"
+V6_SOFT_EXIT_MIN = int(os.getenv("V6_SOFT_EXIT_MIN", "240"))
+V6_HARD_EXIT_MIN = int(os.getenv("V6_HARD_EXIT_MIN", "720"))
+V6_REPORT_MIN = int(os.getenv("V6_REPORT_MIN", "15"))
+V6_BTC_SYMBOL = os.getenv("V6_BTC_SYMBOL", "BTC/USDT:USDT")
+
+_v6_position_meta = {}
+_v6_last_report = 0.0
+
+
+def _v6_df(symbol, tf):
+    df = sniper_indicators(ohlcv_df(symbol, tf))
+    df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
+    return df
+
+
+def _v6_closed(df):
+    # Exchange OHLCV normally contains the currently-forming candle as the last row.
+    return df.iloc[:-1].copy()
+
+
+def _v6_pivots(df, left=2, right=2):
+    highs, lows = [], []
+    h = df["high"].to_numpy(dtype=float)
+    l = df["low"].to_numpy(dtype=float)
+    for i in range(left, len(df)-right):
+        if h[i] >= np.max(h[i-left:i+right+1]) and h[i] > np.max(np.r_[h[i-left:i], h[i+1:i+right+1]]):
+            highs.append((i, h[i]))
+        if l[i] <= np.min(l[i-left:i+right+1]) and l[i] < np.min(np.r_[l[i-left:i], l[i+1:i+right+1]]):
+            lows.append((i, l[i]))
+    return highs, lows
+
+
+def _v6_4h_context(symbol):
+    try:
+        df = _v6_df(symbol, "4h")
+        cdf = _v6_closed(df)
+        if len(cdf) < 210:
+            return {"dir":0,"score":0,"adx":0.0,"close":0.0,"ema21":0.0,"ema55":0.0,"ema200":0.0,"structure":0}
+        a, p = cdf.iloc[-1], cdf.iloc[-2]
+        c = safe_float(a["close"]); e21=safe_float(a["ema_slow"]); e55=safe_float(a["ema_trend"]); e200=safe_float(a["ema200"])
+        slope21 = e21 - safe_float(cdf.iloc[-4]["ema_slow"])
+        hist = safe_float(a["macd_hist"]); histp=safe_float(p["macd_hist"])
+        adx = safe_float(a["sniper_adx"])
+        recent = cdf.iloc[-70:]
+        ph, pl = _v6_pivots(recent,2,2)
+        structure=0
+        if len(ph)>=2 and len(pl)>=2:
+            hh=ph[-1][1] > ph[-2][1]; hl=pl[-1][1] > pl[-2][1]
+            lh=ph[-1][1] < ph[-2][1]; ll=pl[-1][1] < pl[-2][1]
+            structure = 1 if hh and hl else -1 if lh and ll else 0
+        bull = int(c>e21) + int(e21>e55) + int(e55>e200) + int(slope21>0) + int(hist>=histp) + int(structure==1)
+        bear = int(c<e21) + int(e21<e55) + int(e55<e200) + int(slope21<0) + int(hist<=histp) + int(structure==-1)
+        d = 1 if bull>=4 and bull>bear else -1 if bear>=4 and bear>bull else 0
+        strength=max(bull,bear)
+        return {"dir":d,"score":strength,"bull":bull,"bear":bear,"adx":adx,"close":c,"ema21":e21,"ema55":e55,"ema200":e200,"structure":structure}
+    except Exception:
+        return {"dir":0,"score":0,"adx":0.0,"close":0.0,"ema21":0.0,"ema55":0.0,"ema200":0.0,"structure":0}
+
+
+def _v6_btc_gate(symbol, d):
+    if not V6_BTC_CONTEXT or symbol == V6_BTC_SYMBOL:
+        return True, "BTC self/off"
+    try:
+        h4=_v6_4h_context(V6_BTC_SYMBOL)
+        b15=_v6_df(V6_BTC_SYMBOL,"15m"); a=_v6_closed(b15).iloc[-1]
+        c=safe_float(a["close"]); e21=safe_float(a["ema_slow"])
+        d15=1 if c>e21 else -1 if c<e21 else 0
+        if h4["dir"] == -d and d15 == -d and h4["score"]>=4:
+            return False, f"BTC 4H/15M against ({h4['dir']:+d}/{d15:+d})"
+        return True, f"BTC 4H/15M {h4['dir']:+d}/{d15:+d}"
+    except Exception:
+        return True, "BTC context unavailable"
+
+
+def _v6_candle_pattern(cdf, d):
+    if len(cdf)<4:return False,"none",0.0
+    a,b,c=cdf.iloc[-3],cdf.iloc[-2],cdf.iloc[-1]
+    atr=max(safe_float(c["atr"]),1e-12)
+    ao,ac=safe_float(a["open"]),safe_float(a["close"])
+    bo,bc=safe_float(b["open"]),safe_float(b["close"])
+    co,cc=safe_float(c["open"]),safe_float(c["close"])
+    ch,cl=safe_float(c["high"]),safe_float(c["low"])
+    cr=max(ch-cl,1e-12); body=abs(cc-co); upper=ch-max(co,cc); lower=min(co,cc)-cl
+    if d==-1:
+        star=(ac>ao and abs(bc-bo)<=abs(ac-ao)*0.60 and cc<co and cc <= (ao+ac)/2)
+        rejection=upper/cr>=0.38 and cc<co
+        engulf=cc<co and co>=bc and cc<=bo
+        if star:return True,"evening-star",min(1.0,abs(cc-co)/atr)
+        if engulf:return True,"bearish-engulf",min(1.0,body/atr)
+        if rejection:return True,"upper-wick-reject",upper/cr
+    else:
+        star=(ac<ao and abs(bc-bo)<=abs(ac-ao)*0.60 and cc>co and cc >= (ao+ac)/2)
+        rejection=lower/cr>=0.38 and cc>co
+        engulf=cc>co and co<=bc and cc>=bo
+        if star:return True,"morning-star",min(1.0,abs(cc-co)/atr)
+        if engulf:return True,"bullish-engulf",min(1.0,body/atr)
+        if rejection:return True,"lower-wick-reject",lower/cr
+    return False,"none",0.0
+
+
+def _v6_role_reversal(cdf, d, atr):
+    look=cdf.iloc[-min(len(cdf),V6_ZONE_LOOKBACK):]
+    ph,pl=_v6_pivots(look,2,2)
+    current=look.iloc[-1]; cc=safe_float(current["close"]); hi=safe_float(current["high"]); lo=safe_float(current["low"])
+    tol=V6_ZONE_TOL_ATR*atr
+    pivots=ph if d==1 else pl  # long: old resistance -> support; short: old support -> resistance
+    for idx,level in reversed(pivots[-8:]):
+        if idx>=len(look)-5:continue
+        after=look.iloc[idx+1:-1]
+        if after.empty:continue
+        if d==1:
+            broken=(after["close"]>level+0.04*atr).any()
+            touched=(lo<=level+tol and hi>=level-tol)
+            held=cc>level and cc>safe_float(current["ema_slow"])
+        else:
+            broken=(after["close"]<level-0.04*atr).any()
+            touched=(hi>=level-tol and lo<=level+tol)
+            held=cc<level and cc<safe_float(current["ema_slow"])
+        if broken and touched and held:
+            return True,level
+    return False,0.0
+
+
+def _v6_liquidity_sweep(cdf,d,atr):
+    if len(cdf)<V6_SWEEP_LOOKBACK+3:return False,0.0,0.0
+    a=cdf.iloc[-1]; prior=cdf.iloc[-(V6_SWEEP_LOOKBACK+1):-1]
+    hi=safe_float(prior["high"].max()); lo=safe_float(prior["low"].min())
+    c=safe_float(a["close"]); ah=safe_float(a["high"]); al=safe_float(a["low"])
+    if d==1 and al<lo-0.03*atr and c>lo:
+        return True,lo,(lo-al)/atr
+    if d==-1 and ah>hi+0.03*atr and c<hi:
+        return True,hi,(ah-hi)/atr
+    return False,0.0,0.0
+
+
+def _v6_fvg(cdf,d,atr):
+    # Search recent 3-candle imbalances and require the current/recent price to interact with the zone.
+    if len(cdf)<V6_FVG_LOOKBACK+4:return False,0.0,0.0
+    start=max(2,len(cdf)-V6_FVG_LOOKBACK-2)
+    cur=cdf.iloc[-1]; ch=safe_float(cur["high"]); cl=safe_float(cur["low"]); cc=safe_float(cur["close"])
+    best=None
+    for i in range(start,len(cdf)-1):
+        left=cdf.iloc[i-2]; right=cdf.iloc[i]
+        if d==1:
+            # Bullish FVG: right low above left high.
+            zlo=safe_float(left["high"]); zhi=safe_float(right["low"])
+            if zhi-zlo >= 0.06*atr:
+                interacted=cl<=zhi+0.05*atr and ch>=zlo-0.05*atr and cc>=zlo
+                if interacted:best=(zlo,zhi)
+        else:
+            # Bearish FVG: right high below left low.
+            zlo=safe_float(right["high"]); zhi=safe_float(left["low"])
+            if zhi-zlo >= 0.06*atr:
+                interacted=ch>=zlo-0.05*atr and cl<=zhi+0.05*atr and cc<=zhi
+                if interacted:best=(zlo,zhi)
+    return (True,best[0],best[1]) if best else (False,0.0,0.0)
+
+
+def _v6_hns(cdf,d,atr):
+    look=cdf.iloc[-min(len(cdf),V6_HNS_LOOKBACK):]
+    ph,pl=_v6_pivots(look,2,2)
+    cc=safe_float(look.iloc[-1]["close"])
+    if d==-1 and len(ph)>=3:
+        # Test recent triples, newest first, for left shoulder / head / right shoulder.
+        for p1,p2,p3 in reversed([ph[i:i+3] for i in range(max(0,len(ph)-6),len(ph)-2)]):
+            if not (p1[0]<p2[0]<p3[0]):continue
+            shoulders=abs(p1[1]-p3[1])<=0.65*atr
+            head=p2[1]>=max(p1[1],p3[1])+0.18*atr
+            lows1=look.iloc[p1[0]:p2[0]+1]["low"]; lows2=look.iloc[p2[0]:p3[0]+1]["low"]
+            if lows1.empty or lows2.empty:continue
+            neck=(safe_float(lows1.min())+safe_float(lows2.min()))/2
+            if shoulders and head and cc<neck-0.03*atr:
+                return True,neck
+    if d==1 and len(pl)>=3:
+        for p1,p2,p3 in reversed([pl[i:i+3] for i in range(max(0,len(pl)-6),len(pl)-2)]):
+            if not (p1[0]<p2[0]<p3[0]):continue
+            shoulders=abs(p1[1]-p3[1])<=0.65*atr
+            head=p2[1]<=min(p1[1],p3[1])-0.18*atr
+            highs1=look.iloc[p1[0]:p2[0]+1]["high"]; highs2=look.iloc[p2[0]:p3[0]+1]["high"]
+            if highs1.empty or highs2.empty:continue
+            neck=(safe_float(highs1.max())+safe_float(highs2.max()))/2
+            if shoulders and head and cc>neck+0.03*atr:
+                return True,neck
+    return False,0.0
+
+
+def _v6_plan(cdf,side,route,zone_level=0.0):
+    a=cdf.iloc[-1]; d=1 if side=="long" else -1
+    entry=safe_float(a["close"]); atr=safe_float(a["atr"])
+    if entry<=0 or atr<=0:return None
+    recent=cdf.iloc[-12:]
+    struct=safe_float(recent["low"].min())-V6_STOP_BUFFER_ATR*atr if d==1 else safe_float(recent["high"].max())+V6_STOP_BUFFER_ATR*atr
+    if zone_level>0:
+        zone_stop=zone_level-d*V6_STOP_BUFFER_ATR*atr
+        struct=min(struct,zone_stop) if d==1 else max(struct,zone_stop)
+    raw=abs(entry-struct)
+    risk=max(V6_MIN_STOP_ATR*atr,min(raw,V6_MAX_STOP_ATR*atr))
+    return {"risk_distance":risk,"atr":atr,"origin":f"V6 {route} structure","final_r":V6_FINAL_R}
+
+
+def _v6_candidate(symbol):
+    h4=_v6_4h_context(symbol); d=h4.get("dir",0)
+    df=_v6_df(symbol,"15m"); cdf=_v6_closed(df)
+    if len(cdf)<210:return None
+    a,p=cdf.iloc[-1],cdf.iloc[-2]
+    c=safe_float(a["close"]); atr=safe_float(a["atr"]); atrm=safe_float(a["atr_mean"])
+    if atr<=0:return None
+    if d==0:
+        return {"symbol":symbol,"side":None,"score":0,"quality":0,"grade":"-","skip":"4H-no-clean-direction","entry_route":"WAIT","strategy":"STRUCTURE","price":c,"atr":atr,"signal_bar_ts":int(a["ts"]),"h4_adx":h4.get("adx",0)}
+    side="long" if d==1 else "short"
+    e21=safe_float(a["ema_slow"]); e21p=safe_float(cdf.iloc[-4]["ema_slow"])
+    ema_ok=(c>e21 and e21>e21p) if d==1 else (c<e21 and e21<e21p)
+    extension=d*(c-e21)/atr
+    role,role_level=_v6_role_reversal(cdf,d,atr)
+    sweep,sweep_level,sweep_depth=_v6_liquidity_sweep(cdf,d,atr)
+    fvg,fvg_lo,fvg_hi=_v6_fvg(cdf,d,atr)
+    hns,neck=_v6_hns(cdf,d,atr)
+    candle,candle_name,candle_strength=_v6_candle_pattern(cdf,d)
+    hist=safe_float(a["macd_hist"]); hp=safe_float(p["macd_hist"])
+    macd_ok=(hist>hp) if d==1 else (hist<hp)
+    rsi=safe_float(a["sniper_rsi"],50); rsi_ok=(50<=rsi<=70) if d==1 else (30<=rsi<=50)
+    adx=safe_float(a["sniper_adx"]); adx_ok=adx>=15
+    volm=safe_float(a["vol_mean"]); vol=safe_float(a["volume"]); vol_ok=volm>0 and vol>=volm*1.08
+    vol_ratio=atr/atrm if atrm>0 else 99
+    btc_ok,btc_note=_v6_btc_gate(symbol,d)
+
+    # Primary structure is mandatory. This prevents indicator-only entries.
+    primary = role or sweep or hns
+    confirmations = int(role)+int(sweep)+int(fvg)+int(hns)+int(candle)+int(macd_ok)+int(vol_ok)
+    q=0.0
+    q += 24 if h4.get("score",0)>=5 else 20
+    q += 14 if ema_ok else 0
+    q += 18 if role else 0
+    q += 17 if sweep else 0
+    q += 13 if fvg else 0
+    q += 20 if hns else 0
+    q += 11 if candle else 0
+    q += 8 if macd_ok else 0
+    q += 5 if rsi_ok else 0
+    q += 4 if adx_ok else 0
+    q += 4 if vol_ok else 0
+    q=min(q,100.0)
+
+    if hns:route="HNS-NECKLINE"
+    elif sweep and fvg:route="SWEEP-FVG"
+    elif role and candle:route="DOUBLE-CONFIRM"
+    elif role:route="ROLE-REVERSAL"
+    else:route="STRUCTURE"
+    level=neck if hns else sweep_level if sweep else role_level if role else 0.0
+    plan=_v6_plan(cdf,side,route,level)
+
+    skip=None
+    if h4.get("adx",0)<V6_4H_MIN_ADX and h4.get("score",0)<5:skip=f"4H-weak-ADX-{h4.get('adx',0):.0f}"
+    elif not ema_ok:skip="15M-EMA21-filter"
+    elif not primary:skip="no-key-structure"
+    elif confirmations<V6_MIN_CONFIRMATIONS:skip=f"confirmations-{confirmations}<{V6_MIN_CONFIRMATIONS}"
+    elif not macd_ok:skip="15M-momentum-not-confirmed"
+    elif vol_ratio>V6_MAX_VOL_RATIO:skip=f"volatility-{vol_ratio:.2f}x"
+    elif extension>V6_MAX_ENTRY_EXTENSION_ATR:skip=f"entry-extended-{extension:.2f}ATR"
+    elif not btc_ok:skip=btc_note
+    elif q<V6_MIN_QUALITY:skip=f"quality-{q:.0f}<{V6_MIN_QUALITY:.0f}"
+    elif not plan:skip="invalid-plan"
+
+    return {"symbol":symbol,"side":side,"score":q,"score_max":100.0,"quality":q,"threshold":V6_MIN_QUALITY,
+            "grade":"A+" if q>=V6_ELITE_QUALITY else "A" if q>=V6_MIN_QUALITY else "C","skip":skip,
+            "entry_route":route if skip is None else "WAIT","strategy":"STRUCTURE","price":c,"atr":atr,"adx":adx,"rsi":rsi,
+            "signal_bar_ts":int(a["ts"]),"risk_distance":plan["risk_distance"] if plan else 0.0,
+            "stop_origin":plan["origin"] if plan else "N/A","final_r":V6_FINAL_R,"h4_score":h4.get("score",0),"h4_adx":h4.get("adx",0),
+            "confirmations":confirmations,"role":role,"sweep":sweep,"fvg":fvg,"hns":hns,"candle":candle_name if candle else "-",
+            "macd_ok":macd_ok,"volume_above":vol_ok,"extension_atr":extension,"btc_note":btc_note,
+            "zone_level":level,"fvg_zone":(fvg_lo,fvg_hi) if fvg else None,"sweep_depth":sweep_depth}
+
+
+def evaluate_symbol(symbol, btc=None):
+    return _v6_candidate(symbol)
+
+
+def sizing_profile(signal):
+    elite=safe_float(signal.get("score"))>=V6_ELITE_QUALITY and int(signal.get("confirmations",0))>=4
+    return {"name":"V6-ELITE" if elite else "V6-STRUCTURE","risk_pct":V6_ELITE_RISK_PCT if elite else V6_RISK_PCT,"target_net_tp":V6_TARGET_NET}
+
+
+def _v6_levels(signal,live,tick):
+    side=signal["side"];d=1 if side=="long" else -1;risk=safe_float(signal.get("risk_distance"))
+    if live<=0 or risk<=0:return None
+    sl=round_trade_price(live-d*risk,tick,side,"sl")
+    t1=round_trade_price(live+d*risk*V6_TP1_R,tick,side,"tp")
+    t2=round_trade_price(live+d*risk*V6_TP2_R,tick,side,"tp")
+    t3=round_trade_price(live+d*risk*V6_FINAL_R,tick,side,"tp")
+    return sl,t1,t2,t3,risk
+
+
+def sniper_portfolio_allows(signal,positions):
+    side=signal.get("side");same=sum(1 for p in positions if position_side(p)==side)
+    if same>=V6_MAX_SAME_SIDE:return False,f"max-{V6_MAX_SAME_SIDE}-same-side"
+    if sniper_side_loss_streak.get(side,0)>=2 and safe_float(signal.get("score"))<V6_ELITE_QUALITY:
+        return False,f"{side}-loss-streak-needs-elite"
+    return True,"OK"
+
+
+def open_trade(signal):
+    global protection_lock
+    symbol,side=signal["symbol"],signal["side"]
+    acc=futures_account();equity,available=acc["total_equity"],acc["available"];reset_daily_if_needed(equity)
+    if equity<MIN_EQUITY_USDT or available<=0 or (not PAPER_TRADING and protection_lock):return False
+    tick=safe_float(get_instrument(symbol).get("tickSize"),0.0001)
+    live=safe_float(exchange.fetch_ticker(symbol).get("last"),signal["price"]);sig=safe_float(signal["price"])
+    if live<=0 or sig<=0:return False
+    d=1 if side=="long" else -1;adverse=d*((live-sig)/sig)
+    if adverse>SNIPER_MAX_FILL_DRIFT:
+        tg(f"⏭️ {symbol} {side.upper()} V6 too late\nAdverse drift {adverse*100:.2f}% > {SNIPER_MAX_FILL_DRIFT*100:.2f}%");return False
+    levels=_v6_levels(signal,live,tick)
+    if not levels:return False
+    sl,t1,t2,t3,risk=levels;profile=sizing_profile(signal)
+    sizing=calculate_contracts_v5(symbol,live,sl,equity,available,profile["risk_pct"],profile["target_net_tp"],V6_FINAL_R)
+    if not sizing or sizing["margin"]>available*AVAILABLE_MARGIN_BUFFER:return False
+    before_ids={position_id(p) for p in get_positions() if position_id(p)}
+    oklev,levres=set_leverage(symbol,LEVERAGE)
+    if not oklev:tg(f"⛔ LEVERAGE FAILED\n{symbol}\n{levres}");return False
+    tag="ps6s"
+    payload={"instId":blofin_inst_id(symbol),"marginMode":MARGIN_MODE,"positionSide":"net","side":"buy" if side=="long" else "sell","orderType":"market","size":str(sizing["contracts"]),
+             "tpTriggerPrice":str(t3),"tpOrderPrice":"-1","tpTriggerPriceType":"mark","slTriggerPrice":str(sl),"slOrderPrice":"-1","slTriggerPriceType":"mark",
+             "clientOrderId":f"{tag}{int(time.time()*1000)%1000000000}"}
+    if BROKER_ID:payload["brokerId"]=BROKER_ID
+    flags=[]
+    for k,label in (("role","ROLE"),("sweep","SWEEP"),("fvg","FVG"),("hns","H&S")):
+        if signal.get(k):flags.append(label)
+    if signal.get("candle") not in (None,"-","none"):flags.append(str(signal.get("candle")))
+    msg=(f"{'🧪 PAPER' if PAPER_TRADING else '🧠 V6 STRUCTURE ENTRY'} v{SNIPER_VERSION}\n{symbol} {side.upper()} · {signal.get('entry_route')} · {signal['grade']} {signal['score']:.0f}/100\n"
+         f"4H score {signal.get('h4_score',0)}/6 · ADX {signal.get('h4_adx',0):.1f}\n15M confirmations {signal.get('confirmations',0)} · {' + '.join(flags) if flags else '-'}\n"
+         f"BTC {signal.get('btc_note','-')}\nEntry ~ {live:.8g}\nSL {sl:.8g}\nTP1 {t1:.8g} (1R)\nTP2 {t2:.8g} (2R)\nTP3 {t3:.8g} (3R)\n"
+         f"Risk cap {profile['risk_pct']*100:.1f}% · expected TP net ~${sizing['expected_net_tp_usdt']:.2f} · SL+cost ~${sizing['expected_net_sl_usdt']:.2f}\n"
+         f"Notional ${sizing['notional']:.2f} · Margin ${sizing['margin']:.2f} · {LEVERAGE}x\nAdverse drift {max(0,adverse)*100:.2f}%/{SNIPER_MAX_FILL_DRIFT*100:.2f}%")
+    if PAPER_TRADING:tg(msg);return True
+    resp=native("private_post_trade_order",payload)
+    if not native_ok(resp):
+        err=response_error(resp)
+        if "152012" in err:protection_lock=True
+        tg(f"❌ V6 ORDER FAILED\n{symbol} {side.upper()}\n{err}");return False
+    tg(msg);new_pos=find_new_position(symbol,before_ids,timeout=8)
+    if new_pos is None:tg(f"⚠️ {symbol}: V6 order accepted, position not visible yet.");return True
+    pid=position_id(new_pos)
+    if pid:
+        sniper_managed_positions.add(pid);_v6_position_meta[pid]={"risk":risk,"tp1":t1,"tp2":t2,"opened":time.time(),"route":signal.get("entry_route"),"side":side}
+    if has_live_protection(new_pos)[0]:tg(f"🛡️ V6 PROTECTION CONFIRMED\n{symbol} {side.upper()}\n3R TP + structural SL visible.");return True
+    last=safe_float(exchange.fetch_ticker(symbol).get("last"))
+    if tpsl_prices_valid(side,sl,t3,last):
+        ok,res=place_tpsl_for_position(new_pos,sl,t3,client_tag=tag)
+        if ok:tg(f"🛡️ V6 FALLBACK PROTECTION CONFIRMED\n{symbol}");return True
+        protection_lock=True;tg(f"🚨 V6 PROTECTION FAILURE\n{symbol}\n{res}\nNEW TRADES PAUSED.");return True
+    protection_lock=True;tg(f"🚨 {symbol}: V6 position exists but safe fallback protection failed.\nNEW TRADES PAUSED.");return True
+
+
+def _v6_managed(p):
+    pid=position_id(p)
+    if pid in sniper_managed_positions or pid in _v6_position_meta:return True
+    try:
+        ok,probe=has_live_protection(p);cid=str((probe or {}).get("clientOrderId","") or "")
+        if cid.startswith("ps6"):
+            if pid:sniper_managed_positions.add(pid)
+            return True
+    except Exception:pass
+    return False
+
+
+def _v6_close_position(p,reason):
+    payload={"instId":p["instId"],"marginMode":position_margin_mode(p),"positionSide":str(p.get("positionSide","net") or "net"),"clientOrderId":f"ps6x{int(time.time()*1000)%1000000000}"}
+    pid=position_id(p)
+    if pid:payload["positionId"]=pid
+    if BROKER_ID:payload["brokerId"]=BROKER_ID
+    resp=native("private_post_trade_close_position",payload)
+    if native_ok(resp):tg(f"⚡ V6 ACTIVE EXIT\n{position_symbol(p)} {position_side(p).upper()}\n{reason}\nClosed at market.");return True
+    tg(f"⚠️ V6 ACTIVE EXIT FAILED\n{position_symbol(p)}\n{response_error(resp)}");return False
+
+
+def manage_sniper_step_stops():
+    if PAPER_TRADING:return
+    now=time.time()
+    for p in get_positions():
+        if not _v6_managed(p):continue
+        symbol,side,entry=position_symbol(p),position_side(p),position_entry(p);pid=position_id(p)
+        if entry<=0:continue
+        ok,order=has_live_protection(p)
+        if not ok or not order:continue
+        tp=safe_float(order.get("tpTriggerPrice"));current_sl=safe_float(order.get("slTriggerPrice"))
+        if tp<=0 or current_sl<=0:continue
+        meta=_v6_position_meta.get(pid,{})
+        risk=safe_float(meta.get("risk"))
+        if risk<=0:
+            base=abs(tp-entry)/V6_FINAL_R
+            if base<=0:continue
+            risk=base;meta={"risk":risk,"opened":safe_float(p.get("createTime"))/1000.0,"route":"restart-adopt"};_v6_position_meta[pid]=meta
+        d=1 if side=="long" else -1;tick=safe_float(get_instrument(symbol).get("tickSize"),0.0001)
+        current=safe_float(exchange.fetch_ticker(symbol).get("last"));ext=sniper_recent_extreme(symbol,side)
+        favorable=max(current,ext) if d==1 else min(current,ext)
+        current_r=d*(current-entry)/risk;best_r=d*(favorable-entry)/risk
+        desired=None;stage=None
+        if best_r>=V6_TP2_R:
+            desired=round_trade_price(entry+d*V6_LOCK_R*risk,tick,side,"sl");stage="2R → lock +1R"
+        elif best_r>=V6_TP1_R:
+            desired=round_trade_price(entry,tick,side,"sl");stage="1R → break-even"
+        if desired is not None:
+            improves=desired>current_sl+tick*0.1 if d==1 else desired<current_sl-tick*0.1
+            if improves:
+                ok2,res=amend_tpsl_stop(p,desired);key=f"{pid}:{stage}"
+                if ok2 and not sniper_step_notified.get(key):tg(f"🪜 V6 STEP STOP\n{symbol} {side.upper()}\n{stage} · SL {desired:.8g}");sniper_step_notified[key]=True
+        opened=safe_float(meta.get("opened")) or safe_float(p.get("createTime"))/1000.0;age=(now-opened)/60 if opened>0 else 0
+        # Only 15M + 4H are consulted for thesis exits.
+        if age>=45 and current_r<0.35:
+            try:
+                cdf=_v6_closed(_v6_df(symbol,"15m"));a,pr=cdf.iloc[-1],cdf.iloc[-2]
+                c=safe_float(a["close"]);e21=safe_float(a["ema_slow"]);pc=safe_float(pr["close"]);pe21=safe_float(pr["ema_slow"])
+                lost15=(c<e21 and pc<pe21) if d==1 else (c>e21 and pc>pe21)
+                h4=_v6_4h_context(symbol);macro_flip=h4.get("dir",0)==-d
+                if lost15 and macro_flip:
+                    _v6_close_position(p,f"4H/15M thesis invalidated after {age:.0f}m ({current_r:+.2f}R).");continue
+            except Exception:pass
+        if age>=V6_HARD_EXIT_MIN:_v6_close_position(p,f"Hard time exit {age:.0f}m ({current_r:+.2f}R).");continue
+        if age>=V6_SOFT_EXIT_MIN and current_r<0.20:_v6_close_position(p,f"No follow-through after {age:.0f}m ({current_r:+.2f}R).");continue
+
+
+def repair_one_position(p):
+    symbol,side,entry=position_symbol(p),position_side(p),position_entry(p)
+    if entry<=0:return False
+    if has_live_protection(p)[0]:return True
+    pid=position_id(p);meta=_v6_position_meta.get(pid,{});risk=safe_float(meta.get("risk"))
+    if risk<=0:
+        try:
+            cdf=_v6_closed(_v6_df(symbol,"15m"));atr=safe_float(cdf.iloc[-1]["atr"]);risk=max(V6_MIN_STOP_ATR*atr,min(1.0*atr,V6_MAX_STOP_ATR*atr))
+        except Exception:return False
+    d=1 if side=="long" else -1;tick=safe_float(get_instrument(symbol).get("tickSize"),0.0001)
+    sl=round_trade_price(entry-d*risk,tick,side,"sl");tp=round_trade_price(entry+d*risk*V6_FINAL_R,tick,side,"tp")
+    last=safe_float(exchange.fetch_ticker(symbol).get("last"))
+    if not tpsl_prices_valid(side,sl,tp,last):return False
+    return place_tpsl_for_position(p,sl,tp,client_tag="ps6s")[0]
+
+
+def maybe_score_report(rows):
+    global _v6_last_report
+    now=time.time();interesting=[r for r in rows if r and (r.get("side") or r.get("skip"))]
+    if not interesting or now-_v6_last_report<V6_REPORT_MIN*60:return
+    _v6_last_report=now
+    ranked=sorted(interesting,key=lambda r:safe_float(r.get("quality",r.get("score",0))),reverse=True)[:10]
+    lines=[f"🧠 PRECISION STRUCTURE FUSION v{SNIPER_VERSION} · 4H + 15M ONLY"]
+    for r in ranked:
+        state="🟢 READY" if r.get("side") and not r.get("skip") else f"⏭ {r.get('skip','wait')}"
+        lines.append(f"{r['symbol'].split('/')[0]} {str(r.get('side') or '-').upper()} {r.get('entry_route','-')} Q{safe_float(r.get('score')):.0f} C{r.get('confirmations','-')} 4H{r.get('h4_score','-')}/6 {state}")
+    tg("\n".join(lines))
+
+
+def startup_diagnostics():
+    acc=futures_account();reset_daily_if_needed(acc["total_equity"])
+    tg(f"🧠 PRECISION STRUCTURE FUSION STARTED v{SNIPER_VERSION}\nMode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
+       f"TIMEFRAMES: 4H + 15M ONLY — no 1H, no 5M\n"
+       f"4H: EMA21/55/200 + structure + MACD/ADX regime\n"
+       f"15M: EMA21 direction + key-zone role reversal + liquidity sweep + FVG + H&S + candle rejection\n"
+       f"Entry requires primary market structure + >= {V6_MIN_CONFIRMATIONS} confirmations + Q >= {V6_MIN_QUALITY:.0f}\n"
+       f"TP model: 1R→BE · 2R→lock +1R · 3R final\n"
+       f"Risk caps: normal {V6_RISK_PCT*100:.1f}% · elite {V6_ELITE_RISK_PCT*100:.1f}% · max positions {MAX_ACTIVE_POSITIONS} · max same side {V6_MAX_SAME_SIDE}\n"
+       f"BTC context (4H+15M only): {'ON' if V6_BTC_CONTEXT else 'OFF'}\n"
+       f"Equity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}")
+
+
+def main():
+    global protection_lock
+    load_learning();startup_diagnostics()
+    if not PAPER_TRADING:
+        try:seed_closed_history_v5()
+        except Exception as e:tg(f"⚠️ V6 PNL seed warning\n{e}")
+        try:
+            inherited=get_positions();protection_lock=not all_positions_protected() if inherited else False
+            if inherited:tg(f"ℹ️ V6 HANDOVER\n{len(inherited)} existing position(s). Existing protection left untouched."+("\n⚠️ Unprotected position detected: entries locked." if protection_lock else "\n✅ Protection verified."))
+        except Exception as e:protection_lock=True;tg(f"🚨 STARTUP PROTECTION CHECK FAILED\n{e}")
+    while True:
+        try:
+            if not PAPER_TRADING:
+                try:check_for_closed_positions()
+                except Exception as e:tg(f"⚠️ PNL TRACKER ERROR\n{e}")
+                try:manage_sniper_step_stops()
+                except Exception as e:tg(f"⚠️ V6 MANAGER ERROR\n{e}")
+            acc=futures_account();ok,reason=check_daily_risk(acc["total_equity"])
+            if not ok:tg(f"🛑 {reason}");time.sleep(120);continue
+            if time.time()<loss_pause_until:time.sleep(SCAN_SECONDS);continue
+            positions=get_positions()
+            if not PAPER_TRADING:protection_watch();positions=get_positions()
+            if protection_lock and not PAPER_TRADING:time.sleep(SCAN_SECONDS);continue
+            scanned=[];candidates=[];existing={position_symbol(p) for p in positions}
+            for symbol in SYMBOLS:
+                if not cooldown_ok(symbol):continue
+                try:
+                    s=evaluate_symbol(symbol)
+                    if not s:continue
+                    scanned.append(s)
+                    if s.get("side") and not s.get("skip") and s.get("entry_route") not in ("WAIT",None):
+                        key=int(s.get("signal_bar_ts",0))
+                        if sniper_last_signal_bar.get(symbol)==key:continue
+                        if symbol in existing:sniper_last_signal_bar[symbol]=key;continue
+                        candidates.append(s)
+                except Exception:continue
+            maybe_score_report(scanned)
+            candidates.sort(key=lambda x:(safe_float(x.get("quality")),int(x.get("confirmations",0)),safe_float(x.get("h4_score"))),reverse=True)
+            attempts=0
+            for s in candidates:
+                if len(get_positions())>=MAX_ACTIVE_POSITIONS or attempts>=MAX_EXECUTION_ATTEMPTS_PER_SCAN:break
+                allowed,why=sniper_portfolio_allows(s,get_positions())
+                if not allowed:
+                    sniper_last_signal_bar[s["symbol"]]=int(s.get("signal_bar_ts",0));tg(f"⏭️ {s['symbol']} {s['side'].upper()} V6 PORTFOLIO\n{why}");continue
+                attempts+=1;opened=open_trade(s);sniper_last_signal_bar[s["symbol"]]=int(s.get("signal_bar_ts",0))
+                if opened:symbol_last_trade[s["symbol"]]=time.time();break
+            time.sleep(SCAN_SECONDS)
+        except KeyboardInterrupt:tg("🛑 Precision Structure Fusion V6 stopped.");raise
+        except Exception as e:
+            msg=f"{type(e).__name__}: {e}"
+            if "152002" in msg:time.sleep(20);continue
+            tg(f"⚠️ PRECISION STRUCTURE FUSION V6 LOOP ERROR\n{msg}");time.sleep(30)
 
 
 if __name__ == "__main__":
