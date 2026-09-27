@@ -3831,35 +3831,68 @@ def repair_one_position(p):
     return place_tpsl_for_position(p,sl,tp,client_tag=tag)[0]
 
 def seed_closed_history_v5():
-    """Rebuild today's dashboard on restart instead of pretending the day starts at bot boot."""
+    """V6.1: rebuild risk/PnL only from the intentional V6 risk epoch onward.
+
+    Old V2-V5 closes earlier today remain known (so they are not re-notified), but they
+    no longer count against the fresh Structure Fusion daily risk budget. The epoch is
+    a fixed timestamp, so ordinary process restarts cannot repeatedly erase losses.
+    On later Amsterdam dates, the normal start-of-day boundary is used.
+    """
     global consecutive_losses
     reset_daily_if_needed()
     records=closed_positions_history(100)
-    today=amsterdam_today(); todays=[]
+    today=amsterdam_today(); scoped=[]
     try:
         from zoneinfo import ZoneInfo
         tz=ZoneInfo("Europe/Amsterdam")
-    except Exception:tz=timezone(timedelta(hours=2))
+    except Exception:
+        tz=timezone(timedelta(hours=2))
+
+    # Normal day boundary.
+    now_local=datetime.now(tz)
+    day_start=now_local.replace(hour=0,minute=0,second=0,microsecond=0)
+    risk_start=day_start
+    if V6_RISK_EPOCH_LOCAL:
+        try:
+            epoch=datetime.fromisoformat(V6_RISK_EPOCH_LOCAL)
+            if epoch.tzinfo is None: epoch=epoch.replace(tzinfo=tz)
+            else: epoch=epoch.astimezone(tz)
+            # The manual reset only overrides the day boundary on that same day.
+            if epoch.date()==now_local.date() and epoch>risk_start:
+                risk_start=epoch
+        except Exception as e:
+            tg(f"⚠️ V6 risk epoch parse warning\n{V6_RISK_EPOCH_LOCAL}\n{e}")
+
     for r in records:
         hid=str(r.get("historyId",""))
-        if hid:seen_closed_history_ids.add(hid)
+        if hid: seen_closed_history_ids.add(hid)
         ts=safe_float(r.get("updateTime"))/1000.0
-        if ts<=0:continue
-        if datetime.fromtimestamp(ts,tz).date().isoformat()==today:todays.append(r)
-    # Rebuild counters in chronological order.
-    daily.update({"trades":0,"wins":0,"losses":0,"net":0.0,"long_trades":0,"long_wins":0,"long_net":0.0,"short_trades":0,"short_wins":0,"short_net":0.0})
+        if ts<=0: continue
+        dt=datetime.fromtimestamp(ts,tz)
+        if dt.date().isoformat()==today and dt>=risk_start:
+            scoped.append(r)
+
+    daily.update({"trades":0,"wins":0,"losses":0,"net":0.0,
+                  "long_trades":0,"long_wins":0,"long_net":0.0,
+                  "short_trades":0,"short_wins":0,"short_net":0.0})
     consecutive_losses=0; sniper_side_loss_streak["long"]=0; sniper_side_loss_streak["short"]=0
-    for r in sorted(todays,key=lambda x:safe_float(x.get("updateTime"))):
-        side=infer_side(r); bucket="short" if side=="short" else "long"; gross=safe_float(r.get("realizedPnl")); fee=abs(safe_float(r.get("fee"))); net=gross-fee
-        daily["trades"]+=1;daily["net"]+=net;daily[f"{bucket}_trades"]+=1;daily[f"{bucket}_net"]+=net
-        if net>=0:daily["wins"]+=1;daily[f"{bucket}_wins"]+=1;consecutive_losses=0;sniper_side_loss_streak[bucket]=0
-        else:daily["losses"]+=1;consecutive_losses+=1;sniper_side_loss_streak[bucket]=sniper_side_loss_streak.get(bucket,0)+1
+    for r in sorted(scoped,key=lambda x:safe_float(x.get("updateTime"))):
+        side=infer_side(r); bucket="short" if side=="short" else "long"
+        gross=safe_float(r.get("realizedPnl")); fee=abs(safe_float(r.get("fee"))); net=gross-fee
+        daily["trades"]+=1; daily["net"]+=net; daily[f"{bucket}_trades"]+=1; daily[f"{bucket}_net"]+=net
+        if net>=0:
+            daily["wins"]+=1; daily[f"{bucket}_wins"]+=1; consecutive_losses=0; sniper_side_loss_streak[bucket]=0
+        else:
+            daily["losses"]+=1; consecutive_losses+=1; sniper_side_loss_streak[bucket]=sniper_side_loss_streak.get(bucket,0)+1
     try:
         current_equity=futures_account()["total_equity"]
+        # If no closes occurred since the reset this is exactly current equity: 0.00% DD.
         daily["start_equity"]=current_equity-daily["net"]
     except Exception:
         pass
-    tg(f"📚 V5 PNL TRACKER READY\nKnown closes: {len(seen_closed_history_ids)}\nToday's closes rebuilt: {daily['trades']} · W/L {daily['wins']}/{daily['losses']} · Net ${daily['net']:.2f}")
+    tg(f"📚 V6.1 RISK BASELINE READY\nRisk window starts: {risk_start.strftime('%Y-%m-%d %H:%M')} Amsterdam\n"
+       f"Closes since reset: {daily['trades']} · W/L {daily['wins']}/{daily['losses']} · Net ${daily['net']:.2f}\n"
+       f"Risk baseline: ${safe_float(daily.get('start_equity')):.2f}")
 
 
 def maybe_score_report(rows):
@@ -3956,7 +3989,15 @@ def main():
 #   5) Final target is 3R; stop is structural and never widened after entry.
 # No 1H and no 5M data are used by the active V6 engine.
 
-SNIPER_VERSION = "6.0.0"
+SNIPER_VERSION = "6.1.0"
+
+# V6.1 risk baseline: intentional reset when Structure Fusion became the active strategy.
+# This timestamp is persistent across process restarts, so a restart does NOT reset risk again.
+# On following Amsterdam calendar days the normal midnight daily reset applies.
+V6_RISK_EPOCH_LOCAL = os.getenv("V6_RISK_EPOCH_LOCAL", "2026-09-27T21:30:00").strip()
+V6_DAILY_RISK_REMINDER_MIN = int(os.getenv("V6_DAILY_RISK_REMINDER_MIN", "60"))
+_v6_daily_risk_alerted = False
+_v6_daily_risk_last_notice = 0.0
 V6_MIN_QUALITY = float(os.getenv("V6_MIN_QUALITY", "78"))
 V6_ELITE_QUALITY = float(os.getenv("V6_ELITE_QUALITY", "90"))
 V6_MIN_CONFIRMATIONS = int(os.getenv("V6_MIN_CONFIRMATIONS", "3"))
@@ -4440,6 +4481,7 @@ def startup_diagnostics():
        f"TP model: 1R→BE · 2R→lock +1R · 3R final\n"
        f"Risk caps: normal {V6_RISK_PCT*100:.1f}% · elite {V6_ELITE_RISK_PCT*100:.1f}% · max positions {MAX_ACTIVE_POSITIONS} · max same side {V6_MAX_SAME_SIDE}\n"
        f"BTC context (4H+15M only): {'ON' if V6_BTC_CONTEXT else 'OFF'}\n"
+       f"Risk reset epoch: {V6_RISK_EPOCH_LOCAL or 'normal day start'} Amsterdam\n"
        f"Equity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}")
 
 
@@ -4461,7 +4503,16 @@ def main():
                 try:manage_sniper_step_stops()
                 except Exception as e:tg(f"⚠️ V6 MANAGER ERROR\n{e}")
             acc=futures_account();ok,reason=check_daily_risk(acc["total_equity"])
-            if not ok:tg(f"🛑 {reason}");time.sleep(120);continue
+            if not ok:
+                global _v6_daily_risk_alerted, _v6_daily_risk_last_notice
+                now_ts=time.time()
+                if (not _v6_daily_risk_alerted) or (now_ts-_v6_daily_risk_last_notice >= V6_DAILY_RISK_REMINDER_MIN*60):
+                    tg(f"🛑 {reason}\nNew entries paused. Existing positions remain protected.\nNext reminder in {V6_DAILY_RISK_REMINDER_MIN} min.")
+                    _v6_daily_risk_alerted=True; _v6_daily_risk_last_notice=now_ts
+                time.sleep(120);continue
+            elif _v6_daily_risk_alerted:
+                tg("🟢 DAILY RISK STOP CLEARED\nNew entries are allowed again.")
+                _v6_daily_risk_alerted=False; _v6_daily_risk_last_notice=0.0
             if time.time()<loss_pause_until:time.sleep(SCAN_SECONDS);continue
             positions=get_positions()
             if not PAPER_TRADING:protection_watch();positions=get_positions()
