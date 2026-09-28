@@ -4912,7 +4912,7 @@ def open_trade(signal):
         details=(f"4H score {signal.get('h4_score',0)}/6 · ADX {signal.get('h4_adx',0):.1f} · EMA21 ext {signal.get('h4_ext_atr',0):.2f}ATR\n"
                  f"15M confirmations {signal.get('confirmations',0)} · {' + '.join(flags) if flags else '-'}\n"
                  f"Entry {live:.8g} · SL {sl:.8g} · TP1 {t1:.8g} · TP2 {t2:.8g} · FINAL {t3:.8g} ({final_r:.1f}R)")
-    msg=(f"{'🧪 PAPER' if PAPER_TRADING else '🎯 V6.4 ENTRY'}\n{symbol} {side.upper()} · {signal.get('entry_route')} · {signal.get('grade')} {signal.get('score',0):.0f}/100\n"
+    msg=(f"{'🧪 PAPER' if PAPER_TRADING else '🎯 V6.6 ENTRY'}\n{symbol} {side.upper()} · {signal.get('entry_route')} · {signal.get('grade')} {signal.get('score',0):.0f}/100\n"
          f"{details}\nBTC {signal.get('btc_note','-')}\nRisk cap {profile['risk_pct']*100:.1f}% · expected final net ~${sizing['expected_net_tp_usdt']:.2f}\n"
          f"Notional ${sizing['notional']:.2f} · Margin ${sizing['margin']:.2f} · {LEVERAGE}x")
     if PAPER_TRADING:tg(msg);_v62_last_entry_time=time.time();return True
@@ -4926,12 +4926,12 @@ def open_trade(signal):
     pid=position_id(new_pos)
     if pid:
         sniper_managed_positions.add(pid);_v6_position_meta[pid]={"risk":risk,"tp1":t1,"tp2":t2,"opened":time.time(),"route":signal.get("entry_route"),"side":side,"final_r":final_r,"strategy":signal.get("strategy")}
-    if has_live_protection(new_pos)[0]:tg(f"🛡️ V6.4 PROTECTION CONFIRMED\n{symbol} {side.upper()}\n{final_r:.1f}R TP + structural SL visible.");return True
+    if has_live_protection(new_pos)[0]:tg(f"🛡️ V6.6 PROTECTION CONFIRMED\n{symbol} {side.upper()}\n{final_r:.1f}R TP + structural SL visible.");return True
     last=safe_float(exchange.fetch_ticker(symbol).get("last"))
     if tpsl_prices_valid(side,sl,t3,last):
         ok,res=place_tpsl_for_position(new_pos,sl,t3,client_tag=tag)
-        if ok:tg(f"🛡️ V6.4 FALLBACK PROTECTION CONFIRMED\n{symbol}");return True
-        protection_lock=True;tg(f"🚨 V6.4 PROTECTION FAILURE\n{symbol}\n{res}\nNEW TRADES PAUSED.");return True
+        if ok:tg(f"🛡️ V6.6 FALLBACK PROTECTION CONFIRMED\n{symbol}");return True
+        protection_lock=True;tg(f"🚨 V6.6 PROTECTION FAILURE\n{symbol}\n{res}\nNEW TRADES PAUSED.");return True
     protection_lock=True;tg(f"🚨 {symbol}: V6.3 position exists but safe fallback protection failed.\nNEW TRADES PAUSED.");return True
 
 
@@ -5188,6 +5188,428 @@ def startup_diagnostics():
        f"Max positions {MAX_ACTIVE_POSITIONS} · max same side {V6_MAX_SAME_SIDE} · entry spacing {V62_GLOBAL_ENTRY_GAP_MIN}m\n"
        f"Scanner summary every {V64_REPORT_MIN}m instead of Telegram walls.\n"
        f"Equity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}")
+
+
+# ============================================================
+# V6.6 — CONFIRM OR FLIP / MARKET-REGIME REPAIR
+# ============================================================
+# Why this exists:
+# The 2026-09-28 live review showed three EBP-FVG shorts (ORDI, APT, IMX)
+# being allowed while BTC 15M was bullish (+0/+1 in Telegram). The old BTC
+# gate only blocked when BOTH BTC 4H and 15M were strongly opposite.
+# EBP also entered on the first live FVG touch without waiting for a CLOSED
+# 15M rejection candle. That made "A/A+" quality too optimistic.
+#
+# V6.6 changes:
+# 1) BTC 15M opposition + non-supportive BTC 4H now blocks alt entries.
+# 2) EBP-FVG needs a CLOSED 15M rejection/confirmation after the retrace.
+# 3) A failed EBP can flip direction ONLY when 4H trend + 15M break + BTC all
+#    confirm the opposite direction. No blind signal inversion.
+# 4) Same-side cold mode is stricter after a poor intraday side record.
+# 5) Risk is temporarily capped lower until the repaired entries prove edge.
+# 6) BloFin instrument metadata is cached/retried so the position manager does
+#    not repeatedly depend on /market/instruments every management cycle.
+
+SNIPER_VERSION = "6.6.0"
+
+V66_EBP_CONFIRM_LOOKBACK = int(os.getenv("V66_EBP_CONFIRM_LOOKBACK", "4"))
+V66_EBP_CONFIRM_TOL_ATR = float(os.getenv("V66_EBP_CONFIRM_TOL_ATR", "0.06"))
+V66_EBP_MIN_CONFIRM_SCORE = int(os.getenv("V66_EBP_MIN_CONFIRM_SCORE", "4"))
+V66_FLIP_ENABLED = os.getenv("V66_FLIP_ENABLED", "true").lower() == "true"
+V66_FLIP_MIN_H4_SCORE = int(os.getenv("V66_FLIP_MIN_H4_SCORE", "5"))
+V66_FLIP_MIN_H4_ADX = float(os.getenv("V66_FLIP_MIN_H4_ADX", "17"))
+V66_FLIP_RISK_PCT = float(os.getenv("V66_FLIP_RISK_PCT", "0.010"))
+V66_MAX_EBP_RISK_PCT = float(os.getenv("V66_MAX_EBP_RISK_PCT", "0.010"))
+V66_MAX_TREND_RISK_PCT = float(os.getenv("V66_MAX_TREND_RISK_PCT", "0.011"))
+V66_MAX_STRUCTURE_RISK_PCT = float(os.getenv("V66_MAX_STRUCTURE_RISK_PCT", "0.012"))
+V66_SIDE_COLD_MIN_TRADES = int(os.getenv("V66_SIDE_COLD_MIN_TRADES", "3"))
+V66_SIDE_COLD_MAX_WR = float(os.getenv("V66_SIDE_COLD_MAX_WR", "0.25"))
+V66_SIDE_COLD_MIN_LOSS = float(os.getenv("V66_SIDE_COLD_MIN_LOSS", "1.00"))
+V66_INSTRUMENT_CACHE_TTL = int(os.getenv("V66_INSTRUMENT_CACHE_TTL", "21600"))
+
+_v66_instrument_cache = {}
+
+# Preserve the V6.5 implementations before overriding them.
+_v65_get_instrument = get_instrument
+_v65_ebp_candidate = _v63_ebp_candidate
+_v65_sizing_profile = sizing_profile
+
+
+def get_instrument(symbol):
+    """Cached BloFin contract metadata with retry + stale-cache fallback."""
+    now = time.time()
+    cached = _v66_instrument_cache.get(symbol)
+    if cached and now - cached["ts"] < V66_INSTRUMENT_CACHE_TTL:
+        return cached["data"]
+
+    last_err = None
+    for delay in (0.0, 0.7, 1.5):
+        if delay:
+            time.sleep(delay)
+        try:
+            data = _v65_get_instrument(symbol)
+            _v66_instrument_cache[symbol] = {"ts": now, "data": data}
+            return data
+        except Exception as e:
+            last_err = e
+
+    # Metadata such as tick/lot/contract value is stable enough to use a stale
+    # cached copy when the public endpoint has a transient problem.
+    if cached:
+        return cached["data"]
+    raise last_err if last_err else RuntimeError(f"Instrument lookup failed: {symbol}")
+
+
+def _v66_btc_state(d):
+    """Return (allowed, note, strongly_supportive) for an alt direction."""
+    try:
+        h4 = _v6_4h_context(V6_BTC_SYMBOL)
+        b15 = _v6_closed(_v6_df(V6_BTC_SYMBOL, "15m"))
+        a, p = b15.iloc[-1], b15.iloc[-2]
+        c = safe_float(a["close"])
+        e21 = safe_float(a["ema_slow"])
+        d15 = 1 if c > e21 else -1 if c < e21 else 0
+        h4d = int(h4.get("dir", 0))
+        h4score = int(h4.get("score", 0))
+        hist = safe_float(a["macd_hist"])
+        hp = safe_float(p["macd_hist"])
+        momentum15 = 1 if hist > hp else -1 if hist < hp else 0
+
+        strong_support = (h4d == d and d15 == d)
+        # Important repair: if BTC 15M is actively against the alt trade and
+        # BTC 4H is not supporting that trade, do not fight the market rebound.
+        if d15 == -d and h4d != d:
+            return False, f"BTC REGIME BLOCK 4H/15M {h4d:+d}/{d15:+d}", False
+        if h4d == -d and h4score >= 4 and d15 != d:
+            return False, f"BTC 4H BLOCK 4H/15M {h4d:+d}/{d15:+d}", False
+
+        if strong_support:
+            return True, f"BTC support 4H/15M {h4d:+d}/{d15:+d}", True
+        if d15 == d and momentum15 == d:
+            return True, f"BTC 15M support 4H/15M {h4d:+d}/{d15:+d}", True
+        return True, f"BTC neutral 4H/15M {h4d:+d}/{d15:+d}", False
+    except Exception:
+        # Do not pretend unavailable BTC data is positive confirmation.
+        return True, "BTC context unavailable-neutral", False
+
+
+def _v6_btc_gate(symbol, d):
+    if not V6_BTC_CONTEXT or symbol == V6_BTC_SYMBOL:
+        return True, "BTC self/off"
+    ok, note, _ = _v66_btc_state(d)
+    return ok, note
+
+
+def _v66_ebp_closed_confirmation(symbol, ebp, fvg):
+    """Require a closed 15M rejection after the post-EBP FVG retrace."""
+    try:
+        cdf = _v6_closed(_v6_df(symbol, "15m"))
+        post = cdf[cdf["ts"] >= ebp["end_ts"]].tail(max(3, V66_EBP_CONFIRM_LOOKBACK))
+        if post.empty:
+            return False, "wait-first-closed-15M", 0, 0
+
+        atr = max(safe_float(post.iloc[-1]["atr"]), 1e-12)
+        tol = V66_EBP_CONFIRM_TOL_ATR * atr
+        lo, hi = safe_float(fvg["lo"]), safe_float(fvg["hi"])
+        mid = (lo + hi) / 2.0
+
+        touched_positions = []
+        for j in range(len(post)):
+            r = post.iloc[j]
+            if safe_float(r["low"]) <= hi + tol and safe_float(r["high"]) >= lo - tol:
+                touched_positions.append(j)
+        if not touched_positions:
+            return False, "wait-retrace", 0, int(post.iloc[-1]["ts"])
+
+        touch_j = touched_positions[-1]
+        # Confirmation must happen on the touch candle or the very next candle.
+        if len(post) - 1 - touch_j > 1:
+            return False, "retrace-confirmation-stale", 0, int(post.iloc[-1]["ts"])
+
+        a = post.iloc[-1]
+        p = post.iloc[-2] if len(post) >= 2 else a
+        d = int(ebp["dir"])
+        o, c = safe_float(a["open"]), safe_float(a["close"])
+        h, l = safe_float(a["high"]), safe_float(a["low"])
+        pc, ph, pl = safe_float(p["close"]), safe_float(p["high"]), safe_float(p["low"])
+        rng = max(h - l, 1e-12)
+        upper = h - max(o, c)
+        lower = min(o, c) - l
+        hist, hp = safe_float(a["macd_hist"]), safe_float(p["macd_hist"])
+        ema21 = safe_float(a["ema_slow"])
+
+        if d == 1:
+            body_dir = c > o
+            zone_reject = c >= mid and lower / rng >= 0.18
+            micro_break = c > ph + 0.02 * atr
+            macd_turn = hist > hp
+            ema_side = c >= ema21
+            close_not_failed = c >= lo - tol
+        else:
+            body_dir = c < o
+            zone_reject = c <= mid and upper / rng >= 0.18
+            micro_break = c < pl - 0.02 * atr
+            macd_turn = hist < hp
+            ema_side = c <= ema21
+            close_not_failed = c <= hi + tol
+
+        score = int(body_dir) + int(zone_reject) + int(micro_break) + int(macd_turn) + int(ema_side)
+        confirmed = (
+            close_not_failed
+            and body_dir
+            and macd_turn
+            and (zone_reject or micro_break)
+            and score >= V66_EBP_MIN_CONFIRM_SCORE
+        )
+        why = f"15M-confirm {score}/5 body={int(body_dir)} reject={int(zone_reject)} break={int(micro_break)} macd={int(macd_turn)} ema={int(ema_side)}"
+        return confirmed, why, score, int(a["ts"])
+    except Exception as e:
+        return False, f"confirm-error-{type(e).__name__}", 0, 0
+
+
+def _v63_ebp_candidate(symbol):
+    """V6.6 EBP: location + CLOSED rejection + stricter BTC regime."""
+    base = _v65_ebp_candidate(symbol)
+    if not base or not base.get("side"):
+        return base
+
+    d = 1 if base.get("side") == "long" else -1
+    btc_ok, btc_note, btc_support = _v66_btc_state(d) if V63_EBP_REQUIRE_BTC else (True, "BTC gate off", False)
+    base["btc_note"] = btc_note
+
+    # The old score awarded +8 merely because BTC did not hard-block. Remove
+    # that bonus when BTC is only neutral/unavailable.
+    if not btc_support:
+        base["score"] = max(0.0, safe_float(base.get("score")) - 8.0)
+        base["quality"] = base["score"]
+        base["grade"] = "A+" if base["score"] >= 92 else "A" if base["score"] >= V63_EBP_MIN_QUALITY else "C"
+
+    if not btc_ok:
+        base["skip"] = btc_note
+        base["entry_route"] = "WAIT"
+        return base
+
+    ebp = _v63_h4_ebp(symbol)
+    fvg = _v63_fvg_inside_ebp(symbol, ebp) if ebp else None
+    if not ebp or not fvg:
+        return base
+
+    confirmed, why, conf_score, conf_ts = _v66_ebp_closed_confirmation(symbol, ebp, fvg)
+    base["v66_confirm"] = why
+    base["confirmations"] = conf_score
+    if conf_ts:
+        # Makes each closed confirmation a one-shot event rather than reusing
+        # the same 4H EBP timestamp forever.
+        base["signal_bar_ts"] = conf_ts
+
+    if safe_float(base.get("score")) < V63_EBP_MIN_QUALITY:
+        base["skip"] = f"EBP-quality-{safe_float(base.get('score')):.0f}<{V63_EBP_MIN_QUALITY:.0f}"
+        base["entry_route"] = "WAIT"
+        return base
+
+    if not confirmed:
+        if "invalidated" not in str(base.get("skip", "")):
+            base["skip"] = f"EBP-TOUCHED-wait-15M-rejection · {why}"
+            base["entry_route"] = "WAIT"
+        return base
+
+    # Confirmation is present. Still require current live price to be at/very
+    # near the FVG; we do not chase after the confirmation candle.
+    try:
+        live = safe_float(exchange.fetch_ticker(symbol).get("last"), base.get("live_price"))
+        atr = max(safe_float(base.get("atr")), 1e-12)
+        zlo, zhi = base.get("fvg_zone") or (0, 0)
+        tol = V63_EBP_TOUCH_TOL_ATR * atr
+        if not (safe_float(zlo) - tol <= live <= safe_float(zhi) + tol):
+            base["skip"] = "EBP-confirmed-but-price-left-zone"
+            base["entry_route"] = "WAIT"
+            return base
+        base["live_price"] = live
+    except Exception:
+        base["skip"] = "EBP-live-price-unavailable"
+        base["entry_route"] = "WAIT"
+        return base
+
+    base["score"] = min(100.0, safe_float(base.get("score")) + 4.0)
+    base["quality"] = base["score"]
+    base["grade"] = "A+" if base["score"] >= 92 else "A"
+    base["skip"] = None
+    base["entry_route"] = "EBP-CONFIRMED"
+    return base
+
+
+def _v66_failed_ebp_flip_candidate(symbol):
+    """Opposite trade only after the EBP thesis actually fails + full confirmation."""
+    if not V66_FLIP_ENABLED:
+        return None
+    try:
+        ebp = _v63_h4_ebp(symbol)
+        if not ebp:
+            return None
+        fvg = _v63_fvg_inside_ebp(symbol, ebp)
+        if not fvg:
+            return None
+
+        original_d = int(ebp["dir"])
+        d = -original_d
+        side = "long" if d == 1 else "short"
+        df = _v6_closed(_v6_df(symbol, "15m"))
+        if len(df) < 210:
+            return None
+        a, p = df.iloc[-1], df.iloc[-2]
+        atr = max(safe_float(a["atr"]), 1e-12)
+        c, o = safe_float(a["close"]), safe_float(a["open"])
+        pc, ph, pl = safe_float(p["close"]), safe_float(p["high"]), safe_float(p["low"])
+        e21, pe21 = safe_float(a["ema_slow"]), safe_float(p["ema_slow"])
+        hist, hp = safe_float(a["macd_hist"]), safe_float(p["macd_hist"])
+        live = safe_float(exchange.fetch_ticker(symbol).get("last"), c)
+        tol = V63_EBP_TOUCH_TOL_ATR * atr
+
+        # Original EBP must be genuinely invalidated through the far FVG side.
+        failed = live > safe_float(fvg["hi"]) + tol if original_d == -1 else live < safe_float(fvg["lo"]) - tol
+        if not failed:
+            return None
+
+        h4 = _v6_4h_context(symbol)
+        h4_ok = int(h4.get("dir", 0)) == d and int(h4.get("score", 0)) >= V66_FLIP_MIN_H4_SCORE and safe_float(h4.get("adx")) >= V66_FLIP_MIN_H4_ADX
+        loc_ok, loc_note, loc = _v62_4h_location(h4, d, live)
+        ema_ok = (c > e21 and e21 > pe21) if d == 1 else (c < e21 and e21 < pe21)
+        macd_ok = hist > hp if d == 1 else hist < hp
+        micro_break = c > ph + 0.03 * atr if d == 1 else c < pl - 0.03 * atr
+        body_ok = (c > o) if d == 1 else (c < o)
+        btc_ok, btc_note, btc_support = _v66_btc_state(d)
+
+        q = 30 + (22 if h4_ok else 0) + (14 if loc_ok else 0) + (12 if ema_ok else 0) + (10 if macd_ok else 0) + (12 if micro_break else 0) + (5 if body_ok else 0) + (10 if btc_support else 0)
+        q = min(100.0, q)
+
+        skip = None
+        if not h4_ok: skip = "FLIP-wait-4H-opposite-trend"
+        elif not loc_ok: skip = f"FLIP-{loc_note}"
+        elif not ema_ok: skip = "FLIP-wait-15M-EMA21"
+        elif not macd_ok: skip = "FLIP-wait-momentum"
+        elif not micro_break: skip = "FLIP-wait-micro-break"
+        elif not body_ok: skip = "FLIP-wait-directional-candle"
+        elif not btc_ok or not btc_support: skip = f"FLIP-{btc_note}"
+        elif q < 92: skip = f"FLIP-quality-{q:.0f}<92"
+
+        recent = df.iloc[-7:]
+        if d == 1:
+            raw = c - (safe_float(recent["low"].min()) - 0.10 * atr)
+        else:
+            raw = (safe_float(recent["high"].max()) + 0.10 * atr) - c
+        risk = max(0.55 * atr, min(raw, 1.20 * atr))
+
+        return {
+            "symbol": symbol, "side": side, "score": q, "score_max": 100.0, "quality": q,
+            "threshold": 92, "grade": "A+" if q >= 96 else "A",
+            "skip": skip, "entry_route": "FAILED-EBP-FLIP" if skip is None else "WAIT",
+            "strategy": "FAILED-EBP-FLIP", "price": c, "atr": atr,
+            "signal_bar_ts": int(a["ts"]), "risk_distance": risk,
+            "stop_origin": "V6.6 failed EBP + opposite 4H/15M confirmation", "final_r": 2.5,
+            "h4_score": h4.get("score", 0), "h4_adx": h4.get("adx", 0),
+            "confirmations": int(h4_ok)+int(loc_ok)+int(ema_ok)+int(macd_ok)+int(micro_break)+int(btc_support),
+            "role": False, "sweep": False, "fvg": True, "hns": False,
+            "candle": "failed-EBP-flip", "macd_ok": macd_ok, "volume_above": False,
+            "extension_atr": 0.0, "btc_note": btc_note, "ema21_reset": True,
+            "location_note": loc_note, "h4_ext_atr": safe_float(loc.get("h4_ext_atr")),
+            "h4_range_pos": safe_float(loc.get("h4_range_pos")), "h4_impulse3_atr": safe_float(loc.get("h4_impulse3_atr")),
+            "zone_level": safe_float(fvg["entry"]), "fvg_zone": (fvg["lo"], fvg["hi"]),
+            "sweep_depth": ebp["sweep_atr"], "v66_failed_side": "long" if original_d == 1 else "short",
+        }
+    except Exception:
+        return None
+
+
+def _v6_candidate(symbol):
+    """V6.6 router: confirmed EBP, failed-EBP flip, trend reset, structure."""
+    ebp = _v63_ebp_candidate(symbol)
+    flip = _v66_failed_ebp_flip_candidate(symbol)
+    base = _v62_structure_candidate(symbol)
+    tr = _v64_trend_reset_candidate(symbol)
+
+    ready = [x for x in (ebp, flip, tr, base)
+             if x and x.get("side") and not x.get("skip") and x.get("entry_route") not in (None, "WAIT")]
+    if ready:
+        # Do not give raw EBP an artificial priority anymore. Closed confirmation
+        # and actual quality decide.
+        return max(ready, key=lambda x: (safe_float(x.get("quality")), int(x.get("confirmations", 0))))
+
+    waits = [x for x in (ebp, flip, tr, base) if x]
+    def wait_rank(x):
+        sk = str(x.get("skip", ""))
+        action = 4 if "wait-15M-rejection" in sk else 3 if ("ARMED" in sk or "wait-retrace" in sk) else 2 if sk.startswith(("TR-wait", "FLIP-wait")) else 1
+        return action, safe_float(x.get("quality", x.get("score", 0)))
+    return max(waits, key=wait_rank) if waits else None
+
+
+def evaluate_symbol(symbol, btc=None):
+    return _v6_candidate(symbol)
+
+
+def sizing_profile(signal):
+    """Undo the premature V6.5 scale-up until the repaired edge proves itself."""
+    base = _v65_sizing_profile(signal)
+    strategy = signal.get("strategy")
+    if strategy == "FAILED-EBP-FLIP":
+        cap = V66_FLIP_RISK_PCT
+    elif strategy == "EBP-FVG":
+        cap = V66_MAX_EBP_RISK_PCT
+    elif strategy == "TREND-RESET":
+        cap = V66_MAX_TREND_RISK_PCT
+    else:
+        cap = V66_MAX_STRUCTURE_RISK_PCT
+    out = dict(base)
+    out["risk_pct"] = min(safe_float(base.get("risk_pct"), cap), cap)
+    out["name"] = "V66-" + str(base.get("name", strategy or "SETUP"))
+    return out
+
+
+def sniper_portfolio_allows(signal, positions):
+    """Side-aware circuit breaker; never blindly invert a losing direction."""
+    side = signal.get("side")
+    same = sum(1 for p in positions if position_side(p) == side)
+    if same >= V6_MAX_SAME_SIDE:
+        return False, f"max-{V6_MAX_SAME_SIDE}-same-side"
+
+    # Existing loss streak becomes a stronger gate: elite score alone is no
+    # longer enough; BTC must actively support that side.
+    streak = int(sniper_side_loss_streak.get(side, 0))
+    d = 1 if side == "long" else -1
+    btc_ok, btc_note, btc_support = _v66_btc_state(d)
+    if streak >= 2 and (safe_float(signal.get("score")) < 94 or not btc_ok or not btc_support):
+        return False, f"{side}-loss-streak-{streak}: need Q94 + BTC support"
+
+    # Intraday cold-side circuit breaker.
+    trades = int(daily.get(f"{side}_trades", 0))
+    wins = int(daily.get(f"{side}_wins", 0))
+    net = safe_float(daily.get(f"{side}_net", 0))
+    wr = wins / trades if trades else 1.0
+    if trades >= V66_SIDE_COLD_MIN_TRADES and wr <= V66_SIDE_COLD_MAX_WR and net <= -V66_SIDE_COLD_MIN_LOSS:
+        if safe_float(signal.get("score")) < 96 or not btc_support:
+            return False, f"{side}-COLD {wins}/{trades} net ${net:.2f}: only Q96 + BTC support"
+
+    return True, "OK"
+
+
+def startup_diagnostics():
+    acc = futures_account()
+    reset_daily_if_needed(acc["total_equity"])
+    tg(
+        f"🧠 PRECISION STRUCTURE FUSION STARTED v{SNIPER_VERSION}\n"
+        f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
+        f"TIMEFRAMES: 4H + 15M ONLY\n"
+        f"V6.6 CONFIRM OR FLIP\n"
+        f"• EBP-FVG: retrace is NOT enough → closed 15M rejection required\n"
+        f"• BTC regime: opposing BTC 15M blocks alts unless BTC 4H supports the trade\n"
+        f"• Failed EBP may flip ONLY with 4H trend + 15M micro-break + BTC support\n"
+        f"• Side cold-mode after repeated directional losses\n"
+        f"• Instrument metadata cache/retry enabled\n"
+        f"Risk caps while proving repaired edge: EBP {V66_MAX_EBP_RISK_PCT*100:.1f}% · "
+        f"Trend {V66_MAX_TREND_RISK_PCT*100:.1f}% · Structure {V66_MAX_STRUCTURE_RISK_PCT*100:.1f}% · "
+        f"Flip {V66_FLIP_RISK_PCT*100:.1f}%\n"
+        f"Leverage {LEVERAGE}x · max positions {MAX_ACTIVE_POSITIONS} · max same side {V6_MAX_SAME_SIDE}\n"
+        f"Equity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}"
+    )
 
 if __name__ == "__main__":
     main()
