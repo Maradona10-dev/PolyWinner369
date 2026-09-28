@@ -4629,5 +4629,558 @@ def main():
             tg(f"⚠️ PRECISION STRUCTURE FUSION V6 LOOP ERROR\n{msg}");time.sleep(30)
 
 
+
+# ============================================================
+# V6.3 — 4H EBP -> 15M FVG PRECISION RETRACE ENGINE
+# ============================================================
+# Added from the supplied strategy video. The active engine still uses ONLY
+# 4H + 15M chart data. Live ticker price is used solely to execute the entry.
+#
+# Bullish EBP (4H):
+#   - candle sweeps below the prior 4H low
+#   - candle closes ABOVE the prior 4H open
+# Bearish EBP is the exact mirror.
+# Then, inside that completed 4H EBP candle, locate a directional 15M FVG.
+# We DO NOT chase the impulse. The setup becomes actionable only when live
+# price retraces into the FVG. Stop goes beyond the 15M impulse extreme and
+# target is 2R, matching the video.
+#
+# Innovation vs blindly placing exchange limit orders:
+#   the bot keeps the FVG setup "armed" and only submits the protected market
+#   order when price is actually inside the FVG. This avoids stale limit orders
+#   filling hours later after the 4H thesis has already changed.
+
+SNIPER_VERSION = "6.3.0"
+V63_EBP_ENABLED = os.getenv("V63_EBP_ENABLED", "true").lower() == "true"
+V63_EBP_MAX_AGE_HOURS = float(os.getenv("V63_EBP_MAX_AGE_HOURS", "7.9"))
+V63_EBP_MIN_SWEEP_ATR = float(os.getenv("V63_EBP_MIN_SWEEP_ATR", "0.03"))
+V63_EBP_MIN_FVG_ATR = float(os.getenv("V63_EBP_MIN_FVG_ATR", "0.06"))
+V63_EBP_ENTRY_FRACTION = float(os.getenv("V63_EBP_ENTRY_FRACTION", "0.50"))  # midpoint reference
+V63_EBP_TOUCH_TOL_ATR = float(os.getenv("V63_EBP_TOUCH_TOL_ATR", "0.04"))
+V63_EBP_STOP_BUFFER_ATR = float(os.getenv("V63_EBP_STOP_BUFFER_ATR", "0.12"))
+V63_EBP_MIN_STOP_ATR = float(os.getenv("V63_EBP_MIN_STOP_ATR", "0.45"))
+V63_EBP_MAX_STOP_ATR = float(os.getenv("V63_EBP_MAX_STOP_ATR", "1.35"))
+V63_EBP_FINAL_R = float(os.getenv("V63_EBP_FINAL_R", "2.0"))
+V63_EBP_RISK_PCT = float(os.getenv("V63_EBP_RISK_PCT", "0.012"))
+V63_EBP_ELITE_RISK_PCT = float(os.getenv("V63_EBP_ELITE_RISK_PCT", "0.015"))
+V63_EBP_REQUIRE_BTC = os.getenv("V63_EBP_REQUIRE_BTC", "true").lower() == "true"
+V63_EBP_MIN_QUALITY = float(os.getenv("V63_EBP_MIN_QUALITY", "82"))
+V63_EBP_RECLAIM_EMA21 = os.getenv("V63_EBP_RECLAIM_EMA21", "false").lower() == "true"
+
+
+def _v63_h4_ebp(symbol):
+    """Return the newest still-valid completed 4H EBP candle, or None."""
+    try:
+        cdf = _v6_closed(_v6_df(symbol, "4h"))
+        if len(cdf) < 205:
+            return None
+        # The newest completed EBP is preferred. Looking back two completed H4
+        # bars lets the next H4 candle retrace into the 15M FVG as in the video.
+        for off in (1, 2):
+            i = len(cdf) - off
+            if i <= 0:
+                continue
+            a, p = cdf.iloc[i], cdf.iloc[i-1]
+            atr = max(safe_float(a["atr"]), 1e-12)
+            o, h, l, c = map(safe_float, (a["open"], a["high"], a["low"], a["close"]))
+            po, ph, pl = map(safe_float, (p["open"], p["high"], p["low"]))
+            bull_sweep = l < pl - V63_EBP_MIN_SWEEP_ATR * atr
+            bear_sweep = h > ph + V63_EBP_MIN_SWEEP_ATR * atr
+            bull = bull_sweep and c > po
+            bear = bear_sweep and c < po
+            if not (bull or bear):
+                continue
+            ts = int(a["ts"])
+            age_h = max(0.0, (time.time()*1000 - (ts + 4*60*60*1000)) / 3600000.0)
+            if age_h > V63_EBP_MAX_AGE_HOURS:
+                continue
+            d = 1 if bull else -1
+            # Quality of the displacement/reclaim itself.
+            body = abs(c-o)/atr
+            reclaim = (c-po)/atr if d == 1 else (po-c)/atr
+            sweep = (pl-l)/atr if d == 1 else (h-ph)/atr
+            return {"dir":d,"ts":ts,"end_ts":ts+4*60*60*1000,"open":o,"high":h,"low":l,"close":c,
+                    "atr":atr,"body_atr":body,"reclaim_atr":reclaim,"sweep_atr":sweep,"age_h":age_h}
+    except Exception:
+        return None
+    return None
+
+
+def _v63_fvg_inside_ebp(symbol, ebp):
+    """Find the best directional 15M FVG formed inside the EBP's 4H window."""
+    try:
+        cdf = _v6_closed(_v6_df(symbol, "15m"))
+        if len(cdf) < 30:
+            return None
+        inside = cdf[(cdf["ts"] >= ebp["ts"]) & (cdf["ts"] < ebp["end_ts"])].copy()
+        if len(inside) < 3:
+            return None
+        d = ebp["dir"]
+        candidates=[]
+        for i in range(2, len(inside)):
+            left, mid, right = inside.iloc[i-2], inside.iloc[i-1], inside.iloc[i]
+            atr15=max(safe_float(right["atr"]),1e-12)
+            if d == 1:
+                lo=safe_float(left["high"]); hi=safe_float(right["low"])
+                impulse=safe_float(mid["close"])-safe_float(mid["open"])
+                valid=hi>lo and (hi-lo)>=V63_EBP_MIN_FVG_ATR*atr15 and impulse>0
+            else:
+                lo=safe_float(right["high"]); hi=safe_float(left["low"])
+                impulse=safe_float(mid["open"])-safe_float(mid["close"])
+                valid=hi>lo and (hi-lo)>=V63_EBP_MIN_FVG_ATR*atr15 and impulse>0
+            if not valid:
+                continue
+            width=(hi-lo)/atr15
+            displacement=impulse/atr15
+            # Prefer a clean gap created later in the EBP displacement, with
+            # meaningful width and a strong middle candle.
+            score=width*1.5 + displacement + i/len(inside)*0.35
+            candidates.append((score,lo,hi,atr15,int(right["ts"]),i))
+        if not candidates:
+            return None
+        _,lo,hi,atr15,fts,idx=max(candidates,key=lambda x:x[0])
+        entry=lo+(hi-lo)*V63_EBP_ENTRY_FRACTION
+        # Structural stop uses the 15M impulse swing INSIDE the H4 EBP candle.
+        upto=inside.iloc[:idx+1]
+        if d==1:
+            extreme=safe_float(upto["low"].min())
+            raw_stop=extreme - V63_EBP_STOP_BUFFER_ATR*atr15
+            risk=entry-raw_stop
+        else:
+            extreme=safe_float(upto["high"].max())
+            raw_stop=extreme + V63_EBP_STOP_BUFFER_ATR*atr15
+            risk=raw_stop-entry
+        risk=max(V63_EBP_MIN_STOP_ATR*atr15,min(risk,V63_EBP_MAX_STOP_ATR*atr15))
+        stop=entry-d*risk
+        return {"lo":lo,"hi":hi,"entry":entry,"atr":atr15,"ts":fts,"risk":risk,"stop":stop,"extreme":extreme}
+    except Exception:
+        return None
+
+
+def _v63_ebp_candidate(symbol):
+    if not V63_EBP_ENABLED:
+        return None
+    ebp=_v63_h4_ebp(symbol)
+    if not ebp:
+        return None
+    d=ebp["dir"]; side="long" if d==1 else "short"
+    fvg=_v63_fvg_inside_ebp(symbol,ebp)
+    if not fvg:
+        return {"symbol":symbol,"side":side,"score":0,"quality":0,"grade":"-","skip":"EBP-no-15M-FVG",
+                "entry_route":"WAIT","strategy":"EBP-FVG","price":ebp["close"],"atr":ebp["atr"],"signal_bar_ts":ebp["ts"],
+                "confirmations":1,"h4_score":"EBP"}
+    try:
+        c15=_v6_closed(_v6_df(symbol,"15m")); a=c15.iloc[-1]
+        atr15=max(safe_float(a["atr"]),1e-12); close15=safe_float(a["close"]); ema21=safe_float(a["ema_slow"])
+        live=safe_float(exchange.fetch_ticker(symbol).get("last"),close15)
+    except Exception:
+        return None
+    tol=V63_EBP_TOUCH_TOL_ATR*atr15
+    # The strategy is explicitly a retracement entry. Above the bullish FVG or
+    # below the bearish FVG = ARMED/WAIT. Through the far side = invalidated.
+    if d==1:
+        invalid = live < fvg["lo"]-tol
+        touched = fvg["lo"]-tol <= live <= fvg["hi"]+tol
+        chase = live > fvg["hi"]+tol
+    else:
+        invalid = live > fvg["hi"]+tol
+        touched = fvg["lo"]-tol <= live <= fvg["hi"]+tol
+        chase = live < fvg["lo"]-tol
+    btc_ok,btc_note=_v6_btc_gate(symbol,d) if V63_EBP_REQUIRE_BTC else (True,"BTC gate off")
+    ema_ok=(close15>=ema21) if d==1 else (close15<=ema21)
+    # EMA21 is a bonus for EBP, not mandatory by default: the video entry is
+    # defined by H4 sweep/reclaim + M15 FVG retrace, not an EMA cross.
+    q=55.0
+    q += min(12.0, ebp["sweep_atr"]*20.0)
+    q += min(10.0, max(0.0,ebp["reclaim_atr"])*20.0)
+    q += min(8.0, max(0.0,ebp["body_atr"])*8.0)
+    q += 7.0 if ema_ok else 0.0
+    q += 8.0 if btc_ok else 0.0
+    q=min(100.0,q)
+    skip=None
+    if invalid: skip="EBP-FVG-invalidated"
+    elif not btc_ok: skip=btc_note
+    elif V63_EBP_RECLAIM_EMA21 and not ema_ok: skip="EBP-15M-EMA21-not-reclaimed"
+    elif q<V63_EBP_MIN_QUALITY: skip=f"EBP-quality-{q:.0f}<{V63_EBP_MIN_QUALITY:.0f}"
+    elif not touched: skip="EBP-FVG-ARMED-wait-retrace" if chase else "EBP-FVG-wait-touch"
+    # This route deliberately does NOT use the V6.2 4H extension blocker: an EBP
+    # is itself a 4H liquidity sweep/reclaim event. The anti-chase mechanism is
+    # the FVG retracement requirement.
+    return {"symbol":symbol,"side":side,"score":q,"score_max":100.0,"quality":q,"threshold":V63_EBP_MIN_QUALITY,
+            "grade":"A+" if q>=92 else "A" if q>=V63_EBP_MIN_QUALITY else "C","skip":skip,
+            "entry_route":"EBP-FVG" if skip is None else "WAIT","strategy":"EBP-FVG","price":fvg["entry"],"live_price":live,
+            "atr":atr15,"adx":safe_float(a["sniper_adx"]),"rsi":safe_float(a["sniper_rsi"],50),"signal_bar_ts":int(ebp["ts"]),
+            "risk_distance":fvg["risk"],"stop_origin":"V6.3 EBP 4H sweep + 15M FVG structure","final_r":V63_EBP_FINAL_R,
+            "h4_score":"EBP","h4_adx":0.0,"confirmations":3+int(ema_ok)+int(btc_ok),"role":False,"sweep":True,"fvg":True,"hns":False,
+            "candle":"4H-EBP","macd_ok":True,"volume_above":False,"extension_atr":0.0,"btc_note":btc_note,"ema21_reset":True,
+            "location_note":"EBP retrace location","h4_ext_atr":0.0,"h4_range_pos":0.5,"h4_impulse3_atr":0.0,
+            "zone_level":fvg["entry"],"fvg_zone":(fvg["lo"],fvg["hi"]),"sweep_depth":ebp["sweep_atr"],
+            "ebp_age_h":ebp["age_h"],"ebp_sweep_atr":ebp["sweep_atr"],"ebp_reclaim_atr":ebp["reclaim_atr"]}
+
+
+# Keep the existing Structure-Fusion engine and ADD EBP-FVG as a second route.
+_v62_structure_candidate = _v6_candidate
+
+def _v6_candidate(symbol):
+    ebp=_v63_ebp_candidate(symbol)
+    base=_v62_structure_candidate(symbol)
+    # A live EBP retracement has priority because it has a precise pre-defined
+    # location. Otherwise a normal V6.2 Structure Fusion setup can still trade.
+    if ebp and ebp.get("side") and not ebp.get("skip"):
+        return ebp
+    if base and base.get("side") and not base.get("skip"):
+        return base
+    # For reports, show the more actionable EBP ARMED state when present.
+    if ebp and str(ebp.get("skip","")).startswith("EBP-FVG-ARMED"):
+        return ebp
+    return base if base is not None else ebp
+
+
+def evaluate_symbol(symbol, btc=None):
+    return _v6_candidate(symbol)
+
+
+def sizing_profile(signal):
+    if signal.get("strategy")=="EBP-FVG":
+        elite=safe_float(signal.get("score"))>=92
+        return {"name":"V63-EBP-ELITE" if elite else "V63-EBP","risk_pct":V63_EBP_ELITE_RISK_PCT if elite else V63_EBP_RISK_PCT,
+                "target_net_tp":V6_TARGET_NET}
+    elite=safe_float(signal.get("score"))>=V6_ELITE_QUALITY and int(signal.get("confirmations",0))>=4
+    return {"name":"V6-ELITE" if elite else "V6-STRUCTURE","risk_pct":V6_ELITE_RISK_PCT if elite else V6_RISK_PCT,"target_net_tp":V6_TARGET_NET}
+
+
+def _v6_levels(signal,live,tick):
+    side=signal["side"];d=1 if side=="long" else -1;risk=safe_float(signal.get("risk_distance"))
+    final_r=safe_float(signal.get("final_r"),V6_FINAL_R) or V6_FINAL_R
+    if live<=0 or risk<=0:return None
+    sl=round_trade_price(live-d*risk,tick,side,"sl")
+    t1r=0.75 if signal.get("strategy")=="EBP-FVG" else V6_TP1_R
+    t2r=1.25 if signal.get("strategy")=="EBP-FVG" else V6_TP2_R
+    t1=round_trade_price(live+d*risk*t1r,tick,side,"tp")
+    t2=round_trade_price(live+d*risk*t2r,tick,side,"tp")
+    t3=round_trade_price(live+d*risk*final_r,tick,side,"tp")
+    return sl,t1,t2,t3,risk
+
+
+# V6.3 execution override. Fixes the V6.2 _v62_last_entry_time scope bug and
+# uses each strategy's own final-R in sizing/protection.
+def open_trade(signal):
+    global protection_lock, _v62_last_entry_time
+    symbol,side=signal["symbol"],signal["side"]
+    acc=futures_account();equity,available=acc["total_equity"],acc["available"];reset_daily_if_needed(equity)
+    if equity<MIN_EQUITY_USDT or available<=0 or (not PAPER_TRADING and protection_lock):return False
+    if time.time()-_v62_last_entry_time < V62_GLOBAL_ENTRY_GAP_MIN*60:return False
+    tick=safe_float(get_instrument(symbol).get("tickSize"),0.0001)
+    live=safe_float(exchange.fetch_ticker(symbol).get("last"),signal["price"]);sig=safe_float(signal["price"])
+    if live<=0 or sig<=0:return False
+    d=1 if side=="long" else -1
+    is_ebp=signal.get("strategy")=="EBP-FVG"
+    if is_ebp:
+        z=signal.get("fvg_zone") or (0,0);zlo,zhi=safe_float(z[0]),safe_float(z[1]);tol=V63_EBP_TOUCH_TOL_ATR*safe_float(signal.get("atr"))
+        if not (zlo-tol <= live <= zhi+tol):
+            return False
+        adverse=0.0  # entry is intentionally on the retrace into the zone
+    else:
+        adverse=d*((live-sig)/sig)
+        if adverse>V62_MAX_ADVERSE_DRIFT:
+            tg(f"⏭️ {symbol} {side.upper()} V6.3 TOO LATE\nAdverse drift {adverse*100:.2f}% > {V62_MAX_ADVERSE_DRIFT*100:.2f}%");return False
+        live_loc_ok,live_loc_note,_=_v62_live_location_ok(symbol,side,live)
+        if not live_loc_ok:
+            tg(f"⏭️ {symbol} {side.upper()} V6.3 LOCATION BLOCK\n{live_loc_note}\nNo chase at 4H extreme.");return False
+    levels=_v6_levels(signal,live,tick)
+    if not levels:return False
+    sl,t1,t2,t3,risk=levels;profile=sizing_profile(signal);final_r=safe_float(signal.get("final_r"),V6_FINAL_R) or V6_FINAL_R
+    sizing=calculate_contracts_v5(symbol,live,sl,equity,available,profile["risk_pct"],profile["target_net_tp"],final_r)
+    if not sizing or sizing["margin"]>available*AVAILABLE_MARGIN_BUFFER:return False
+    before_ids={position_id(p) for p in get_positions() if position_id(p)}
+    oklev,levres=set_leverage(symbol,LEVERAGE)
+    if not oklev:tg(f"⛔ LEVERAGE FAILED\n{symbol}\n{levres}");return False
+    tag="ps63e" if is_ebp else "ps63s"
+    payload={"instId":blofin_inst_id(symbol),"marginMode":MARGIN_MODE,"positionSide":"net","side":"buy" if side=="long" else "sell","orderType":"market","size":str(sizing["contracts"]),
+             "tpTriggerPrice":str(t3),"tpOrderPrice":"-1","tpTriggerPriceType":"mark","slTriggerPrice":str(sl),"slOrderPrice":"-1","slTriggerPriceType":"mark",
+             "clientOrderId":f"{tag}{int(time.time()*1000)%1000000000}"}
+    if BROKER_ID:payload["brokerId"]=BROKER_ID
+    if is_ebp:
+        zlo,zhi=signal.get("fvg_zone",(0,0))
+        details=(f"4H EBP sweep {signal.get('ebp_sweep_atr',0):.2f}ATR · reclaim {signal.get('ebp_reclaim_atr',0):.2f}ATR · age {signal.get('ebp_age_h',0):.1f}h\n"
+                 f"15M FVG {zlo:.8g} → {zhi:.8g} · RETRACE TOUCHED\n"
+                 f"Entry {live:.8g} · SL {sl:.8g}\nTP-A {t1:.8g} (0.75R) · TP-B {t2:.8g} (1.25R) · FINAL {t3:.8g} ({final_r:.1f}R)")
+    else:
+        flags=[]
+        for k,label in (("role","ROLE"),("sweep","SWEEP"),("fvg","FVG"),("hns","H&S")):
+            if signal.get(k):flags.append(label)
+        details=(f"4H score {signal.get('h4_score',0)}/6 · ADX {signal.get('h4_adx',0):.1f} · EMA21 ext {signal.get('h4_ext_atr',0):.2f}ATR\n"
+                 f"15M confirmations {signal.get('confirmations',0)} · {' + '.join(flags) if flags else '-'}\n"
+                 f"Entry {live:.8g} · SL {sl:.8g} · TP1 {t1:.8g} · TP2 {t2:.8g} · FINAL {t3:.8g} ({final_r:.1f}R)")
+    msg=(f"{'🧪 PAPER' if PAPER_TRADING else '🎯 V6.4 ENTRY'}\n{symbol} {side.upper()} · {signal.get('entry_route')} · {signal.get('grade')} {signal.get('score',0):.0f}/100\n"
+         f"{details}\nBTC {signal.get('btc_note','-')}\nRisk cap {profile['risk_pct']*100:.1f}% · expected final net ~${sizing['expected_net_tp_usdt']:.2f}\n"
+         f"Notional ${sizing['notional']:.2f} · Margin ${sizing['margin']:.2f} · {LEVERAGE}x")
+    if PAPER_TRADING:tg(msg);_v62_last_entry_time=time.time();return True
+    resp=native("private_post_trade_order",payload)
+    if not native_ok(resp):
+        err=response_error(resp)
+        if "152012" in err:protection_lock=True
+        tg(f"❌ V6.4 ORDER FAILED\n{symbol} {side.upper()}\n{err}");return False
+    _v62_last_entry_time=time.time();tg(msg);new_pos=find_new_position(symbol,before_ids,timeout=8)
+    if new_pos is None:tg(f"⚠️ {symbol}: V6.3 order accepted, position not visible yet.");return True
+    pid=position_id(new_pos)
+    if pid:
+        sniper_managed_positions.add(pid);_v6_position_meta[pid]={"risk":risk,"tp1":t1,"tp2":t2,"opened":time.time(),"route":signal.get("entry_route"),"side":side,"final_r":final_r,"strategy":signal.get("strategy")}
+    if has_live_protection(new_pos)[0]:tg(f"🛡️ V6.4 PROTECTION CONFIRMED\n{symbol} {side.upper()}\n{final_r:.1f}R TP + structural SL visible.");return True
+    last=safe_float(exchange.fetch_ticker(symbol).get("last"))
+    if tpsl_prices_valid(side,sl,t3,last):
+        ok,res=place_tpsl_for_position(new_pos,sl,t3,client_tag=tag)
+        if ok:tg(f"🛡️ V6.4 FALLBACK PROTECTION CONFIRMED\n{symbol}");return True
+        protection_lock=True;tg(f"🚨 V6.4 PROTECTION FAILURE\n{symbol}\n{res}\nNEW TRADES PAUSED.");return True
+    protection_lock=True;tg(f"🚨 {symbol}: V6.3 position exists but safe fallback protection failed.\nNEW TRADES PAUSED.");return True
+
+
+def maybe_score_report(rows):
+    global _v6_last_report
+    now=time.time();interesting=[r for r in rows if r and (r.get("side") or r.get("skip"))]
+    if not interesting or now-_v6_last_report<V6_REPORT_MIN*60:return
+    _v6_last_report=now
+    ranked=sorted(interesting,key=lambda r:safe_float(r.get("quality",r.get("score",0))),reverse=True)[:10]
+    lines=[f"🧠 STRUCTURE FUSION v{SNIPER_VERSION} · 4H + 15M ONLY"]
+    for r in ranked:
+        state="🟢 READY" if r.get("side") and not r.get("skip") else f"⏭ {r.get('skip','wait')}"
+        if r.get("strategy")=="EBP-FVG":
+            z=r.get("fvg_zone") or (0,0)
+            lines.append(f"{r['symbol'].split('/')[0]} {str(r.get('side') or '-').upper()} EBP-FVG Q{safe_float(r.get('score')):.0f} zone {safe_float(z[0]):.5g}-{safe_float(z[1]):.5g} {state}")
+        else:
+            lines.append(f"{r['symbol'].split('/')[0]} {str(r.get('side') or '-').upper()} {r.get('entry_route','-')} Q{safe_float(r.get('score')):.0f} C{r.get('confirmations','-')} {state}")
+    tg("\n".join(lines))
+
+
+def startup_diagnostics():
+    acc=futures_account();reset_daily_if_needed(acc["total_equity"])
+    tg(f"🧠 PRECISION STRUCTURE FUSION STARTED v{SNIPER_VERSION}\nMode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
+       f"TIMEFRAMES: 4H + 15M ONLY — no 1H, no 5M\n"
+       f"NEW: 4H EBP sweep/reclaim → 15M FVG → WAIT FOR RETRACE → protected entry\n"
+       f"EBP rule LONG: sweep prior 4H low + close above prior 4H open; SHORT mirrored\n"
+       f"EBP target: {V63_EBP_FINAL_R:.1f}R · no chasing: price must return into the 15M FVG\n"
+       f"Existing engine: 4H location + 15M role reversal / sweep / FVG / H&S\n"
+       f"Risk caps: structure {V6_RISK_PCT*100:.1f}% · EBP {V63_EBP_RISK_PCT*100:.1f}% · elite {max(V6_ELITE_RISK_PCT,V63_EBP_ELITE_RISK_PCT)*100:.1f}%\n"
+       f"Max positions {MAX_ACTIVE_POSITIONS} · max same side {V6_MAX_SAME_SIDE} · entry spacing {V62_GLOBAL_ENTRY_GAP_MIN}m\n"
+       f"Equity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}")
+
+
+# ============================================================
+# V6.4 — ADAPTIVE RETRACE ROUTER
+# ============================================================
+# Overnight V6.3 diagnostics showed a healthy anti-chase gate, but too many
+# symbols died in WAIT because the normal Structure route required role/sweep/
+# H&S while the EBP route is intentionally rare. V6.4 does NOT loosen the
+# anti-chase rules. It adds a third, location-first continuation route:
+#
+#   strong 4H trend -> 15M reset into EMA21 -> 15M reclaim -> momentum returns
+#   -> at least one price-action trigger (micro break / FVG touch / rejection)
+#
+# This creates entries AFTER a pullback instead of buying/selling an extended
+# impulse. It uses only 4H + 15M market structure.
+
+SNIPER_VERSION = "6.4.0"
+V64_TREND_RESET_ENABLED = os.getenv("V64_TREND_RESET_ENABLED", "true").lower() == "true"
+V64_MIN_H4_SCORE = int(os.getenv("V64_MIN_H4_SCORE", "5"))
+V64_MIN_H4_ADX = float(os.getenv("V64_MIN_H4_ADX", "17"))
+V64_MIN_QUALITY = float(os.getenv("V64_MIN_QUALITY", "82"))
+V64_ELITE_QUALITY = float(os.getenv("V64_ELITE_QUALITY", "92"))
+V64_MAX_15M_EXT_ATR = float(os.getenv("V64_MAX_15M_EXT_ATR", "0.30"))
+V64_MAX_4H_EXT_ATR = float(os.getenv("V64_MAX_4H_EXT_ATR", "0.90"))
+V64_RECLAIM_TOL_ATR = float(os.getenv("V64_RECLAIM_TOL_ATR", "0.16"))
+V64_RESET_LOOKBACK = int(os.getenv("V64_RESET_LOOKBACK", "8"))
+V64_MIN_STOP_ATR = float(os.getenv("V64_MIN_STOP_ATR", "0.55"))
+V64_MAX_STOP_ATR = float(os.getenv("V64_MAX_STOP_ATR", "1.25"))
+V64_STOP_BUFFER_ATR = float(os.getenv("V64_STOP_BUFFER_ATR", "0.10"))
+V64_FINAL_R = float(os.getenv("V64_FINAL_R", "2.5"))
+V64_RISK_PCT = float(os.getenv("V64_RISK_PCT", "0.010"))
+V64_ELITE_RISK_PCT = float(os.getenv("V64_ELITE_RISK_PCT", "0.012"))
+V64_REPORT_MIN = int(os.getenv("V64_REPORT_MIN", "30"))
+V64_REQUIRE_BTC = os.getenv("V64_REQUIRE_BTC", "true").lower() == "true"
+
+
+def _v64_recent_reset(cdf, d, atr):
+    n=max(3,V64_RESET_LOOKBACK)
+    recent=cdf.iloc[-(n+1):-1] if len(cdf)>n+1 else cdf.iloc[:-1]
+    if recent.empty:return False
+    tol=V64_RECLAIM_TOL_ATR*atr
+    if d==1:
+        return bool((recent["low"] <= recent["ema_slow"] + tol).any())
+    return bool((recent["high"] >= recent["ema_slow"] - tol).any())
+
+
+def _v64_trend_reset_candidate(symbol):
+    if not V64_TREND_RESET_ENABLED:return None
+    try:
+        h4=_v6_4h_context(symbol);d=int(h4.get("dir",0))
+        if d==0:return None
+        side="long" if d==1 else "short"
+        df=_v6_df(symbol,"15m");cdf=_v6_closed(df)
+        if len(cdf)<210:return None
+        a,p=cdf.iloc[-1],cdf.iloc[-2]
+        c=safe_float(a["close"]);o=safe_float(a["open"]);hi=safe_float(a["high"]);lo=safe_float(a["low"])
+        pc=safe_float(p["close"]);ph=safe_float(p["high"]);pl=safe_float(p["low"])
+        atr=max(safe_float(a["atr"]),1e-12);e21=safe_float(a["ema_slow"]);pe21=safe_float(p["ema_slow"])
+        if c<=0 or e21<=0:return None
+
+        loc_ok,loc_note,loc=_v62_4h_location(h4,d)
+        h4_ext=safe_float(loc.get("h4_ext_atr"),99)
+        h4_strong=(int(h4.get("score",0))>=V64_MIN_H4_SCORE and safe_float(h4.get("adx"))>=V64_MIN_H4_ADX)
+        reset=_v64_recent_reset(cdf,d,atr)
+        ext=d*(c-e21)/atr
+        ema_slope=d*(e21-pe21)>0
+        correct_side=(c>e21) if d==1 else (c<e21)
+        touched_now=(lo<=e21+V64_RECLAIM_TOL_ATR*atr) if d==1 else (hi>=e21-V64_RECLAIM_TOL_ATR*atr)
+        crossed_now=(pc<=pe21 and c>e21) if d==1 else (pc>=pe21 and c<e21)
+        reclaim=correct_side and (touched_now or crossed_now)
+        micro_break=(c>ph+0.02*atr) if d==1 else (c<pl-0.02*atr)
+        candle,candle_name,_=_v6_candle_pattern(cdf,d)
+        fvg,flo,fhi=_v6_fvg(cdf,d,atr)
+        hist=safe_float(a["macd_hist"]);hp=safe_float(p["macd_hist"])
+        macd_ok=(hist>hp) if d==1 else (hist<hp)
+        volm=safe_float(a["vol_mean"]);vol=safe_float(a["volume"]);vol_ok=volm>0 and vol>=0.95*volm
+        body=abs(c-o)/atr
+        body_ok=body>=0.18
+        btc_ok,btc_note=_v6_btc_gate(symbol,d) if V64_REQUIRE_BTC else (True,"BTC gate off")
+        pa_trigger=micro_break or candle or fvg
+
+        q=0.0
+        q+=26 if int(h4.get("score",0))>=6 else 22 if int(h4.get("score",0))>=5 else 0
+        q+=8 if safe_float(h4.get("adx"))>=22 else 5 if safe_float(h4.get("adx"))>=V64_MIN_H4_ADX else 0
+        q+=12 if loc_ok and h4_ext<=V64_MAX_4H_EXT_ATR else 0
+        q+=14 if reset else 0
+        q+=17 if reclaim else 0
+        q+=8 if ema_slope else 0
+        q+=10 if macd_ok else 0
+        q+=8 if micro_break else 0
+        q+=7 if candle else 0
+        q+=6 if fvg else 0
+        q+=4 if vol_ok else 0
+        q+=3 if body_ok else 0
+        q=min(100.0,q)
+
+        skip=None
+        if not h4_strong:skip=f"TR-4H-not-strong-{h4.get('score',0)}/6-ADX{safe_float(h4.get('adx')):.0f}"
+        elif not loc_ok:skip=f"TR-ARMED-{loc_note}"
+        elif h4_ext>V64_MAX_4H_EXT_ATR:skip=f"TR-ARMED-4H-ext-{h4_ext:.2f}ATR"
+        elif not reset:skip="TR-wait-15M-EMA21-reset"
+        elif not correct_side:skip="TR-wait-EMA21-reclaim"
+        elif ext>V64_MAX_15M_EXT_ATR:skip=f"TR-too-far-after-reclaim-{ext:.2f}ATR"
+        elif not reclaim:skip="TR-wait-reclaim-candle"
+        elif not ema_slope:skip="TR-EMA21-slope-not-ready"
+        elif not macd_ok:skip="TR-momentum-not-returned"
+        elif not pa_trigger:skip="TR-wait-price-action-trigger"
+        elif not body_ok:skip="TR-reclaim-body-too-small"
+        elif not btc_ok:skip=btc_note
+        elif q<V64_MIN_QUALITY:skip=f"TR-quality-{q:.0f}<{V64_MIN_QUALITY:.0f}"
+
+        recent=cdf.iloc[-7:]
+        if d==1:
+            structural=safe_float(recent["low"].min())-V64_STOP_BUFFER_ATR*atr
+            raw=c-structural
+        else:
+            structural=safe_float(recent["high"].max())+V64_STOP_BUFFER_ATR*atr
+            raw=structural-c
+        risk=max(V64_MIN_STOP_ATR*atr,min(raw,V64_MAX_STOP_ATR*atr))
+        flags=[]
+        if micro_break:flags.append("MICRO-BREAK")
+        if fvg:flags.append("FVG")
+        if candle:flags.append(candle_name.upper())
+        return {"symbol":symbol,"side":side,"score":q,"score_max":100.0,"quality":q,"threshold":V64_MIN_QUALITY,
+                "grade":"A+" if q>=V64_ELITE_QUALITY else "A" if q>=V64_MIN_QUALITY else "C","skip":skip,
+                "entry_route":"TREND-RESET" if skip is None else "WAIT","strategy":"TREND-RESET","price":c,"atr":atr,
+                "signal_bar_ts":int(a["ts"]),"risk_distance":risk,"stop_origin":"V6.4 15M EMA21 reset swing","final_r":V64_FINAL_R,
+                "h4_score":h4.get("score",0),"h4_adx":h4.get("adx",0),"confirmations":int(reset)+int(reclaim)+int(macd_ok)+int(pa_trigger)+int(vol_ok),
+                "role":False,"sweep":False,"fvg":fvg,"hns":False,"candle":candle_name if candle else "-","macd_ok":macd_ok,
+                "volume_above":vol_ok,"extension_atr":ext,"btc_note":btc_note,"ema21_reset":reset,"location_note":loc_note,
+                "h4_ext_atr":h4_ext,"h4_range_pos":safe_float(loc.get("h4_range_pos")),"h4_impulse3_atr":safe_float(loc.get("h4_impulse3_atr")),
+                "zone_level":e21,"fvg_zone":(flo,fhi) if fvg else None,"sweep_depth":0.0,"v64_flags":flags}
+    except Exception:
+        return None
+
+
+# Preserve V6.3 router, then add the Trend-Reset route without weakening EBP or
+# Structure Fusion.
+_v63_router_candidate = _v6_candidate
+
+def _v6_candidate(symbol):
+    # Evaluate each route independently so a rare EBP and a normal structure
+    # setup remain available while Trend-Reset fills the clean pullback gap.
+    ebp=_v63_ebp_candidate(symbol)
+    base=_v62_structure_candidate(symbol)
+    tr=_v64_trend_reset_candidate(symbol)
+    ready=[x for x in (ebp,tr,base) if x and x.get("side") and not x.get("skip") and x.get("entry_route") not in (None,"WAIT")]
+    if ready:
+        # EBP gets a small priority bonus because its retrace zone is defined in
+        # advance; otherwise choose quality rather than route name.
+        return max(ready,key=lambda x:(safe_float(x.get("quality"))+ (3 if x.get("strategy")=="EBP-FVG" else 0),int(x.get("confirmations",0))))
+    # For WAIT reports prefer actionable armed/retrace states over generic blocks.
+    waits=[x for x in (ebp,tr,base) if x]
+    def wait_rank(x):
+        sk=str(x.get("skip",""))
+        action=3 if ("ARMED" in sk or "wait-retrace" in sk) else 2 if sk.startswith("TR-wait") else 1
+        return (action,safe_float(x.get("quality",x.get("score",0))))
+    return max(waits,key=wait_rank) if waits else None
+
+
+def evaluate_symbol(symbol, btc=None):
+    return _v6_candidate(symbol)
+
+
+def sizing_profile(signal):
+    if signal.get("strategy")=="EBP-FVG":
+        elite=safe_float(signal.get("score"))>=92
+        return {"name":"V64-EBP-ELITE" if elite else "V64-EBP","risk_pct":V63_EBP_ELITE_RISK_PCT if elite else V63_EBP_RISK_PCT,"target_net_tp":V6_TARGET_NET}
+    if signal.get("strategy")=="TREND-RESET":
+        elite=safe_float(signal.get("score"))>=V64_ELITE_QUALITY
+        return {"name":"V64-TR-ELITE" if elite else "V64-TREND-RESET","risk_pct":V64_ELITE_RISK_PCT if elite else V64_RISK_PCT,"target_net_tp":V6_TARGET_NET}
+    elite=safe_float(signal.get("score"))>=V6_ELITE_QUALITY and int(signal.get("confirmations",0))>=4
+    return {"name":"V64-STRUCT-ELITE" if elite else "V64-STRUCTURE","risk_pct":V6_ELITE_RISK_PCT if elite else V6_RISK_PCT,"target_net_tp":V6_TARGET_NET}
+
+
+def maybe_score_report(rows):
+    global _v6_last_report
+    from collections import Counter
+    now=time.time();interesting=[r for r in rows if r]
+    if not interesting or now-_v6_last_report<V64_REPORT_MIN*60:return
+    _v6_last_report=now
+    ready=[r for r in interesting if r.get("side") and not r.get("skip") and r.get("entry_route") not in (None,"WAIT")]
+    armed=[r for r in interesting if "ARMED" in str(r.get("skip","")) or str(r.get("skip","")).startswith("TR-wait")]
+    blockers=Counter()
+    for r in interesting:
+        sk=str(r.get("skip") or "READY")
+        if "too-far-from-EMA21" in sk or "4H-ext" in sk or "range-edge" in sk:bucket="4H extended"
+        elif "no-key-structure" in sk:bucket="no key structure"
+        elif "EMA21" in sk:bucket="15M EMA21/reset"
+        elif "momentum" in sk:bucket="momentum"
+        elif "confirmations" in sk:bucket="confirmations"
+        elif "BTC" in sk:bucket="BTC context"
+        elif sk=="READY":bucket="ready"
+        else:bucket=sk.split("-")[0][:22]
+        blockers[bucket]+=1
+    ranked=sorted(interesting,key=lambda r:(0 if r.get("skip") else 1,safe_float(r.get("quality",r.get("score",0)))),reverse=True)[:8]
+    lines=[f"🧠 STRUCTURE FUSION v{SNIPER_VERSION} · 4H + 15M",f"Ready {len(ready)} · Armed/retrace {len(armed)} · scanned {len(interesting)}"]
+    if blockers:lines.append("Main waits: "+" · ".join(f"{k} {v}" for k,v in blockers.most_common(4)))
+    for r in ranked:
+        state="🟢 READY" if not r.get("skip") else f"⏭ {r.get('skip')}"
+        route=r.get("strategy",r.get("entry_route","-"))
+        lines.append(f"{r['symbol'].split('/')[0]} {str(r.get('side') or '-').upper()} {route} Q{safe_float(r.get('score')):.0f} {state}")
+    tg("\n".join(lines))
+
+
+def startup_diagnostics():
+    acc=futures_account();reset_daily_if_needed(acc["total_equity"])
+    tg(f"🧠 PRECISION STRUCTURE FUSION STARTED v{SNIPER_VERSION}\nMode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
+       f"TIMEFRAMES: 4H + 15M ONLY — no 1H, no 5M\n"
+       f"ROUTE 1 EBP-FVG: 4H sweep/reclaim → 15M FVG → retrace entry\n"
+       f"ROUTE 2 TREND-RESET: strong 4H → 15M EMA21 reset/reclaim → momentum + price action\n"
+       f"ROUTE 3 STRUCTURE: role reversal / sweep / FVG / H&S\n"
+       f"Anti-chase stays ON: 4H location gate + 15M extension gate + live drift check\n"
+       f"Trend-Reset: H4 >= {V64_MIN_H4_SCORE}/6, ADX >= {V64_MIN_H4_ADX:.0f}, 15M ext <= {V64_MAX_15M_EXT_ATR:.2f}ATR, Q >= {V64_MIN_QUALITY:.0f}\n"
+       f"Risk caps: Trend-Reset {V64_RISK_PCT*100:.1f}% / elite {V64_ELITE_RISK_PCT*100:.1f}% · Structure {V6_RISK_PCT*100:.1f}% · EBP {V63_EBP_RISK_PCT*100:.1f}%\n"
+       f"Max positions {MAX_ACTIVE_POSITIONS} · max same side {V6_MAX_SAME_SIDE} · entry spacing {V62_GLOBAL_ENTRY_GAP_MIN}m\n"
+       f"Scanner summary every {V64_REPORT_MIN}m instead of Telegram walls.\n"
+       f"Equity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}")
+
 if __name__ == "__main__":
     main()
