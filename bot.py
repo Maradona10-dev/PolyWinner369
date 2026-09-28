@@ -4033,9 +4033,9 @@ V6_FINAL_R = float(os.getenv("V6_FINAL_R", "3.0"))
 V6_TP1_R = float(os.getenv("V6_TP1_R", "1.0"))
 V6_TP2_R = float(os.getenv("V6_TP2_R", "2.0"))
 V6_LOCK_R = float(os.getenv("V6_LOCK_R", "1.0"))
-V6_RISK_PCT = float(os.getenv("V6_RISK_PCT", "0.012"))
-V6_ELITE_RISK_PCT = float(os.getenv("V6_ELITE_RISK_PCT", "0.015"))
-V6_TARGET_NET = float(os.getenv("V6_TARGET_NET", "1.50"))
+V6_RISK_PCT = float(os.getenv("V6_RISK_PCT", "0.017"))
+V6_ELITE_RISK_PCT = float(os.getenv("V6_ELITE_RISK_PCT", "0.020"))
+V6_TARGET_NET = float(os.getenv("V6_TARGET_NET", "2.10"))
 V6_MAX_SAME_SIDE = int(os.getenv("V6_MAX_SAME_SIDE", "2"))
 V6_BTC_CONTEXT = os.getenv("V6_BTC_CONTEXT", "true").lower() == "true"
 V6_SOFT_EXIT_MIN = int(os.getenv("V6_SOFT_EXIT_MIN", "240"))
@@ -4661,8 +4661,8 @@ V63_EBP_STOP_BUFFER_ATR = float(os.getenv("V63_EBP_STOP_BUFFER_ATR", "0.12"))
 V63_EBP_MIN_STOP_ATR = float(os.getenv("V63_EBP_MIN_STOP_ATR", "0.45"))
 V63_EBP_MAX_STOP_ATR = float(os.getenv("V63_EBP_MAX_STOP_ATR", "1.35"))
 V63_EBP_FINAL_R = float(os.getenv("V63_EBP_FINAL_R", "2.0"))
-V63_EBP_RISK_PCT = float(os.getenv("V63_EBP_RISK_PCT", "0.012"))
-V63_EBP_ELITE_RISK_PCT = float(os.getenv("V63_EBP_ELITE_RISK_PCT", "0.015"))
+V63_EBP_RISK_PCT = float(os.getenv("V63_EBP_RISK_PCT", "0.017"))
+V63_EBP_ELITE_RISK_PCT = float(os.getenv("V63_EBP_ELITE_RISK_PCT", "0.020"))
 V63_EBP_REQUIRE_BTC = os.getenv("V63_EBP_REQUIRE_BTC", "true").lower() == "true"
 V63_EBP_MIN_QUALITY = float(os.getenv("V63_EBP_MIN_QUALITY", "82"))
 V63_EBP_RECLAIM_EMA21 = os.getenv("V63_EBP_RECLAIM_EMA21", "false").lower() == "true"
@@ -4979,7 +4979,13 @@ def startup_diagnostics():
 # This creates entries AFTER a pullback instead of buying/selling an extended
 # impulse. It uses only 4H + 15M market structure.
 
-SNIPER_VERSION = "6.4.0"
+SNIPER_VERSION = "6.5.0"
+# V6.5 SIZING BOOST:
+# - leverage stays 10x
+# - structural stops and entry filters are unchanged
+# - risk budget is increased ~40-50%, with stronger A+ setups receiving more
+# - the existing BASE_MARGIN_USDT=10 ceiling remains the hard per-position target cap
+# - risk-based sizing can still choose less than $10 margin when the structural stop is wider
 V64_TREND_RESET_ENABLED = os.getenv("V64_TREND_RESET_ENABLED", "true").lower() == "true"
 V64_MIN_H4_SCORE = int(os.getenv("V64_MIN_H4_SCORE", "5"))
 V64_MIN_H4_ADX = float(os.getenv("V64_MIN_H4_ADX", "17"))
@@ -4993,8 +4999,8 @@ V64_MIN_STOP_ATR = float(os.getenv("V64_MIN_STOP_ATR", "0.55"))
 V64_MAX_STOP_ATR = float(os.getenv("V64_MAX_STOP_ATR", "1.25"))
 V64_STOP_BUFFER_ATR = float(os.getenv("V64_STOP_BUFFER_ATR", "0.10"))
 V64_FINAL_R = float(os.getenv("V64_FINAL_R", "2.5"))
-V64_RISK_PCT = float(os.getenv("V64_RISK_PCT", "0.010"))
-V64_ELITE_RISK_PCT = float(os.getenv("V64_ELITE_RISK_PCT", "0.012"))
+V64_RISK_PCT = float(os.getenv("V64_RISK_PCT", "0.014"))
+V64_ELITE_RISK_PCT = float(os.getenv("V64_ELITE_RISK_PCT", "0.017"))
 V64_REPORT_MIN = int(os.getenv("V64_REPORT_MIN", "30"))
 V64_REQUIRE_BTC = os.getenv("V64_REQUIRE_BTC", "true").lower() == "true"
 
@@ -5177,7 +5183,8 @@ def startup_diagnostics():
        f"ROUTE 3 STRUCTURE: role reversal / sweep / FVG / H&S\n"
        f"Anti-chase stays ON: 4H location gate + 15M extension gate + live drift check\n"
        f"Trend-Reset: H4 >= {V64_MIN_H4_SCORE}/6, ADX >= {V64_MIN_H4_ADX:.0f}, 15M ext <= {V64_MAX_15M_EXT_ATR:.2f}ATR, Q >= {V64_MIN_QUALITY:.0f}\n"
-       f"Risk caps: Trend-Reset {V64_RISK_PCT*100:.1f}% / elite {V64_ELITE_RISK_PCT*100:.1f}% · Structure {V6_RISK_PCT*100:.1f}% · EBP {V63_EBP_RISK_PCT*100:.1f}%\n"
+       f"V6.5 SIZING BOOST · leverage stays {LEVERAGE}x · margin ceiling ${min(BASE_MARGIN_USDT, MAX_MARGIN_USDT):.2f}\n"\
+       f"Risk caps: Trend-Reset {V64_RISK_PCT*100:.1f}% / elite {V64_ELITE_RISK_PCT*100:.1f}% · Structure {V6_RISK_PCT*100:.1f}% / elite {V6_ELITE_RISK_PCT*100:.1f}% · EBP {V63_EBP_RISK_PCT*100:.1f}% / elite {V63_EBP_ELITE_RISK_PCT*100:.1f}%\n"
        f"Max positions {MAX_ACTIVE_POSITIONS} · max same side {V6_MAX_SAME_SIDE} · entry spacing {V62_GLOBAL_ENTRY_GAP_MIN}m\n"
        f"Scanner summary every {V64_REPORT_MIN}m instead of Telegram walls.\n"
        f"Equity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}")
