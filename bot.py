@@ -5611,5 +5611,556 @@ def startup_diagnostics():
         f"Equity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}"
     )
 
+
+# ============================================================
+# V6.7 — PRECISION RETRACE / FRESH-FVG / TRUE SIDE ACCOUNTING
+# ============================================================
+# Review of the 2026-09-29 overnight run:
+# - WIF EBP LONG reached +1R, then closed around entry; fees made it net negative.
+# - ORDI EBP LONG reached the final target and closed +$1.16 net.
+# - Both useful EBP longs had BTC 15M aligned while BTC 4H was opposite.
+# - The close-history side classifier mislabeled a near-BE LONG as SHORT because
+#   it inferred direction from PnL sign. In one-way mode this polluted side
+#   streaks and could block the wrong direction.
+#
+# V6.7 therefore improves precision without simply raising thresholds:
+# 1) use BloFin positions-history `side` (buy/sell) as the primary direction;
+# 2) only use a still-fresh FVG from inside the EBP candle;
+# 3) retrace must penetrate meaningfully into the FVG before 15M confirmation;
+# 4) EBP SL stays anchored to the precomputed FVG/impulse structure;
+# 5) management locks a fee/slippage buffer after a trade proves itself;
+# 6) EBP management is route-specific instead of using generic 1R/2R steps.
+
+SNIPER_VERSION = "6.7.0"
+
+V67_FVG_MAX_PREMITIGATION = float(os.getenv("V67_FVG_MAX_PREMITIGATION", "0.55"))
+V67_MIN_RETRACE_DEPTH = float(os.getenv("V67_MIN_RETRACE_DEPTH", "0.25"))
+V67_EBP_BE_TRIGGER_R = float(os.getenv("V67_EBP_BE_TRIGGER_R", "0.90"))
+V67_EBP_LOCK_TRIGGER_R = float(os.getenv("V67_EBP_LOCK_TRIGGER_R", "1.25"))
+V67_EBP_LOCK_R = float(os.getenv("V67_EBP_LOCK_R", "0.45"))
+V67_GENERIC_BE_TRIGGER_R = float(os.getenv("V67_GENERIC_BE_TRIGGER_R", "1.0"))
+V67_GENERIC_LOCK_TRIGGER_R = float(os.getenv("V67_GENERIC_LOCK_TRIGGER_R", "2.0"))
+V67_GENERIC_LOCK_R = float(os.getenv("V67_GENERIC_LOCK_R", "1.0"))
+V67_FEE_LOCK_MULT = float(os.getenv("V67_FEE_LOCK_MULT", "1.05"))
+
+# Preserve V6.6 functions that V6.7 wraps.
+_v66_candidate_impl = _v63_ebp_candidate
+
+
+def infer_side(record):
+    """Use BloFin's explicit historical side before any price/PnL inference."""
+    ps = str(record.get("positionSide", "") or "").lower()
+    if ps in ("long", "short"):
+        return ps
+
+    # BloFin GET /account/positions-history documents `side` as buy/sell.
+    # In one-way/net mode buy = long position, sell = short position.
+    hist_side = str(record.get("side", "") or "").lower()
+    if hist_side == "buy":
+        return "long"
+    if hist_side == "sell":
+        return "short"
+
+    # Last-resort fallback. Do NOT use PnL sign: a near-BE long can have a
+    # negative realized PnL because of fees/funding and would be mislabeled.
+    entry = safe_float(record.get("openAveragePrice"))
+    exit_p = safe_float(record.get("closeAveragePrice"))
+    if entry > 0 and exit_p > 0:
+        # Direction cannot be known with certainty from two prices alone.
+        # Prefer stored local position metadata when an exact positionId exists.
+        pid = str(record.get("positionId", "") or "")
+        meta = _v6_position_meta.get(pid, {}) if pid else {}
+        mside = str(meta.get("side", "") or "").lower()
+        if mside in ("long", "short"):
+            return mside
+    return "net"
+
+
+def _v63_fvg_inside_ebp(symbol, ebp):
+    """Select a directional 15M FVG that remained sufficiently fresh."""
+    try:
+        cdf = _v6_closed(_v6_df(symbol, "15m"))
+        if len(cdf) < 30:
+            return None
+        inside = cdf[(cdf["ts"] >= ebp["ts"]) & (cdf["ts"] < ebp["end_ts"])].copy()
+        if len(inside) < 3:
+            return None
+
+        d = int(ebp["dir"])
+        candidates = []
+        for i in range(2, len(inside)):
+            left, midc, right = inside.iloc[i-2], inside.iloc[i-1], inside.iloc[i]
+            atr15 = max(safe_float(right["atr"]), 1e-12)
+
+            if d == 1:
+                lo = safe_float(left["high"])
+                hi = safe_float(right["low"])
+                impulse = safe_float(midc["close"]) - safe_float(midc["open"])
+                valid = hi > lo and (hi-lo) >= V63_EBP_MIN_FVG_ATR*atr15 and impulse > 0
+            else:
+                lo = safe_float(right["high"])
+                hi = safe_float(left["low"])
+                impulse = safe_float(midc["open"]) - safe_float(midc["close"])
+                valid = hi > lo and (hi-lo) >= V63_EBP_MIN_FVG_ATR*atr15 and impulse > 0
+            if not valid:
+                continue
+
+            width_px = hi - lo
+            later = inside.iloc[i+1:]
+            premitigation = 0.0
+            invalidated_inside = False
+            if not later.empty:
+                if d == 1:
+                    later_low = safe_float(later["low"].min())
+                    premitigation = max(0.0, min(1.5, (hi - later_low) / max(width_px, 1e-12)))
+                    invalidated_inside = later_low < lo - 0.04*atr15
+                else:
+                    later_high = safe_float(later["high"].max())
+                    premitigation = max(0.0, min(1.5, (later_high - lo) / max(width_px, 1e-12)))
+                    invalidated_inside = later_high > hi + 0.04*atr15
+
+            # If the gap was already deeply filled during the same 4H EBP
+            # candle, the later "retrace" is no longer a clean first return.
+            if invalidated_inside or premitigation > V67_FVG_MAX_PREMITIGATION:
+                continue
+
+            width_atr = width_px / atr15
+            displacement = impulse / atr15
+            freshness = max(0.0, 1.0 - premitigation)
+            score = width_atr*1.5 + displacement + i/len(inside)*0.35 + freshness*0.75
+            candidates.append((score, lo, hi, atr15, int(right["ts"]), i, premitigation))
+
+        if not candidates:
+            return None
+
+        _, lo, hi, atr15, fts, idx, premitigation = max(candidates, key=lambda x: x[0])
+        entry = lo + (hi-lo)*V63_EBP_ENTRY_FRACTION
+        upto = inside.iloc[:idx+1]
+        if d == 1:
+            extreme = safe_float(upto["low"].min())
+            raw_stop = extreme - V63_EBP_STOP_BUFFER_ATR*atr15
+            raw_risk = entry - raw_stop
+        else:
+            extreme = safe_float(upto["high"].max())
+            raw_stop = extreme + V63_EBP_STOP_BUFFER_ATR*atr15
+            raw_risk = raw_stop - entry
+
+        risk = max(V63_EBP_MIN_STOP_ATR*atr15, min(raw_risk, V63_EBP_MAX_STOP_ATR*atr15))
+        stop = entry - d*risk
+        return {
+            "lo": lo, "hi": hi, "entry": entry, "atr": atr15, "ts": fts,
+            "risk": risk, "stop": stop, "extreme": extreme,
+            "premitigation": premitigation, "freshness": max(0.0, 1.0-premitigation),
+        }
+    except Exception:
+        return None
+
+
+def _v66_ebp_closed_confirmation(symbol, ebp, fvg):
+    """Closed 15M confirmation + meaningful FVG penetration."""
+    try:
+        cdf = _v6_closed(_v6_df(symbol, "15m"))
+        post = cdf[cdf["ts"] >= ebp["end_ts"]].tail(max(3, V66_EBP_CONFIRM_LOOKBACK))
+        if post.empty:
+            return False, "wait-first-closed-15M", 0, 0
+
+        atr = max(safe_float(post.iloc[-1]["atr"]), 1e-12)
+        tol = V66_EBP_CONFIRM_TOL_ATR * atr
+        lo, hi = safe_float(fvg["lo"]), safe_float(fvg["hi"])
+        width = max(hi-lo, 1e-12)
+        mid = (lo+hi)/2.0
+        d = int(ebp["dir"])
+
+        touched_positions = []
+        best_depth = 0.0
+        for j in range(len(post)):
+            r = post.iloc[j]
+            rl, rh = safe_float(r["low"]), safe_float(r["high"])
+            overlaps = rl <= hi + tol and rh >= lo - tol
+            if not overlaps:
+                continue
+            if d == 1:
+                depth = (hi - rl) / width
+            else:
+                depth = (rh - lo) / width
+            depth = max(0.0, min(1.5, depth))
+            if depth >= V67_MIN_RETRACE_DEPTH:
+                touched_positions.append(j)
+                best_depth = max(best_depth, depth)
+
+        if not touched_positions:
+            return False, f"wait-deeper-FVG-retrace<{V67_MIN_RETRACE_DEPTH:.0%}", 0, int(post.iloc[-1]["ts"])
+
+        touch_j = touched_positions[-1]
+        if len(post)-1-touch_j > 1:
+            return False, "retrace-confirmation-stale", 0, int(post.iloc[-1]["ts"])
+
+        a = post.iloc[-1]
+        p = post.iloc[-2] if len(post) >= 2 else a
+        o, c = safe_float(a["open"]), safe_float(a["close"])
+        h, l = safe_float(a["high"]), safe_float(a["low"])
+        ph, pl = safe_float(p["high"]), safe_float(p["low"])
+        rng = max(h-l, 1e-12)
+        upper = h-max(o,c)
+        lower = min(o,c)-l
+        hist, hp = safe_float(a["macd_hist"]), safe_float(p["macd_hist"])
+        ema21 = safe_float(a["ema_slow"])
+
+        if d == 1:
+            body_dir = c > o
+            zone_reject = c >= mid and lower/rng >= 0.18
+            micro_break = c > ph + 0.02*atr
+            macd_turn = hist > hp
+            ema_side = c >= ema21
+            close_not_failed = c >= lo-tol
+        else:
+            body_dir = c < o
+            zone_reject = c <= mid and upper/rng >= 0.18
+            micro_break = c < pl - 0.02*atr
+            macd_turn = hist < hp
+            ema_side = c <= ema21
+            close_not_failed = c <= hi+tol
+
+        score = int(body_dir)+int(zone_reject)+int(micro_break)+int(macd_turn)+int(ema_side)
+        confirmed = (
+            close_not_failed and body_dir and macd_turn
+            and (zone_reject or micro_break)
+            and score >= V66_EBP_MIN_CONFIRM_SCORE
+        )
+        why = (
+            f"15M-confirm {score}/5 · depth {best_depth:.0%} · "
+            f"body={int(body_dir)} reject={int(zone_reject)} break={int(micro_break)} "
+            f"macd={int(macd_turn)} ema={int(ema_side)}"
+        )
+        return confirmed, why, score, int(a["ts"])
+    except Exception as e:
+        return False, f"confirm-error-{type(e).__name__}", 0, 0
+
+
+def _v63_ebp_candidate(symbol):
+    """V6.6 logic + V6.7 freshness/structural-stop metadata."""
+    base = _v66_candidate_impl(symbol)
+    if not base or base.get("strategy") != "EBP-FVG":
+        return base
+    try:
+        ebp = _v63_h4_ebp(symbol)
+        fvg = _v63_fvg_inside_ebp(symbol, ebp) if ebp else None
+        if fvg:
+            base["structural_stop"] = safe_float(fvg["stop"])
+            base["fvg_freshness"] = safe_float(fvg.get("freshness"), 0.0)
+            base["fvg_premitigation"] = safe_float(fvg.get("premitigation"), 0.0)
+            # Reward freshness modestly; it cannot turn a blocked setup into a
+            # trade by itself because all V6.6 confirmation gates still apply.
+            bonus = min(3.0, max(0.0, base["fvg_freshness"]*3.0))
+            base["score"] = min(100.0, safe_float(base.get("score")) + bonus)
+            base["quality"] = base["score"]
+            base["grade"] = "A+" if base["score"] >= 92 else "A" if base["score"] >= V63_EBP_MIN_QUALITY else "C"
+    except Exception:
+        pass
+    return base
+
+
+def _v6_levels(signal, live, tick):
+    side = signal["side"]
+    d = 1 if side == "long" else -1
+    final_r = safe_float(signal.get("final_r"), V6_FINAL_R) or V6_FINAL_R
+
+    if signal.get("strategy") == "EBP-FVG":
+        structural_sl = safe_float(signal.get("structural_stop"))
+        if structural_sl <= 0:
+            risk0 = safe_float(signal.get("risk_distance"))
+            structural_sl = live - d*risk0
+        # Structural stop must remain on the correct side of the live entry.
+        if (d == 1 and structural_sl >= live) or (d == -1 and structural_sl <= live):
+            return None
+        sl = round_trade_price(structural_sl, tick, side, "sl")
+        risk = abs(live-sl)
+        if risk <= 0:
+            return None
+        t1 = round_trade_price(live+d*risk*0.75, tick, side, "tp")
+        t2 = round_trade_price(live+d*risk*1.25, tick, side, "tp")
+        t3 = round_trade_price(live+d*risk*final_r, tick, side, "tp")
+        return sl, t1, t2, t3, risk
+
+    risk = safe_float(signal.get("risk_distance"))
+    if live <= 0 or risk <= 0:
+        return None
+    sl = round_trade_price(live-d*risk, tick, side, "sl")
+    t1 = round_trade_price(live+d*risk*V6_TP1_R, tick, side, "tp")
+    t2 = round_trade_price(live+d*risk*V6_TP2_R, tick, side, "tp")
+    t3 = round_trade_price(live+d*risk*final_r, tick, side, "tp")
+    return sl, t1, t2, t3, risk
+
+
+def open_trade(signal):
+    """V6.7 execution: same protected market entry, true EBP structural stop."""
+    global protection_lock, _v62_last_entry_time
+    symbol, side = signal["symbol"], signal["side"]
+    acc = futures_account()
+    equity, available = acc["total_equity"], acc["available"]
+    reset_daily_if_needed(equity)
+    if equity < MIN_EQUITY_USDT or available <= 0 or (not PAPER_TRADING and protection_lock):
+        return False
+    if time.time()-_v62_last_entry_time < V62_GLOBAL_ENTRY_GAP_MIN*60:
+        return False
+
+    tick = safe_float(get_instrument(symbol).get("tickSize"), 0.0001)
+    live = safe_float(exchange.fetch_ticker(symbol).get("last"), signal["price"])
+    sig = safe_float(signal["price"])
+    if live <= 0 or sig <= 0:
+        return False
+    d = 1 if side == "long" else -1
+    is_ebp = signal.get("strategy") == "EBP-FVG"
+
+    if is_ebp:
+        z = signal.get("fvg_zone") or (0,0)
+        zlo, zhi = safe_float(z[0]), safe_float(z[1])
+        tol = V63_EBP_TOUCH_TOL_ATR*safe_float(signal.get("atr"))
+        if not (zlo-tol <= live <= zhi+tol):
+            return False
+    else:
+        adverse = d*((live-sig)/sig)
+        if adverse > V62_MAX_ADVERSE_DRIFT:
+            tg(f"⏭️ {symbol} {side.upper()} V6.7 TOO LATE\nAdverse drift {adverse*100:.2f}% > {V62_MAX_ADVERSE_DRIFT*100:.2f}%")
+            return False
+        live_loc_ok, live_loc_note, _ = _v62_live_location_ok(symbol, side, live)
+        if not live_loc_ok:
+            tg(f"⏭️ {symbol} {side.upper()} V6.7 LOCATION BLOCK\n{live_loc_note}\nNo chase at 4H extreme.")
+            return False
+
+    levels = _v6_levels(signal, live, tick)
+    if not levels:
+        return False
+    sl, t1, t2, t3, risk = levels
+    profile = sizing_profile(signal)
+    final_r = safe_float(signal.get("final_r"), V6_FINAL_R) or V6_FINAL_R
+    sizing = calculate_contracts_v5(symbol, live, sl, equity, available, profile["risk_pct"], profile["target_net_tp"], final_r)
+    if not sizing or sizing["margin"] > available*AVAILABLE_MARGIN_BUFFER:
+        return False
+
+    before_ids = {position_id(p) for p in get_positions() if position_id(p)}
+    oklev, levres = set_leverage(symbol, LEVERAGE)
+    if not oklev:
+        tg(f"⛔ LEVERAGE FAILED\n{symbol}\n{levres}")
+        return False
+
+    tag = "ps67e" if is_ebp else "ps67s"
+    payload = {
+        "instId": blofin_inst_id(symbol), "marginMode": MARGIN_MODE, "positionSide": "net",
+        "side": "buy" if side == "long" else "sell", "orderType": "market",
+        "size": str(sizing["contracts"]),
+        "tpTriggerPrice": str(t3), "tpOrderPrice": "-1", "tpTriggerPriceType": "mark",
+        "slTriggerPrice": str(sl), "slOrderPrice": "-1", "slTriggerPriceType": "mark",
+        "clientOrderId": f"{tag}{int(time.time()*1000)%1000000000}",
+    }
+    if BROKER_ID:
+        payload["brokerId"] = BROKER_ID
+
+    if is_ebp:
+        zlo, zhi = signal.get("fvg_zone", (0,0))
+        details = (
+            f"4H EBP sweep {signal.get('ebp_sweep_atr',0):.2f}ATR · reclaim {signal.get('ebp_reclaim_atr',0):.2f}ATR · age {signal.get('ebp_age_h',0):.1f}h\n"
+            f"15M FVG {zlo:.8g} → {zhi:.8g} · freshness {signal.get('fvg_freshness',0)*100:.0f}%\n"
+            f"{signal.get('v66_confirm','closed 15M confirmation')}\n"
+            f"Entry {live:.8g} · STRUCT SL {sl:.8g}\n"
+            f"TP-A {t1:.8g} (0.75R) · TP-B {t2:.8g} (1.25R) · FINAL {t3:.8g} ({final_r:.1f}R)"
+        )
+    else:
+        flags = []
+        for k,label in (("role","ROLE"),("sweep","SWEEP"),("fvg","FVG"),("hns","H&S")):
+            if signal.get(k):
+                flags.append(label)
+        details = (
+            f"4H score {signal.get('h4_score',0)}/6 · ADX {signal.get('h4_adx',0):.1f} · EMA21 ext {signal.get('h4_ext_atr',0):.2f}ATR\n"
+            f"15M confirmations {signal.get('confirmations',0)} · {' + '.join(flags) if flags else '-'}\n"
+            f"Entry {live:.8g} · SL {sl:.8g} · TP1 {t1:.8g} · TP2 {t2:.8g} · FINAL {t3:.8g} ({final_r:.1f}R)"
+        )
+
+    msg = (
+        f"{'🧪 PAPER' if PAPER_TRADING else '🎯 V6.7 ENTRY'}\n"
+        f"{symbol} {side.upper()} · {signal.get('entry_route')} · {signal.get('grade')} {signal.get('score',0):.0f}/100\n"
+        f"{details}\nBTC {signal.get('btc_note','-')}\n"
+        f"Risk cap {profile['risk_pct']*100:.1f}% · expected final net ~${sizing['expected_net_tp_usdt']:.2f}\n"
+        f"Notional ${sizing['notional']:.2f} · Margin ${sizing['margin']:.2f} · {LEVERAGE}x"
+    )
+
+    if PAPER_TRADING:
+        tg(msg)
+        _v62_last_entry_time = time.time()
+        return True
+
+    resp = native("private_post_trade_order", payload)
+    if not native_ok(resp):
+        err = response_error(resp)
+        if "152012" in err:
+            protection_lock = True
+        tg(f"❌ V6.7 ORDER FAILED\n{symbol} {side.upper()}\n{err}")
+        return False
+
+    _v62_last_entry_time = time.time()
+    tg(msg)
+    new_pos = find_new_position(symbol, before_ids, timeout=8)
+    if new_pos is None:
+        tg(f"⚠️ {symbol}: V6.7 order accepted, position not visible yet.")
+        return True
+
+    pid = position_id(new_pos)
+    actual_entry = position_entry(new_pos) or live
+    actual_risk = abs(actual_entry-sl)
+    if actual_risk <= 0:
+        actual_risk = risk
+    if pid:
+        sniper_managed_positions.add(pid)
+        _v6_position_meta[pid] = {
+            "risk": actual_risk, "planned_risk": risk, "structural_sl": sl,
+            "tp1": t1, "tp2": t2, "tp3": t3, "opened": time.time(),
+            "route": signal.get("entry_route"), "side": side,
+            "final_r": final_r, "strategy": signal.get("strategy"),
+            "planned_entry": live, "actual_entry": actual_entry,
+        }
+
+    if has_live_protection(new_pos)[0]:
+        if abs(actual_entry-live)/max(live,1e-12) >= 0.001:
+            eff_r = d*(t3-actual_entry)/max(actual_risk,1e-12)
+            tg(f"🎯 V6.7 FILL CHECK\n{symbol} {side.upper()}\nPlanned {live:.8g} · actual {actual_entry:.8g}\nStructural SL kept {sl:.8g} · final target effective {eff_r:.2f}R")
+        tg(f"🛡️ V6.7 PROTECTION CONFIRMED\n{symbol} {side.upper()}\n{final_r:.1f}R planned TP + structural SL visible.")
+        return True
+
+    last = safe_float(exchange.fetch_ticker(symbol).get("last"))
+    if tpsl_prices_valid(side, sl, t3, last):
+        ok, res = place_tpsl_for_position(new_pos, sl, t3, client_tag=tag)
+        if ok:
+            tg(f"🛡️ V6.7 FALLBACK PROTECTION CONFIRMED\n{symbol}")
+            return True
+        protection_lock = True
+        tg(f"🚨 V6.7 PROTECTION FAILURE\n{symbol}\n{res}\nNEW TRADES PAUSED.")
+        return True
+
+    protection_lock = True
+    tg(f"🚨 {symbol}: V6.7 position exists but safe fallback protection failed.\nNEW TRADES PAUSED.")
+    return True
+
+
+def manage_sniper_step_stops():
+    """Route-specific, fee-aware profit protection."""
+    if PAPER_TRADING:
+        return
+    now = time.time()
+    for p in get_positions():
+        try:
+            if not _v6_managed(p):
+                continue
+            symbol, side, entry = position_symbol(p), position_side(p), position_entry(p)
+            pid = position_id(p)
+            if entry <= 0:
+                continue
+            ok, order = has_live_protection(p)
+            if not ok or not order:
+                continue
+            tp = safe_float(order.get("tpTriggerPrice"))
+            current_sl = safe_float(order.get("slTriggerPrice"))
+            if tp <= 0 or current_sl <= 0:
+                continue
+
+            meta = _v6_position_meta.get(pid, {})
+            risk = safe_float(meta.get("risk"))
+            strategy = str(meta.get("strategy", "") or "")
+            if risk <= 0:
+                final_r = safe_float(meta.get("final_r"), V6_FINAL_R) or V6_FINAL_R
+                base = abs(tp-entry)/max(final_r, 1e-12)
+                if base <= 0:
+                    continue
+                risk = base
+                meta = {"risk":risk, "opened":safe_float(p.get("createTime"))/1000.0, "route":"restart-adopt", "strategy":strategy}
+                _v6_position_meta[pid] = meta
+
+            d = 1 if side == "long" else -1
+            tick = safe_float(get_instrument(symbol).get("tickSize"), 0.0001)
+            current = safe_float(exchange.fetch_ticker(symbol).get("last"))
+            ext = sniper_recent_extreme(symbol, side)
+            favorable = max(current, ext) if d == 1 else min(current, ext)
+            current_r = d*(current-entry)/risk
+            best_r = d*(favorable-entry)/risk
+
+            # Cover estimated round-trip taker fees + slippage once the trade
+            # has proved itself. This prevents a nominal BE from becoming a
+            # small net loser like WIF.
+            fee_px = entry*(TAKER_FEE_RATE*2 + SLIPPAGE_RATE)*V67_FEE_LOCK_MULT
+            fee_be = round_trade_price(entry+d*fee_px, tick, side, "sl")
+
+            desired = None
+            stage = None
+            if strategy == "EBP-FVG":
+                if best_r >= V67_EBP_LOCK_TRIGGER_R:
+                    lock_px = entry+d*V67_EBP_LOCK_R*risk
+                    desired = round_trade_price(max(lock_px, fee_be) if d==1 else min(lock_px, fee_be), tick, side, "sl")
+                    stage = f"{V67_EBP_LOCK_TRIGGER_R:.2f}R → lock +{V67_EBP_LOCK_R:.2f}R"
+                elif best_r >= V67_EBP_BE_TRIGGER_R:
+                    desired = fee_be
+                    stage = f"{V67_EBP_BE_TRIGGER_R:.2f}R → fee-safe BE"
+            else:
+                if best_r >= V67_GENERIC_LOCK_TRIGGER_R:
+                    desired = round_trade_price(entry+d*V67_GENERIC_LOCK_R*risk, tick, side, "sl")
+                    stage = f"{V67_GENERIC_LOCK_TRIGGER_R:.0f}R → lock +{V67_GENERIC_LOCK_R:.0f}R"
+                elif best_r >= V67_GENERIC_BE_TRIGGER_R:
+                    desired = fee_be
+                    stage = f"{V67_GENERIC_BE_TRIGGER_R:.0f}R → fee-safe BE"
+
+            if desired is not None:
+                improves = desired > current_sl+tick*0.1 if d==1 else desired < current_sl-tick*0.1
+                if improves:
+                    ok2, res = amend_tpsl_stop(p, desired)
+                    key = f"{pid}:{stage}"
+                    if ok2 and not sniper_step_notified.get(key):
+                        tg(f"🪜 V6.7 STEP STOP\n{symbol} {side.upper()}\n{stage} · SL {desired:.8g}")
+                        sniper_step_notified[key] = True
+
+            opened = safe_float(meta.get("opened")) or safe_float(p.get("createTime"))/1000.0
+            age = (now-opened)/60 if opened > 0 else 0
+            if age >= 45 and current_r < 0.35:
+                try:
+                    cdf = _v6_closed(_v6_df(symbol, "15m"))
+                    a, pr = cdf.iloc[-1], cdf.iloc[-2]
+                    c, e21 = safe_float(a["close"]), safe_float(a["ema_slow"])
+                    pc, pe21 = safe_float(pr["close"]), safe_float(pr["ema_slow"])
+                    lost15 = (c<e21 and pc<pe21) if d==1 else (c>e21 and pc>pe21)
+                    h4 = _v6_4h_context(symbol)
+                    macro_flip = h4.get("dir",0) == -d
+                    if lost15 and macro_flip:
+                        _v6_close_position(p, f"4H/15M thesis invalidated after {age:.0f}m ({current_r:+.2f}R).")
+                        continue
+                except Exception:
+                    pass
+            if age >= V6_HARD_EXIT_MIN:
+                _v6_close_position(p, f"Hard time exit {age:.0f}m ({current_r:+.2f}R).")
+                continue
+            if age >= V6_SOFT_EXIT_MIN and current_r < 0.20:
+                _v6_close_position(p, f"No follow-through after {age:.0f}m ({current_r:+.2f}R).")
+                continue
+        except Exception as e:
+            # One symbol must never stop management of the other positions.
+            tg(f"⚠️ V6.7 POSITION MANAGER\n{position_symbol(p) if isinstance(p,dict) else '-'}\n{type(e).__name__}: {e}")
+
+
+def startup_diagnostics():
+    acc = futures_account()
+    reset_daily_if_needed(acc["total_equity"])
+    tg(
+        f"🧠 PRECISION STRUCTURE FUSION STARTED v{SNIPER_VERSION}\n"
+        f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
+        f"TIMEFRAMES: 4H + 15M ONLY\n"
+        f"V6.7 PRECISION RETRACE\n"
+        f"• EBP uses fresh 15M FVG only; pre-mitigation <= {V67_FVG_MAX_PREMITIGATION:.0%}\n"
+        f"• Retrace must penetrate >= {V67_MIN_RETRACE_DEPTH:.0%} of FVG + closed 15M confirmation\n"
+        f"• EBP stop anchored to FVG/impulse structure, not re-centered on market entry\n"
+        f"• EBP {V67_EBP_BE_TRIGGER_R:.2f}R → fee-safe BE; {V67_EBP_LOCK_TRIGGER_R:.2f}R → lock +{V67_EBP_LOCK_R:.2f}R\n"
+        f"• BloFin history buy/sell fixes LONG/SHORT stats and side-streak gates\n"
+        f"• BTC 15M synchronization + V6.6 Confirm-or-Flip remain active\n"
+        f"Risk caps unchanged: EBP {V66_MAX_EBP_RISK_PCT*100:.1f}% · Trend {V66_MAX_TREND_RISK_PCT*100:.1f}% · "
+        f"Structure {V66_MAX_STRUCTURE_RISK_PCT*100:.1f}% · Flip {V66_FLIP_RISK_PCT*100:.1f}%\n"
+        f"Leverage {LEVERAGE}x · max positions {MAX_ACTIVE_POSITIONS} · max same side {V6_MAX_SAME_SIDE}\n"
+        f"Equity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}"
+    )
+
 if __name__ == "__main__":
     main()
