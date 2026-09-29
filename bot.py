@@ -6162,5 +6162,616 @@ def startup_diagnostics():
         f"Equity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}"
     )
 
+
+# ============================================================
+# V6.8 — PRE-ARM PRECISION ENGINE
+# ============================================================
+# Built from the observed V6.7 scan sequence:
+# - strong setups often became Q99/Q100 only AFTER price had already run;
+# - Q100 mixed setup quality with entry quality;
+# - BTC context could be stale/inconsistent at execution;
+# - too many useful near-setups were thrown away instead of being prepared.
+#
+# V6.8 separates:
+#   SQ = setup quality
+#   EQ = entry/location quality NOW
+#   RR = usable reward room before nearby opposing structure
+# and adds:
+#   PRE-ARM -> SCOUT trigger -> PRECISION entry state flow
+#   fresh BTC 15M execution veto immediately before every order
+#   small-risk SCOUT entries for strong early setups
+#   shadow tracking of rejected/near setups for later evidence
+#
+# The bot still uses only 4H + 15M chart logic. Live ticker is execution only.
+
+SNIPER_VERSION = "6.8.0"
+
+V68_PRECISION_MIN_SQ = float(os.getenv("V68_PRECISION_MIN_SQ", "86"))
+V68_PRECISION_MIN_EQ = float(os.getenv("V68_PRECISION_MIN_EQ", "72"))
+V68_PRECISION_MIN_RR = float(os.getenv("V68_PRECISION_MIN_RR", "1.45"))
+V68_SCOUT_MIN_SQ = float(os.getenv("V68_SCOUT_MIN_SQ", "88"))
+V68_SCOUT_MIN_EQ = float(os.getenv("V68_SCOUT_MIN_EQ", "78"))
+V68_SCOUT_MIN_RR = float(os.getenv("V68_SCOUT_MIN_RR", "1.55"))
+V68_SCOUT_RISK_PCT = float(os.getenv("V68_SCOUT_RISK_PCT", "0.005"))
+V68_SCOUT_MIN_TRIGGER_SCORE = int(os.getenv("V68_SCOUT_MIN_TRIGGER_SCORE", "3"))
+V68_MAX_LIVE_DRIFT_ATR = float(os.getenv("V68_MAX_LIVE_DRIFT_ATR", "0.22"))
+V68_MAX_ENTRY_EXT_ATR = float(os.getenv("V68_MAX_ENTRY_EXT_ATR", "0.62"))
+V68_BTC_EXECUTION_VETO = os.getenv("V68_BTC_EXECUTION_VETO", "true").lower() == "true"
+V68_REQUIRE_BTC_MOMENTUM_NOT_AGAINST = os.getenv("V68_REQUIRE_BTC_MOMENTUM_NOT_AGAINST", "true").lower() == "true"
+V68_SHADOW_ENABLED = os.getenv("V68_SHADOW_ENABLED", "true").lower() == "true"
+V68_SHADOW_FILE = os.getenv("V68_SHADOW_FILE", "v68_shadow_learning.jsonl")
+V68_REPORT_MIN = int(os.getenv("V68_REPORT_MIN", "15"))
+
+_v68_base_candidate = _v6_candidate
+_v68_base_sizing_profile = sizing_profile
+_v68_prearms = {}
+_v68_shadow = {}
+_v68_last_report = 0.0
+
+
+def _v68_btc_snapshot(d):
+    """Fresh BTC state. 15M direction is the execution clock."""
+    try:
+        h4 = _v6_4h_context(V6_BTC_SYMBOL)
+        cdf = _v6_closed(_v6_df(V6_BTC_SYMBOL, "15m"))
+        if len(cdf) < 3:
+            return {"ok": False, "d15": 0, "h4": 0, "mom": 0, "note": "BTC15 unavailable"}
+        a, p = cdf.iloc[-1], cdf.iloc[-2]
+        c = safe_float(a["close"])
+        e21 = safe_float(a["ema_slow"])
+        d15 = 1 if c > e21 else -1 if c < e21 else 0
+        hist, hp = safe_float(a["macd_hist"]), safe_float(p["macd_hist"])
+        mom = 1 if hist > hp else -1 if hist < hp else 0
+        h4d = int(h4.get("dir", 0))
+        aligned = d15 == d
+        mom_ok = (mom != -d) if V68_REQUIRE_BTC_MOMENTUM_NOT_AGAINST else True
+        ok = aligned and mom_ok
+        return {
+            "ok": ok, "d15": d15, "h4": h4d, "mom": mom,
+            "note": f"BTC fresh 4H/15M/mom {h4d:+d}/{d15:+d}/{mom:+d}"
+        }
+    except Exception as e:
+        # Execution safety is fail-closed: if we cannot verify BTC now, no order.
+        return {"ok": False, "d15": 0, "h4": 0, "mom": 0,
+                "note": f"BTC fresh check unavailable ({type(e).__name__})"}
+
+
+def _v68_pivot_reward_room(symbol, side, live, risk, final_r):
+    """Estimate free room to a meaningful recent opposing pivot, expressed in R."""
+    if live <= 0 or risk <= 0:
+        return 0.0, 0.0
+    d = 1 if side == "long" else -1
+    levels = []
+    try:
+        c15 = _v6_closed(_v6_df(symbol, "15m")).tail(70).reset_index(drop=True)
+        ph, pl = _v6_pivots(c15, 2, 2)
+        if d == 1:
+            levels += [float(v) for _, v in ph if float(v) > live]
+        else:
+            levels += [float(v) for _, v in pl if float(v) < live]
+    except Exception:
+        pass
+    try:
+        c4 = _v6_closed(_v6_df(symbol, "4h")).tail(45).reset_index(drop=True)
+        ph4, pl4 = _v6_pivots(c4, 2, 2)
+        if d == 1:
+            levels += [float(v) for _, v in ph4 if float(v) > live]
+        else:
+            levels += [float(v) for _, v in pl4 if float(v) < live]
+    except Exception:
+        pass
+
+    if levels:
+        obstacle = min(levels) if d == 1 else max(levels)
+        obstacle_r = d * (obstacle - live) / risk
+        # Ignore microscopic pivots that are effectively inside spread/noise.
+        if obstacle_r >= 0.35:
+            return max(0.0, min(final_r, obstacle_r)), obstacle
+    return float(final_r), 0.0
+
+
+def _v68_entry_metrics(signal, live=None):
+    """Return independent SQ, EQ and reward-room metrics."""
+    side = signal.get("side")
+    if side not in ("long", "short"):
+        return {"sq": safe_float(signal.get("score")), "eq": 0.0, "rr": 0.0,
+                "net_rr": 0.0, "live": 0.0, "ext": 99.0, "drift_atr": 99.0}
+    d = 1 if side == "long" else -1
+    symbol = signal["symbol"]
+    try:
+        cdf = _v6_closed(_v6_df(symbol, "15m"))
+        a = cdf.iloc[-1]
+        atr = max(safe_float(a["atr"]), 1e-12)
+        c = safe_float(a["close"])
+        e21 = safe_float(a["ema_slow"])
+        if live is None:
+            live = safe_float(exchange.fetch_ticker(symbol).get("last"), c)
+        live = safe_float(live, c)
+        sig_px = safe_float(signal.get("price"), c)
+        ext = d * (live - e21) / atr
+        drift_atr = d * (live - sig_px) / atr
+
+        eq = 100.0
+        # Best entries are close to the reset/retest, not after the impulse.
+        if ext > 0.20:
+            eq -= min(48.0, (ext - 0.20) * 70.0)
+        elif ext < -0.12:
+            eq -= min(30.0, abs(ext + 0.12) * 55.0)
+        if drift_atr > 0.05:
+            eq -= min(30.0, (drift_atr - 0.05) * 85.0)
+
+        h4_ext = safe_float(signal.get("h4_ext_atr"))
+        if h4_ext > 0.65:
+            eq -= min(28.0, (h4_ext - 0.65) * 55.0)
+
+        rp = safe_float(signal.get("h4_range_pos"), 0.5)
+        edge = rp if d == 1 else 1.0-rp
+        if edge > 0.80:
+            eq -= min(30.0, (edge - 0.80) * 120.0)
+
+        # Reward FVG/retest entries that are still physically near their zone.
+        z = signal.get("fvg_zone")
+        if z and isinstance(z, (tuple, list)) and len(z) == 2:
+            lo, hi = safe_float(z[0]), safe_float(z[1])
+            if lo <= live <= hi:
+                eq += 5.0
+
+        risk = safe_float(signal.get("risk_distance"))
+        structural = safe_float(signal.get("structural_stop"))
+        if structural > 0:
+            risk = abs(live-structural)
+        if risk <= 0:
+            risk = max(0.55*atr, 1e-12)
+
+        final_r = safe_float(signal.get("final_r"), 2.0) or 2.0
+        rr, obstacle = _v68_pivot_reward_room(symbol, side, live, risk, final_r)
+        fee_r = live * (2*TAKER_FEE_RATE + SLIPPAGE_RATE) / max(risk, 1e-12)
+        net_rr = max(0.0, rr - fee_r)
+        eq = max(0.0, min(100.0, eq))
+
+        return {"sq": safe_float(signal.get("score")), "eq": eq, "rr": rr,
+                "net_rr": net_rr, "obstacle": obstacle, "live": live,
+                "ext": ext, "drift_atr": drift_atr, "risk": risk, "atr": atr}
+    except Exception:
+        return {"sq": safe_float(signal.get("score")), "eq": 0.0, "rr": 0.0,
+                "net_rr": 0.0, "live": 0.0, "ext": 99.0, "drift_atr": 99.0}
+
+
+def _v68_scout_trigger(signal):
+    """Early 15M trigger: price action can lead MACD, but must not be blind."""
+    try:
+        side = signal["side"]
+        d = 1 if side == "long" else -1
+        cdf = _v6_closed(_v6_df(signal["symbol"], "15m"))
+        a, p = cdf.iloc[-1], cdf.iloc[-2]
+        c, o = safe_float(a["close"]), safe_float(a["open"])
+        pc = safe_float(p["close"])
+        e21 = safe_float(a["ema_slow"])
+        rsi, prsi = safe_float(a["sniper_rsi"], 50), safe_float(p["sniper_rsi"], 50)
+        hist, hp = safe_float(a["macd_hist"]), safe_float(p["macd_hist"])
+        body_dir = (c > o) if d == 1 else (c < o)
+        close_progress = (c > pc) if d == 1 else (c < pc)
+        rsi_turn = (rsi > prsi) if d == 1 else (rsi < prsi)
+        ema_side = (c > e21) if d == 1 else (c < e21)
+        macd_not_worsening = (hist >= hp) if d == 1 else (hist <= hp)
+        score = sum(map(int, (body_dir, close_progress, rsi_turn, ema_side, macd_not_worsening)))
+        return score >= V68_SCOUT_MIN_TRIGGER_SCORE, score, (
+            f"15M early {score}/5 body={int(body_dir)} progress={int(close_progress)} "
+            f"rsi={int(rsi_turn)} ema={int(ema_side)} macd={int(macd_not_worsening)}"
+        )
+    except Exception as e:
+        return False, 0, f"early-trigger-{type(e).__name__}"
+
+
+def _v68_shadow_write(event):
+    if not V68_SHADOW_ENABLED:
+        return
+    try:
+        import json
+        with open(V68_SHADOW_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
+
+
+def _v68_shadow_track(signal, metrics):
+    """Track near/rejected setups without risking money."""
+    if not V68_SHADOW_ENABLED or not signal or signal.get("side") not in ("long", "short"):
+        return
+    symbol, side = signal["symbol"], signal["side"]
+    key = f"{symbol}|{side}|{int(signal.get('signal_bar_ts',0))}|{signal.get('strategy','-')}"
+    now = time.time()
+    live = safe_float(metrics.get("live"))
+    risk = safe_float(metrics.get("risk"))
+    if live <= 0 or risk <= 0:
+        return
+
+    # Update existing observations for this symbol/side.
+    for k, rec in list(_v68_shadow.items()):
+        if rec["symbol"] != symbol or rec["side"] != side or rec.get("done"):
+            continue
+        d = 1 if side == "long" else -1
+        r_now = d*(live-rec["entry"])/max(rec["risk"], 1e-12)
+        rec["mfe"] = max(rec.get("mfe", r_now), r_now)
+        rec["mae"] = min(rec.get("mae", r_now), r_now)
+        age = now-rec["ts"]
+        for sec, label in ((1800,"30m"),(3600,"1h"),(7200,"2h"),(14400,"4h")):
+            if age >= sec and label not in rec["snapshots"]:
+                rec["snapshots"][label] = round(r_now, 3)
+                _v68_shadow_write({"type":"shadow_snapshot","key":k,"age":label,
+                                   "r":round(r_now,3),"mfe":round(rec["mfe"],3),
+                                   "mae":round(rec["mae"],3),"ts":int(now)})
+        if age >= 14400:
+            rec["done"] = True
+
+    if key in _v68_shadow:
+        return
+    # Only collect setups that were at least plausible.
+    if safe_float(metrics.get("sq")) < 75:
+        return
+    rec = {
+        "symbol":symbol, "side":side, "strategy":signal.get("strategy"),
+        "reason":str(signal.get("skip") or "READY"), "entry":live, "risk":risk,
+        "sq":round(safe_float(metrics.get("sq")),1),
+        "eq":round(safe_float(metrics.get("eq")),1),
+        "rr":round(safe_float(metrics.get("net_rr")),2),
+        "ts":now, "mfe":0.0, "mae":0.0, "snapshots":{}, "done":False,
+    }
+    _v68_shadow[key] = rec
+    _v68_shadow_write({"type":"shadow_open","key":key,**{k:v for k,v in rec.items() if k not in ("snapshots","done")}})
+
+
+def _v68_can_prearm(signal, metrics):
+    if not signal or signal.get("side") not in ("long","short"):
+        return False
+    sq, eq = safe_float(metrics.get("sq")), safe_float(metrics.get("eq"))
+    if sq < V68_SCOUT_MIN_SQ or eq < V68_SCOUT_MIN_EQ:
+        return False
+    sk = str(signal.get("skip") or "")
+    # Never scout a mature/chased setup or a macro-location rejection.
+    hard = ("extended", "too-far", "range-edge", "impulse-already-ran",
+            "BTC", "quality-", "4H-no-clean", "4H-weak", "COLD")
+    if any(x in sk for x in hard):
+        return False
+    eligible = (
+        "momentum-not-confirmed" in sk or
+        "TR-momentum-not-returned" in sk or
+        "TR-wait-price-action-trigger" in sk or
+        "TR-wait-reclaim-candle" in sk or
+        "wait-15M-rejection" in sk
+    )
+    return eligible
+
+
+def _v6_candidate(symbol):
+    """V6.8 router wrapper: SQ/EQ/RR + PRE-ARM/SCOUT + fresh BTC scan gate."""
+    base = _v68_base_candidate(symbol)
+    if not base:
+        return None
+    if base.get("side") not in ("long","short"):
+        return base
+
+    metrics = _v68_entry_metrics(base)
+    base["setup_quality"] = metrics["sq"]
+    base["entry_quality"] = metrics["eq"]
+    base["reward_room_r"] = metrics["rr"]
+    base["net_reward_room_r"] = metrics["net_rr"]
+    base["v68_ext_atr"] = metrics["ext"]
+    base["v68_drift_atr"] = metrics["drift_atr"]
+    base["v68_mode"] = "PRECISION"
+    # Ranking quality now reflects both idea and price; SQ remains untouched.
+    base["quality"] = 0.60*metrics["sq"] + 0.40*metrics["eq"]
+
+    _v68_shadow_track(base, metrics)
+
+    d = 1 if base["side"] == "long" else -1
+    btc = _v68_btc_snapshot(d)
+    base["btc_fresh_note"] = btc["note"]
+
+    # A normal ready signal must also be a good entry NOW.
+    if not base.get("skip") and base.get("entry_route") not in (None, "WAIT"):
+        if metrics["sq"] < V68_PRECISION_MIN_SQ:
+            base["skip"] = f"V68-SQ-{metrics['sq']:.0f}<{V68_PRECISION_MIN_SQ:.0f}"
+        elif metrics["eq"] < V68_PRECISION_MIN_EQ:
+            base["skip"] = f"V68-EQ-{metrics['eq']:.0f}<{V68_PRECISION_MIN_EQ:.0f}"
+        elif metrics["net_rr"] < V68_PRECISION_MIN_RR:
+            base["skip"] = f"V68-RR-{metrics['net_rr']:.2f}<{V68_PRECISION_MIN_RR:.2f}"
+        elif metrics["ext"] > V68_MAX_ENTRY_EXT_ATR:
+            base["skip"] = f"V68-entry-extended-{metrics['ext']:.2f}ATR"
+        elif not btc["ok"]:
+            base["skip"] = f"V68-BTC15-WAIT · {btc['note']}"
+        if base.get("skip"):
+            base["entry_route"] = "WAIT"
+            return base
+        base["entry_route"] = "PRECISION-" + str(base.get("entry_route"))
+        return base
+
+    # PRE-ARM a strong setup before the old full-confirmation point.
+    if _v68_can_prearm(base, metrics):
+        key = f"{symbol}|{base['side']}|{base.get('strategy','-')}"
+        _v68_prearms[key] = {
+            "ts": time.time(), "price": metrics["live"], "sq": metrics["sq"],
+            "eq": metrics["eq"], "signal_bar_ts": int(base.get("signal_bar_ts",0))
+        }
+        trigger, trig_score, trig_note = _v68_scout_trigger(base)
+        base["v68_trigger"] = trig_note
+        base["v68_mode"] = "PRE-ARM"
+
+        if (trigger and btc["ok"] and metrics["net_rr"] >= V68_SCOUT_MIN_RR
+                and metrics["ext"] <= V68_MAX_ENTRY_EXT_ATR):
+            base["skip"] = None
+            base["entry_route"] = "SCOUT-EARLY"
+            base["v68_mode"] = "SCOUT"
+            base["confirmations"] = max(int(base.get("confirmations",0)), trig_score)
+            return base
+
+        wait_bits = []
+        if not trigger: wait_bits.append(f"trigger {trig_score}/5")
+        if not btc["ok"]: wait_bits.append("BTC15")
+        if metrics["net_rr"] < V68_SCOUT_MIN_RR: wait_bits.append(f"RR {metrics['net_rr']:.2f}")
+        base["skip"] = "V68-PRE-ARM · wait " + ", ".join(wait_bits or ["precision"])
+        base["entry_route"] = "WAIT"
+    return base
+
+
+def evaluate_symbol(symbol, btc=None):
+    return _v6_candidate(symbol)
+
+
+def sizing_profile(signal):
+    """Scout risks half-size; precision keeps repaired V6.7 caps."""
+    if signal.get("v68_mode") == "SCOUT" or str(signal.get("entry_route","")).startswith("SCOUT"):
+        return {"name":"V68-SCOUT","risk_pct":V68_SCOUT_RISK_PCT,"target_net_tp":V6_TARGET_NET}
+    return _v68_base_sizing_profile(signal)
+
+
+def sniper_portfolio_allows(signal, positions):
+    """V6.8 portfolio gate uses true SQ and fresh BTC, not a blended display score."""
+    side = signal.get("side")
+    same = sum(1 for p in positions if position_side(p) == side)
+    if same >= V6_MAX_SAME_SIDE:
+        return False, f"max-{V6_MAX_SAME_SIDE}-same-side"
+
+    d = 1 if side == "long" else -1
+    btc = _v68_btc_snapshot(d)
+    if not btc["ok"]:
+        return False, f"fresh BTC15 veto: {btc['note']}"
+
+    sq = safe_float(signal.get("setup_quality"), safe_float(signal.get("score")))
+    streak = int(sniper_side_loss_streak.get(side, 0))
+    # Scouts are not allowed to fight an active directional loss streak.
+    if signal.get("v68_mode") == "SCOUT" and streak >= 2:
+        return False, f"{side}-loss-streak-{streak}: scout disabled"
+    if streak >= 2 and sq < 94:
+        return False, f"{side}-loss-streak-{streak}: precision needs SQ94"
+
+    trades = int(daily.get(f"{side}_trades", 0))
+    wins = int(daily.get(f"{side}_wins", 0))
+    net = safe_float(daily.get(f"{side}_net", 0))
+    wr = wins/trades if trades else 1.0
+    if trades >= V66_SIDE_COLD_MIN_TRADES and wr <= V66_SIDE_COLD_MAX_WR and net <= -V66_SIDE_COLD_MIN_LOSS:
+        if signal.get("v68_mode") == "SCOUT" or sq < 96:
+            return False, f"{side}-COLD {wins}/{trades} net ${net:.2f}: precision SQ96 only"
+    return True, "OK"
+
+
+def open_trade(signal):
+    """V6.8: revalidate direction, price quality, RR and BTC immediately before order."""
+    global protection_lock, _v62_last_entry_time
+    symbol, side = signal["symbol"], signal["side"]
+    d = 1 if side == "long" else -1
+
+    acc = futures_account()
+    equity, available = acc["total_equity"], acc["available"]
+    reset_daily_if_needed(equity)
+    if equity < MIN_EQUITY_USDT or available <= 0 or (not PAPER_TRADING and protection_lock):
+        return False
+    if time.time()-_v62_last_entry_time < V62_GLOBAL_ENTRY_GAP_MIN*60:
+        return False
+
+    # CRITICAL: do not trust scanner BTC state. Fetch it again right now.
+    btc = _v68_btc_snapshot(d)
+    if V68_BTC_EXECUTION_VETO and not btc["ok"]:
+        tg(f"⛔ {symbol} {side.upper()} V6.8 BTC15 EXECUTION VETO\n{btc['note']}\nOrder cancelled before exchange submission.")
+        return False
+
+    live = safe_float(exchange.fetch_ticker(symbol).get("last"), signal.get("price"))
+    metrics = _v68_entry_metrics(signal, live)
+    min_eq = V68_SCOUT_MIN_EQ if signal.get("v68_mode") == "SCOUT" else V68_PRECISION_MIN_EQ
+    min_rr = V68_SCOUT_MIN_RR if signal.get("v68_mode") == "SCOUT" else V68_PRECISION_MIN_RR
+    if metrics["eq"] < min_eq:
+        tg(f"⏭️ {symbol} {side.upper()} V6.8 ENTRY QUALITY BLOCK\nSQ {metrics['sq']:.0f} · EQ {metrics['eq']:.0f}<{min_eq:.0f} · RR {metrics['net_rr']:.2f}")
+        return False
+    if metrics["net_rr"] < min_rr:
+        tg(f"⏭️ {symbol} {side.upper()} V6.8 RR BLOCK\nSQ {metrics['sq']:.0f} · EQ {metrics['eq']:.0f} · net RR {metrics['net_rr']:.2f}<{min_rr:.2f}")
+        return False
+    if metrics["drift_atr"] > V68_MAX_LIVE_DRIFT_ATR or metrics["ext"] > V68_MAX_ENTRY_EXT_ATR:
+        tg(f"⏭️ {symbol} {side.upper()} V6.8 NO CHASE\nDrift {metrics['drift_atr']:.2f}ATR · extension {metrics['ext']:.2f}ATR")
+        return False
+
+    # Keep the live 4H location check for non-EBP routes.
+    if signal.get("strategy") != "EBP-FVG":
+        loc_ok, loc_note, _ = _v62_live_location_ok(symbol, side, live)
+        if not loc_ok:
+            tg(f"⏭️ {symbol} {side.upper()} V6.8 LOCATION BLOCK\n{loc_note}")
+            return False
+
+    tick = safe_float(get_instrument(symbol).get("tickSize"), 0.0001)
+    levels = _v6_levels(signal, live, tick)
+    if not levels:
+        return False
+    sl, t1, t2, t3, risk = levels
+
+    # Final RR check from the ACTUAL proposed stop, including estimated fees/slippage.
+    final_r = safe_float(signal.get("final_r"), V6_FINAL_R) or V6_FINAL_R
+    room_r, obstacle = _v68_pivot_reward_room(symbol, side, live, risk, final_r)
+    fee_r = live*(2*TAKER_FEE_RATE + SLIPPAGE_RATE)/max(risk,1e-12)
+    actual_net_rr = max(0.0, room_r-fee_r)
+    if actual_net_rr < min_rr:
+        tg(f"⏭️ {symbol} {side.upper()} V6.8 FINAL RR BLOCK\nNet room {actual_net_rr:.2f}R < {min_rr:.2f}R")
+        return False
+
+    profile = sizing_profile(signal)
+    sizing = calculate_contracts_v5(symbol, live, sl, equity, available,
+                                    profile["risk_pct"], profile["target_net_tp"], final_r)
+    if not sizing or sizing["margin"] > available*AVAILABLE_MARGIN_BUFFER:
+        return False
+
+    before_ids = {position_id(p) for p in get_positions() if position_id(p)}
+    oklev, levres = set_leverage(symbol, LEVERAGE)
+    if not oklev:
+        tg(f"⛔ LEVERAGE FAILED\n{symbol}\n{levres}")
+        return False
+
+    mode = signal.get("v68_mode", "PRECISION")
+    tag = "ps68c" if mode == "SCOUT" else "ps68p"
+    payload = {
+        "instId": blofin_inst_id(symbol), "marginMode": MARGIN_MODE, "positionSide": "net",
+        "side": "buy" if side == "long" else "sell", "orderType": "market",
+        "size": str(sizing["contracts"]),
+        "tpTriggerPrice": str(t3), "tpOrderPrice": "-1", "tpTriggerPriceType": "mark",
+        "slTriggerPrice": str(sl), "slOrderPrice": "-1", "slTriggerPriceType": "mark",
+        "clientOrderId": f"{tag}{int(time.time()*1000)%1000000000}",
+    }
+    if BROKER_ID:
+        payload["brokerId"] = BROKER_ID
+
+    msg = (
+        f"{'🧪 PAPER' if PAPER_TRADING else '🎯 V6.8 '+mode}\n"
+        f"{symbol} {side.upper()} · {signal.get('entry_route')}\n"
+        f"SQ {metrics['sq']:.0f}/100 · EQ {metrics['eq']:.0f}/100 · NET RR {actual_net_rr:.2f}R\n"
+        f"{btc['note']}\n"
+        f"Entry {live:.8g} · SL {sl:.8g} · TP {t3:.8g}\n"
+        f"Risk {profile['risk_pct']*100:.2f}% · expected final net ~${sizing['expected_net_tp_usdt']:.2f}\n"
+        f"Notional ${sizing['notional']:.2f} · Margin ${sizing['margin']:.2f} · {LEVERAGE}x"
+    )
+
+    if PAPER_TRADING:
+        tg(msg)
+        _v62_last_entry_time = time.time()
+        return True
+
+    resp = native("private_post_trade_order", payload)
+    if not native_ok(resp):
+        err = response_error(resp)
+        if "152012" in err:
+            protection_lock = True
+        tg(f"❌ V6.8 ORDER FAILED\n{symbol} {side.upper()}\n{err}")
+        return False
+
+    _v62_last_entry_time = time.time()
+    tg(msg)
+    new_pos = find_new_position(symbol, before_ids, timeout=8)
+    if new_pos is None:
+        tg(f"⚠️ {symbol}: V6.8 order accepted, position not visible yet.")
+        return True
+
+    pid = position_id(new_pos)
+    actual_entry = position_entry(new_pos) or live
+    actual_risk = abs(actual_entry-sl) or risk
+    if pid:
+        sniper_managed_positions.add(pid)
+        _v6_position_meta[pid] = {
+            "risk":actual_risk, "planned_risk":risk, "structural_sl":sl,
+            "tp1":t1, "tp2":t2, "tp3":t3, "opened":time.time(),
+            "route":signal.get("entry_route"), "side":side, "final_r":final_r,
+            "strategy":signal.get("strategy"), "planned_entry":live,
+            "actual_entry":actual_entry, "v68_mode":mode,
+            "sq":metrics["sq"], "eq":metrics["eq"], "net_rr":actual_net_rr,
+        }
+
+    if has_live_protection(new_pos)[0]:
+        tg(f"🛡️ V6.8 PROTECTION CONFIRMED\n{symbol} {side.upper()} · {mode}\nSL/TP visible.")
+        return True
+
+    last = safe_float(exchange.fetch_ticker(symbol).get("last"))
+    if tpsl_prices_valid(side, sl, t3, last):
+        ok, res = place_tpsl_for_position(new_pos, sl, t3, client_tag=tag)
+        if ok:
+            tg(f"🛡️ V6.8 FALLBACK PROTECTION CONFIRMED\n{symbol}")
+            return True
+        protection_lock = True
+        tg(f"🚨 V6.8 PROTECTION FAILURE\n{symbol}\n{res}\nNEW TRADES PAUSED.")
+        return True
+
+    protection_lock = True
+    tg(f"🚨 {symbol}: V6.8 position exists but protection could not be verified.\nNEW TRADES PAUSED.")
+    return True
+
+
+def maybe_score_report(rows):
+    """V6.8 report shows why a high-SQ setup is or is not actually tradable."""
+    global _v68_last_report
+    from collections import Counter
+    now = time.time()
+    interesting = [r for r in rows if r]
+    if not interesting or now-_v68_last_report < V68_REPORT_MIN*60:
+        return
+    _v68_last_report = now
+
+    ready = [r for r in interesting if r.get("side") and not r.get("skip")
+             and r.get("entry_route") not in (None,"WAIT")]
+    pre = [r for r in interesting if str(r.get("skip","")).startswith("V68-PRE-ARM")]
+    blockers = Counter()
+    for r in interesting:
+        sk = str(r.get("skip") or "READY")
+        if "PRE-ARM" in sk: bucket = "pre-arm"
+        elif "BTC" in sk: bucket = "BTC15"
+        elif "RR-" in sk or "RR BLOCK" in sk: bucket = "reward room"
+        elif "EQ-" in sk or "extended" in sk or "too-far" in sk: bucket = "entry/location"
+        elif "4H" in sk: bucket = "4H"
+        elif "momentum" in sk: bucket = "momentum"
+        elif "EBP" in sk: bucket = "EBP"
+        else: bucket = sk.split("-")[0][:20]
+        blockers[bucket] += 1
+
+    ranked = sorted(
+        interesting,
+        key=lambda r: (
+            1 if not r.get("skip") else 0,
+            1 if str(r.get("skip","")).startswith("V68-PRE-ARM") else 0,
+            safe_float(r.get("setup_quality"), r.get("score")),
+            safe_float(r.get("entry_quality"))
+        ),
+        reverse=True
+    )[:8]
+
+    lines = [
+        f"🧠 STRUCTURE FUSION v{SNIPER_VERSION} · PRE-ARM PRECISION",
+        f"Ready {len(ready)} · Pre-armed {len(pre)} · scanned {len(interesting)}",
+    ]
+    if blockers:
+        lines.append("Main waits: " + " · ".join(f"{k} {v}" for k,v in blockers.most_common(4)))
+    for r in ranked:
+        status = "🟢 " + str(r.get("entry_route")) if not r.get("skip") else "🟡 PRE-ARM" if str(r.get("skip","")).startswith("V68-PRE-ARM") else "⏩ " + str(r.get("skip"))
+        lines.append(
+            f"{r.get('symbol')} {str(r.get('side') or '-').upper()} {r.get('strategy','-')} "
+            f"SQ{safe_float(r.get('setup_quality'),r.get('score')):.0f} "
+            f"EQ{safe_float(r.get('entry_quality')):.0f} "
+            f"RR{safe_float(r.get('net_reward_room_r')):.2f} {status}"
+        )
+    tg("\n".join(lines))
+
+
+def startup_diagnostics():
+    acc = futures_account()
+    reset_daily_if_needed(acc["total_equity"])
+    tg(
+        f"🧠 PRECISION STRUCTURE FUSION STARTED v{SNIPER_VERSION}\n"
+        f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
+        f"TIMEFRAMES: 4H + 15M ONLY\n"
+        f"V6.8 PRE-ARM PRECISION\n"
+        f"• SQ setup quality is separate from EQ entry quality\n"
+        f"• Reward room is checked in R before every order\n"
+        f"• Fresh BTC 15M direction is a HARD execution veto\n"
+        f"• Strong near-setups can PRE-ARM and trigger a 0.5% SCOUT entry\n"
+        f"• Mature/extended setups are cancelled, never chased\n"
+        f"• Rejected/near setups are shadow-tracked at 30m/1h/2h/4h\n"
+        f"Precision: SQ>={V68_PRECISION_MIN_SQ:.0f} EQ>={V68_PRECISION_MIN_EQ:.0f} RR>={V68_PRECISION_MIN_RR:.2f}R\n"
+        f"Scout: SQ>={V68_SCOUT_MIN_SQ:.0f} EQ>={V68_SCOUT_MIN_EQ:.0f} RR>={V68_SCOUT_MIN_RR:.2f}R · risk {V68_SCOUT_RISK_PCT*100:.2f}%\n"
+        f"Leverage {LEVERAGE}x · max positions {MAX_ACTIVE_POSITIONS} · max same side {V6_MAX_SAME_SIDE}\n"
+        f"Equity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}"
+    )
+
 if __name__ == "__main__":
     main()
