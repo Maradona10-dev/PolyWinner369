@@ -8386,5 +8386,406 @@ def startup_diagnostics():
     )
 
 
+
+# ============================================================
+# LIQUIDITY DAYTRADER v1.3.1 — TRADING-CARD PROSPECTIVE HUNTER
+# ============================================================
+# Fixes the v1.3 state-machine bootstrap problem:
+#   - a thesis is allowed to exist BEFORE the current market price offers 1.65R;
+#   - the bot calculates RR@ZONE from the planned IFVG/Breaker/retest zone;
+#   - actual exchange execution STILL requires live first-liquidity net RR >= 1.65R;
+#   - the supplied Institutional Price Action cheat-sheet is used as an
+#     objective pattern-family layer (QM/2B/Fakeout, MPL/Re-entry, Flag/
+#     Continuation QM, Compression/Can-Can, V-tail, 3-Drive, Double SSR).
+# The card layer ranks and explains a thesis; it never bypasses BOS/MSS,
+# structural invalidation, stop geometry, live RR, or protection checks.
+
+LDT_VERSION = "1.3.1"
+LDT13_STATE_FILE = os.getenv("LDT131_STATE_FILE", "ldt131_state.json")
+LDT131_MIN_PROSPECTIVE_RR = float(os.getenv("LDT131_MIN_PROSPECTIVE_RR", str(LDT_MIN_NET_RR)))
+LDT131_MIN_CARD_EVIDENCE = int(os.getenv("LDT131_MIN_CARD_EVIDENCE", "2"))
+LDT131_MIN_THESIS_STR = float(os.getenv("LDT131_MIN_THESIS_STR", "70"))
+LDT131_RETRACE_TARGET_LOOKBACK = int(os.getenv("LDT131_RETRACE_TARGET_LOOKBACK", "30"))
+LDT131_CARD_BONUS_MAX = float(os.getenv("LDT131_CARD_BONUS_MAX", "8"))
+
+# Fresh state namespace: do not import incompatible v1.3 snapshot states.
+_ldt13_states = {}
+_ldt13_loaded = False
+_ldt13_last_report = 0.0
+_ldt131_base_scan_candidates = _ldt13_scan_candidates
+_ldt131_base_open_trade = open_trade
+
+
+def _ldt131_ltf(signal):
+    if str(signal.get("route")) == "FAST":
+        return "1m"
+    return "5m"
+
+
+def _ldt131_card_profile(signal):
+    """Translate the supplied cheat-sheet into objective, non-magical evidence."""
+    side = str(signal.get("side") or "")
+    if side not in ("long", "short"):
+        return {"score": 0, "families": [], "label": "NONE"}
+    d = 1 if side == "long" else -1
+    strategy = str(signal.get("strategy") or "")
+    zone = signal.get("zone") or {}
+    families = []
+    score = 0
+
+    if strategy == "CRT-MSS":
+        families.append("QM/2B-FAKEOUT")
+        score += 2
+        if safe_float(signal.get("sweep_depth_atr")) >= 0.10:
+            families.append("STOP-HUNT")
+            score += 1
+        if "IFVG" in str(zone.get("kind", "")) or safe_float(zone.get("confluence")) >= 2:
+            families.append("QM-REENTRY/MPL")
+            score += 2
+    elif strategy == "BREAK-RETEST":
+        families.append("CONT-QM/FLAG")
+        score += 2
+        if "BREAKER" in str(zone.get("kind", "")):
+            families.append("FLAG-RETEST")
+            score += 1
+
+    tf = _ldt131_ltf(signal)
+    try:
+        df = _ldt_closed(_ldt_df(signal.get("symbol"), tf, 100))
+        atr = safe_float(df.iloc[-1]["atr"])
+        if atr > 0:
+            # Compression / Can-Can family: several shrinking bars pressing one way.
+            if _ldt_compression(df.tail(7), side):
+                families.append("COMPRESSION/CAN-CAN")
+                score += 1
+
+            highs, lows = _ldt_pivots(df.tail(70).reset_index(drop=True), 2, 2)
+            piv = highs if d == -1 else lows
+            vals = [safe_float(v) for _, v in piv[-4:]]
+            # 3-Drive: successive liquidity pushes into the eventual reversal side.
+            if len(vals) >= 3:
+                tri = vals[-3:]
+                drives = (tri[0] < tri[1] < tri[2]) if d == -1 else (tri[0] > tri[1] > tri[2])
+                if drives:
+                    families.append("3-DRIVE")
+                    score += 1
+                # Double SSR / ruler-like equal liquidity shelf.
+                spread = max(tri) - min(tri)
+                if spread <= 0.30 * atr:
+                    families.append("DOUBLE-SSR/RULER")
+                    score += 1
+
+            # V-tail / DM-shadow style rejection near a local extreme.
+            recent = df.tail(10)
+            for _, r in recent.iterrows():
+                o = safe_float(r["open"]); c = safe_float(r["close"])
+                h = safe_float(r["high"]); l = safe_float(r["low"])
+                body = max(abs(c-o), 0.05*atr)
+                upper = h-max(o,c); lower = min(o,c)-l
+                if d == -1 and upper >= 1.35*body and h >= safe_float(recent["high"].max())-0.10*atr:
+                    families.append("V-TAIL/DM-SHADOW")
+                    score += 1; break
+                if d == 1 and lower >= 1.35*body and l <= safe_float(recent["low"].min())+0.10*atr:
+                    families.append("V-TAIL/DM-SHADOW")
+                    score += 1; break
+    except Exception:
+        pass
+
+    # Deduplicate while preserving order.
+    families = list(dict.fromkeys(families))
+    score = min(8, score)
+    return {"score": score, "families": families, "label": "+".join(families[:3]) if families else "BASE-STRUCTURE"}
+
+
+def _ldt131_prospective_plan(signal):
+    """Evaluate economics at the PLANNED retrace zone, not at the chased live price."""
+    side = str(signal.get("side") or "")
+    zone = signal.get("zone") or {}
+    if side not in ("long", "short") or not zone:
+        return None
+    d = 1 if side == "long" else -1
+    atr = safe_float(signal.get("atr")); stop = safe_float(signal.get("structural_stop"))
+    lo = safe_float(zone.get("lo")); hi = safe_float(zone.get("hi"))
+    if atr <= 0 or stop <= 0 or lo <= 0 or hi <= 0 or hi < lo:
+        return None
+
+    # Mid-zone is deliberately conservative. We do not assume a perfect edge fill.
+    entry = (lo + hi) / 2.0
+    risk = d * (entry - stop)
+    if risk <= 0:
+        return None
+    risk_atr = risk / atr
+    if risk_atr < LDT_MIN_STOP_ATR or risk_atr > LDT_MAX_STOP_ATR:
+        return {"ok": False, "entry": entry, "risk_atr": risk_atr, "net_rr": -99.0,
+                "target": 0.0, "target_kind": "invalid-stop-geometry"}
+
+    far = safe_float(signal.get("far_target") or signal.get("target_price"))
+    tf = _ldt131_ltf(signal)
+    target = 0.0; kind = "prospective-liquidity"; gross = -99.0
+    try:
+        target, kind, gross = _ldt11_first_liquidity_target(signal.get("symbol"), side, entry, stop, far, tf)
+    except Exception:
+        pass
+
+    # If the snapshot's old first-liquidity is already behind price, use the
+    # recent delivered extreme as the natural retest target after a retrace.
+    # This mirrors the cheat-sheet's re-entry / fakeout logic without chasing.
+    if gross <= 0:
+        try:
+            df = _ldt_closed(_ldt_df(signal.get("symbol"), tf, 100))
+            recent = df.tail(max(12, LDT131_RETRACE_TARGET_LOOKBACK))
+            alt = safe_float(recent["high"].max()) if d == 1 else safe_float(recent["low"].min())
+            alt_gross = d * (alt - entry) / max(risk, 1e-12)
+            if alt_gross > gross:
+                target, gross, kind = alt, alt_gross, "recent-delivery-liquidity"
+        except Exception:
+            pass
+
+    cost_r = entry * (2 * TAKER_FEE_RATE + SLIPPAGE_RATE) / max(risk, 1e-12)
+    net_rr = gross - cost_r
+    return {"ok": bool(net_rr >= LDT131_MIN_PROSPECTIVE_RR), "entry": entry, "risk_atr": risk_atr,
+            "target": target, "target_kind": kind, "gross_rr": gross, "net_rr": net_rr,
+            "zone_lo": lo, "zone_hi": hi}
+
+
+def _ldt131_annotate(signal):
+    if not signal:
+        return signal
+    card = _ldt131_card_profile(signal)
+    plan = _ldt131_prospective_plan(signal)
+    signal["card_score"] = int(card.get("score", 0))
+    signal["card_families"] = card.get("families", [])
+    signal["card_label"] = card.get("label", "BASE-STRUCTURE")
+    if plan:
+        signal["prospective_entry"] = safe_float(plan.get("entry"))
+        signal["prospective_rr"] = safe_float(plan.get("net_rr"))
+        signal["prospective_target"] = safe_float(plan.get("target"))
+        signal["prospective_target_kind"] = plan.get("target_kind")
+        signal["prospective_risk_atr"] = safe_float(plan.get("risk_atr"))
+        signal["prospective_ok"] = bool(plan.get("ok"))
+    else:
+        signal["prospective_rr"] = -99.0
+        signal["prospective_ok"] = False
+    # Small ranking bonus only; card recognition never makes an invalid order valid.
+    signal["card_rank_quality"] = safe_float(signal.get("setup_quality")) + min(LDT131_CARD_BONUS_MAX, safe_float(signal.get("card_score")))
+    return signal
+
+
+def _ldt13_scan_candidates(symbol):
+    xs = _ldt131_base_scan_candidates(symbol)
+    return [_ldt131_annotate(s) for s in xs]
+
+
+def _ldt13_trackable(signal):
+    """v1.3.1: track a strong thesis when RR@planned-zone is valid, even if RR NOW is poor."""
+    if not signal or not signal.get("side"):
+        return False
+    sk = str(signal.get("skip") or "")
+    if sk.startswith("stale"):
+        return False
+    if safe_float(signal.get("setup_quality")) < LDT131_MIN_THESIS_STR:
+        return False
+    if int(signal.get("card_score", 0)) < LDT131_MIN_CARD_EVIDENCE:
+        return False
+    pra = safe_float(signal.get("prospective_risk_atr"), 999.0)
+    if pra < LDT_MIN_STOP_ATR or pra > LDT_MAX_STOP_ATR:
+        return False
+    if safe_float(signal.get("prospective_rr"), -99.0) < LDT131_MIN_PROSPECTIVE_RR:
+        return False
+    return True
+
+
+def _ldt13_candidate_rank(s):
+    return (
+        safe_float(s.get("card_score")),
+        safe_float(s.get("prospective_rr")),
+        safe_float(s.get("card_rank_quality")),
+        safe_float(s.get("entry_quality")),
+    )
+
+
+def _ldt13_new_state(signal):
+    now = time.time()
+    sig = _ldt13_jsonable(signal)
+    # Freeze the prospective first-liquidity objective born from the planned zone.
+    ptarget = safe_float(signal.get("prospective_target") or signal.get("target_price"))
+    return {
+        "symbol": signal.get("symbol"), "side": signal.get("side"),
+        "strategy": signal.get("strategy"), "route": signal.get("route"),
+        "created": now, "updated": now, "expires": now + 60 * _ldt13_ttl_min(signal),
+        "state": "WAIT_RETRACE", "last_state": "", "signal": sig,
+        "initial_target": ptarget,
+        "initial_far_target": safe_float(signal.get("far_target") or signal.get("target_price")),
+        "planned_entry": safe_float(signal.get("prospective_entry")),
+        "prospective_rr": safe_float(signal.get("prospective_rr")),
+        "card_score": int(signal.get("card_score", 0)),
+        "card_label": signal.get("card_label", "BASE-STRUCTURE"),
+        "best_rr": safe_float(signal.get("net_rr")), "best_eq": safe_float(signal.get("entry_quality")),
+        "transitions": 0,
+    }
+
+
+def _ldt13_refresh_state(st):
+    """v1.3.1 state refresh: thesis persists through bad RR NOW; execution remains strict."""
+    signal = dict(st.get("signal") or {})
+    symbol = st.get("symbol"); side = st.get("side")
+    if not symbol or side not in ("long", "short"):
+        _ldt13_transition(st, "INVALIDATED", "missing thesis identity"); return None
+    d = 1 if side == "long" else -1
+    now = time.time()
+    if now > safe_float(st.get("expires")):
+        _ldt13_transition(st, "EXPIRED", f"thesis age > {_ldt13_ttl_min(signal)} min"); return None
+    try:
+        live = safe_float(exchange.fetch_ticker(symbol).get("last"), safe_float(signal.get("price")))
+    except Exception:
+        live = safe_float(signal.get("price"))
+    atr = safe_float(signal.get("atr")); stop = safe_float(signal.get("structural_stop")); zone = signal.get("zone") or {}
+    if live <= 0 or atr <= 0 or stop <= 0 or not zone:
+        _ldt13_transition(st, "INVALIDATED", "missing live/ATR/stop/zone"); return None
+
+    invalid_buf = LDT12_LIVE_INVALIDATION_ATR * atr
+    if (d == 1 and live < stop - invalid_buf) or (d == -1 and live > stop + invalid_buf):
+        _ldt13_transition(st, "INVALIDATED", f"price {live:.8g} crossed thesis invalidation {stop:.8g}"); return None
+
+    lo = safe_float(zone.get("lo")); hi = safe_float(zone.get("hi"))
+    eq = _ldt_zone_entry_quality(live, zone, atr, d)
+    in_zone = (lo - LDT_ZONE_TOL_ATR * atr <= live <= hi + LDT_ZONE_TOL_ATR * atr)
+    planned = safe_float(st.get("planned_entry") or signal.get("prospective_entry") or (lo+hi)/2.0)
+    prospective_rr = safe_float(st.get("prospective_rr") or signal.get("prospective_rr"))
+
+    # Recompute live economics only for execution readiness. Poor RR NOW is a
+    # WAIT_RETRACE condition, not a reason to forget the thesis.
+    risk = d * (live - stop)
+    risk_atr = risk / atr if risk > 0 else -1.0
+    live_target = 0.0; target_kind = "waiting-retrace"; gross_rr = -99.0; net_rr = -99.0
+    if risk > 0:
+        hard = safe_float(st.get("initial_far_target") or signal.get("far_target") or signal.get("target_price"))
+        try:
+            live_target, target_kind, gross_rr = _ldt11_first_liquidity_target(symbol, side, live, stop, hard, _ldt131_ltf(signal))
+            cost_r = live * (2 * TAKER_FEE_RATE + SLIPPAGE_RATE) / max(risk, 1e-12)
+            net_rr = gross_rr - cost_r
+        except Exception:
+            pass
+
+    struct = _ldt12_structure_state(symbol, side, signal.get("trigger_tf") or "1m")
+    struct_ok = bool(struct.get("ok"))
+    signal.update({
+        "price": live, "entry_quality": eq,
+        "quality": 0.60 * safe_float(signal.get("setup_quality")) + 0.40 * eq,
+        "risk_distance": max(risk, 0.0), "target_price": live_target or safe_float(st.get("initial_target")),
+        "target_kind": target_kind, "final_r": gross_rr, "net_rr": net_rr,
+        "trigger_note": struct.get("note", ""), "confirmations": int(struct.get("strength", 0)) + 1,
+        "ldt13_state": st.get("state"), "ldt13_age_min": (now-safe_float(st.get("created")))/60.0,
+        "prospective_entry": planned, "prospective_rr": prospective_rr,
+        "card_score": int(st.get("card_score", signal.get("card_score", 0))),
+        "card_label": st.get("card_label", signal.get("card_label", "BASE-STRUCTURE")),
+    })
+    st["signal"] = _ldt13_jsonable(signal)
+    st["best_rr"] = max(safe_float(st.get("best_rr")), net_rr)
+    st["best_eq"] = max(safe_float(st.get("best_eq")), eq)
+
+    # If current price is not executable, keep stalking the planned zone.
+    if risk <= 0 or risk_atr < LDT_MIN_STOP_ATR or risk_atr > LDT_MAX_STOP_ATR:
+        _ldt13_transition(st, "WAIT_RETRACE", f"card {signal.get('card_label')} · wait zone; live stop {risk_atr:.2f}ATR")
+        signal["skip"] = f"TRACK-wait-retrace · RR@zone {prospective_rr:.2f}"
+        signal["entry_route"] = None; return signal
+    if not in_zone or eq < LDT_MIN_ENTRY_QUALITY:
+        _ldt13_transition(st, "WAIT_RETRACE", f"card {signal.get('card_label')} · EQ {eq:.0f}; planned {lo:.8g}-{hi:.8g}")
+        signal["skip"] = f"TRACK-wait-retrace EQ{eq:.0f} · RR@zone {prospective_rr:.2f}"
+        signal["entry_route"] = None; return signal
+    if net_rr < LDT_MIN_NET_RR:
+        _ldt13_transition(st, "IN_ZONE", f"zone reached but live first-liq RR {net_rr:.2f}R")
+        signal["skip"] = f"TRACK-in-zone RRnow {net_rr:.2f}<{LDT_MIN_NET_RR:.2f}"
+        signal["entry_route"] = None; return signal
+    if not struct_ok:
+        _ldt13_transition(st, "IN_ZONE", f"{signal.get('card_label')} · zone reached · {struct.get('note','waiting structure')}")
+        signal["skip"] = f"TRACK-in-zone · {struct.get('note','STRUCT WAIT')}"
+        signal["entry_route"] = None; return signal
+
+    age = int(struct.get("age", 0))
+    _ldt13_transition(st, "READY" if age == 0 else "STRUCT_HOLD", struct.get("note", "structure valid"))
+    signal["skip"] = None
+    base_route = ("CRT-" + str(signal.get("route", "CORE")) + "-SV") if signal.get("strategy") == "CRT-MSS" else ("CONT-" + str(signal.get("route", "CORE")) + "-SV")
+    signal["entry_route"] = base_route + "-CARD-STATE"
+    signal["signal_bar_ts"] = int(time.time() // 60)
+    return signal
+
+
+def open_trade(signal):
+    """v1.3.1 final state refresh, then the hardened v1.2.1 exchange shell."""
+    symbol = signal.get("symbol")
+    st = _ldt13_states.get(symbol)
+    if st:
+        fresh = _ldt13_refresh_state(st); _ldt13_save()
+        if not fresh or fresh.get("skip") or not fresh.get("entry_route"):
+            tg(f"⏭️ LDT v1.3.1 {symbol} {str(signal.get('side')).upper()} STATE CHANGED\n"
+               f"{(fresh or {}).get('skip') or st.get('state_note','not ready')}\nOrder cancelled before submission.")
+            return False
+        signal = fresh
+    try:
+        signal["price"] = safe_float(exchange.fetch_ticker(symbol).get("last"), signal.get("price"))
+    except Exception:
+        pass
+    opened = _ldt13_base_open_trade(signal)
+    if opened and symbol in _ldt13_states:
+        _ldt13_states.pop(symbol, None); _ldt13_save()
+    return opened
+
+
+def maybe_score_report(rows):
+    global _ldt13_last_report
+    now = time.time()
+    if now - _ldt13_last_report < LDT_REPORT_MIN * 60 or not rows:
+        return
+    _ldt13_last_report = now; _ldt13_load()
+    ready = [r for r in rows if r.get("side") and not r.get("skip") and r.get("entry_route")]
+    state_counts = {}
+    for st in _ldt13_states.values():
+        k = str(st.get("state") or "WAIT_RETRACE"); state_counts[k] = state_counts.get(k, 0) + 1
+    ranked = sorted(rows, key=lambda r: (
+        1 if not r.get("skip") else 0,
+        1 if r.get("symbol") in _ldt13_states else 0,
+        safe_float(r.get("card_score")), safe_float(r.get("prospective_rr")),
+        safe_float(r.get("entry_quality")), safe_float(r.get("setup_quality"))
+    ), reverse=True)[:10]
+    state_text = " · ".join(f"{k} {v}" for k,v in sorted(state_counts.items(), key=lambda x:x[1], reverse=True)[:5]) or "none"
+    lines = [
+        "🧠 LIQUIDITY DAYTRADER v1.3.1 · TRADING-CARD PROSPECTIVE",
+        f"Ready {len(ready)} · Tracked {len(_ldt13_states)} · scanned {len(rows)}",
+        f"Theses: {state_text}",
+    ]
+    for r in ranked:
+        st = _ldt13_states.get(r.get("symbol"), {})
+        age = (now-safe_float(st.get("created"),now))/60.0 if st else 0.0
+        if not r.get("skip"):
+            status = "🟢 EXECUTE"
+        elif st:
+            status = f"🟠 {st.get('state','WAIT_RETRACE')} {age:.0f}m"
+        else:
+            status = "🟡 " + str(r.get("skip"))
+        lines.append(
+            f"{r.get('symbol')} {str(r.get('side')).upper()} {r.get('strategy')} "
+            f"CARD[{r.get('card_label','-')}] C{int(r.get('card_score',0))} "
+            f"STR{safe_float(r.get('setup_quality')):.0f}/95 EQ{safe_float(r.get('entry_quality')):.0f} "
+            f"RRnow{safe_float(r.get('net_rr')):.2f} RR@zone{safe_float(r.get('prospective_rr')):.2f} {status}"
+        )
+    tg("\n".join(lines))
+
+
+def startup_diagnostics():
+    _ldt13_load(); acc = futures_account(); reset_daily_if_needed(acc["total_equity"])
+    tg(
+        "🧠 LIQUIDITY DAYTRADER STARTED v1.3.1 · TRADING-CARD PROSPECTIVE HUNTER\n"
+        "The supplied Institutional Price Action card now actively classifies/ranks theses: "
+        "QM/2B/Fakeout, QM Re-entry/MPL, Flag/Continuation QM, Compression/Can-Can, V-tail, 3-Drive and Double SSR.\n"
+        "Card patterns are context, not magic signals: execution still requires live zone + valid BOS/MSS + first-liquidity RR.\n"
+        "Key fix: a thesis may be TRACKED when RR NOW is poor, provided RR@planned retrace zone is valid.\n"
+        f"Min RR@zone to track {LDT131_MIN_PROSPECTIVE_RR:.2f}R · min LIVE RR to execute {LDT_MIN_NET_RR:.2f}R.\n"
+        f"Structure window {LDT12_STRUCTURE_VALID_BARS} closed 1m candles · thesis TTL CORE {LDT13_CORE_TTL_MIN}m / CONT {LDT13_CONT_TTL_MIN}m / FAST {LDT13_FAST_TTL_MIN}m.\n"
+        f"Risk CORE {LDT11_CORE_RISK*100:.2f}% · FAST {LDT11_FAST_RISK*100:.2f}% · CONT {LDT11_CONT_RISK*100:.2f}% · ELITE cap {LDT11_ELITE_RISK*100:.2f}%.\n"
+        f"Max positions {MAX_ACTIVE_POSITIONS} · max same side {LDT_MAX_SAME_SIDE}.\n"
+        f"Restored v1.3.1 theses: {len(_ldt13_states)} · Equity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}"
+    )
+
 if __name__ == "__main__":
     main()
