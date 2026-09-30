@@ -1,3 +1,4 @@
+# LIQUIDITY DAYTRADER v1.0 — new strategy / BloFin execution shell
 import os
 import time
 import json
@@ -6772,6 +6773,628 @@ def startup_diagnostics():
         f"Leverage {LEVERAGE}x · max positions {MAX_ACTIVE_POSITIONS} · max same side {V6_MAX_SAME_SIDE}\n"
         f"Equity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}"
     )
+
+# ============================================================
+# LIQUIDITY DAYTRADER v1.0 — CRT / MSS / IFVG / BREAKER
+# ============================================================
+# NEW STRATEGY ENGINE. The old V6 strategy code above is retained ONLY as the
+# battle-tested BloFin execution/protection/PnL shell. None of the V6 signal
+# engines are called after the overrides in this section.
+#
+# Design:
+#   CORE : 1H parent Range Candle -> 5M sweep/reclaim -> MSS -> IFVG/Breaker retest
+#   FAST : 15M parent Range Candle -> 1M sweep/reclaim -> MSS -> IFVG/Breaker retest
+#   CONT : true range breakout -> pullback/retest -> continuation trigger
+#
+# Price-action families from the supplied cheat sheet are not treated as 20
+# independent magic patterns. They are grouped into objective mechanics:
+#   - QM / 2B / fakeout / V-tail -> liquidity sweep + reclaim + MSS
+#   - Flag / continuation QM     -> breakout + retest continuation
+#   - Compression                -> context/quality bonus, never a standalone entry
+#
+# IMPORTANT: the social-media "99% winrate" claim is NOT encoded as an
+# assumption. Every setup still needs positive net R:R and is risk-capped.
+
+SNIPER_VERSION = "LDT-1.0.0"
+
+# New bot limits — intentionally conservative while the new edge is validated.
+MAX_ACTIVE_POSITIONS = int(os.getenv("LDT_MAX_ACTIVE_POSITIONS", "2"))
+LDT_MAX_SAME_SIDE = int(os.getenv("LDT_MAX_SAME_SIDE", "1"))
+DAILY_LOSS_LIMIT_PCT = float(os.getenv("LDT_DAILY_LOSS_LIMIT_PCT", "4.0"))
+MAX_CONSECUTIVE_LOSSES = int(os.getenv("LDT_MAX_CONSECUTIVE_LOSSES", "3"))
+LOSS_PAUSE_MIN = int(os.getenv("LDT_LOSS_PAUSE_MIN", "90"))
+
+LDT_CORE_RISK = float(os.getenv("LDT_CORE_RISK", "0.008"))       # 0.80%
+LDT_FAST_RISK = float(os.getenv("LDT_FAST_RISK", "0.0045"))      # 0.45%
+LDT_CONT_RISK = float(os.getenv("LDT_CONT_RISK", "0.0065"))      # 0.65%
+LDT_ELITE_RISK = float(os.getenv("LDT_ELITE_RISK", "0.010"))     # hard ceiling 1.00%
+LDT_CORE_TARGET_NET = float(os.getenv("LDT_CORE_TARGET_NET", "0.75"))
+LDT_FAST_TARGET_NET = float(os.getenv("LDT_FAST_TARGET_NET", "0.50"))
+LDT_MIN_NET_RR = float(os.getenv("LDT_MIN_NET_RR", "1.65"))
+LDT_MIN_SETUP_QUALITY = float(os.getenv("LDT_MIN_SETUP_QUALITY", "72"))
+LDT_MIN_ENTRY_QUALITY = float(os.getenv("LDT_MIN_ENTRY_QUALITY", "68"))
+LDT_REPORT_MIN = int(os.getenv("LDT_REPORT_MIN", "15"))
+LDT_MAX_SIGNAL_AGE_MIN = int(os.getenv("LDT_MAX_SIGNAL_AGE_MIN", "180"))
+LDT_SWEEP_MIN_ATR = float(os.getenv("LDT_SWEEP_MIN_ATR", "0.03"))
+LDT_SWEEP_MAX_ATR = float(os.getenv("LDT_SWEEP_MAX_ATR", "0.90"))
+LDT_STOP_BUFFER_ATR = float(os.getenv("LDT_STOP_BUFFER_ATR", "0.08"))
+LDT_MAX_STOP_ATR = float(os.getenv("LDT_MAX_STOP_ATR", "1.45"))
+LDT_MIN_STOP_ATR = float(os.getenv("LDT_MIN_STOP_ATR", "0.18"))
+LDT_ZONE_TOL_ATR = float(os.getenv("LDT_ZONE_TOL_ATR", "0.08"))
+LDT_DISPLACEMENT_ATR = float(os.getenv("LDT_DISPLACEMENT_ATR", "0.42"))
+LDT_VOL_MULT = float(os.getenv("LDT_VOL_MULT", "1.05"))
+LDT_BREAKOUT_ATR = float(os.getenv("LDT_BREAKOUT_ATR", "0.10"))
+LDT_BREAKOUT_BODY_ATR = float(os.getenv("LDT_BREAKOUT_BODY_ATR", "0.55"))
+LDT_LIVE_DRIFT_ATR = float(os.getenv("LDT_LIVE_DRIFT_ATR", "0.18"))
+LDT_BTC_CONTEXT_WEIGHT = float(os.getenv("LDT_BTC_CONTEXT_WEIGHT", "5"))
+LDT_REQUIRE_1M_FAST_TRIGGER = os.getenv("LDT_REQUIRE_1M_FAST_TRIGGER", "true").lower() == "true"
+LDT_ENABLE_FAST = os.getenv("LDT_ENABLE_FAST", "true").lower() == "true"
+LDT_ENABLE_CONTINUATION = os.getenv("LDT_ENABLE_CONTINUATION", "true").lower() == "true"
+LDT_NEW_RISK_EPOCH_LOCAL = os.getenv("LDT_RISK_EPOCH_LOCAL", "2026-09-30T12:06:00+02:00").strip()
+if LDT_NEW_RISK_EPOCH_LOCAL:
+    V6_RISK_EPOCH_LOCAL = LDT_NEW_RISK_EPOCH_LOCAL
+
+_ldt_meta = {}
+_ldt_last_report = 0.0
+_ldt_last_state = {}
+
+
+def _ldt_df(symbol, tf, limit=None):
+    rows = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit or CANDLE_LIMIT)
+    if len(rows) < 30:
+        raise RuntimeError(f"not enough {tf} candles")
+    df = pd.DataFrame(rows, columns=["ts","open","high","low","close","volume"])
+    for c in ["open","high","low","close","volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna().reset_index(drop=True)
+    pc = df["close"].shift(1)
+    tr = pd.concat([(df["high"]-df["low"]), (df["high"]-pc).abs(), (df["low"]-pc).abs()], axis=1).max(axis=1)
+    df["atr"] = tr.rolling(14).mean()
+    df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
+    df["volma"] = df["volume"].rolling(20).mean()
+    return df
+
+
+def _ldt_closed(df):
+    # CCXT/BloFin normally returns the live candle as the final row.
+    return df.iloc[:-1].copy().reset_index(drop=True) if len(df) > 1 else df.copy()
+
+
+def _ldt_pivots(df, left=2, right=2):
+    highs, lows = [], []
+    for i in range(left, len(df)-right):
+        h = safe_float(df.iloc[i]["high"]); l = safe_float(df.iloc[i]["low"])
+        if h >= max(safe_float(x) for x in df.iloc[i-left:i+right+1]["high"]): highs.append((i,h))
+        if l <= min(safe_float(x) for x in df.iloc[i-left:i+right+1]["low"]): lows.append((i,l))
+    return highs, lows
+
+
+def _ldt_compression(df, side):
+    """Compression from the cheat sheet: shrinking bars pushing toward a level."""
+    if len(df) < 6: return False
+    x = df.tail(5)
+    ranges = (x["high"]-x["low"]).values
+    shrinking = sum(ranges[i] <= ranges[i-1]*1.08 for i in range(1,len(ranges))) >= 3
+    closes = x["close"].values
+    directional = closes[-1] > closes[0] if side == "long" else closes[-1] < closes[0]
+    return bool(shrinking and directional)
+
+
+def _ldt_fvgs(df, start=2, end=None):
+    """Return bullish/bearish 3-candle FVGs."""
+    out=[]; end = len(df) if end is None else min(end, len(df))
+    for i in range(max(2,start), end):
+        a, c = df.iloc[i-2], df.iloc[i]
+        if safe_float(c["low"]) > safe_float(a["high"]):
+            out.append({"dir":1,"lo":safe_float(a["high"]),"hi":safe_float(c["low"]),"i":i})
+        if safe_float(c["high"]) < safe_float(a["low"]):
+            out.append({"dir":-1,"lo":safe_float(c["high"]),"hi":safe_float(a["low"]),"i":i})
+    return out
+
+
+def _ldt_ifvg(df, d, sweep_i, mss_i):
+    """Actual inversion FVG: an opposite FVG that is closed through after the MSS."""
+    gaps = _ldt_fvgs(df, max(2,sweep_i-8), mss_i+1)
+    candidates=[]
+    for g in gaps:
+        if g["dir"] == d: continue
+        later = df.iloc[g["i"]:mss_i+1]
+        if d == 1:
+            inverted = any(safe_float(v) > g["hi"] for v in later["close"])
+        else:
+            inverted = any(safe_float(v) < g["lo"] for v in later["close"])
+        if inverted: candidates.append(g)
+    if not candidates: return None
+    g=candidates[-1]
+    return {"lo":g["lo"],"hi":g["hi"],"kind":"IFVG"}
+
+
+def _ldt_directional_fvg(df, d, sweep_i, mss_i):
+    gaps=[g for g in _ldt_fvgs(df,max(2,sweep_i),mss_i+2) if g["dir"]==d]
+    if not gaps:return None
+    g=gaps[-1]; return {"lo":g["lo"],"hi":g["hi"],"kind":"FVG"}
+
+
+def _ldt_breaker(df, d, sweep_i, mss_i):
+    """Last opposing candle before the displacement/MSS break."""
+    lo=max(0,sweep_i-2); hi=min(mss_i+1,len(df))
+    for i in range(hi-1,lo-1,-1):
+        r=df.iloc[i]; bullish=safe_float(r["close"])>safe_float(r["open"])
+        opposing = bullish if d==-1 else not bullish
+        if opposing:
+            body_lo=min(safe_float(r["open"]),safe_float(r["close"]))
+            body_hi=max(safe_float(r["open"]),safe_float(r["close"]))
+            return {"lo":body_lo,"hi":body_hi,"kind":"BREAKER","i":i}
+    return None
+
+
+def _ldt_zone_merge(a,b):
+    if a and b:
+        lo=max(a["lo"],b["lo"]); hi=min(a["hi"],b["hi"])
+        if lo < hi:
+            return {"lo":lo,"hi":hi,"kind":"IFVG+BREAKER","confluence":2}
+        # No overlap: use the narrower zone; the second remains confluence evidence.
+        wa=a["hi"]-a["lo"]; wb=b["hi"]-b["lo"]
+        z=dict(a if wa<=wb else b); z["confluence"]=1; return z
+    if a or b:
+        z=dict(a or b); z["confluence"]=1; return z
+    return None
+
+
+def _ldt_cr_time_bonus(parent):
+    """Key CRT times are a bonus, not a magical hard filter. Timezone: New York."""
+    try:
+        from zoneinfo import ZoneInfo
+        dt=datetime.fromtimestamp(parent["ts"]/1000.0, ZoneInfo("America/New_York"))
+        key_hours={1,3,5,9,13}
+        return (5 if dt.hour in key_hours else 0), dt.strftime("%H:%M NY")
+    except Exception:
+        return 0,"time-n/a"
+
+
+def _ldt_parent_candidates(symbol, tf):
+    df=_ldt_closed(_ldt_df(symbol,tf,120))
+    if len(df)<35:return []
+    out=[]
+    # Recent closed candles only. Older untouched parents are allowed but decay in quality.
+    for j in range(max(20,len(df)-6),len(df)):
+        r=df.iloc[j]; atr=safe_float(r["atr"])
+        rng=safe_float(r["high"])-safe_float(r["low"])
+        if atr<=0 or rng<=0:continue
+        ratio=rng/atr
+        if 0.55 <= ratio <= 2.20:
+            out.append({"tf":tf,"ts":int(r["ts"]),"high":safe_float(r["high"]),"low":safe_float(r["low"]),
+                        "mid":(safe_float(r["high"])+safe_float(r["low"]))/2,"atr":atr,
+                        "range":rng,"ratio":ratio,"age":len(df)-1-j,"end_ts":int(r["ts"])+(3600000 if tf=="1h" else 900000 if tf=="15m" else 0)})
+    return list(reversed(out))
+
+
+def _ldt_find_sweep_mss(symbol, parent, ltf):
+    df=_ldt_closed(_ldt_df(symbol,ltf,220))
+    if len(df)<40:return None
+    atr=safe_float(df.iloc[-1]["atr"])
+    if atr<=0:return None
+    # Only lower-timeframe candles after the parent opened; this also keeps stale ranges out.
+    sub=df[df["ts"]>=parent.get("end_ts",parent["ts"])].copy().reset_index(drop=True)
+    if len(sub)<8:return None
+    ph,pl=parent["high"],parent["low"]
+    best=None
+    for i in range(max(3,len(sub)-35),len(sub)):
+        r=sub.iloc[i]
+        # Sweep high and close back inside -> SHORT hypothesis.
+        for d in (-1,1):
+            if d==-1:
+                depth=(safe_float(r["high"])-ph)/atr
+                swept=safe_float(r["high"])>ph and safe_float(r["close"])<ph
+            else:
+                depth=(pl-safe_float(r["low"]))/atr
+                swept=safe_float(r["low"])<pl and safe_float(r["close"])>pl
+            if not swept or depth<LDT_SWEEP_MIN_ATR or depth>LDT_SWEEP_MAX_ATR:continue
+            pre=sub.iloc[max(0,i-7):i]
+            if len(pre)<3:continue
+            mss_level=(safe_float(pre["low"].min()) if d==-1 else safe_float(pre["high"].max()))
+            mss_i=None
+            for k in range(i+1,len(sub)):
+                c=safe_float(sub.iloc[k]["close"])
+                if (d==-1 and c<mss_level) or (d==1 and c>mss_level):
+                    mss_i=k;break
+            if mss_i is None:continue
+            mr=sub.iloc[mss_i]; mat=safe_float(mr["atr"],atr) or atr
+            body=abs(safe_float(mr["close"])-safe_float(mr["open"]))/max(mat,1e-12)
+            vol=safe_float(mr["volume"]); vma=safe_float(mr["volma"])
+            displacement=body>=LDT_DISPLACEMENT_ATR
+            vol_ok=(vma<=0 or vol>=vma*LDT_VOL_MULT)
+            # We accept clean structure shift with either displacement or volume, strongest with both.
+            if not (displacement or vol_ok):continue
+            actual_i0 = max(0, len(df)-len(sub))
+            sweep_abs=actual_i0+i; mss_abs=actual_i0+mss_i
+            ifvg=_ldt_ifvg(df,d,sweep_abs,mss_abs)
+            fvg=_ldt_directional_fvg(df,d,sweep_abs,mss_abs)
+            breaker=_ldt_breaker(df,d,sweep_abs,mss_abs)
+            zone=_ldt_zone_merge(ifvg or fvg,breaker)
+            if not zone:continue
+            sweep_ext=safe_float(r["high"] if d==-1 else r["low"])
+            age_bars=len(sub)-1-mss_i
+            setup={"d":d,"side":"long" if d==1 else "short","sweep_i":i,"mss_i":mss_i,
+                   "mss_level":mss_level,"sweep_extreme":sweep_ext,"sweep_depth_atr":depth,
+                   "body_atr":body,"vol_ok":vol_ok,"displacement":displacement,"zone":zone,
+                   "ifvg":ifvg,"fvg":fvg,"breaker":breaker,"age_bars":age_bars,"df":df,"sub":sub,"atr":atr}
+            if best is None or (zone.get("confluence",0),-age_bars)>(best["zone"].get("confluence",0),-best["age_bars"]):
+                best=setup
+    return best
+
+
+def _ldt_break_retest(symbol,parent,ltf):
+    if not LDT_ENABLE_CONTINUATION:return None
+    df=_ldt_closed(_ldt_df(symbol,ltf,180)); atr=safe_float(df.iloc[-1]["atr"])
+    if len(df)<35 or atr<=0:return None
+    sub=df[df["ts"]>=parent.get("end_ts",parent["ts"])].copy().reset_index(drop=True)
+    if len(sub)<8:return None
+    for i in range(max(2,len(sub)-24),len(sub)):
+        r=sub.iloc[i]; body=abs(safe_float(r["close"])-safe_float(r["open"]))/atr
+        vma=safe_float(r["volma"]); vol=safe_float(r["volume"])
+        for d in (1,-1):
+            level=parent["high"] if d==1 else parent["low"]
+            broke=(safe_float(r["close"])>level+LDT_BREAKOUT_ATR*atr if d==1 else safe_float(r["close"])<level-LDT_BREAKOUT_ATR*atr)
+            if not broke or body<LDT_BREAKOUT_BODY_ATR:continue
+            if vma>0 and vol<vma*LDT_VOL_MULT:continue
+            # Retest after the breakout: wick into/through level, close back on breakout side.
+            for k in range(i+1,len(sub)):
+                q=sub.iloc[k]
+                touched=(safe_float(q["low"])<=level+LDT_ZONE_TOL_ATR*atr if d==1 else safe_float(q["high"])>=level-LDT_ZONE_TOL_ATR*atr)
+                held=(safe_float(q["close"])>level if d==1 else safe_float(q["close"])<level)
+                if touched and held:
+                    breaker=_ldt_breaker(df,d,max(0,len(df)-len(sub)+i),max(0,len(df)-len(sub)+k))
+                    z=breaker or {"lo":level-LDT_ZONE_TOL_ATR*atr,"hi":level+LDT_ZONE_TOL_ATR*atr,"kind":"RANGE-RETEST","confluence":1}
+                    return {"d":d,"side":"long" if d==1 else "short","break_i":i,"retest_i":k,
+                            "level":level,"zone":z,"atr":atr,"df":df,"sub":sub,"age_bars":len(sub)-1-k,
+                            "body_atr":body,"vol_ok":True,"compression":_ldt_compression(sub.iloc[max(0,i-6):i+1],"long" if d==1 else "short")}
+    return None
+
+
+def _ldt_micro_trigger(symbol, side, tf):
+    """Last-mile trigger: do not catch a falling knife on the zone touch."""
+    df=_ldt_closed(_ldt_df(symbol,tf,100))
+    if len(df)<25:return False,0,"no-data"
+    a,p=df.iloc[-1],df.iloc[-2]; d=1 if side=="long" else -1
+    body_ok=(safe_float(a["close"])>safe_float(a["open"])) if d==1 else (safe_float(a["close"])<safe_float(a["open"]))
+    progress=(safe_float(a["close"])>safe_float(p["high"])) if d==1 else (safe_float(a["close"])<safe_float(p["low"]))
+    ema_ok=(safe_float(a["close"])>safe_float(a["ema21"])) if d==1 else (safe_float(a["close"])<safe_float(a["ema21"]))
+    wick=(min(safe_float(a["open"]),safe_float(a["close"]))-safe_float(a["low"])) if d==1 else (safe_float(a["high"])-max(safe_float(a["open"]),safe_float(a["close"])))
+    body=abs(safe_float(a["close"])-safe_float(a["open"]))
+    reject=wick>=max(body*0.7,1e-12)
+    score=sum(map(int,(body_ok,progress,ema_ok,reject)))
+    return score>=2,score,f"{tf} trigger {score}/4 body={int(body_ok)} break={int(progress)} ema={int(ema_ok)} reject={int(reject)}"
+
+
+def _ldt_btc_context(side):
+    """BTC is context, not a binary permission switch."""
+    try:
+        d=1 if side=="long" else -1
+        df=_ldt_closed(_ldt_df(BTC_SYMBOL,"15m",100)); a,p=df.iloc[-1],df.iloc[-2]
+        direction=1 if safe_float(a["close"])>safe_float(a["ema21"]) else -1
+        slope=1 if safe_float(a["ema21"])>safe_float(p["ema21"]) else -1
+        score=(1 if direction==d else -1)+(1 if slope==d else -1)
+        return score, f"BTC15 dir/slope {direction:+d}/{slope:+d}"
+    except Exception:
+        return 0,"BTC context unavailable"
+
+
+def _ldt_zone_entry_quality(live,zone,atr,d):
+    if live<=0 or atr<=0:return 0.0
+    lo,hi=zone["lo"],zone["hi"]; mid=(lo+hi)/2
+    dist=abs(live-mid)/atr
+    eq=100-min(70,dist*100)
+    if lo-LDT_ZONE_TOL_ATR*atr <= live <= hi+LDT_ZONE_TOL_ATR*atr: eq+=8
+    # Penalize already crossing completely through the zone against the thesis.
+    if d==1 and live<lo-LDT_ZONE_TOL_ATR*atr:eq-=35
+    if d==-1 and live>hi+LDT_ZONE_TOL_ATR*atr:eq-=35
+    return max(0,min(100,eq))
+
+
+def _ldt_build_reversal(symbol,parent,setup,route,ltf,trigger_tf):
+    d=setup["d"]; side=setup["side"]; atr=setup["atr"]; zone=setup["zone"]
+    live=safe_float(exchange.fetch_ticker(symbol).get("last"))
+    eq=_ldt_zone_entry_quality(live,zone,atr,d)
+    stop_raw=setup["sweep_extreme"]-d*LDT_STOP_BUFFER_ATR*atr
+    risk=d*(live-stop_raw)
+    if risk<=0:return None
+    risk_atr=risk/atr
+    target=parent["high"] if d==1 else parent["low"]
+    gross_rr=d*(target-live)/risk
+    cost_r=live*(2*TAKER_FEE_RATE+SLIPPAGE_RATE)/max(risk,1e-12)
+    net_rr=gross_rr-cost_r
+    btc_score,btc_note=_ldt_btc_context(side)
+    time_bonus,cr_time=_ldt_cr_time_bonus(parent)
+    sq=64 + time_bonus + min(10,setup["sweep_depth_atr"]*18) + (8 if setup["displacement"] else 0) + (5 if setup["vol_ok"] else 0)
+    sq += 9 if setup["zone"].get("confluence",0)>=2 else 3
+    sq += btc_score*LDT_BTC_CONTEXT_WEIGHT/2
+    sq -= min(12,setup["age_bars"]*1.5)
+    sq=max(0,min(100,sq))
+    in_zone=zone["lo"]-LDT_ZONE_TOL_ATR*atr <= live <= zone["hi"]+LDT_ZONE_TOL_ATR*atr
+    trig_ok,trig_score,trig_note=_ldt_micro_trigger(symbol,side,trigger_tf)
+    skip=None
+    if setup["age_bars"]*({"1m":1,"5m":5,"15m":15}.get(ltf,5)) > LDT_MAX_SIGNAL_AGE_MIN: skip="stale-MSS"
+    elif risk_atr<LDT_MIN_STOP_ATR or risk_atr>LDT_MAX_STOP_ATR: skip=f"stop-{risk_atr:.2f}ATR"
+    elif net_rr<LDT_MIN_NET_RR: skip=f"RR-{net_rr:.2f}<{LDT_MIN_NET_RR:.2f}"
+    elif sq<LDT_MIN_SETUP_QUALITY: skip=f"SQ-{sq:.0f}<{LDT_MIN_SETUP_QUALITY:.0f}"
+    elif eq<LDT_MIN_ENTRY_QUALITY: skip=f"wait-zone EQ{eq:.0f}"
+    elif not in_zone: skip="ARMED-wait-retest"
+    elif route=="FAST" and LDT_REQUIRE_1M_FAST_TRIGGER and not trig_ok: skip=f"wait-{trig_note}"
+    elif route=="CORE" and not trig_ok: skip=f"wait-{trig_note}"
+    return {"symbol":symbol,"side":side,"strategy":"CRT-MSS","entry_route":None if skip else f"CRT-{route}",
+            "skip":skip,"price":live,"score":sq,"quality":0.65*sq+0.35*eq,"setup_quality":sq,"entry_quality":eq,
+            "confirmations":trig_score+(2 if setup["zone"].get("confluence",0)>=2 else 1),"h4_score":0,
+            "signal_bar_ts":int(setup["sub"].iloc[setup["mss_i"]]["ts"]),"atr":atr,
+            "structural_stop":stop_raw,"target_price":target,"risk_distance":risk,"final_r":gross_rr,
+            "net_rr":net_rr,"zone":zone,"parent":parent,"route":route,"btc_note":btc_note,
+            "trigger_note":trig_note,"pattern_family":"QM/2B/FAKEOUT -> MSS",
+            "sweep_depth_atr":setup["sweep_depth_atr"],"mss_level":setup["mss_level"],"cr_time":cr_time}
+
+
+def _ldt_build_cont(symbol,parent,setup,route,ltf,trigger_tf):
+    d=setup["d"]; side=setup["side"]; atr=setup["atr"]; zone=setup["zone"]
+    live=safe_float(exchange.fetch_ticker(symbol).get("last")); eq=_ldt_zone_entry_quality(live,zone,atr,d)
+    # Stop behind the retest/zone and parent boundary.
+    if d==1: stop_raw=min(zone["lo"],setup["level"])-LDT_STOP_BUFFER_ATR*atr
+    else: stop_raw=max(zone["hi"],setup["level"])+LDT_STOP_BUFFER_ATR*atr
+    risk=d*(live-stop_raw)
+    if risk<=0:return None
+    risk_atr=risk/atr
+    # Continuation target: 2.2R unless a measured parent-range objective is closer.
+    measured=setup["level"]+d*parent["range"]
+    measured_rr=d*(measured-live)/risk
+    gross_rr=max(0,min(2.5,measured_rr))
+    target=live+d*risk*gross_rr
+    cost_r=live*(2*TAKER_FEE_RATE+SLIPPAGE_RATE)/max(risk,1e-12); net_rr=gross_rr-cost_r
+    btc_score,btc_note=_ldt_btc_context(side)
+    time_bonus,cr_time=_ldt_cr_time_bonus(parent)
+    sq=67 + time_bonus + min(10,setup["body_atr"]*8) + 6 + (6 if setup.get("compression") else 0) + btc_score*LDT_BTC_CONTEXT_WEIGHT/2
+    sq=max(0,min(100,sq)); in_zone=zone["lo"]-LDT_ZONE_TOL_ATR*atr<=live<=zone["hi"]+LDT_ZONE_TOL_ATR*atr
+    trig_ok,trig_score,trig_note=_ldt_micro_trigger(symbol,side,trigger_tf)
+    skip=None
+    if risk_atr<LDT_MIN_STOP_ATR or risk_atr>LDT_MAX_STOP_ATR:skip=f"stop-{risk_atr:.2f}ATR"
+    elif net_rr<LDT_MIN_NET_RR:skip=f"RR-{net_rr:.2f}<{LDT_MIN_NET_RR:.2f}"
+    elif sq<LDT_MIN_SETUP_QUALITY:skip=f"SQ-{sq:.0f}"
+    elif eq<LDT_MIN_ENTRY_QUALITY:skip=f"wait-zone EQ{eq:.0f}"
+    elif not in_zone:skip="ARMED-wait-break-retest"
+    elif not trig_ok:skip=f"wait-{trig_note}"
+    return {"symbol":symbol,"side":side,"strategy":"BREAK-RETEST","entry_route":None if skip else f"CONT-{route}",
+            "skip":skip,"price":live,"score":sq,"quality":0.65*sq+0.35*eq,"setup_quality":sq,"entry_quality":eq,
+            "confirmations":trig_score+(1 if setup.get("compression") else 0),"h4_score":0,
+            "signal_bar_ts":int(setup["sub"].iloc[setup["retest_i"]]["ts"]),"atr":atr,
+            "structural_stop":stop_raw,"target_price":target,"risk_distance":risk,"final_r":gross_rr,
+            "net_rr":net_rr,"zone":zone,"parent":parent,"route":route,"btc_note":btc_note,
+            "trigger_note":trig_note,"pattern_family":"FLAG/CONTINUATION + RETEST","cr_time":cr_time}
+
+
+def evaluate_symbol(symbol, btc=None):
+    """New bot only: CRT liquidity reversal first, breakout/retest second."""
+    candidates=[]
+    pairs=[("CORE","1h","5m","1m")]
+    if LDT_ENABLE_FAST:pairs.append(("FAST","15m","1m","1m"))
+    for route,ptf,ltf,ttf in pairs:
+        try:
+            parents=_ldt_parent_candidates(symbol,ptf)
+        except Exception:
+            continue
+        for parent in parents[:3]:
+            try:
+                rev=_ldt_find_sweep_mss(symbol,parent,ltf)
+                if rev:
+                    s=_ldt_build_reversal(symbol,parent,rev,route,ltf,ttf)
+                    if s:candidates.append(s)
+                cont=_ldt_break_retest(symbol,parent,ltf)
+                if cont:
+                    s=_ldt_build_cont(symbol,parent,cont,route,ltf,ttf)
+                    if s:candidates.append(s)
+            except Exception:
+                continue
+    if not candidates:return None
+    # Prefer ready, then armed closest to entry, then higher net RR/setup quality.
+    candidates.sort(key=lambda s:(1 if not s.get("skip") else 0,
+                                  1 if str(s.get("skip","")).startswith("ARMED") else 0,
+                                  safe_float(s.get("entry_quality")),safe_float(s.get("net_rr")),safe_float(s.get("setup_quality"))),reverse=True)
+    return candidates[0]
+
+
+def sizing_profile(signal):
+    route=signal.get("route"); strategy=signal.get("strategy")
+    elite=(safe_float(signal.get("setup_quality"))>=90 and safe_float(signal.get("entry_quality"))>=85 and safe_float(signal.get("net_rr"))>=2.2)
+    if elite:return {"name":"LDT-ELITE","risk_pct":LDT_ELITE_RISK,"target_net_tp":LDT_CORE_TARGET_NET}
+    if route=="FAST":return {"name":"LDT-FAST","risk_pct":LDT_FAST_RISK,"target_net_tp":LDT_FAST_TARGET_NET}
+    if strategy=="BREAK-RETEST":return {"name":"LDT-CONT","risk_pct":LDT_CONT_RISK,"target_net_tp":LDT_CORE_TARGET_NET}
+    return {"name":"LDT-CORE","risk_pct":LDT_CORE_RISK,"target_net_tp":LDT_CORE_TARGET_NET}
+
+
+def sniper_portfolio_allows(signal, positions):
+    if len(positions)>=MAX_ACTIVE_POSITIONS:return False,f"max-{MAX_ACTIVE_POSITIONS}-positions"
+    side=signal.get("side"); same=sum(1 for p in positions if position_side(p)==side)
+    if same>=LDT_MAX_SAME_SIDE:return False,f"max-{LDT_MAX_SAME_SIDE}-same-side"
+    # Directional loss streak: do not keep hammering the same market direction.
+    streak=int(sniper_side_loss_streak.get(side,0))
+    if streak>=2 and safe_float(signal.get("setup_quality"))<90:
+        return False,f"{side}-loss-streak-{streak}: needs SQ90"
+    return True,"OK"
+
+
+def _ldt_levels(signal,live,tick):
+    side=signal["side"]; d=1 if side=="long" else -1
+    sl=safe_float(signal.get("structural_stop")); target=safe_float(signal.get("target_price"))
+    if live<=0 or sl<=0 or target<=0:return None
+    risk=d*(live-sl); reward=d*(target-live)
+    if risk<=0 or reward<=0:return None
+    sl=round_trade_price(sl,tick,side,"sl"); target=round_trade_price(target,tick,side,"tp")
+    risk=abs(live-sl); final_r=abs(target-live)/max(risk,1e-12)
+    return sl,target,risk,final_r
+
+
+def open_trade(signal):
+    global protection_lock, _v62_last_entry_time
+    symbol,side=signal["symbol"],signal["side"]; d=1 if side=="long" else -1
+    acc=futures_account(); equity,available=acc["total_equity"],acc["available"]
+    reset_daily_if_needed(equity)
+    if equity<MIN_EQUITY_USDT or available<=0 or (not PAPER_TRADING and protection_lock):return False
+    if time.time()-_v62_last_entry_time < 4*60:return False
+
+    # Recompute the actual entry geometry at execution. No stale zone fills.
+    live=safe_float(exchange.fetch_ticker(symbol).get("last"),signal.get("price")); atr=safe_float(signal.get("atr"))
+    zone=signal.get("zone") or {}; eq=_ldt_zone_entry_quality(live,zone,atr,d)
+    if eq<LDT_MIN_ENTRY_QUALITY:
+        tg(f"⏭️ LDT {symbol} {side.upper()} ENTRY MOVED\nEQ {eq:.0f} < {LDT_MIN_ENTRY_QUALITY:.0f} · no chase")
+        return False
+    signal_px=safe_float(signal.get("price"),live); drift=d*(live-signal_px)/max(atr,1e-12)
+    if drift>LDT_LIVE_DRIFT_ATR:
+        tg(f"⏭️ LDT {symbol} {side.upper()} TOO LATE\nAdverse drift {drift:.2f}ATR > {LDT_LIVE_DRIFT_ATR:.2f}ATR")
+        return False
+
+    tick=safe_float(get_instrument(symbol).get("tickSize"),0.0001)
+    levels=_ldt_levels(signal,live,tick)
+    if not levels:return False
+    sl,tp,risk,final_r=levels
+    cost_r=live*(2*TAKER_FEE_RATE+SLIPPAGE_RATE)/max(risk,1e-12); net_rr=final_r-cost_r
+    if net_rr<LDT_MIN_NET_RR:
+        tg(f"⏭️ LDT {symbol} {side.upper()} RR BLOCK\nNet RR {net_rr:.2f} < {LDT_MIN_NET_RR:.2f}")
+        return False
+
+    profile=sizing_profile(signal)
+    sizing=calculate_contracts_v5(symbol,live,sl,equity,available,profile["risk_pct"],profile["target_net_tp"],final_r)
+    if not sizing or sizing["margin"]>available*AVAILABLE_MARGIN_BUFFER:return False
+    before_ids={position_id(p) for p in get_positions() if position_id(p)}
+    oklev,levres=set_leverage(symbol,LEVERAGE)
+    if not oklev:tg(f"⛔ LDT LEVERAGE FAILED\n{symbol}\n{levres}");return False
+
+    tag="ldt10"
+    payload={"instId":blofin_inst_id(symbol),"marginMode":MARGIN_MODE,"positionSide":"net",
+             "side":"buy" if side=="long" else "sell","orderType":"market","size":str(sizing["contracts"]),
+             "tpTriggerPrice":str(tp),"tpOrderPrice":"-1","tpTriggerPriceType":"mark",
+             "slTriggerPrice":str(sl),"slOrderPrice":"-1","slTriggerPriceType":"mark",
+             "clientOrderId":f"{tag}{int(time.time()*1000)%1000000000}"}
+    if BROKER_ID:payload["brokerId"]=BROKER_ID
+    msg=(f"🎯 {'PAPER ' if PAPER_TRADING else ''}LIQUIDITY DAYTRADER v1\n{symbol} {side.upper()} · {signal.get('entry_route')}\n"
+         f"{signal.get('pattern_family')}\nSQ {safe_float(signal.get('setup_quality')):.0f} · EQ {eq:.0f} · net RR {net_rr:.2f}R\n"
+         f"Parent {signal.get('parent',{}).get('tf','-')} · {signal.get('cr_time','-')} H/L {safe_float(signal.get('parent',{}).get('high')):.8g}/{safe_float(signal.get('parent',{}).get('low')):.8g}\n"
+         f"Zone {zone.get('kind','-')} {safe_float(zone.get('lo')):.8g}-{safe_float(zone.get('hi')):.8g}\n"
+         f"{signal.get('trigger_note','')} · {signal.get('btc_note','')}\n"
+         f"Entry {live:.8g} · SL {sl:.8g} · TP {tp:.8g}\nRisk cap {profile['risk_pct']*100:.2f}% · expected net TP ~${sizing['expected_net_tp_usdt']:.2f}\n"
+         f"Notional ${sizing['notional']:.2f} · Margin ${sizing['margin']:.2f} · {LEVERAGE}x")
+    if PAPER_TRADING:tg(msg);_v62_last_entry_time=time.time();return True
+    resp=native("private_post_trade_order",payload)
+    if not native_ok(resp):
+        err=response_error(resp)
+        if "152012" in err:protection_lock=True
+        tg(f"❌ LDT ORDER FAILED\n{symbol} {side.upper()}\n{err}");return False
+    _v62_last_entry_time=time.time();tg(msg)
+    new_pos=find_new_position(symbol,before_ids,timeout=8)
+    if new_pos is None:tg(f"⚠️ {symbol}: LDT order accepted, position not visible yet.");return True
+    pid=position_id(new_pos)
+    if pid:
+        sniper_managed_positions.add(pid)
+        _ldt_meta[pid]={"risk":risk,"entry":position_entry(new_pos) or live,"sl":sl,"tp":tp,"final_r":final_r,
+                        "side":side,"opened":time.time(),"strategy":signal.get("strategy"),"route":signal.get("entry_route")}
+    if has_live_protection(new_pos)[0]:tg(f"🛡️ LDT PROTECTION CONFIRMED\n{symbol} {side.upper()}\nSL/TP visible.");return True
+    last=safe_float(exchange.fetch_ticker(symbol).get("last"))
+    if tpsl_prices_valid(side,sl,tp,last):
+        ok,res=place_tpsl_for_position(new_pos,sl,tp,client_tag=tag)
+        if ok:tg(f"🛡️ LDT FALLBACK PROTECTION CONFIRMED\n{symbol}");return True
+        protection_lock=True;tg(f"🚨 LDT PROTECTION FAILURE\n{symbol}\n{res}\nNEW TRADES PAUSED.");return True
+    protection_lock=True;tg(f"🚨 {symbol}: LDT position exists but protection could not be verified.\nNEW TRADES PAUSED.");return True
+
+
+def repair_one_position(p):
+    pid=position_id(p); meta=_ldt_meta.get(pid)
+    if not meta:return False
+    if has_live_protection(p)[0]:return True
+    return place_tpsl_for_position(p,meta["sl"],meta["tp"],client_tag="ldt10r")[0]
+
+
+def manage_sniper_step_stops():
+    """LDT management: protect after proof, but do not suffocate normal retests."""
+    if PAPER_TRADING:return
+    for p in get_positions():
+        try:
+            pid=position_id(p); meta=_ldt_meta.get(pid)
+            if not meta:continue
+            symbol=position_symbol(p); side=position_side(p); d=1 if side=="long" else -1
+            entry=safe_float(meta.get("entry")) or position_entry(p); risk=safe_float(meta.get("risk"))
+            if entry<=0 or risk<=0:continue
+            ok,order=has_live_protection(p)
+            if not ok or not order:continue
+            current_sl=safe_float(order.get("slTriggerPrice")); tick=safe_float(get_instrument(symbol).get("tickSize"),0.0001)
+            current=safe_float(exchange.fetch_ticker(symbol).get("last")); ext=sniper_recent_extreme(symbol,side)
+            favorable=max(current,ext) if d==1 else min(current,ext); best_r=d*(favorable-entry)/risk
+            fee_px=entry*(TAKER_FEE_RATE*2+SLIPPAGE_RATE)*1.10
+            desired=None;stage=None
+            if best_r>=1.75:
+                desired=round_trade_price(entry+d*0.75*risk,tick,side,"sl");stage="+1.75R → lock +0.75R"
+            elif best_r>=1.00:
+                desired=round_trade_price(entry+d*fee_px,tick,side,"sl");stage="+1R → fee-safe BE"
+            if desired is not None:
+                improves=desired>current_sl+tick*0.1 if d==1 else desired<current_sl-tick*0.1
+                if improves:
+                    ok2,_=amend_tpsl_stop(p,desired)
+                    key=f"ldt:{pid}:{stage}"
+                    if ok2 and not sniper_step_notified.get(key):tg(f"🪜 LDT STEP STOP\n{symbol} {side.upper()}\n{stage} · SL {desired:.8g}");sniper_step_notified[key]=True
+        except Exception as e:
+            tg(f"⚠️ LDT POSITION MANAGER\n{position_symbol(p) if isinstance(p,dict) else '-'}\n{type(e).__name__}: {e}")
+
+
+def maybe_score_report(rows):
+    global _ldt_last_report
+    now=time.time()
+    if now-_ldt_last_report<LDT_REPORT_MIN*60 or not rows:return
+    _ldt_last_report=now
+    ready=[r for r in rows if r.get("side") and not r.get("skip") and r.get("entry_route")]
+    armed=[r for r in rows if "ARMED" in str(r.get("skip","")) or "wait-zone" in str(r.get("skip",""))]
+    waits={}
+    for r in rows:
+        sk=str(r.get("skip") or "READY")
+        key="READY" if sk=="READY" else "zone/retest" if ("ARMED" in sk or "wait-zone" in sk) else "RR" if sk.startswith("RR") else "trigger" if sk.startswith("wait-") else "structure"
+        waits[key]=waits.get(key,0)+1
+    ranked=sorted(rows,key=lambda r:(1 if not r.get("skip") else 0,safe_float(r.get("entry_quality")),safe_float(r.get("setup_quality")),safe_float(r.get("net_rr"))),reverse=True)[:8]
+    lines=[f"🧠 LIQUIDITY DAYTRADER v1.0 · CRT/MSS","Ready %d · Armed/retest %d · scanned %d"%(len(ready),len(armed),len(rows)),
+           "States: "+" · ".join(f"{k} {v}" for k,v in sorted(waits.items(),key=lambda x:x[1],reverse=True)[:4])]
+    for r in ranked:
+        status="🟢 "+str(r.get("entry_route")) if not r.get("skip") else "🟡 "+str(r.get("skip"))
+        lines.append(f"{r.get('symbol')} {str(r.get('side')).upper()} {r.get('strategy')} SQ{safe_float(r.get('setup_quality')):.0f} EQ{safe_float(r.get('entry_quality')):.0f} RR{safe_float(r.get('net_rr')):.2f} {status}")
+    tg("\n".join(lines))
+
+
+def startup_diagnostics():
+    acc=futures_account();reset_daily_if_needed(acc["total_equity"])
+    tg(f"🧠 LIQUIDITY DAYTRADER STARTED v1.0\n"
+       f"NEW strategy — old Structure Fusion signals are disabled.\n"
+       f"CORE: 1H Range Candle → 5M sweep/reclaim → MSS → IFVG/Breaker → retest\n"
+       f"FAST: 15M Range Candle → 1M structure/retest ({'ON' if LDT_ENABLE_FAST else 'OFF'})\n"
+       f"CONT: breakout → pullback → continuation ({'ON' if LDT_ENABLE_CONTINUATION else 'OFF'})\n"
+       f"Pattern families: QM/2B/fakeout · flag/continuation · compression context\n"
+       f"Min net RR {LDT_MIN_NET_RR:.2f}R · max positions {MAX_ACTIVE_POSITIONS} · max same side {LDT_MAX_SAME_SIDE}\n"
+       f"Risk CORE {LDT_CORE_RISK*100:.2f}% · FAST {LDT_FAST_RISK*100:.2f}% · CONT {LDT_CONT_RISK*100:.2f}% · ELITE cap {LDT_ELITE_RISK*100:.2f}%\n"
+       f"Daily loss stop {DAILY_LOSS_LIMIT_PCT:.1f}% · 3 losses → {LOSS_PAUSE_MIN}m pause\n"
+       f"Equity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}\n"
+       f"Risk epoch: {V6_RISK_EPOCH_LOCAL or 'Amsterdam day start'}")
+
+
+def notify_closed_trade(record):
+    global consecutive_losses, loss_pause_until
+    reset_daily_if_needed()
+    symbol=str(record.get("instId","")).replace("-USDT","/USDT:USDT"); side=infer_side(record)
+    entry=safe_float(record.get("openAveragePrice")); exit_price=safe_float(record.get("closeAveragePrice"))
+    gross=safe_float(record.get("realizedPnl")); fee=abs(safe_float(record.get("fee"))); net=gross-fee
+    duration=fmt_duration(record.get("createTime"),record.get("updateTime")); reason=close_reason(record)
+    bucket="short" if side=="short" else "long"
+    daily["trades"]+=1;daily["net"]+=net;daily[f"{bucket}_trades"]+=1;daily[f"{bucket}_net"]+=net
+    if net>=0:
+        daily["wins"]+=1;daily[f"{bucket}_wins"]+=1;consecutive_losses=0;sniper_side_loss_streak[bucket]=0;symbol_last_result[symbol]="win";symbol_loss_streak[symbol]=0
+    else:
+        daily["losses"]+=1;consecutive_losses+=1;sniper_side_loss_streak[bucket]=sniper_side_loss_streak.get(bucket,0)+1;symbol_last_result[symbol]="loss";symbol_loss_streak[symbol]=symbol_loss_streak.get(symbol,0)+1
+        if consecutive_losses>=MAX_CONSECUTIVE_LOSSES:loss_pause_until=time.time()+LOSS_PAUSE_MIN*60
+    symbol_last_trade[symbol]=time.time();update_learning(record,net)
+    tg(f"{'🟢' if net>=0 else '🔴'} LIQUIDITY DAYTRADER CLOSED\n{symbol} {side.upper()}\n"
+       f"Entry {entry:.8g} → Exit {exit_price:.8g}\nGross ${gross:+.2f} · Fee -${fee:.2f} · Net ${net:+.2f}\n"
+       f"{reason} · {duration}\nTODAY: {daily['trades']} trades · W/L {daily['wins']}/{daily['losses']} · Net ${daily['net']:.2f}\n"
+       f"Side loss streak L/S {sniper_side_loss_streak.get('long',0)}/{sniper_side_loss_streak.get('short',0)}"
+       + (f"\n⏸ {MAX_CONSECUTIVE_LOSSES} losses → pause {LOSS_PAUSE_MIN} min" if consecutive_losses>=MAX_CONSECUTIVE_LOSSES else ""))
 
 if __name__ == "__main__":
     main()
