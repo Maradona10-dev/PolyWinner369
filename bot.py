@@ -4619,7 +4619,7 @@ def main():
                 if len(get_positions())>=MAX_ACTIVE_POSITIONS or attempts>=MAX_EXECUTION_ATTEMPTS_PER_SCAN:break
                 allowed,why=sniper_portfolio_allows(s,get_positions())
                 if not allowed:
-                    sniper_last_signal_bar[s["symbol"]]=int(s.get("signal_bar_ts",0));tg(f"⏭️ {s['symbol']} {s['side'].upper()} V6 PORTFOLIO\n{why}");continue
+                    sniper_last_signal_bar[s["symbol"]]=int(s.get("signal_bar_ts",0));tg(f"⏭️ {s['symbol']} {s['side'].upper()} LDT PORTFOLIO\n{why}");continue
                 attempts+=1;opened=open_trade(s);sniper_last_signal_bar[s["symbol"]]=int(s.get("signal_bar_ts",0))
                 if opened:symbol_last_trade[s["symbol"]]=time.time();break
             time.sleep(SCAN_SECONDS)
@@ -7208,13 +7208,15 @@ def sizing_profile(signal):
 
 
 def sniper_portfolio_allows(signal, positions):
-    if len(positions)>=MAX_ACTIVE_POSITIONS:return False,f"max-{MAX_ACTIVE_POSITIONS}-positions"
-    side=signal.get("side"); same=sum(1 for p in positions if position_side(p)==side)
-    if same>=LDT_MAX_SAME_SIDE:return False,f"max-{LDT_MAX_SAME_SIDE}-same-side"
-    # Directional loss streak: do not keep hammering the same market direction.
-    streak=int(sniper_side_loss_streak.get(side,0))
-    if streak>=2 and safe_float(signal.get("setup_quality"))<90:
-        return False,f"{side}-loss-streak-{streak}: needs SQ90"
+    # LDT v1.2.1 portfolio gate. Keep the new strategy isolated from legacy
+    # V6 directional-loss streak state. Risk is already controlled by the
+    # daily loss gate, consecutive-loss pause, max positions and same-side cap.
+    if len(positions)>=MAX_ACTIVE_POSITIONS:
+        return False,f"max-{MAX_ACTIVE_POSITIONS}-positions"
+    side=signal.get("side")
+    same=sum(1 for p in positions if position_side(p)==side)
+    if same>=LDT_MAX_SAME_SIDE:
+        return False,f"max-{LDT_MAX_SAME_SIDE}-same-side"
     return True,"OK"
 
 
@@ -7397,9 +7399,9 @@ def notify_closed_trade(record):
        + (f"\n⏸ {MAX_CONSECUTIVE_LOSSES} losses → pause {LOSS_PAUSE_MIN} min" if consecutive_losses>=MAX_CONSECUTIVE_LOSSES else ""))
 
 # ============================================================
-# LIQUIDITY DAYTRADER v1.1 — STRUCTURE VERIFIED
+# LIQUIDITY DAYTRADER v1.2 — STRUCTURE VERIFIED
 # ============================================================
-# v1.1 is a deliberate correction of v1.0 based on the first live run:
+# v1.2 is a deliberate correction of v1.0 based on the first live run:
 #   1) previous-candle "break" is NOT accepted as BOS/MSS anymore;
 #   2) sweep->MSS must break a confirmed swing with displacement;
 #   3) last-mile trigger must break a confirmed micro swing with displacement;
@@ -7408,7 +7410,7 @@ def notify_closed_trade(record):
 #   6) every stop amendment is checked against the current market price;
 #   7) execution re-validates the structural trigger immediately before order submit.
 
-LDT_VERSION = "1.1"
+LDT_VERSION = "1.2.1"
 LDT11_MICRO_LEFT = int(os.getenv("LDT11_MICRO_LEFT", "2"))
 LDT11_MICRO_RIGHT = int(os.getenv("LDT11_MICRO_RIGHT", "2"))
 LDT11_MICRO_BREAK_ATR = float(os.getenv("LDT11_MICRO_BREAK_ATR", "0.015"))
@@ -7442,7 +7444,7 @@ def _ldt11_bar_strength(row, d, atr):
 
 
 def _ldt_find_sweep_mss(symbol, parent, ltf):
-    """v1.1: external CR sweep/reclaim followed by a CONFIRMED swing MSS + displacement."""
+    """v1.2: external CR sweep/reclaim followed by a CONFIRMED swing MSS + displacement."""
     df=_ldt_closed(_ldt_df(symbol,ltf,240))
     if len(df)<45:return None
     atr=safe_float(df.iloc[-1]["atr"])
@@ -7491,7 +7493,7 @@ def _ldt_find_sweep_mss(symbol, parent, ltf):
 
 
 def _ldt_micro_trigger(symbol, side, tf):
-    """v1.1 structural trigger: confirmed swing BOS/MSS + displacement, never a 2/4 candle score."""
+    """v1.2 structural trigger: confirmed swing BOS/MSS + displacement, never a 2/4 candle score."""
     df=_ldt_closed(_ldt_df(symbol,tf,140))
     if len(df)<35:return False,0,f"{tf} no-structure-data"
     d=1 if side=="long" else -1; a=df.iloc[-1]; atr=safe_float(a["atr"])
@@ -7612,17 +7614,17 @@ def open_trade(signal):
     acc=futures_account(); equity,available=acc["total_equity"],acc["available"]; reset_daily_if_needed(equity)
     if equity<MIN_EQUITY_USDT or available<=0 or (not PAPER_TRADING and protection_lock):return False
     if time.time()-_v62_last_entry_time<4*60:return False
-    # v1.1: structure must STILL be confirmed immediately before exchange submission.
+    # v1.2: structure must STILL be confirmed immediately before exchange submission.
     trig_ok,trig_score,trig_note=_ldt_micro_trigger(symbol,side,signal.get("trigger_tf") or "1m")
     if not trig_ok:
-        tg(f"⏭️ LDT v1.1 {symbol} {side.upper()} STRUCTURE EXPIRED\n{trig_note}\nOrder cancelled before submission."); return False
+        tg(f"⏭️ LDT v1.2 {symbol} {side.upper()} STRUCTURE EXPIRED\n{trig_note}\nOrder cancelled before submission."); return False
     live=safe_float(exchange.fetch_ticker(symbol).get("last"),signal.get("price")); atr=safe_float(signal.get("atr")); zone=signal.get("zone") or {}
     eq=_ldt_zone_entry_quality(live,zone,atr,d)
     if eq<LDT_MIN_ENTRY_QUALITY:
-        tg(f"⏭️ LDT v1.1 {symbol} {side.upper()} ENTRY MOVED\nEQ {eq:.0f} < {LDT_MIN_ENTRY_QUALITY:.0f} · no chase");return False
+        tg(f"⏭️ LDT v1.2 {symbol} {side.upper()} ENTRY MOVED\nEQ {eq:.0f} < {LDT_MIN_ENTRY_QUALITY:.0f} · no chase");return False
     signal_px=safe_float(signal.get("price"),live); drift=d*(live-signal_px)/max(atr,1e-12)
     if drift>LDT_LIVE_DRIFT_ATR:
-        tg(f"⏭️ LDT v1.1 {symbol} {side.upper()} TOO LATE\nAdverse drift {drift:.2f}ATR > {LDT_LIVE_DRIFT_ATR:.2f}ATR");return False
+        tg(f"⏭️ LDT v1.2 {symbol} {side.upper()} TOO LATE\nAdverse drift {drift:.2f}ATR > {LDT_LIVE_DRIFT_ATR:.2f}ATR");return False
     tick=safe_float(get_instrument(symbol).get("tickSize"),0.0001); sl=safe_float(signal.get("structural_stop"))
     if live<=0 or sl<=0:return False
     risk=d*(live-sl)
@@ -7634,14 +7636,14 @@ def open_trade(signal):
     risk=abs(live-sl); final_r=d*(target-live)/max(risk,1e-12)
     cost_r=live*(2*TAKER_FEE_RATE+SLIPPAGE_RATE)/max(risk,1e-12); net_rr=final_r-cost_r
     if net_rr<LDT_MIN_NET_RR:
-        tg(f"⏭️ LDT v1.1 {symbol} {side.upper()} FIRST-LIQUIDITY RR BLOCK\n{target_kind} · net RR {net_rr:.2f} < {LDT_MIN_NET_RR:.2f}");return False
+        tg(f"⏭️ LDT v1.2 {symbol} {side.upper()} FIRST-LIQUIDITY RR BLOCK\n{target_kind} · net RR {net_rr:.2f} < {LDT_MIN_NET_RR:.2f}");return False
     profile=sizing_profile(signal); sizing=calculate_contracts_v5(symbol,live,sl,equity,available,profile["risk_pct"],profile["target_net_tp"],final_r)
     if not sizing or sizing["margin"]>available*AVAILABLE_MARGIN_BUFFER:return False
     before_ids={position_id(p) for p in get_positions() if position_id(p)}; oklev,levres=set_leverage(symbol,LEVERAGE)
-    if not oklev:tg(f"⛔ LDT v1.1 LEVERAGE FAILED\n{symbol}\n{levres}");return False
+    if not oklev:tg(f"⛔ LDT v1.2 LEVERAGE FAILED\n{symbol}\n{levres}");return False
     tag="ldt11"; payload={"instId":blofin_inst_id(symbol),"marginMode":MARGIN_MODE,"positionSide":"net","side":"buy" if side=="long" else "sell","orderType":"market","size":str(sizing["contracts"]),"tpTriggerPrice":str(target),"tpOrderPrice":"-1","tpTriggerPriceType":"mark","slTriggerPrice":str(sl),"slOrderPrice":"-1","slTriggerPriceType":"mark","clientOrderId":f"{tag}{int(time.time()*1000)%1000000000}"}
     if BROKER_ID:payload["brokerId"]=BROKER_ID
-    msg=(f"🎯 {'PAPER ' if PAPER_TRADING else ''}LIQUIDITY DAYTRADER v1.1 STRUCTURE VERIFIED\n{symbol} {side.upper()} · {signal.get('entry_route')}\n"
+    msg=(f"🎯 {'PAPER ' if PAPER_TRADING else ''}LIQUIDITY DAYTRADER v1.2 STRUCTURE VERIFIED\n{symbol} {side.upper()} · {signal.get('entry_route')}\n"
          f"{signal.get('pattern_family')}\nSTR {safe_float(signal.get('setup_quality')):.0f}/95 · EQ {eq:.0f} · first-liq net RR {net_rr:.2f}R\n"
          f"Target {target_kind} · {target:.8g}\n{trig_note}\n{signal.get('btc_note','')}\n"
          f"Entry {live:.8g} · SL {sl:.8g} · TP1/full {target:.8g}\nRisk cap {profile['risk_pct']*100:.2f}% · expected net TP ~${sizing['expected_net_tp_usdt']:.2f}\n"
@@ -7651,23 +7653,23 @@ def open_trade(signal):
     if not native_ok(resp):
         err=response_error(resp)
         if "152012" in err:protection_lock=True
-        tg(f"❌ LDT v1.1 ORDER FAILED\n{symbol} {side.upper()}\n{err}");return False
+        tg(f"❌ LDT v1.2 ORDER FAILED\n{symbol} {side.upper()}\n{err}");return False
     _v62_last_entry_time=time.time();tg(msg);new_pos=find_new_position(symbol,before_ids,timeout=8)
-    if new_pos is None:tg(f"⚠️ {symbol}: v1.1 order accepted, position not visible yet.");return True
+    if new_pos is None:tg(f"⚠️ {symbol}: v1.2 order accepted, position not visible yet.");return True
     pid=position_id(new_pos); fill=position_entry(new_pos) or live
     if pid:
         sniper_managed_positions.add(pid);_ldt_meta[pid]={"risk":risk,"entry":fill,"sl":sl,"tp":target,"final_r":final_r,"side":side,"opened":time.time(),"strategy":signal.get("strategy"),"route":signal.get("entry_route"),"mfe_price":fill,"mfe_r":0.0,"version":"1.1"}
-    if has_live_protection(new_pos)[0]:tg(f"🛡️ LDT v1.1 PROTECTION CONFIRMED\n{symbol} {side.upper()}\nSL/TP visible.");return True
+    if has_live_protection(new_pos)[0]:tg(f"🛡️ LDT v1.2 PROTECTION CONFIRMED\n{symbol} {side.upper()}\nSL/TP visible.");return True
     last=safe_float(exchange.fetch_ticker(symbol).get("last"))
     if tpsl_prices_valid(side,sl,target,last):
         ok,res=place_tpsl_for_position(new_pos,sl,target,client_tag=tag)
-        if ok:tg(f"🛡️ LDT v1.1 FALLBACK PROTECTION CONFIRMED\n{symbol}");return True
-        protection_lock=True;tg(f"🚨 LDT v1.1 PROTECTION FAILURE\n{symbol}\n{res}\nNEW TRADES PAUSED.");return True
-    protection_lock=True;tg(f"🚨 {symbol}: v1.1 position exists but protection could not be verified.\nNEW TRADES PAUSED.");return True
+        if ok:tg(f"🛡️ LDT v1.2 FALLBACK PROTECTION CONFIRMED\n{symbol}");return True
+        protection_lock=True;tg(f"🚨 LDT v1.2 PROTECTION FAILURE\n{symbol}\n{res}\nNEW TRADES PAUSED.");return True
+    protection_lock=True;tg(f"🚨 {symbol}: v1.2 position exists but protection could not be verified.\nNEW TRADES PAUSED.");return True
 
 
 def manage_sniper_step_stops():
-    """v1.1: MFE is observed only AFTER fill. Stop amendments can never cross the live market."""
+    """v1.2: MFE is observed only AFTER fill. Stop amendments can never cross the live market."""
     if PAPER_TRADING:return
     for p in get_positions():
         try:
@@ -7697,9 +7699,9 @@ def manage_sniper_step_stops():
                 continue
             ok2,res=amend_tpsl_stop(p,desired);key=f"ldt11:{pid}:{stage}"
             if ok2 and not sniper_step_notified.get(key):
-                tg(f"🪜 LDT v1.1 STEP STOP\n{symbol} {side.upper()}\n{stage} · MFE {best_r:.2f}R · SL {desired:.8g}");sniper_step_notified[key]=True
+                tg(f"🪜 LDT v1.2 STEP STOP\n{symbol} {side.upper()}\n{stage} · MFE {best_r:.2f}R · SL {desired:.8g}");sniper_step_notified[key]=True
         except Exception as e:
-            tg(f"⚠️ LDT v1.1 POSITION MANAGER\n{position_symbol(p) if isinstance(p,dict) else '-'}\n{type(e).__name__}: {e}")
+            tg(f"⚠️ LDT v1.2 POSITION MANAGER\n{position_symbol(p) if isinstance(p,dict) else '-'}\n{type(e).__name__}: {e}")
 
 
 def maybe_score_report(rows):
@@ -7713,7 +7715,7 @@ def maybe_score_report(rows):
         sk=str(r.get("skip") or "READY"); key="READY" if sk=="READY" else "zone/retest" if ("ARMED" in sk or "wait-zone" in sk) else "RR/liquidity" if sk.startswith("RR") else "structure" if sk.startswith("wait-") else "other"
         waits[key]=waits.get(key,0)+1
     ranked=sorted(rows,key=lambda r:(1 if not r.get("skip") else 0,safe_float(r.get("entry_quality")),safe_float(r.get("net_rr")),safe_float(r.get("setup_quality"))),reverse=True)[:8]
-    lines=["🧠 LIQUIDITY DAYTRADER v1.1 · STRUCTURE VERIFIED",f"Ready {len(ready)} · Armed/retest {len(armed)} · scanned {len(rows)}","States: "+" · ".join(f"{k} {v}" for k,v in sorted(waits.items(),key=lambda x:x[1],reverse=True)[:4])]
+    lines=["🧠 LIQUIDITY DAYTRADER v1.2 · STRUCTURE VERIFIED",f"Ready {len(ready)} · Armed/retest {len(armed)} · scanned {len(rows)}","States: "+" · ".join(f"{k} {v}" for k,v in sorted(waits.items(),key=lambda x:x[1],reverse=True)[:4])]
     for r in ranked:
         status="🟢 "+str(r.get("entry_route")) if not r.get("skip") else "🟡 "+str(r.get("skip"));lines.append(f"{r.get('symbol')} {str(r.get('side')).upper()} {r.get('strategy')} STR{safe_float(r.get('setup_quality')):.0f}/95 EQ{safe_float(r.get('entry_quality')):.0f} RR1st{safe_float(r.get('net_rr')):.2f} {status}")
     tg("\n".join(lines))
@@ -7721,7 +7723,7 @@ def maybe_score_report(rows):
 
 def startup_diagnostics():
     acc=futures_account();reset_daily_if_needed(acc["total_equity"])
-    tg(f"🧠 LIQUIDITY DAYTRADER STARTED v1.1 · STRUCTURE VERIFIED\n"
+    tg(f"🧠 LIQUIDITY DAYTRADER STARTED v1.2 · STRUCTURE VERIFIED\n"
        f"v1.0 candle-score trigger removed.\n"
        f"CORE: 1H CR → 5M external sweep/reclaim → confirmed swing MSS → IFVG/Breaker → 1M swing BOS/displacement\n"
        f"FAST: 15M CR → 1M verified structure ({'ON' if LDT_ENABLE_FAST else 'OFF'})\n"
@@ -7732,6 +7734,216 @@ def startup_diagnostics():
        f"Risk CORE {LDT11_CORE_RISK*100:.2f}% · FAST {LDT11_FAST_RISK*100:.2f}% · CONT {LDT11_CONT_RISK*100:.2f}% · ELITE cap {LDT11_ELITE_RISK*100:.2f}%\n"
        f"Equity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}")
 
+
+
+# ============================================================
+# LIQUIDITY DAYTRADER v1.2 — STRUCTURE VALIDITY WINDOW
+# ============================================================
+# v1.2 keeps the strict swing-based BOS/MSS from v1.1, but a valid structural
+# break no longer has to occur on the newest closed trigger candle.
+# A confirmation remains valid for a small number of CLOSED trigger candles,
+# provided that:
+#   - the opposite structural invalidation swing has not been closed through;
+#   - the setup is still in/near its entry zone (existing EQ/no-chase gates);
+#   - first-liquidity RR is still sufficient at execution;
+#   - the live market has not already traded materially through invalidation.
+# This fixes READY -> EXPIRED merely because the next 1m candle pauses/retests.
+
+LDT_VERSION = "1.2.1"
+LDT12_STRUCTURE_VALID_BARS = int(os.getenv("LDT12_STRUCTURE_VALID_BARS", "4"))
+LDT12_INVALIDATION_ATR_BUFFER = float(os.getenv("LDT12_INVALIDATION_ATR_BUFFER", "0.04"))
+LDT12_LIVE_INVALIDATION_ATR = float(os.getenv("LDT12_LIVE_INVALIDATION_ATR", "0.08"))
+
+
+def _ldt12_structure_state(symbol, side, tf):
+    """Return the newest still-valid swing BOS/MSS in the recent closed-candle window.
+
+    Confirmation candle must satisfy the same strict v1.1 displacement rules.
+    The confirmation may be 0..N-1 bars old. It stays valid until price CLOSES
+    through the opposite pre-BOS swing (with a small ATR buffer). The current
+    forming/live price is checked separately at execution.
+    """
+    df=_ldt_closed(_ldt_df(symbol,tf,180))
+    if len(df)<40:
+        return {"ok":False,"note":f"{tf} no-structure-data","age":999}
+    d=1 if side=="long" else -1
+    last_i=len(df)-1
+    start=max(8, last_i-max(1,LDT12_STRUCTURE_VALID_BARS)+1)
+    candidates=[]
+
+    for i in range(start,last_i+1):
+        row=df.iloc[i]; atr=safe_float(row["atr"])
+        if atr<=0: continue
+        # Only pivots fully confirmed BEFORE this candidate BOS candle are eligible.
+        prior=df.iloc[:i].copy().reset_index(drop=True)
+        highs,lows=_ldt_pivots(prior,LDT11_MICRO_LEFT,LDT11_MICRO_RIGHT)
+        break_piv=(highs[-1] if d==1 and highs else lows[-1] if d==-1 and lows else None)
+        invalid_piv=(lows[-1] if d==1 and lows else highs[-1] if d==-1 and highs else None)
+        if not break_piv: continue
+        _,level=break_piv
+        c=safe_float(row["close"])
+        broke=(c>level+LDT11_MICRO_BREAK_ATR*atr) if d==1 else (c<level-LDT11_MICRO_BREAK_ATR*atr)
+        body,close_loc,directional=_ldt11_bar_strength(row,d,atr)
+        displacement=directional and body>=LDT11_MICRO_BODY_ATR and close_loc>=LDT11_MICRO_CLOSE_LOCATION
+        if not (broke and displacement): continue
+
+        # True structure invalidation uses the opposite confirmed swing that existed
+        # before the BOS. If unavailable, fall back to the BOS candle extreme.
+        invalidation=(invalid_piv[1] if invalid_piv else safe_float(row["low"] if d==1 else row["high"]))
+        age=last_i-i
+        held=True; invalidated_at=None
+        for k in range(i+1,last_i+1):
+            rr=df.iloc[k]; katr=safe_float(rr["atr"],atr) or atr; cc=safe_float(rr["close"])
+            if d==1 and cc < invalidation-LDT12_INVALIDATION_ATR_BUFFER*katr:
+                held=False; invalidated_at=k; break
+            if d==-1 and cc > invalidation+LDT12_INVALIDATION_ATR_BUFFER*katr:
+                held=False; invalidated_at=k; break
+        if not held: continue
+
+        latest=df.iloc[-1]; latest_close=safe_float(latest["close"])
+        ema_side=(latest_close>safe_float(latest["ema21"])) if d==1 else (latest_close<safe_float(latest["ema21"]))
+        vol=safe_float(row["volume"]); vma=safe_float(row["volma"]); vol_ok=(vma<=0 or vol>=vma)
+        candidates.append({
+            "ok":True,"age":age,"level":level,"invalidation":invalidation,"atr":atr,
+            "body":body,"close_loc":close_loc,"ema_side":ema_side,"vol_ok":vol_ok,
+            "confirm_ts":int(safe_float(row.get("ts"),0)),"confirm_i":i,
+        })
+
+    if not candidates:
+        # Preserve a useful current-candle diagnostic for Telegram/scans.
+        a=df.iloc[-1]; atr=safe_float(a["atr"])
+        prior=df.iloc[:-1].copy().reset_index(drop=True)
+        highs,lows=_ldt_pivots(prior,LDT11_MICRO_LEFT,LDT11_MICRO_RIGHT)
+        piv=(highs[-1] if d==1 and highs else lows[-1] if d==-1 and lows else None)
+        if not piv:
+            return {"ok":False,"note":f"{tf} STRUCT WAIT · no confirmed swing in {LDT12_STRUCTURE_VALID_BARS}-bar window","age":999}
+        _,level=piv; c=safe_float(a["close"])
+        broke=(c>level+LDT11_MICRO_BREAK_ATR*atr) if d==1 else (c<level-LDT11_MICRO_BREAK_ATR*atr)
+        body,close_loc,directional=_ldt11_bar_strength(a,d,atr)
+        ema_side=(c>safe_float(a["ema21"])) if d==1 else (c<safe_float(a["ema21"]))
+        vol=safe_float(a["volume"]); vma=safe_float(a["volma"]); vol_ok=(vma<=0 or vol>=vma)
+        note=(f"{tf} STRUCT WAIT window={LDT12_STRUCTURE_VALID_BARS} swing={level:.8g} "
+              f"BOS={int(broke)} disp={body:.2f}ATR close={close_loc:.0%} EMA={int(ema_side)} vol={int(vol_ok)}")
+        return {"ok":False,"note":note,"age":999,"level":level,"atr":atr}
+
+    # Newest valid confirmation wins.
+    st=max(candidates,key=lambda x:x["confirm_i"])
+    st["strength"]=2+int(st["ema_side"])+int(st["vol_ok"])
+    st["note"]=(f"{tf} STRUCT HOLD age={st['age']}/{LDT12_STRUCTURE_VALID_BARS-1} "
+                f"BOS={st['level']:.8g} inv={st['invalidation']:.8g} "
+                f"disp={st['body']:.2f}ATR close={st['close_loc']:.0%} "
+                f"EMA={int(st['ema_side'])} vol={int(st['vol_ok'])}")
+    return st
+
+
+def _ldt_micro_trigger(symbol, side, tf):
+    """v1.2: strict BOS/MSS confirmation with a multi-candle validity window."""
+    st=_ldt12_structure_state(symbol,side,tf)
+    return bool(st.get("ok")),int(st.get("strength",0)),str(st.get("note",f"{tf} STRUCT WAIT"))
+
+
+# Keep a reference to the inherited v1.2-labelled position manager; only entry validation changes.
+
+def open_trade(signal):
+    global protection_lock, _v62_last_entry_time
+    symbol,side=signal["symbol"],signal["side"]; d=1 if side=="long" else -1
+    acc=futures_account(); equity,available=acc["total_equity"],acc["available"]; reset_daily_if_needed(equity)
+    if equity<MIN_EQUITY_USDT or available<=0 or (not PAPER_TRADING and protection_lock):return False
+    if time.time()-_v62_last_entry_time<4*60:return False
+
+    # v1.2: a recent strict BOS/MSS may remain valid across pause/retest candles.
+    # It expires only by age or actual structural invalidation, not merely BOS=0 on the newest candle.
+    st=_ldt12_structure_state(symbol,side,signal.get("trigger_tf") or "1m")
+    if not st.get("ok"):
+        tg(f"⏭️ LDT v1.2 {symbol} {side.upper()} STRUCTURE NOT VALID\n{st.get('note','')}\nOrder cancelled before submission."); return False
+
+    live=safe_float(exchange.fetch_ticker(symbol).get("last"),signal.get("price")); atr=safe_float(signal.get("atr")); zone=signal.get("zone") or {}
+    # Hard live-price invalidation guard: don't wait for candle close if price has already
+    # materially crossed the structural invalidation swing.
+    inv=safe_float(st.get("invalidation")); statr=safe_float(st.get("atr"),atr) or atr
+    if inv>0:
+        live_invalid=(live < inv-LDT12_LIVE_INVALIDATION_ATR*statr) if d==1 else (live > inv+LDT12_LIVE_INVALIDATION_ATR*statr)
+        if live_invalid:
+            tg(f"⏭️ LDT v1.2 {symbol} {side.upper()} LIVE STRUCTURE INVALIDATED\n"
+               f"mark {live:.8g} crossed invalidation {inv:.8g} · no order"); return False
+
+    eq=_ldt_zone_entry_quality(live,zone,atr,d)
+    if eq<LDT_MIN_ENTRY_QUALITY:
+        tg(f"⏭️ LDT v1.2 {symbol} {side.upper()} ENTRY MOVED\nEQ {eq:.0f} < {LDT_MIN_ENTRY_QUALITY:.0f} · no chase");return False
+    signal_px=safe_float(signal.get("price"),live); drift=d*(live-signal_px)/max(atr,1e-12)
+    if drift>LDT_LIVE_DRIFT_ATR:
+        tg(f"⏭️ LDT v1.2 {symbol} {side.upper()} TOO LATE\nAdverse drift {drift:.2f}ATR > {LDT_LIVE_DRIFT_ATR:.2f}ATR");return False
+    tick=safe_float(get_instrument(symbol).get("tickSize"),0.0001); sl=safe_float(signal.get("structural_stop"))
+    if live<=0 or sl<=0:return False
+    risk=d*(live-sl)
+    if risk<=0:return False
+    hard=safe_float(signal.get("far_target") or signal.get("target_price")); ltf="1m" if signal.get("route")=="FAST" else "5m"
+    target,target_kind,gross_rr=_ldt11_first_liquidity_target(symbol,side,live,sl,hard,ltf)
+    sl=round_trade_price(sl,tick,side,"sl"); target=round_trade_price(target,tick,side,"tp")
+    risk=abs(live-sl); final_r=d*(target-live)/max(risk,1e-12)
+    cost_r=live*(2*TAKER_FEE_RATE+SLIPPAGE_RATE)/max(risk,1e-12); net_rr=final_r-cost_r
+    if net_rr<LDT_MIN_NET_RR:
+        tg(f"⏭️ LDT v1.2 {symbol} {side.upper()} FIRST-LIQUIDITY RR BLOCK\n{target_kind} · net RR {net_rr:.2f} < {LDT_MIN_NET_RR:.2f}");return False
+    profile=sizing_profile(signal); sizing=calculate_contracts_v5(symbol,live,sl,equity,available,profile["risk_pct"],profile["target_net_tp"],final_r)
+    if not sizing or sizing["margin"]>available*AVAILABLE_MARGIN_BUFFER:return False
+    before_ids={position_id(p) for p in get_positions() if position_id(p)}; oklev,levres=set_leverage(symbol,LEVERAGE)
+    if not oklev:tg(f"⛔ LDT v1.2 LEVERAGE FAILED\n{symbol}\n{levres}");return False
+    tag="ldt12"; payload={"instId":blofin_inst_id(symbol),"marginMode":MARGIN_MODE,"positionSide":"net","side":"buy" if side=="long" else "sell","orderType":"market","size":str(sizing["contracts"]),"tpTriggerPrice":str(target),"tpOrderPrice":"-1","tpTriggerPriceType":"mark","slTriggerPrice":str(sl),"slOrderPrice":"-1","slTriggerPriceType":"mark","clientOrderId":f"{tag}{int(time.time()*1000)%1000000000}"}
+    if BROKER_ID:payload["brokerId"]=BROKER_ID
+    msg=(f"🎯 {'PAPER ' if PAPER_TRADING else ''}LIQUIDITY DAYTRADER v1.2 STRUCTURE WINDOW\n{symbol} {side.upper()} · {signal.get('entry_route')}\n"
+         f"{signal.get('pattern_family')}\nSTR {safe_float(signal.get('setup_quality')):.0f}/95 · EQ {eq:.0f} · first-liq net RR {net_rr:.2f}R\n"
+         f"Target {target_kind} · {target:.8g}\n{st.get('note','')}\n{signal.get('btc_note','')}\n"
+         f"Entry {live:.8g} · SL {sl:.8g} · TP1/full {target:.8g}\nRisk cap {profile['risk_pct']*100:.2f}% · expected net TP ~${sizing['expected_net_tp_usdt']:.2f}\n"
+         f"Notional ${sizing['notional']:.2f} · Margin ${sizing['margin']:.2f} · {LEVERAGE}x")
+    if PAPER_TRADING:tg(msg);_v62_last_entry_time=time.time();return True
+    resp=native("private_post_trade_order",payload)
+    if not native_ok(resp):
+        err=response_error(resp)
+        if "152012" in err:protection_lock=True
+        tg(f"❌ LDT v1.2 ORDER FAILED\n{symbol} {side.upper()}\n{err}");return False
+    _v62_last_entry_time=time.time();tg(msg);new_pos=find_new_position(symbol,before_ids,timeout=8)
+    if new_pos is None:tg(f"⚠️ {symbol}: v1.2 order accepted, position not visible yet.");return True
+    pid=position_id(new_pos); fill=position_entry(new_pos) or live
+    if pid:
+        sniper_managed_positions.add(pid);_ldt_meta[pid]={"risk":risk,"entry":fill,"sl":sl,"tp":target,"final_r":final_r,"side":side,"opened":time.time(),"strategy":signal.get("strategy"),"route":signal.get("entry_route"),"mfe_price":fill,"mfe_r":0.0,"version":"1.2","structure_confirm_ts":st.get("confirm_ts"),"structure_invalidation":inv}
+    if has_live_protection(new_pos)[0]:tg(f"🛡️ LDT v1.2 PROTECTION CONFIRMED\n{symbol} {side.upper()}\nSL/TP visible.");return True
+    last=safe_float(exchange.fetch_ticker(symbol).get("last"))
+    if tpsl_prices_valid(side,sl,target,last):
+        ok,res=place_tpsl_for_position(new_pos,sl,target,client_tag=tag)
+        if ok:tg(f"🛡️ LDT v1.2 FALLBACK PROTECTION CONFIRMED\n{symbol}");return True
+        protection_lock=True;tg(f"🚨 LDT v1.2 PROTECTION FAILURE\n{symbol}\n{res}\nNEW TRADES PAUSED.");return True
+    protection_lock=True;tg(f"🚨 {symbol}: v1.2 position exists but protection could not be verified.\nNEW TRADES PAUSED.");return True
+
+
+def maybe_score_report(rows):
+    global _ldt_last_report
+    now=time.time()
+    if now-_ldt_last_report<LDT_REPORT_MIN*60 or not rows:return
+    _ldt_last_report=now;ready=[r for r in rows if r.get("side") and not r.get("skip") and r.get("entry_route")]
+    armed=[r for r in rows if "ARMED" in str(r.get("skip","")) or "wait-zone" in str(r.get("skip",""))]
+    waits={}
+    for r in rows:
+        sk=str(r.get("skip") or "READY"); key="READY" if sk=="READY" else "zone/retest" if ("ARMED" in sk or "wait-zone" in sk) else "RR/liquidity" if sk.startswith("RR") else "structure" if sk.startswith("wait-") else "other"
+        waits[key]=waits.get(key,0)+1
+    ranked=sorted(rows,key=lambda r:(1 if not r.get("skip") else 0,safe_float(r.get("entry_quality")),safe_float(r.get("net_rr")),safe_float(r.get("setup_quality"))),reverse=True)[:8]
+    lines=["🧠 LIQUIDITY DAYTRADER v1.2.1 · STRUCTURE WINDOW",f"Ready {len(ready)} · Armed/retest {len(armed)} · scanned {len(rows)}","States: "+" · ".join(f"{k} {v}" for k,v in sorted(waits.items(),key=lambda x:x[1],reverse=True)[:4])]
+    for r in ranked:
+        status="🟢 "+str(r.get("entry_route")) if not r.get("skip") else "🟡 "+str(r.get("skip"));lines.append(f"{r.get('symbol')} {str(r.get('side')).upper()} {r.get('strategy')} STR{safe_float(r.get('setup_quality')):.0f}/95 EQ{safe_float(r.get('entry_quality')):.0f} RR1st{safe_float(r.get('net_rr')):.2f} {status}")
+    tg("\n".join(lines))
+
+
+def startup_diagnostics():
+    acc=futures_account();reset_daily_if_needed(acc["total_equity"])
+    tg(f"🧠 LIQUIDITY DAYTRADER STARTED v1.2.1 · STRUCTURE WINDOW\n"
+       f"Strict swing BOS/MSS retained; confirmation valid for {LDT12_STRUCTURE_VALID_BARS} closed trigger candles.\n"
+       f"No repeated BOS required on every next 1M candle. Structure expires only by age or real swing invalidation.\n"
+       f"CORE: 1H CR → 5M sweep/reclaim → MSS → IFVG/Breaker → 1M structure window\n"
+       f"FAST: 15M CR → 1M structure window ({'ON' if LDT_ENABLE_FAST else 'OFF'})\n"
+       f"CONT: breakout → retest → swing BOS/displacement → validity window ({'ON' if LDT_ENABLE_CONTINUATION else 'OFF'})\n"
+       f"Execution still rechecks EQ/no-chase + live invalidation + first-liquidity RR.\n"
+       f"Min first-liquidity net RR {LDT_MIN_NET_RR:.2f}R · max positions {MAX_ACTIVE_POSITIONS} · max same side {LDT_MAX_SAME_SIDE}\n"
+       f"Risk CORE {LDT11_CORE_RISK*100:.2f}% · FAST {LDT11_FAST_RISK*100:.2f}% · CONT {LDT11_CONT_RISK*100:.2f}% · ELITE cap {LDT11_ELITE_RISK*100:.2f}%\n"
+       f"Equity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}")
 
 if __name__ == "__main__":
     main()
