@@ -7945,5 +7945,446 @@ def startup_diagnostics():
        f"Risk CORE {LDT11_CORE_RISK*100:.2f}% · FAST {LDT11_FAST_RISK*100:.2f}% · CONT {LDT11_CONT_RISK*100:.2f}% · ELITE cap {LDT11_ELITE_RISK*100:.2f}%\n"
        f"Equity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}")
 
+
+# ============================================================
+# LIQUIDITY DAYTRADER v1.3 — STATEFUL LIQUIDITY HUNTER
+# ============================================================
+# Architectural change from v1.2.1:
+#   - setups are no longer treated as one-scan snapshots;
+#   - a valid thesis is stored and followed across scans;
+#   - state progression: TRACKING -> WAIT_RETRACE -> IN_ZONE ->
+#     STRUCT_HOLD/READY -> EXECUTE, or INVALIDATED/EXPIRED;
+#   - 4-candle structure window from v1.2.1 is retained;
+#   - RR/EQ/stop/live invalidation are re-evaluated continuously;
+#   - all viable candidates per symbol are considered, avoiding a high-EQ
+#     but already-spent setup hiding a better state-worthy setup.
+
+LDT_VERSION = "1.3.0"
+LDT13_STATE_FILE = os.getenv("LDT13_STATE_FILE", "ldt13_state.json")
+LDT13_CORE_TTL_MIN = int(os.getenv("LDT13_CORE_TTL_MIN", "120"))
+LDT13_CONT_TTL_MIN = int(os.getenv("LDT13_CONT_TTL_MIN", "90"))
+LDT13_FAST_TTL_MIN = int(os.getenv("LDT13_FAST_TTL_MIN", "35"))
+LDT13_MIN_TRACK_RR = float(os.getenv("LDT13_MIN_TRACK_RR", str(LDT_MIN_NET_RR)))
+LDT13_MIN_TRACK_STR = float(os.getenv("LDT13_MIN_TRACK_STR", str(LDT_MIN_SETUP_QUALITY)))
+LDT13_REPLACE_EDGE = float(os.getenv("LDT13_REPLACE_EDGE", "5"))
+LDT13_NOTIFY_TRANSITIONS = os.getenv("LDT13_NOTIFY_TRANSITIONS", "true").lower() == "true"
+
+_ldt13_states = {}
+_ldt13_loaded = False
+_ldt13_last_report = 0.0
+_ldt13_base_open_trade = open_trade
+
+
+def _ldt13_jsonable(v):
+    if isinstance(v, dict):
+        return {str(k): _ldt13_jsonable(x) for k, x in v.items() if k not in ("df", "sub")}
+    if isinstance(v, (list, tuple)):
+        return [_ldt13_jsonable(x) for x in v]
+    if isinstance(v, (str, int, float, bool)) or v is None:
+        return v
+    try:
+        if hasattr(v, "item"):
+            return v.item()
+    except Exception:
+        pass
+    try:
+        return float(v)
+    except Exception:
+        return str(v)
+
+
+def _ldt13_save():
+    try:
+        tmp = LDT13_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_ldt13_jsonable(_ldt13_states), f, ensure_ascii=False, indent=2)
+        os.replace(tmp, LDT13_STATE_FILE)
+    except Exception:
+        pass
+
+
+def _ldt13_load():
+    global _ldt13_loaded, _ldt13_states
+    if _ldt13_loaded:
+        return
+    _ldt13_loaded = True
+    try:
+        if os.path.exists(LDT13_STATE_FILE):
+            with open(LDT13_STATE_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                _ldt13_states = raw
+    except Exception:
+        _ldt13_states = {}
+
+
+def _ldt13_ttl_min(signal):
+    if str(signal.get("route")) == "FAST":
+        return LDT13_FAST_TTL_MIN
+    if str(signal.get("strategy")) == "BREAK-RETEST":
+        return LDT13_CONT_TTL_MIN
+    return LDT13_CORE_TTL_MIN
+
+
+def _ldt13_scan_candidates(symbol):
+    """Return ALL current LDT candidates instead of only the best snapshot."""
+    candidates = []
+    pairs = [("CORE", "1h", "5m", "1m")]
+    if LDT_ENABLE_FAST:
+        pairs.append(("FAST", "15m", "1m", "1m"))
+    for route, ptf, ltf, ttf in pairs:
+        try:
+            parents = _ldt_parent_candidates(symbol, ptf)
+        except Exception:
+            continue
+        for parent in parents[:3]:
+            try:
+                rev = _ldt_find_sweep_mss(symbol, parent, ltf)
+                if rev:
+                    s = _ldt_build_reversal(symbol, parent, rev, route, ltf, ttf)
+                    if s:
+                        candidates.append(s)
+                if LDT_ENABLE_CONTINUATION:
+                    cont = _ldt_break_retest(symbol, parent, ltf)
+                    if cont:
+                        s = _ldt_build_cont(symbol, parent, cont, route, ltf, ttf)
+                        if s:
+                            candidates.append(s)
+            except Exception:
+                continue
+    return candidates
+
+
+def _ldt13_risk_atr(signal):
+    atr = safe_float(signal.get("atr"))
+    risk = abs(safe_float(signal.get("risk_distance")))
+    if atr <= 0:
+        return 999.0
+    return risk / atr
+
+
+def _ldt13_trackable(signal):
+    if not signal or not signal.get("side"):
+        return False
+    sk = str(signal.get("skip") or "")
+    if sk.startswith("stale") or sk.startswith("stop-"):
+        return False
+    if safe_float(signal.get("setup_quality")) < LDT13_MIN_TRACK_STR:
+        return False
+    ra = _ldt13_risk_atr(signal)
+    if ra < LDT_MIN_STOP_ATR or ra > LDT_MAX_STOP_ATR:
+        return False
+    # A new thesis must still have real economic room when discovered.
+    if safe_float(signal.get("net_rr")) < LDT13_MIN_TRACK_RR:
+        return False
+    return True
+
+
+def _ldt13_candidate_rank(s):
+    sk = str(s.get("skip") or "")
+    ready = 1 if not sk and s.get("entry_route") else 0
+    structural = 1 if ("STRUCT" in str(s.get("trigger_note", "")) or sk.startswith("wait-")) else 0
+    return (ready, structural, safe_float(s.get("setup_quality")), safe_float(s.get("entry_quality")), safe_float(s.get("net_rr")))
+
+
+def _ldt13_best_trackable(candidates):
+    xs = [s for s in candidates if _ldt13_trackable(s)]
+    return max(xs, key=_ldt13_candidate_rank) if xs else None
+
+
+def _ldt13_best_diagnostic(candidates):
+    if not candidates:
+        return None
+    return max(candidates, key=lambda s: (
+        1 if not s.get("skip") else 0,
+        safe_float(s.get("setup_quality")),
+        safe_float(s.get("entry_quality")),
+        safe_float(s.get("net_rr")),
+    ))
+
+
+def _ldt13_new_state(signal):
+    now = time.time()
+    return {
+        "symbol": signal.get("symbol"),
+        "side": signal.get("side"),
+        "strategy": signal.get("strategy"),
+        "route": signal.get("route"),
+        "created": now,
+        "updated": now,
+        "expires": now + 60 * _ldt13_ttl_min(signal),
+        "state": "TRACKING",
+        "last_state": "",
+        "signal": _ldt13_jsonable(signal),
+        "initial_target": safe_float(signal.get("target_price")),
+        "initial_far_target": safe_float(signal.get("far_target") or signal.get("target_price")),
+        "best_rr": safe_float(signal.get("net_rr")),
+        "best_eq": safe_float(signal.get("entry_quality")),
+        "transitions": 0,
+    }
+
+
+def _ldt13_transition(st, new_state, note=""):
+    old = str(st.get("state") or "")
+    st["last_state"] = old
+    st["state"] = new_state
+    st["state_note"] = note
+    st["updated"] = time.time()
+    if old != new_state:
+        st["transitions"] = int(st.get("transitions", 0)) + 1
+        if LDT13_NOTIFY_TRANSITIONS and new_state in ("IN_ZONE", "STRUCT_HOLD", "READY", "INVALIDATED", "EXPIRED"):
+            sym = st.get("symbol"); side = str(st.get("side", "")).upper()
+            tg(f"🧭 LDT v1.3 {sym} {side} · {new_state}\n{note}")
+    return old != new_state
+
+
+def _ldt13_merge_fresh(st, fresh):
+    if not fresh:
+        return
+    oldsig = st.get("signal") or {}
+    # Preserve the thesis identity, but refresh all current economics/zone fields.
+    merged = dict(oldsig)
+    merged.update(_ldt13_jsonable(fresh))
+    st["signal"] = merged
+    st["updated"] = time.time()
+    st["best_rr"] = max(safe_float(st.get("best_rr")), safe_float(fresh.get("net_rr")))
+    st["best_eq"] = max(safe_float(st.get("best_eq")), safe_float(fresh.get("entry_quality")))
+
+
+def _ldt13_same_thesis(st, s):
+    return bool(s and str(st.get("side")) == str(s.get("side")) and str(st.get("strategy")) == str(s.get("strategy")) and str(st.get("route")) == str(s.get("route")))
+
+
+def _ldt13_refresh_state(st):
+    """Re-price an existing thesis without demanding the entire setup be rediscovered."""
+    signal = dict(st.get("signal") or {})
+    symbol = st.get("symbol"); side = st.get("side")
+    if not symbol or side not in ("long", "short"):
+        _ldt13_transition(st, "INVALIDATED", "missing thesis identity")
+        return None
+    d = 1 if side == "long" else -1
+    now = time.time()
+    if now > safe_float(st.get("expires")):
+        _ldt13_transition(st, "EXPIRED", f"thesis age > {_ldt13_ttl_min(signal)} min")
+        return None
+    try:
+        live = safe_float(exchange.fetch_ticker(symbol).get("last"), safe_float(signal.get("price")))
+    except Exception:
+        live = safe_float(signal.get("price"))
+    atr = safe_float(signal.get("atr")); stop = safe_float(signal.get("structural_stop")); zone = signal.get("zone") or {}
+    if live <= 0 or atr <= 0 or stop <= 0 or not zone:
+        _ldt13_transition(st, "INVALIDATED", "missing live/ATR/stop/zone")
+        return None
+
+    # The original structural stop is the thesis invalidation. A tiny live buffer
+    # prevents a one-tick print from killing the thesis prematurely.
+    invalid_buf = LDT12_LIVE_INVALIDATION_ATR * atr
+    if (d == 1 and live < stop - invalid_buf) or (d == -1 and live > stop + invalid_buf):
+        _ldt13_transition(st, "INVALIDATED", f"price {live:.8g} crossed thesis invalidation {stop:.8g}")
+        return None
+
+    risk = d * (live - stop)
+    if risk <= 0:
+        _ldt13_transition(st, "INVALIDATED", "price crossed structural stop")
+        return None
+    risk_atr = risk / atr
+    if risk_atr > LDT_MAX_STOP_ATR:
+        _ldt13_transition(st, "WAIT_RETRACE", f"stop currently {risk_atr:.2f}ATR > {LDT_MAX_STOP_ATR:.2f}ATR")
+    elif risk_atr < LDT_MIN_STOP_ATR:
+        _ldt13_transition(st, "WAIT_RETRACE", f"stop currently {risk_atr:.2f}ATR < {LDT_MIN_STOP_ATR:.2f}ATR")
+
+    initial_target = safe_float(st.get("initial_target") or signal.get("target_price"))
+    # The first-liquidity objective is frozen when the thesis is born. Do not
+    # move the goalposts forward after price already delivered the original target.
+    if initial_target > 0 and ((d == 1 and live >= initial_target) or (d == -1 and live <= initial_target)):
+        _ldt13_transition(st, "EXPIRED", f"original first liquidity {initial_target:.8g} already delivered")
+        return None
+    far = initial_target or safe_float(st.get("initial_far_target") or signal.get("far_target") or signal.get("target_price"))
+    ltf = "1m" if str(signal.get("route")) == "FAST" else "5m"
+    target, target_kind, gross_rr = _ldt11_first_liquidity_target(symbol, side, live, stop, far, ltf)
+    cost_r = live * (2 * TAKER_FEE_RATE + SLIPPAGE_RATE) / max(risk, 1e-12)
+    net_rr = gross_rr - cost_r
+    eq = _ldt_zone_entry_quality(live, zone, atr, d)
+    lo = safe_float(zone.get("lo")); hi = safe_float(zone.get("hi"))
+    in_zone = (lo - LDT_ZONE_TOL_ATR * atr <= live <= hi + LDT_ZONE_TOL_ATR * atr)
+
+    trigger_tf = signal.get("trigger_tf") or "1m"
+    struct = _ldt12_structure_state(symbol, side, trigger_tf)
+    struct_ok = bool(struct.get("ok"))
+
+    signal.update({
+        "price": live,
+        "entry_quality": eq,
+        "quality": 0.60 * safe_float(signal.get("setup_quality")) + 0.40 * eq,
+        "risk_distance": risk,
+        "target_price": target,
+        "target_kind": target_kind,
+        "final_r": gross_rr,
+        "net_rr": net_rr,
+        "trigger_note": struct.get("note", ""),
+        "confirmations": int(struct.get("strength", 0)) + 1,
+        "ldt13_state": st.get("state"),
+        "ldt13_age_min": (now - safe_float(st.get("created"))) / 60.0,
+    })
+    st["signal"] = _ldt13_jsonable(signal)
+    st["best_rr"] = max(safe_float(st.get("best_rr")), net_rr)
+    st["best_eq"] = max(safe_float(st.get("best_eq")), eq)
+
+    if risk_atr < LDT_MIN_STOP_ATR or risk_atr > LDT_MAX_STOP_ATR:
+        signal["skip"] = f"TRACK-stop-{risk_atr:.2f}ATR"
+        signal["entry_route"] = None
+        return signal
+    if net_rr < LDT_MIN_NET_RR:
+        _ldt13_transition(st, "WAIT_RETRACE", f"first-liq RR {net_rr:.2f}R; wait for better price")
+        signal["skip"] = f"TRACK-RR {net_rr:.2f}<{LDT_MIN_NET_RR:.2f}"
+        signal["entry_route"] = None
+        return signal
+    if not in_zone or eq < LDT_MIN_ENTRY_QUALITY:
+        _ldt13_transition(st, "WAIT_RETRACE", f"EQ {eq:.0f}; waiting zone {lo:.8g}-{hi:.8g}")
+        signal["skip"] = f"TRACK-wait-retrace EQ{eq:.0f}"
+        signal["entry_route"] = None
+        return signal
+    if not struct_ok:
+        _ldt13_transition(st, "IN_ZONE", f"zone reached · {struct.get('note','waiting structure')}")
+        signal["skip"] = f"TRACK-in-zone · {struct.get('note','STRUCT WAIT')}"
+        signal["entry_route"] = None
+        return signal
+
+    age = int(struct.get("age", 0))
+    _ldt13_transition(st, "READY" if age == 0 else "STRUCT_HOLD", struct.get("note", "structure valid"))
+    signal["skip"] = None
+    base_route = str(signal.get("entry_route") or "")
+    if not base_route:
+        base_route = ("CRT-" + str(signal.get("route", "CORE")) + "-SV") if signal.get("strategy") == "CRT-MSS" else ("CONT-" + str(signal.get("route", "CORE")) + "-SV")
+    signal["entry_route"] = base_route + "-STATE"
+    # Let main retry on a later minute if execution revalidation blocks this attempt.
+    signal["signal_bar_ts"] = int(time.time() // 60)
+    return signal
+
+
+def evaluate_symbol(symbol, btc=None):
+    """v1.3: discover once, then follow the thesis across later scans."""
+    _ldt13_load()
+    candidates = _ldt13_scan_candidates(symbol)
+    fresh = _ldt13_best_trackable(candidates)
+    st = _ldt13_states.get(symbol)
+
+    if st:
+        # A strong opposite thesis may replace an old one; don't keep stale directional bias forever.
+        if fresh and str(fresh.get("side")) != str(st.get("side")):
+            oldq = safe_float((st.get("signal") or {}).get("setup_quality"))
+            if safe_float(fresh.get("setup_quality")) >= oldq + LDT13_REPLACE_EDGE:
+                _ldt13_transition(st, "INVALIDATED", f"replaced by stronger {fresh.get('side')} thesis")
+                st = _ldt13_new_state(fresh)
+                _ldt13_states[symbol] = st
+        elif fresh and _ldt13_same_thesis(st, fresh):
+            _ldt13_merge_fresh(st, fresh)
+
+        out = _ldt13_refresh_state(st)
+        if out is None or st.get("state") in ("INVALIDATED", "EXPIRED"):
+            _ldt13_states.pop(symbol, None)
+            _ldt13_save()
+            # If a new independent thesis exists, start it immediately.
+            if fresh and _ldt13_trackable(fresh):
+                st = _ldt13_new_state(fresh); _ldt13_states[symbol] = st
+                out = _ldt13_refresh_state(st)
+            else:
+                return _ldt13_best_diagnostic(candidates)
+        _ldt13_save()
+        return out
+
+    if fresh:
+        st = _ldt13_new_state(fresh)
+        _ldt13_states[symbol] = st
+        out = _ldt13_refresh_state(st)
+        _ldt13_save()
+        return out
+
+    return _ldt13_best_diagnostic(candidates)
+
+
+def open_trade(signal):
+    """v1.3 delegates exchange execution to the hardened v1.2.1 shell after a final state refresh."""
+    symbol = signal.get("symbol")
+    st = _ldt13_states.get(symbol)
+    if st:
+        fresh = _ldt13_refresh_state(st)
+        _ldt13_save()
+        if not fresh or fresh.get("skip") or not fresh.get("entry_route"):
+            tg(f"⏭️ LDT v1.3 {symbol} {str(signal.get('side')).upper()} STATE CHANGED\n"
+               f"{(fresh or {}).get('skip') or st.get('state_note','not ready')}\nOrder cancelled before submission.")
+            return False
+        signal = fresh
+    # Reset snapshot price to the current state price so the inherited no-chase
+    # guard measures execution drift, not thesis age.
+    try:
+        signal["price"] = safe_float(exchange.fetch_ticker(symbol).get("last"), signal.get("price"))
+    except Exception:
+        pass
+    opened = _ldt13_base_open_trade(signal)
+    if opened and symbol in _ldt13_states:
+        _ldt13_states.pop(symbol, None)
+        _ldt13_save()
+    return opened
+
+
+def maybe_score_report(rows):
+    global _ldt13_last_report
+    now = time.time()
+    if now - _ldt13_last_report < LDT_REPORT_MIN * 60 or not rows:
+        return
+    _ldt13_last_report = now
+    _ldt13_load()
+    ready = [r for r in rows if r.get("side") and not r.get("skip") and r.get("entry_route")]
+    tracked = [r for r in rows if str(r.get("skip", "")).startswith("TRACK")]
+    state_counts = {}
+    for st in _ldt13_states.values():
+        k = str(st.get("state") or "TRACKING")
+        state_counts[k] = state_counts.get(k, 0) + 1
+    ranked = sorted(rows, key=lambda r: (
+        1 if not r.get("skip") else 0,
+        1 if str(r.get("skip", "")).startswith("TRACK") else 0,
+        safe_float(r.get("entry_quality")), safe_float(r.get("net_rr")), safe_float(r.get("setup_quality"))
+    ), reverse=True)[:9]
+    state_text = " · ".join(f"{k} {v}" for k, v in sorted(state_counts.items(), key=lambda x: x[1], reverse=True)[:5]) or "none"
+    lines = [
+        "🧠 LIQUIDITY DAYTRADER v1.3 · STATEFUL LIQUIDITY HUNTER",
+        f"Ready {len(ready)} · Tracked {len(_ldt13_states)} · scanned {len(rows)}",
+        f"Theses: {state_text}",
+    ]
+    for r in ranked:
+        st = _ldt13_states.get(r.get("symbol"), {})
+        age = (now - safe_float(st.get("created"), now)) / 60.0 if st else 0.0
+        if not r.get("skip"):
+            status = "🟢 EXECUTE"
+        elif str(r.get("skip", "")).startswith("TRACK"):
+            status = f"🟠 {st.get('state','TRACK')} {age:.0f}m"
+        else:
+            status = "🟡 " + str(r.get("skip"))
+        lines.append(
+            f"{r.get('symbol')} {str(r.get('side')).upper()} {r.get('strategy')} "
+            f"STR{safe_float(r.get('setup_quality')):.0f}/95 EQ{safe_float(r.get('entry_quality')):.0f} "
+            f"RR1st{safe_float(r.get('net_rr')):.2f} {status}"
+        )
+    tg("\n".join(lines))
+
+
+def startup_diagnostics():
+    _ldt13_load()
+    acc = futures_account(); reset_daily_if_needed(acc["total_equity"])
+    tg(
+        "🧠 LIQUIDITY DAYTRADER STARTED v1.3 · STATEFUL LIQUIDITY HUNTER\n"
+        "A setup is now remembered and followed across scans instead of requiring every condition simultaneously.\n"
+        "State flow: TRACKING → WAIT_RETRACE → IN_ZONE → STRUCT_HOLD/READY → EXECUTE.\n"
+        "Invalidation: structural stop crossed, first liquidity already delivered, or thesis TTL expires.\n"
+        f"TTL CORE {LDT13_CORE_TTL_MIN}m · CONT {LDT13_CONT_TTL_MIN}m · FAST {LDT13_FAST_TTL_MIN}m.\n"
+        f"Structure confirmation window remains {LDT12_STRUCTURE_VALID_BARS} closed 1m candles.\n"
+        f"Min first-liquidity net RR {LDT_MIN_NET_RR:.2f}R · stop {LDT_MIN_STOP_ATR:.2f}-{LDT_MAX_STOP_ATR:.2f}ATR.\n"
+        f"Risk CORE {LDT11_CORE_RISK*100:.2f}% · FAST {LDT11_FAST_RISK*100:.2f}% · CONT {LDT11_CONT_RISK*100:.2f}% · ELITE cap {LDT11_ELITE_RISK*100:.2f}%.\n"
+        f"Max positions {MAX_ACTIVE_POSITIONS} · max same side {LDT_MAX_SAME_SIDE}.\n"
+        f"Restored tracked theses: {len(_ldt13_states)} · Equity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}"
+    )
+
+
 if __name__ == "__main__":
     main()
