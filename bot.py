@@ -9252,7 +9252,7 @@ LDT_VERSION = "1.5.0"
 LDT13_STATE_FILE = os.getenv("LDT15_STATE_FILE", "ldt15_state.json")
 LDT15_DEAD_FILE = os.getenv("LDT15_DEAD_FILE", "ldt15_dead_theses.json")
 LDT15_REARM_COOLDOWN_MIN = int(os.getenv("LDT15_REARM_COOLDOWN_MIN", "12"))
-LDT15_MAX_FEE_R = float(os.getenv("LDT15_MAX_FEE_R", "0.32"))
+LDT15_MAX_FEE_R = float(os.getenv("LDT15_MAX_FEE_R", "0.45"))
 LDT15_MAX_TRACKED = int(os.getenv("LDT15_MAX_TRACKED", "12"))
 LDT15_FRESH_REPLACE_MIN = int(os.getenv("LDT15_FRESH_REPLACE_MIN", "8"))
 LDT15_CONT_TREND_LIVE_RR = float(os.getenv("LDT15_CONT_TREND_LIVE_RR", "1.35"))
@@ -9652,7 +9652,7 @@ LDT16_ACTIVE_MIN_STR = float(os.getenv("LDT16_ACTIVE_MIN_STR", "64"))
 LDT16_ACTIVE_MIN_EQ = float(os.getenv("LDT16_ACTIVE_MIN_EQ", "54"))
 LDT16_ACTIVE_MIN_STOP_ATR = float(os.getenv("LDT16_ACTIVE_MIN_STOP_ATR", "0.28"))
 LDT16_ACTIVE_MAX_STOP_ATR = float(os.getenv("LDT16_ACTIVE_MAX_STOP_ATR", "1.25"))
-LDT16_ACTIVE_MAX_FEE_R = float(os.getenv("LDT16_ACTIVE_MAX_FEE_R", "0.28"))
+LDT16_ACTIVE_MAX_FEE_R = float(os.getenv("LDT16_ACTIVE_MAX_FEE_R", "0.35"))
 LDT16_ACTIVE_ZONE_ATR = float(os.getenv("LDT16_ACTIVE_ZONE_ATR", "0.22"))
 LDT16_ACTIVE_RANGE_EDGE = float(os.getenv("LDT16_ACTIVE_RANGE_EDGE", "0.24"))
 LDT16_ACTIVE_COOLDOWN_MIN = int(os.getenv("LDT16_ACTIVE_COOLDOWN_MIN", "8"))
@@ -10458,7 +10458,7 @@ def startup_diagnostics():
 # This is intentionally more active. It does NOT force a trade when geometry is
 # negative or transaction costs consume too much of the stop.
 
-LDT_VERSION = "1.7.0"
+LDT_VERSION = "1.7.1"
 LDT17_TRACK_FLOOR_R = float(os.getenv("LDT17_TRACK_FLOOR_R", "0.25"))
 LDT17_TRACK_CURRENT_FLOOR_R = float(os.getenv("LDT17_TRACK_CURRENT_FLOOR_R", "0.50"))
 LDT17_CONT_ALIGNED_LIVE_RR = float(os.getenv("LDT17_CONT_ALIGNED_LIVE_RR", "0.70"))
@@ -10670,7 +10670,7 @@ def open_trade(signal):
     if st:
         fresh = _ldt14_refresh_state(st); _ldt13_save()
         if not fresh or fresh.get('skip') or not fresh.get('entry_route'):
-            tg(f"⏭️ LDT v1.7 {symbol} {str(signal.get('side')).upper()} STATE CHANGED\n{(fresh or {}).get('skip') or st.get('state_note','not ready')}\nOrder cancelled before submission.")
+            tg(f"⏭️ LDT v1.7.1 {symbol} {str(signal.get('side')).upper()} STATE CHANGED\n{(fresh or {}).get('skip') or st.get('state_note','not ready')}\nOrder cancelled before submission.")
             return False
         signal = fresh
     # The old hardened shell uses global EQ. Temporarily set it to this route's
@@ -10705,7 +10705,7 @@ def _ldt13_transition(st,new_state,note=''):
     if old!=new_state:
         st['transitions']=int(st.get('transitions',0))+1
         if LDT13_NOTIFY_TRANSITIONS and new_state in ('IN_ZONE','TRIGGER_HOLD','READY','INVALIDATED','EXPIRED'):
-            tg(f"🧭 LDT v1.7 {st.get('symbol')} {str(st.get('side','')).upper()} · {st.get('engine','-')} · {new_state}\n{note}")
+            tg(f"🧭 LDT v1.7.1 {st.get('symbol')} {str(st.get('side','')).upper()} · {st.get('engine','-')} · {new_state}\n{note}")
     return old!=new_state
 
 
@@ -10720,7 +10720,7 @@ def maybe_score_report(rows):
         sig=st.get('signal') or {}; e='ACTIVE' if _ldt16_is_active(sig) else str(st.get('engine') or '-'); engines[e]=engines.get(e,0)+1
     ranked=sorted(rows,key=lambda r:(1 if not r.get('skip') else 0,1 if r.get('symbol') in _ldt13_states else 0,_ldt15_utility(r)),reverse=True)[:12]
     state_text=' · '.join(f'{k} {v}' for k,v in sorted(counts.items(),key=lambda x:x[1],reverse=True)[:5]) or 'none'; eng_text=' · '.join(f'{k} {v}' for k,v in engines.items()) or 'none'
-    lines=['🧠 LIQUIDITY DAYTRADER v1.7 · EXECUTION FIRST',f"Ready {len(ready)} · Tracked {len(_ldt13_states)}/{LDT15_MAX_TRACKED} · scanned {len(rows)}",f"Today {daily.get('trades',0)} trades · W/L {daily.get('wins',0)}/{daily.get('losses',0)} · Net ${safe_float(daily.get('net')):.2f}",f'Engines: {eng_text}',f'States: {state_text}']
+    lines=['🧠 LIQUIDITY DAYTRADER v1.7.1 · EXECUTION FIRST',f"Ready {len(ready)} · Tracked {len(_ldt13_states)}/{LDT15_MAX_TRACKED} · scanned {len(rows)}",f"Today {daily.get('trades',0)} trades · W/L {daily.get('wins',0)}/{daily.get('losses',0)} · Net ${safe_float(daily.get('net')):.2f}",f'Engines: {eng_text}',f'States: {state_text}']
     for r in ranked:
         st=_ldt13_states.get(r.get('symbol'),{}); age=(now-safe_float(st.get('created'),now))/60 if st else 0; e='ACTIVE-'+str(r.get('active_mode','SCALP')) if _ldt16_is_active(r) else _ldt14_engine(r)
         if not r.get('skip') and r.get('entry_route'): status='🟢 EXECUTE'
@@ -10733,10 +10733,11 @@ def maybe_score_report(rows):
 
 def startup_diagnostics():
     _ldt13_load(); _ldt15_load_dead(); acc=futures_account(); reset_daily_if_needed(acc['total_equity'])
-    tg('🧠 LIQUIDITY DAYTRADER STARTED v1.7 · EXECUTION FIRST\n'
+    tg('🧠 LIQUIDITY DAYTRADER STARTED v1.7.1 · EXECUTION FIRST\n'
        'Tracking is deliberately broad now: low prospective RR no longer prevents the bot from remembering a valid setup.\n'
        f'Aligned CONT: >= {LDT17_CONT_ALIGNED_LIVE_RR:.2f}R net · aligned MOM: >= {LDT17_MOM_ALIGNED_LIVE_RR:.2f}R · REV: >= {LDT17_REV_LIVE_RR:.2f}R · ACTIVE: >= {LDT17_ACTIVE_LIVE_RR:.2f}R.\n'
        f'Aligned fast EQ: CONT {LDT17_CONT_ALIGNED_EQ:.0f} · MOM {LDT17_MOM_ALIGNED_EQ:.0f}; low-RR aligned entries use only {LDT17_SCOUT_RISK*100:.2f}% equity risk.\n'
+       f'Fee gate relaxed but kept: normal routes <= {LDT15_MAX_FEE_R:.2f}R · ACTIVE <= {LDT16_ACTIVE_MAX_FEE_R:.2f}R.\n'
        'Hard safeties kept: fee-drag veto · structural invalidation · regime veto · daily loss cap · max positions · verified SL/TP.\n'
        f'Max positions {MAX_ACTIVE_POSITIONS} · max same side {LDT_MAX_SAME_SIDE} · Equity ${acc["total_equity"]:.2f} · Available ${acc["available"]:.2f}')
 
