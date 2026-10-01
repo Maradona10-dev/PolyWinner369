@@ -9237,5 +9237,400 @@ def startup_diagnostics():
        f"Max positions {MAX_ACTIVE_POSITIONS} · max same side {LDT_MAX_SAME_SIDE}.\n"
        f"Fresh v1.4 theses: {len(_ldt13_states)} · Equity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}")
 
+
+# ==================== LDT v1.5 ADAPTIVE TRADING CARD ====================
+# Overnight v1.4 audit corrections:
+# 1) freeze thesis geometry (zone/stop/target) instead of moving it every scan;
+# 2) do not recycle the same expired/invalidated setup without a fresh signal bar;
+# 3) route entries through a 15m regime classifier so the trading-card family selects
+#    the right engine rather than merely adding another filter;
+# 4) use conservative RR@zone (worst acceptable fill inside the zone);
+# 5) reject fee-heavy micro-stops even when headline RR looks attractive;
+# 6) fee-aware profit protection: after +1R-ish, lock a genuinely positive net result.
+
+LDT_VERSION = "1.5.0"
+LDT13_STATE_FILE = os.getenv("LDT15_STATE_FILE", "ldt15_state.json")
+LDT15_DEAD_FILE = os.getenv("LDT15_DEAD_FILE", "ldt15_dead_theses.json")
+LDT15_REARM_COOLDOWN_MIN = int(os.getenv("LDT15_REARM_COOLDOWN_MIN", "12"))
+LDT15_MAX_FEE_R = float(os.getenv("LDT15_MAX_FEE_R", "0.32"))
+LDT15_MAX_TRACKED = int(os.getenv("LDT15_MAX_TRACKED", "12"))
+LDT15_FRESH_REPLACE_MIN = int(os.getenv("LDT15_FRESH_REPLACE_MIN", "8"))
+LDT15_CONT_TREND_LIVE_RR = float(os.getenv("LDT15_CONT_TREND_LIVE_RR", "1.35"))
+LDT15_MOM_TREND_LIVE_RR = float(os.getenv("LDT15_MOM_TREND_LIVE_RR", "1.30"))
+LDT15_CONT_COUNTER_LIVE_RR = float(os.getenv("LDT15_CONT_COUNTER_LIVE_RR", "1.60"))
+LDT15_MANAGER_STAGE1_R = float(os.getenv("LDT15_MANAGER_STAGE1_R", "1.15"))
+LDT15_MANAGER_STAGE2_R = float(os.getenv("LDT15_MANAGER_STAGE2_R", "1.80"))
+LDT15_MANAGER_LOCK1_R = float(os.getenv("LDT15_MANAGER_LOCK1_R", "0.12"))
+LDT15_MANAGER_LOCK2_R = float(os.getenv("LDT15_MANAGER_LOCK2_R", "0.75"))
+
+_ldt13_states = {}
+_ldt13_loaded = False
+_ldt13_last_report = 0.0
+_ldt15_dead = {}
+_ldt15_dead_loaded = False
+_ldt15_base_open_trade = open_trade
+
+
+def _ldt15_load_dead():
+    global _ldt15_dead_loaded, _ldt15_dead
+    if _ldt15_dead_loaded: return
+    _ldt15_dead_loaded=True
+    try:
+        if os.path.exists(LDT15_DEAD_FILE):
+            with open(LDT15_DEAD_FILE,'r',encoding='utf-8') as f:
+                x=json.load(f)
+            if isinstance(x,dict): _ldt15_dead=x
+    except Exception:
+        _ldt15_dead={}
+
+
+def _ldt15_save_dead():
+    try:
+        tmp=LDT15_DEAD_FILE+'.tmp'
+        with open(tmp,'w',encoding='utf-8') as f: json.dump(_ldt13_jsonable(_ldt15_dead),f,ensure_ascii=False,indent=2)
+        os.replace(tmp,LDT15_DEAD_FILE)
+    except Exception: pass
+
+
+def _ldt15_mark_dead(st, reason=''):
+    if not st: return
+    _ldt15_load_dead(); sym=str(st.get('symbol') or '')
+    if not sym: return
+    sig=st.get('signal') or {}
+    _ldt15_dead[sym]={
+        'ts':time.time(),'side':st.get('side'),'engine':st.get('engine'),
+        'signal_bar_ts':int(st.get('origin_signal_ts') or sig.get('signal_bar_ts') or 0),
+        'reason':reason or st.get('state_note','')
+    }
+    _ldt15_save_dead()
+
+
+def _ldt15_is_recycled(signal):
+    _ldt15_load_dead(); sym=str((signal or {}).get('symbol') or '')
+    x=_ldt15_dead.get(sym)
+    if not x: return False
+    if time.time()-safe_float(x.get('ts')) > LDT15_REARM_COOLDOWN_MIN*60: return False
+    if str(x.get('side'))!=str(signal.get('side')) or str(x.get('engine'))!=_ldt14_engine(signal): return False
+    old_ts=int(x.get('signal_bar_ts') or 0); new_ts=int(signal.get('signal_bar_ts') or 0)
+    return new_ts<=old_ts
+
+
+def _ldt15_regime(symbol, side=None):
+    """15m regime: trend / range / expansion. It routes card families, not a hard BTC-style veto."""
+    try:
+        df=_ldt_closed(_ldt_df(symbol,'15m',140)).copy()
+        if len(df)<65: return {'label':'UNKNOWN','dir':0,'strength':0,'atr_ratio':1.0,'fit':0}
+        df['ema55']=df['close'].ewm(span=55,adjust=False).mean()
+        a=df.iloc[-1]; p3=df.iloc[-4]
+        atr=safe_float(a['atr']); atr_mean=safe_float(df['atr'].tail(20).mean()) or atr
+        close=safe_float(a['close']); e21=safe_float(a['ema21']); e55=safe_float(a['ema55'])
+        slope=(e21-safe_float(p3['ema21']))/max(atr,1e-12)
+        atr_ratio=atr/max(atr_mean,1e-12)
+        body=abs(safe_float(a['close'])-safe_float(a['open']))/max(atr,1e-12)
+        rng=max(safe_float(a['high'])-safe_float(a['low']),1e-12)
+        close_up=(close-safe_float(a['low']))/rng; close_dn=(safe_float(a['high'])-close)/rng
+        trend_dir=1 if close>e21>e55 and slope>0.10 else -1 if close<e21<e55 and slope<-0.10 else 0
+        expansion_dir=1 if body>=0.55 and close_up>=0.72 and atr_ratio>=1.02 else -1 if body>=0.55 and close_dn>=0.72 and atr_ratio>=1.02 else 0
+        if expansion_dir: label='EXPANSION_UP' if expansion_dir==1 else 'EXPANSION_DOWN'; rdir=expansion_dir; strength=3
+        elif trend_dir: label='TREND_UP' if trend_dir==1 else 'TREND_DOWN'; rdir=trend_dir; strength=2 if abs(slope)<0.35 else 3
+        elif atr_ratio<0.88: label='COMPRESSION'; rdir=0; strength=1
+        else: label='RANGE'; rdir=0; strength=1
+        fit=0
+        if side in ('long','short'):
+            d=1 if side=='long' else -1
+            fit=2 if rdir==d else -2 if rdir==-d else 0
+        return {'label':label,'dir':rdir,'strength':strength,'atr_ratio':atr_ratio,'slope':slope,'fit':fit}
+    except Exception:
+        return {'label':'UNKNOWN','dir':0,'strength':0,'atr_ratio':1.0,'fit':0}
+
+
+def _ldt14_live_rr_min(signal):
+    e=_ldt14_engine(signal); fit=int((signal or {}).get('regime_fit',0)); card=int((signal or {}).get('card_score',0))
+    if e=='REVERSAL': return LDT14_REV_LIVE_RR
+    if e=='CONTINUATION':
+        if fit>=2 and card>=3: return LDT15_CONT_TREND_LIVE_RR
+        if fit<=-2: return LDT15_CONT_COUNTER_LIVE_RR
+        return LDT14_CONT_LIVE_RR
+    if fit>=2 and card>=4: return LDT15_MOM_TREND_LIVE_RR
+    return LDT14_MOM_LIVE_RR
+
+
+def _ldt14_track_rr_min(signal):
+    e=_ldt14_engine(signal); fit=int((signal or {}).get('regime_fit',0)); card=int((signal or {}).get('card_score',0))
+    if e=='REVERSAL': return LDT14_REV_TRACK_RR
+    if e=='CONTINUATION' and fit>=2 and card>=3: return min(LDT14_CONT_TRACK_RR,1.22)
+    if e=='MOMENTUM' and fit>=2 and card>=4: return min(LDT14_MOM_TRACK_RR,1.15)
+    return LDT14_MOM_TRACK_RR if e=='MOMENTUM' else LDT14_CONT_TRACK_RR
+
+
+def _ldt14_prospective_plan(signal):
+    side=str((signal or {}).get('side') or ''); zone=(signal or {}).get('zone') or {}
+    if side not in ('long','short') or not zone: return None
+    d=1 if side=='long' else -1; atr=safe_float(signal.get('atr')); stop=safe_float(signal.get('structural_stop'))
+    lo=safe_float(zone.get('lo')); hi=safe_float(zone.get('hi'))
+    if atr<=0 or stop<=0 or lo<=0 or hi<=0 or hi<lo: return None
+    # Conservative fill: long at upper edge, short at lower edge. If economics only work at the
+    # perfect midpoint, the thesis is not worth occupying a tracking slot.
+    entry=hi if d==1 else lo
+    risk=d*(entry-stop)
+    if risk<=0: return None
+    risk_atr=risk/atr
+    fee_r=entry*(2*TAKER_FEE_RATE+SLIPPAGE_RATE)/max(risk,1e-12)
+    if risk_atr<LDT_MIN_STOP_ATR or risk_atr>LDT_MAX_STOP_ATR:
+        return {'ok':False,'entry':entry,'risk_atr':risk_atr,'fee_r':fee_r,'net_rr':-99.0,'target':0.0,'target_kind':'invalid-stop-geometry'}
+    engine=_ldt14_engine(signal); hard=safe_float(signal.get('far_target') or signal.get('target_price')); tf='1m' if str(signal.get('route'))=='FAST' else '5m'
+    target,kind,gross=_ldt14_target(signal.get('symbol'),side,entry,stop,hard,tf,engine)
+    net=gross-fee_r
+    return {'ok':bool(net>=_ldt14_track_rr_min(signal) and fee_r<=LDT15_MAX_FEE_R),'entry':entry,'risk_atr':risk_atr,'fee_r':fee_r,'target':target,'target_kind':kind,'gross_rr':gross,'net_rr':net,'zone_lo':lo,'zone_hi':hi}
+
+
+def _ldt14_annotate(signal):
+    if not signal: return signal
+    signal['engine']=_ldt14_engine(signal)
+    card=_ldt14_card_profile(signal)
+    signal['card_score']=int(card['score']); signal['card_families']=card['families']; signal['card_label']=card['label']
+    reg=_ldt15_regime(signal.get('symbol'),signal.get('side'))
+    signal['regime']=reg.get('label'); signal['regime_dir']=int(reg.get('dir',0)); signal['regime_fit']=int(reg.get('fit',0)); signal['regime_strength']=int(reg.get('strength',0)); signal['regime_atr_ratio']=safe_float(reg.get('atr_ratio'),1.0)
+    plan=_ldt14_prospective_plan(signal)
+    if plan:
+        signal['prospective_entry']=safe_float(plan.get('entry')); signal['prospective_rr']=safe_float(plan.get('net_rr')); signal['prospective_target']=safe_float(plan.get('target')); signal['prospective_target_kind']=plan.get('target_kind'); signal['prospective_risk_atr']=safe_float(plan.get('risk_atr')); signal['prospective_fee_r']=safe_float(plan.get('fee_r')); signal['prospective_ok']=bool(plan.get('ok'))
+    else:
+        signal['prospective_rr']=-99.0; signal['prospective_ok']=False; signal['prospective_risk_atr']=999.0; signal['prospective_fee_r']=99.0
+    # Reversal is allowed against trend only with stronger liquidity evidence. Continuation and
+    # momentum get a bonus only when the market regime agrees with their direction.
+    e=signal['engine']; fit=int(signal.get('regime_fit',0)); route_bonus=0
+    if e=='REVERSAL': route_bonus=2 if fit<=0 else 0
+    elif fit>=2: route_bonus=6
+    elif fit<=-2: route_bonus=-8
+    signal['route_fit_score']=route_bonus
+    signal['card_rank_quality']=safe_float(signal.get('setup_quality'))+min(8,safe_float(signal.get('card_score')))+route_bonus
+    return signal
+
+
+def _ldt13_trackable(signal):
+    if not signal or not signal.get('side') or _ldt15_is_recycled(signal): return False
+    if str(signal.get('skip') or '').startswith('stale'): return False
+    if safe_float(signal.get('setup_quality'))<_ldt14_str_min(signal): return False
+    if int(signal.get('card_score',0))<_ldt14_card_min(signal): return False
+    e=_ldt14_engine(signal); fit=int(signal.get('regime_fit',0)); card=int(signal.get('card_score',0))
+    if e=='CONTINUATION' and fit<=-2 and card<4: return False
+    if e=='MOMENTUM' and fit<0: return False
+    if e=='REVERSAL' and fit>=2 and card<5: return False
+    pra=safe_float(signal.get('prospective_risk_atr'),999.0); fee_r=safe_float(signal.get('prospective_fee_r'),99.0)
+    if pra<LDT_MIN_STOP_ATR or pra>LDT_MAX_STOP_ATR or fee_r>LDT15_MAX_FEE_R: return False
+    if safe_float(signal.get('prospective_rr'),-99.0)<_ldt14_track_rr_min(signal): return False
+    return True
+
+
+def _ldt15_utility(s):
+    if not s: return -999.0
+    rr=max(-2.0,min(5.0,safe_float(s.get('prospective_rr'),-2.0)))
+    return (safe_float(s.get('setup_quality'))*0.35 + safe_float(s.get('entry_quality'))*0.10 + int(s.get('card_score',0))*3.0 + int(s.get('route_fit_score',0))*1.5 + rr*5.0 - safe_float(s.get('prospective_fee_r'),1.0)*12.0)
+
+
+def _ldt13_candidate_rank(s):
+    return (_ldt15_utility(s),safe_float(s.get('prospective_rr')),safe_float(s.get('setup_quality')),safe_float(s.get('entry_quality')))
+
+
+def _ldt13_new_state(signal):
+    now=time.time(); sig=_ldt13_jsonable(signal); zone=dict(signal.get('zone') or {}); ptarget=safe_float(signal.get('prospective_target') or signal.get('target_price'))
+    return {'symbol':signal.get('symbol'),'side':signal.get('side'),'strategy':signal.get('strategy'),'route':signal.get('route'),'engine':_ldt14_engine(signal),
+            'created':now,'updated':now,'expires':now+60*_ldt14_ttl(signal),'state':'WAIT_RETRACE','last_state':'','signal':sig,
+            'origin_signal_ts':int(signal.get('signal_bar_ts') or 0),'frozen_zone':_ldt13_jsonable(zone),'frozen_stop':safe_float(signal.get('structural_stop')),
+            'initial_target':ptarget,'initial_far_target':safe_float(signal.get('far_target') or signal.get('target_price')),
+            'planned_entry':safe_float(signal.get('prospective_entry')),'prospective_rr':safe_float(signal.get('prospective_rr')),
+            'prospective_fee_r':safe_float(signal.get('prospective_fee_r')),'card_score':int(signal.get('card_score',0)),'card_label':signal.get('card_label','BASE-STRUCTURE'),
+            'regime':signal.get('regime','UNKNOWN'),'regime_fit':int(signal.get('regime_fit',0)),'utility':_ldt15_utility(signal),
+            'best_rr':safe_float(signal.get('net_rr')),'best_eq':safe_float(signal.get('entry_quality')),'transitions':0}
+
+
+def _ldt13_merge_fresh(st,fresh):
+    if not fresh: return
+    old=dict(st.get('signal') or {}); merged=dict(old); merged.update(_ldt13_jsonable(fresh))
+    # Thesis geometry is immutable. A genuinely newer setup must replace the state, not drag the
+    # old zone/stop along with price.
+    merged['zone']=_ldt13_jsonable(st.get('frozen_zone') or old.get('zone') or {})
+    merged['structural_stop']=safe_float(st.get('frozen_stop') or old.get('structural_stop'))
+    merged['far_target']=safe_float(st.get('initial_far_target') or old.get('far_target') or old.get('target_price'))
+    merged['target_price']=safe_float(st.get('initial_target') or old.get('target_price'))
+    merged['signal_bar_ts']=int(st.get('origin_signal_ts') or old.get('signal_bar_ts') or 0)
+    st['signal']=merged; st['updated']=time.time(); st['best_rr']=max(safe_float(st.get('best_rr')),safe_float(fresh.get('net_rr'))); st['best_eq']=max(safe_float(st.get('best_eq')),safe_float(fresh.get('entry_quality')))
+
+
+def _ldt14_refresh_state(st):
+    signal=dict(st.get('signal') or {}); symbol=st.get('symbol'); side=st.get('side')
+    if not symbol or side not in ('long','short'): _ldt13_transition(st,'INVALIDATED','missing thesis identity'); return None
+    d=1 if side=='long' else -1; now=time.time(); engine=str(st.get('engine') or _ldt14_engine(signal)); signal['engine']=engine
+    if now>safe_float(st.get('expires')): _ldt13_transition(st,'EXPIRED',f'{engine} thesis age > {_ldt14_ttl(signal)} min'); return None
+    try: live=safe_float(exchange.fetch_ticker(symbol).get('last'),safe_float(signal.get('price')))
+    except Exception: live=safe_float(signal.get('price'))
+    atr=safe_float(signal.get('atr')); stop=safe_float(st.get('frozen_stop') or signal.get('structural_stop')); zone=dict(st.get('frozen_zone') or signal.get('zone') or {})
+    signal['structural_stop']=stop; signal['zone']=zone; signal['far_target']=safe_float(st.get('initial_far_target') or signal.get('far_target')); signal['target_price']=safe_float(st.get('initial_target') or signal.get('target_price'))
+    if live<=0 or atr<=0 or stop<=0 or not zone: _ldt13_transition(st,'INVALIDATED','missing live/ATR/frozen geometry'); return None
+    invalid_buf=LDT12_LIVE_INVALIDATION_ATR*atr
+    if (d==1 and live<stop-invalid_buf) or (d==-1 and live>stop+invalid_buf): _ldt13_transition(st,'INVALIDATED',f'price {live:.8g} crossed frozen thesis invalidation {stop:.8g}'); return None
+    reg=_ldt15_regime(symbol,side); signal['regime']=reg.get('label'); signal['regime_fit']=int(reg.get('fit',0)); signal['regime_strength']=int(reg.get('strength',0)); signal['regime_atr_ratio']=safe_float(reg.get('atr_ratio'),1.0)
+    card=int(st.get('card_score',signal.get('card_score',0))); signal['card_score']=card; signal['card_label']=st.get('card_label',signal.get('card_label','BASE-STRUCTURE'))
+    # If a trend-following thesis is now strongly counter-regime, wait rather than execute.
+    regime_block=(engine=='MOMENTUM' and int(signal['regime_fit'])<0) or (engine=='CONTINUATION' and int(signal['regime_fit'])<=-2 and card<4) or (engine=='REVERSAL' and int(signal['regime_fit'])>=2 and card<5)
+    lo=safe_float(zone.get('lo')); hi=safe_float(zone.get('hi')); eq=_ldt_zone_entry_quality(live,zone,atr,d); in_zone=lo-LDT_ZONE_TOL_ATR*atr<=live<=hi+LDT_ZONE_TOL_ATR*atr
+    risk=d*(live-stop); risk_atr=risk/atr if risk>0 else -1.0; fee_r=live*(2*TAKER_FEE_RATE+SLIPPAGE_RATE)/max(risk,1e-12) if risk>0 else 99.0
+    hard=safe_float(st.get('initial_far_target') or signal.get('far_target') or signal.get('target_price')); tf='1m' if str(signal.get('route'))=='FAST' else '5m'
+    target=0.0; kind='waiting'; gross=-99.0; net=-99.0
+    if risk>0:
+        target,kind,gross=_ldt14_target(symbol,side,live,stop,hard,tf,engine); net=gross-fee_r
+    trig_ok,trig=_ldt14_reclaim_trigger(symbol,side,signal.get('trigger_tf') or '1m',zone,engine)
+    signal.update({'price':live,'entry_quality':eq,'quality':0.60*safe_float(signal.get('setup_quality'))+0.40*eq,'risk_distance':max(risk,0.0),'target_price':target or safe_float(st.get('initial_target')),
+                   'target_kind':kind,'final_r':gross,'net_rr':net,'fee_drag_r':fee_r,'trigger_note':trig.get('note',''),'confirmations':int(trig.get('strength',0))+1,
+                   'ldt13_state':st.get('state'),'ldt13_age_min':(now-safe_float(st.get('created')))/60.0,'prospective_entry':safe_float(st.get('planned_entry')),'prospective_rr':safe_float(st.get('prospective_rr')),
+                   'prospective_fee_r':safe_float(st.get('prospective_fee_r')),'signal_bar_ts':int(st.get('origin_signal_ts') or signal.get('signal_bar_ts') or 0)})
+    st['signal']=_ldt13_jsonable(signal); st['best_rr']=max(safe_float(st.get('best_rr')),net); st['best_eq']=max(safe_float(st.get('best_eq')),eq)
+    if regime_block:
+        _ldt13_transition(st,'WAIT_RETRACE',f'{engine} · regime {signal["regime"]} against route'); signal['skip']=f'TRACK-regime {signal["regime"]}'; signal['entry_route']=None; return signal
+    if risk<=0 or risk_atr<LDT_MIN_STOP_ATR or risk_atr>LDT_MAX_STOP_ATR:
+        _ldt13_transition(st,'WAIT_RETRACE',f'{engine} · live stop {risk_atr:.2f}ATR'); signal['skip']=f'TRACK-wait-retrace · RR@zone {safe_float(st.get("prospective_rr")):.2f}'; signal['entry_route']=None; return signal
+    if fee_r>LDT15_MAX_FEE_R:
+        _ldt13_transition(st,'IN_ZONE' if in_zone else 'WAIT_RETRACE',f'{engine} · fee drag {fee_r:.2f}R>{LDT15_MAX_FEE_R:.2f}R'); signal['skip']=f'fee-drag-{fee_r:.2f}R'; signal['entry_route']=None; return signal
+    if not in_zone or eq<LDT_MIN_ENTRY_QUALITY:
+        _ldt13_transition(st,'WAIT_RETRACE',f'{engine} · EQ {eq:.0f} · frozen zone {lo:.8g}-{hi:.8g}'); signal['skip']=f'TRACK-wait-zone EQ{eq:.0f}'; signal['entry_route']=None; return signal
+    rrmin=_ldt14_live_rr_min(signal)
+    if net<rrmin:
+        _ldt13_transition(st,'IN_ZONE',f'{engine} zone reached · adaptive RR {net:.2f}<{rrmin:.2f}'); signal['skip']=f'TRACK-in-zone RR {net:.2f}<{rrmin:.2f}'; signal['entry_route']=None; return signal
+    if not trig_ok:
+        _ldt13_transition(st,'IN_ZONE',f'{engine} · {trig.get("note","waiting trigger")}'); signal['skip']=f'TRACK-in-zone · {trig.get("note","WAIT TRIGGER")}'; signal['entry_route']=None; return signal
+    age=int(trig.get('age',0)); _ldt13_transition(st,'READY' if age==0 else 'TRIGGER_HOLD',trig.get('note','trigger valid'))
+    signal['skip']=None; signal['entry_route']={'REVERSAL':'REV-CARD','CONTINUATION':'CONT-CARD','MOMENTUM':'MOM-CARD'}[engine]
+    return signal
+
+
+def _ldt15_can_add_state(fresh):
+    if len(_ldt13_states)<LDT15_MAX_TRACKED: return True
+    # Replace only a clearly weaker tracked thesis; this keeps the bot focused instead of carrying
+    # 15-20 stale ideas through the night.
+    weakest_sym=None; weakest=1e9
+    for sym,st in _ldt13_states.items():
+        u=safe_float(st.get('utility'),-999.0)
+        if u<weakest: weakest=u; weakest_sym=sym
+    nu=_ldt15_utility(fresh)
+    if weakest_sym and nu>=weakest+5.0:
+        old=_ldt13_states.pop(weakest_sym,None)
+        if old: _ldt15_mark_dead(old,'evicted by stronger thesis')
+        return True
+    return False
+
+
+def evaluate_symbol(symbol, btc=None):
+    _ldt13_load(); _ldt15_load_dead(); candidates=_ldt13_scan_candidates(symbol); fresh=_ldt13_best_trackable(candidates); st=_ldt13_states.get(symbol)
+    if st:
+        # A genuinely newer structure may replace a frozen thesis. Merely rediscovering the same
+        # parent/zone may not reset its clock.
+        if fresh:
+            old_ts=int(st.get('origin_signal_ts') or (st.get('signal') or {}).get('signal_bar_ts') or 0); new_ts=int(fresh.get('signal_bar_ts') or 0)
+            age_min=(time.time()-safe_float(st.get('created')))/60.0
+            stronger=_ldt15_utility(fresh)>=safe_float(st.get('utility'),-999.0)+2.0
+            if str(fresh.get('side'))!=str(st.get('side')):
+                if _ldt15_utility(fresh)>=safe_float(st.get('utility'),-999.0)+LDT13_REPLACE_EDGE:
+                    _ldt15_mark_dead(st,'replaced opposite thesis'); st=_ldt13_new_state(fresh); _ldt13_states[symbol]=st
+            elif new_ts>old_ts and age_min>=LDT15_FRESH_REPLACE_MIN and stronger:
+                _ldt15_mark_dead(st,'promoted to fresh structure'); st=_ldt13_new_state(fresh); _ldt13_states[symbol]=st
+            elif _ldt13_same_thesis(st,fresh) and _ldt14_engine(fresh)==str(st.get('engine')):
+                _ldt13_merge_fresh(st,fresh)
+        out=_ldt14_refresh_state(st)
+        if out is None or st.get('state') in ('INVALIDATED','EXPIRED'):
+            reason=st.get('state_note',''); _ldt15_mark_dead(st,reason); _ldt13_states.pop(symbol,None); _ldt13_save()
+            if fresh and _ldt13_trackable(fresh) and not _ldt15_is_recycled(fresh) and _ldt15_can_add_state(fresh):
+                st=_ldt13_new_state(fresh); _ldt13_states[symbol]=st; out=_ldt14_refresh_state(st)
+            else: return _ldt13_best_diagnostic(candidates)
+        _ldt13_save(); return out
+    if fresh and not _ldt15_is_recycled(fresh) and _ldt15_can_add_state(fresh):
+        st=_ldt13_new_state(fresh); _ldt13_states[symbol]=st; out=_ldt14_refresh_state(st); _ldt13_save(); return out
+    return _ldt13_best_diagnostic(candidates)
+
+
+def open_trade(signal):
+    # Extra execution vetoes before the v1.4 hardened order shell.
+    symbol=signal.get('symbol'); st=_ldt13_states.get(symbol)
+    if st:
+        fresh=_ldt14_refresh_state(st); _ldt13_save()
+        if not fresh or fresh.get('skip') or not fresh.get('entry_route'):
+            tg(f"⏭️ LDT v1.5 {symbol} {str(signal.get('side')).upper()} STATE CHANGED\n{(fresh or {}).get('skip') or st.get('state_note','not ready')}\nOrder cancelled before submission."); return False
+        signal=fresh
+    side=signal.get('side'); live=safe_float(exchange.fetch_ticker(symbol).get('last'),signal.get('price')); stop=safe_float(signal.get('structural_stop')); d=1 if side=='long' else -1
+    risk=d*(live-stop)
+    if risk<=0: return False
+    fee_r=live*(2*TAKER_FEE_RATE+SLIPPAGE_RATE)/max(risk,1e-12)
+    if fee_r>LDT15_MAX_FEE_R:
+        tg(f"⏭️ LDT v1.5 {symbol} {str(side).upper()} FEE-DRAG VETO\nEstimated round-trip cost {fee_r:.2f}R > {LDT15_MAX_FEE_R:.2f}R"); return False
+    reg=_ldt15_regime(symbol,side); engine=_ldt14_engine(signal); card=int(signal.get('card_score',0)); fit=int(reg.get('fit',0))
+    if (engine=='MOMENTUM' and fit<0) or (engine=='CONTINUATION' and fit<=-2 and card<4) or (engine=='REVERSAL' and fit>=2 and card<5):
+        tg(f"⏭️ LDT v1.5 {symbol} {str(side).upper()} REGIME VETO\n{engine} vs {reg.get('label')} · CARD C{card}"); return False
+    signal['regime']=reg.get('label'); signal['regime_fit']=fit; signal['fee_drag_r']=fee_r
+    return _ldt15_base_open_trade(signal)
+
+
+def manage_sniper_step_stops():
+    """v1.5: fee-aware positive-net lock. A +1R excursion should not become a fee-only loss."""
+    if PAPER_TRADING:return
+    for p in get_positions():
+        try:
+            pid=position_id(p); meta=_ldt_meta.get(pid)
+            if not meta:continue
+            symbol=position_symbol(p); side=position_side(p); d=1 if side=='long' else -1
+            entry=safe_float(meta.get('entry')) or position_entry(p); risk=safe_float(meta.get('risk'))
+            if entry<=0 or risk<=0:continue
+            ok,order=has_live_protection(p)
+            if not ok or not order:continue
+            current_sl=safe_float(order.get('slTriggerPrice')); tick=safe_float(get_instrument(symbol).get('tickSize'),0.0001); current=safe_float(exchange.fetch_ticker(symbol).get('last'))
+            old_mfe=safe_float(meta.get('mfe_price'),entry); mfe=max(old_mfe,current) if d==1 else min(old_mfe,current); meta['mfe_price']=mfe
+            best_r=max(0.0,d*(mfe-entry)/risk); meta['mfe_r']=best_r
+            fee_r=entry*(2*TAKER_FEE_RATE+SLIPPAGE_RATE)/max(risk,1e-12); desired=None; stage=None
+            if best_r>=LDT15_MANAGER_STAGE2_R:
+                lock_r=max(LDT15_MANAGER_LOCK2_R,fee_r+0.25); desired=round_trade_price(entry+d*lock_r*risk,tick,side,'sl'); stage=f'+{best_r:.2f}R → lock +{lock_r:.2f}R'
+            elif best_r>=LDT15_MANAGER_STAGE1_R:
+                lock_r=max(LDT15_MANAGER_LOCK1_R,fee_r+0.08); lock_r=min(lock_r,0.45); desired=round_trade_price(entry+d*lock_r*risk,tick,side,'sl'); stage=f'+{best_r:.2f}R → fee-safe +{lock_r:.2f}R'
+            if desired is None:continue
+            improves=desired>current_sl+tick*0.1 if d==1 else desired<current_sl-tick*0.1
+            if not improves:continue
+            buf=max(tick*LDT11_STOP_MARK_BUFFER_TICKS,abs(current)*1e-6); safe_side=(desired<current-buf) if d==1 else (desired>current+buf)
+            if not safe_side:continue
+            ok2,res=amend_tpsl_stop(p,desired); key=f'ldt15:{pid}:{stage}'
+            if ok2 and not sniper_step_notified.get(key):
+                tg(f"🪜 LDT v1.5 PROFIT LOCK\n{symbol} {side.upper()}\n{stage} · MFE {best_r:.2f}R · fee drag {fee_r:.2f}R · SL {desired:.8g}"); sniper_step_notified[key]=True
+        except Exception as e:
+            tg(f"⚠️ LDT v1.5 POSITION MANAGER\n{position_symbol(p) if isinstance(p,dict) else '-'}\n{type(e).__name__}: {e}")
+
+
+def maybe_score_report(rows):
+    global _ldt13_last_report
+    now=time.time()
+    if now-_ldt13_last_report<LDT_REPORT_MIN*60 or not rows:return
+    _ldt13_last_report=now; _ldt13_load(); ready=[r for r in rows if r.get('side') and not r.get('skip') and r.get('entry_route')]
+    counts={}; engines={}
+    for st in _ldt13_states.values():
+        k=str(st.get('state') or 'WAIT_RETRACE'); counts[k]=counts.get(k,0)+1; e=str(st.get('engine') or '-'); engines[e]=engines.get(e,0)+1
+    ranked=sorted(rows,key=lambda r:(1 if not r.get('skip') else 0,1 if r.get('symbol') in _ldt13_states else 0,_ldt15_utility(r)),reverse=True)[:10]
+    state_text=' · '.join(f'{k} {v}' for k,v in sorted(counts.items(),key=lambda x:x[1],reverse=True)[:5]) or 'none'; eng_text=' · '.join(f'{k} {v}' for k,v in engines.items()) or 'none'
+    lines=['🧠 LIQUIDITY DAYTRADER v1.5 · ADAPTIVE TRADING CARD',f"Ready {len(ready)} · Tracked {len(_ldt13_states)}/{LDT15_MAX_TRACKED} · scanned {len(rows)}",f"Today {daily.get('trades',0)} trades · W/L {daily.get('wins',0)}/{daily.get('losses',0)} · Net ${safe_float(daily.get('net')):.2f}",f'Engines: {eng_text}',f'States: {state_text}']
+    for r in ranked:
+        st=_ldt13_states.get(r.get('symbol'),{}); age=(now-safe_float(st.get('created'),now))/60 if st else 0; e=_ldt14_engine(r)
+        if not r.get('skip'):status='🟢 EXECUTE'
+        elif st:status=f"🟠 {st.get('state','WAIT_RETRACE')} {age:.0f}m"
+        else:status='🟡 '+str(r.get('skip'))
+        pr=safe_float(r.get('prospective_rr'),-99.0); prtxt='N/A' if pr<=-90 else f'{pr:.2f}'; fr=safe_float(r.get('prospective_fee_r',r.get('fee_drag_r',-1)))
+        frtxt='-' if fr<0 or fr>10 else f'{fr:.2f}R'
+        lines.append(f"{r.get('symbol')} {str(r.get('side')).upper()} {e} · {r.get('regime','?')} fit{int(r.get('regime_fit',0)):+d} · C{int(r.get('card_score',0))} STR{safe_float(r.get('setup_quality')):.0f} EQ{safe_float(r.get('entry_quality')):.0f} RRnow{safe_float(r.get('net_rr')):.2f} RR@zone{prtxt} fee{frtxt} {status}")
+    tg('\n'.join(lines))
+
+
+def startup_diagnostics():
+    _ldt13_load(); _ldt15_load_dead(); acc=futures_account(); reset_daily_if_needed(acc['total_equity'])
+    tg('🧠 LIQUIDITY DAYTRADER STARTED v1.5 · ADAPTIVE TRADING CARD\n'
+       'Overnight audit: frozen thesis geometry · stale-thesis recycle lock · 15m regime routing · conservative RR@zone · fee-drag veto · positive-net profit lock.\n'
+       f'Adaptive live RR: REV {LDT14_REV_LIVE_RR:.2f}R · CONT {LDT15_CONT_TREND_LIVE_RR:.2f}-{LDT15_CONT_COUNTER_LIVE_RR:.2f}R · MOM {LDT15_MOM_TREND_LIVE_RR:.2f}-{LDT14_MOM_LIVE_RR:.2f}R.\n'
+       f'Max fee drag {LDT15_MAX_FEE_R:.2f}R · tracked cap {LDT15_MAX_TRACKED} · same stale thesis cooldown {LDT15_REARM_COOLDOWN_MIN}m.\n'
+       f'Risk: REV {LDT14_REV_RISK*100:.2f}% · CONT {LDT14_CONT_RISK*100:.2f}% · MOM {LDT14_MOM_RISK*100:.2f}% · ELITE {LDT14_ELITE_RISK*100:.2f}%.\n'
+       f'Max positions {MAX_ACTIVE_POSITIONS} · max same side {LDT_MAX_SAME_SIDE}.\n'
+       f'Fresh v1.5 theses {len(_ldt13_states)} · Equity ${acc["total_equity"]:.2f} · Available ${acc["available"]:.2f}')
+
 if __name__ == "__main__":
     main()
