@@ -9553,17 +9553,17 @@ def open_trade(signal):
     if st:
         fresh=_ldt14_refresh_state(st); _ldt13_save()
         if not fresh or fresh.get('skip') or not fresh.get('entry_route'):
-            tg(f"⏭️ LDT v1.6.1 {symbol} {str(signal.get('side')).upper()} STATE CHANGED\n{(fresh or {}).get('skip') or st.get('state_note','not ready')}\nOrder cancelled before submission."); return False
+            tg(f"⏭️ LDT v1.6.3 {symbol} {str(signal.get('side')).upper()} STATE CHANGED\n{(fresh or {}).get('skip') or st.get('state_note','not ready')}\nOrder cancelled before submission."); return False
         signal=fresh
     side=signal.get('side'); live=safe_float(exchange.fetch_ticker(symbol).get('last'),signal.get('price')); stop=safe_float(signal.get('structural_stop')); d=1 if side=='long' else -1
     risk=d*(live-stop)
     if risk<=0: return False
     fee_r=live*(2*TAKER_FEE_RATE+SLIPPAGE_RATE)/max(risk,1e-12)
     if fee_r>LDT15_MAX_FEE_R:
-        tg(f"⏭️ LDT v1.6.1 {symbol} {str(side).upper()} FEE-DRAG VETO\nEstimated round-trip cost {fee_r:.2f}R > {LDT15_MAX_FEE_R:.2f}R"); return False
+        tg(f"⏭️ LDT v1.6.3 {symbol} {str(side).upper()} FEE-DRAG VETO\nEstimated round-trip cost {fee_r:.2f}R > {LDT15_MAX_FEE_R:.2f}R"); return False
     reg=_ldt15_regime(symbol,side); engine=_ldt14_engine(signal); card=int(signal.get('card_score',0)); fit=int(reg.get('fit',0))
     if (engine=='MOMENTUM' and fit<0) or (engine=='CONTINUATION' and fit<=-2 and card<4) or (engine=='REVERSAL' and fit>=2 and card<5):
-        tg(f"⏭️ LDT v1.6.1 {symbol} {str(side).upper()} REGIME VETO\n{engine} vs {reg.get('label')} · CARD C{card}"); return False
+        tg(f"⏭️ LDT v1.6.3 {symbol} {str(side).upper()} REGIME VETO\n{engine} vs {reg.get('label')} · CARD C{card}"); return False
     signal['regime']=reg.get('label'); signal['regime_fit']=fit; signal['fee_drag_r']=fee_r
     return _ldt15_base_open_trade(signal)
 
@@ -9595,7 +9595,7 @@ def manage_sniper_step_stops():
             if not safe_side:continue
             ok2,res=amend_tpsl_stop(p,desired); key=f'ldt15:{pid}:{stage}'
             if ok2 and not sniper_step_notified.get(key):
-                tg(f"🪜 LDT v1.6.1 PROFIT LOCK\n{symbol} {side.upper()}\n{stage} · MFE {best_r:.2f}R · fee drag {fee_r:.2f}R · SL {desired:.8g}"); sniper_step_notified[key]=True
+                tg(f"🪜 LDT v1.6.3 PROFIT LOCK\n{symbol} {side.upper()}\n{stage} · MFE {best_r:.2f}R · fee drag {fee_r:.2f}R · SL {desired:.8g}"); sniper_step_notified[key]=True
         except Exception as e:
             tg(f"⚠️ LDT v1.5 POSITION MANAGER\n{position_symbol(p) if isinstance(p,dict) else '-'}\n{type(e).__name__}: {e}")
 
@@ -10176,7 +10176,7 @@ def _ldt13_transition(st, new_state, note=""):
     if old != new_state:
         st["transitions"] = int(st.get("transitions", 0)) + 1
         if LDT13_NOTIFY_TRANSITIONS and new_state in ("IN_ZONE", "TRIGGER_HOLD", "READY", "INVALIDATED", "EXPIRED"):
-            tg(f"🧭 LDT v1.6.2 {st.get('symbol')} {str(st.get('side','')).upper()} · {st.get('engine','-')} · {new_state}\n{note}")
+            tg(f"🧭 LDT v1.6.3 {st.get('symbol')} {str(st.get('side','')).upper()} · {st.get('engine','-')} · {new_state}\n{note}")
     return old != new_state
 
 
@@ -10196,7 +10196,7 @@ def maybe_score_report(rows):
     ranked = sorted(rows, key=lambda r:(1 if not r.get('skip') else 0, 1 if r.get('symbol') in _ldt13_states else 0, _ldt15_utility(r)), reverse=True)[:11]
     state_text = ' · '.join(f'{k} {v}' for k,v in sorted(counts.items(), key=lambda x:x[1], reverse=True)[:5]) or 'none'
     eng_text = ' · '.join(f'{k} {v}' for k,v in engines.items()) or 'none'
-    lines = ['🧠 LIQUIDITY DAYTRADER v1.6.2 · MEANINGFUL LIQUIDITY',
+    lines = ['🧠 LIQUIDITY DAYTRADER v1.6.3 · MEANINGFUL LIQUIDITY',
              f"Ready {len(ready)} · Tracked {len(_ldt13_states)}/{LDT15_MAX_TRACKED} · scanned {len(rows)}",
              f"Today {daily.get('trades',0)} trades · W/L {daily.get('wins',0)}/{daily.get('losses',0)} · Net ${safe_float(daily.get('net')):.2f}",
              f'Engines: {eng_text}', f'States: {state_text}']
@@ -10214,10 +10214,224 @@ def maybe_score_report(rows):
 
 def startup_diagnostics():
     _ldt13_load(); _ldt15_load_dead(); acc=futures_account(); reset_daily_if_needed(acc['total_equity'])
-    tg('🧠 LIQUIDITY DAYTRADER STARTED v1.6.2 · MEANINGFUL LIQUIDITY\n'
+    tg('🧠 LIQUIDITY DAYTRADER STARTED v1.6.3 · MEANINGFUL LIQUIDITY\n'
        'Most common live blocker changed after v1.6.1: tiny first-liquidity pivots are no longer a hard final-target gate.\n'
        'Targets now skip insignificant internal pivots and use the first meaningful route liquidity.\n'
        f'Live net RR: ACTIVE {LDT162_ACTIVE_LIVE_RR:.2f}R · REV {LDT162_REV_LIVE_RR:.2f}R · CONT aligned {LDT162_CONT_ALIGNED_LIVE_RR:.2f}R · MOM aligned {LDT162_MOM_ALIGNED_LIVE_RR:.2f}R.\n'
+       'Fee-drag, regime direction, entry trigger, daily loss cap, position sizing and verified SL/TP remain active.\n'
+       f'Core max positions {MAX_ACTIVE_POSITIONS} · max same side {LDT_MAX_SAME_SIDE} · Equity ${acc["total_equity"]:.2f} · Available ${acc["available"]:.2f}')
+
+
+
+# ============================================================
+# v1.6.3 - AGGRESSIVE ALIGNED CONTINUATION / FRESH MOMENTUM REARM
+# ============================================================
+# Live review after v1.6.2:
+# - aligned continuation setups were repeatedly reaching IN_ZONE around 0.95R
+#   and dying only on the 1.10R last-mile gate;
+# - old momentum theses were correctly expiring after 40m, but a genuinely new
+#   momentum pulse should be able to replace the old frozen thesis quickly.
+#
+# v1.6.3 therefore changes ONE execution threshold materially:
+#   CONTINUATION with regime_fit >= +2 and CARD >= C3: 0.90R net minimum.
+# Neutral/counter-trend continuation, reversal and momentum keep their v1.6.2
+# economics. Fee drag, entry trigger, daily loss, sizing and verified SL/TP stay.
+
+LDT_VERSION = "1.6.3"
+LDT163_CONT_ALIGNED_LIVE_RR = float(os.getenv("LDT163_CONT_ALIGNED_LIVE_RR", "0.90"))
+LDT163_MOM_FRESH_REPLACE_MIN = float(os.getenv("LDT163_MOM_FRESH_REPLACE_MIN", "2"))
+LDT163_MOM_FRESH_UTILITY_SLACK = float(os.getenv("LDT163_MOM_FRESH_UTILITY_SLACK", "1.5"))
+
+
+def _ldt14_live_rr_min(signal):
+    if _ldt16_is_active(signal):
+        return LDT162_ACTIVE_LIVE_RR
+    e = _ldt14_engine(signal)
+    fit = int((signal or {}).get("regime_fit", 0))
+    card = int((signal or {}).get("card_score", 0))
+    if e == "REVERSAL":
+        return LDT162_REV_LIVE_RR
+    if e == "CONTINUATION":
+        if fit >= 2 and card >= 3:
+            return LDT163_CONT_ALIGNED_LIVE_RR
+        if fit <= -2:
+            return LDT162_CONT_COUNTER_LIVE_RR
+        return LDT162_CONT_NEUTRAL_LIVE_RR
+    if fit >= 2 and card >= 3:
+        return LDT162_MOM_ALIGNED_LIVE_RR
+    return LDT162_MOM_NEUTRAL_LIVE_RR
+
+
+def evaluate_symbol(symbol, btc=None):
+    """v1.6.3 state machine: fresh momentum pulses can replace stale momentum quickly."""
+    _ldt13_load(); _ldt15_load_dead()
+    candidates = _ldt13_scan_candidates(symbol)
+    fresh = _ldt13_best_trackable(candidates)
+    st = _ldt13_states.get(symbol)
+
+    if st:
+        if fresh:
+            old_ts = int(st.get('origin_signal_ts') or (st.get('signal') or {}).get('signal_bar_ts') or 0)
+            new_ts = int(fresh.get('signal_bar_ts') or 0)
+            age_min = (time.time() - safe_float(st.get('created'))) / 60.0
+            old_u = safe_float(st.get('utility'), -999.0)
+            new_u = _ldt15_utility(fresh)
+            old_engine = str(st.get('engine') or '')
+            new_engine = _ldt14_engine(fresh)
+            same_side = str(fresh.get('side')) == str(st.get('side'))
+
+            # A genuinely new momentum release is new information. Do not make it
+            # wait behind a 40-minute-old frozen thesis merely because its utility
+            # score differs by a fraction. Same signal-bar never rearms.
+            fresh_momentum = (
+                same_side and old_engine == 'MOMENTUM' and new_engine == 'MOMENTUM'
+                and new_ts > old_ts
+                and age_min >= LDT163_MOM_FRESH_REPLACE_MIN
+                and int(fresh.get('regime_fit', 0)) >= 0
+                and new_u >= old_u - LDT163_MOM_FRESH_UTILITY_SLACK
+            )
+
+            if fresh_momentum:
+                _ldt15_mark_dead(st, 'rearmed by fresh momentum pulse')
+                st = _ldt13_new_state(fresh)
+                _ldt13_states[symbol] = st
+                tg(f"🔄 LDT v1.6.3 {symbol} {str(fresh.get('side')).upper()} MOMENTUM REARM\nFresh signal bar replaced older frozen momentum thesis.")
+            elif not same_side:
+                if new_u >= old_u + LDT13_REPLACE_EDGE:
+                    _ldt15_mark_dead(st, 'replaced opposite thesis')
+                    st = _ldt13_new_state(fresh)
+                    _ldt13_states[symbol] = st
+            elif new_ts > old_ts and age_min >= LDT15_FRESH_REPLACE_MIN and new_u >= old_u + 2.0:
+                _ldt15_mark_dead(st, 'promoted to fresh structure')
+                st = _ldt13_new_state(fresh)
+                _ldt13_states[symbol] = st
+            elif _ldt13_same_thesis(st, fresh) and new_engine == str(st.get('engine')):
+                _ldt13_merge_fresh(st, fresh)
+
+        out = _ldt14_refresh_state(st)
+        if out is None or st.get('state') in ('INVALIDATED', 'EXPIRED'):
+            reason = st.get('state_note', '')
+            _ldt15_mark_dead(st, reason)
+            _ldt13_states.pop(symbol, None)
+            _ldt13_save()
+            if fresh and _ldt13_trackable(fresh) and not _ldt15_is_recycled(fresh) and _ldt15_can_add_state(fresh):
+                st = _ldt13_new_state(fresh)
+                _ldt13_states[symbol] = st
+                out = _ldt14_refresh_state(st)
+            else:
+                return _ldt13_best_diagnostic(candidates)
+        _ldt13_save()
+        return out
+
+    if fresh and not _ldt15_is_recycled(fresh) and _ldt15_can_add_state(fresh):
+        st = _ldt13_new_state(fresh)
+        _ldt13_states[symbol] = st
+        out = _ldt14_refresh_state(st)
+        _ldt13_save()
+        return out
+    return _ldt13_best_diagnostic(candidates)
+
+
+# Current-version state messages.
+def _ldt13_transition(st, new_state, note=""):
+    old = str(st.get("state") or "")
+    st["last_state"] = old
+    st["state"] = new_state
+    st["state_note"] = note
+    st["updated"] = time.time()
+    if old != new_state:
+        st["transitions"] = int(st.get("transitions", 0)) + 1
+        if LDT13_NOTIFY_TRANSITIONS and new_state in ("IN_ZONE", "TRIGGER_HOLD", "READY", "INVALIDATED", "EXPIRED"):
+            tg(f"🧭 LDT v1.6.3 {st.get('symbol')} {str(st.get('side','')).upper()} · {st.get('engine','-')} · {new_state}\n{note}")
+    return old != new_state
+
+
+# Final execution wrapper with current labels and v1.6.3 aligned-RR economics.
+def open_trade(signal):
+    symbol = signal.get('symbol')
+    st = _ldt13_states.get(symbol)
+    active = _ldt16_is_active(signal)
+
+    # ACTIVE retains its local geometry thresholds only during final recheck.
+    global LDT_MIN_STOP_ATR, LDT_MAX_STOP_ATR, LDT_MIN_ENTRY_QUALITY, LDT15_MAX_FEE_R
+    old_globals = (LDT_MIN_STOP_ATR, LDT_MAX_STOP_ATR, LDT_MIN_ENTRY_QUALITY, LDT15_MAX_FEE_R)
+    if active:
+        LDT_MIN_STOP_ATR = LDT16_ACTIVE_MIN_STOP_ATR
+        LDT_MAX_STOP_ATR = LDT16_ACTIVE_MAX_STOP_ATR
+        LDT_MIN_ENTRY_QUALITY = LDT16_ACTIVE_MIN_EQ
+        LDT15_MAX_FEE_R = LDT16_ACTIVE_MAX_FEE_R
+    try:
+        if st:
+            fresh = _ldt14_refresh_state(st); _ldt13_save()
+            if not fresh or fresh.get('skip') or not fresh.get('entry_route'):
+                tg(f"⏭️ LDT v1.6.3 {symbol} {str(signal.get('side')).upper()} STATE CHANGED\n{(fresh or {}).get('skip') or st.get('state_note','not ready')}\nOrder cancelled before submission.")
+                return False
+            signal = fresh
+
+        side = signal.get('side')
+        live = safe_float(exchange.fetch_ticker(symbol).get('last'), signal.get('price'))
+        stop = safe_float(signal.get('structural_stop'))
+        d = 1 if side == 'long' else -1
+        risk = d * (live - stop)
+        if risk <= 0:
+            return False
+        fee_r = live * (2 * TAKER_FEE_RATE + SLIPPAGE_RATE) / max(risk, 1e-12)
+        if fee_r > LDT15_MAX_FEE_R:
+            tg(f"⏭️ LDT v1.6.3 {symbol} {str(side).upper()} FEE-DRAG VETO\nEstimated round-trip cost {fee_r:.2f}R > {LDT15_MAX_FEE_R:.2f}R")
+            return False
+        reg = _ldt15_regime(symbol, side)
+        engine = _ldt14_engine(signal)
+        card = int(signal.get('card_score', 0))
+        fit = int(reg.get('fit', 0))
+        if (engine == 'MOMENTUM' and fit < 0) or (engine == 'CONTINUATION' and fit <= -2 and card < 4) or (engine == 'REVERSAL' and fit >= 2 and card < 5):
+            tg(f"⏭️ LDT v1.6.3 {symbol} {str(side).upper()} REGIME VETO\n{engine} vs {reg.get('label')} · CARD C{card}")
+            return False
+        signal['regime'] = reg.get('label')
+        signal['regime_fit'] = fit
+        signal['fee_drag_r'] = fee_r
+        # Hardened v1.4 execution shell performs a second trigger/RR/order/protection check.
+        return _ldt15_base_open_trade(signal)
+    finally:
+        LDT_MIN_STOP_ATR, LDT_MAX_STOP_ATR, LDT_MIN_ENTRY_QUALITY, LDT15_MAX_FEE_R = old_globals
+
+
+def maybe_score_report(rows):
+    global _ldt13_last_report
+    now = time.time()
+    if now - _ldt13_last_report < LDT_REPORT_MIN * 60 or not rows:
+        return
+    _ldt13_last_report = now; _ldt13_load()
+    ready = [r for r in rows if r.get('side') and not r.get('skip') and r.get('entry_route')]
+    counts = {}; engines = {}
+    for st in _ldt13_states.values():
+        k = str(st.get('state') or 'WAIT_RETRACE'); counts[k] = counts.get(k, 0) + 1
+        sig = st.get('signal') or {}; e = 'ACTIVE' if _ldt16_is_active(sig) else str(st.get('engine') or '-')
+        engines[e] = engines.get(e, 0) + 1
+    ranked = sorted(rows, key=lambda r:(1 if not r.get('skip') else 0, 1 if r.get('symbol') in _ldt13_states else 0, _ldt15_utility(r)), reverse=True)[:11]
+    state_text = ' · '.join(f'{k} {v}' for k,v in sorted(counts.items(), key=lambda x:x[1], reverse=True)[:5]) or 'none'
+    eng_text = ' · '.join(f'{k} {v}' for k,v in engines.items()) or 'none'
+    lines = ['🧠 LIQUIDITY DAYTRADER v1.6.3 · AGGRESSIVE ALIGNED CONTINUATION',
+             f"Ready {len(ready)} · Tracked {len(_ldt13_states)}/{LDT15_MAX_TRACKED} · scanned {len(rows)}",
+             f"Today {daily.get('trades',0)} trades · W/L {daily.get('wins',0)}/{daily.get('losses',0)} · Net ${safe_float(daily.get('net')):.2f}",
+             f'Engines: {eng_text}', f'States: {state_text}']
+    for r in ranked:
+        st = _ldt13_states.get(r.get('symbol'), {}); age = (now-safe_float(st.get('created'), now))/60 if st else 0
+        e = 'ACTIVE-'+str(r.get('active_mode','SCALP')) if _ldt16_is_active(r) else _ldt14_engine(r)
+        if not r.get('skip') and r.get('entry_route'): status = '🟢 EXECUTE'
+        elif st: status = f"🟠 {st.get('state','WAIT_RETRACE')} {age:.0f}m"
+        else: status = '🟡 '+str(r.get('skip') or 'candidate')
+        pr=safe_float(r.get('prospective_rr'),-99.0); prtxt='N/A' if pr<=-90 else f'{pr:.2f}'
+        fr=safe_float(r.get('prospective_fee_r',r.get('fee_drag_r',-1))); frtxt='-' if fr<0 or fr>10 else f'{fr:.2f}R'
+        lines.append(f"{r.get('symbol')} {str(r.get('side')).upper()} {e} · {r.get('regime','?')} fit{int(r.get('regime_fit',0)):+d} · C{int(r.get('card_score',0))} STR{safe_float(r.get('setup_quality')):.0f} EQ{safe_float(r.get('entry_quality')):.0f} RRnow{safe_float(r.get('net_rr')):.2f} RR@zone{prtxt} fee{frtxt} {status}")
+    tg('\n'.join(lines))
+
+
+def startup_diagnostics():
+    _ldt13_load(); _ldt15_load_dead(); acc=futures_account(); reset_daily_if_needed(acc['total_equity'])
+    tg('🧠 LIQUIDITY DAYTRADER STARTED v1.6.3 · AGGRESSIVE ALIGNED CONTINUATION\n'
+       f'Aligned CONTINUATION (fit+2, CARD>=C3): live net RR >= {LDT163_CONT_ALIGNED_LIVE_RR:.2f}R.\n'
+       f'Fresh MOMENTUM pulse may replace an older momentum thesis after {LDT163_MOM_FRESH_REPLACE_MIN:.0f}m when the signal bar is genuinely newer.\n'
+       f'Other live RR: ACTIVE {LDT162_ACTIVE_LIVE_RR:.2f}R · REV {LDT162_REV_LIVE_RR:.2f}R · CONT neutral {LDT162_CONT_NEUTRAL_LIVE_RR:.2f}R · CONT counter {LDT162_CONT_COUNTER_LIVE_RR:.2f}R · MOM aligned {LDT162_MOM_ALIGNED_LIVE_RR:.2f}R.\n'
        'Fee-drag, regime direction, entry trigger, daily loss cap, position sizing and verified SL/TP remain active.\n'
        f'Core max positions {MAX_ACTIVE_POSITIONS} · max same side {LDT_MAX_SAME_SIDE} · Equity ${acc["total_equity"]:.2f} · Available ${acc["available"]:.2f}')
 
