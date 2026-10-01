@@ -10052,5 +10052,175 @@ def startup_diagnostics():
        f'Core max positions {MAX_ACTIVE_POSITIONS} · max same side {LDT_MAX_SAME_SIDE}.\n'
        f'Equity ${acc["total_equity"]:.2f} · Available ${acc["available"]:.2f}')
 
+
+
+# ============================================================
+# v1.6.2 - MEANINGFUL LIQUIDITY / ACTIVE RR RELEASE
+# ============================================================
+# Live review after v1.6.1 showed that once the legacy 1.45 ATR max-stop gate
+# was removed, the dominant blocker became tiny "first-liquidity" pivots and
+# the 1.10R ACTIVE last-mile threshold.  A daytrader should not treat every
+# micro pivot as the final objective.  v1.6.2 therefore:
+#   1) ignores insignificant internal liquidity when selecting the route target;
+#   2) lowers RR requirements only for regime-aligned continuation/momentum and
+#      the small-risk ACTIVE lane;
+#   3) keeps fee-drag, regime, trigger, daily-loss and SL/TP protection intact.
+# This is deliberately more active, but dollar risk per trade is unchanged.
+
+LDT_VERSION = "1.6.2"
+LDT162_REV_LIVE_RR = float(os.getenv("LDT162_REV_LIVE_RR", "1.30"))
+LDT162_REV_TRACK_RR = float(os.getenv("LDT162_REV_TRACK_RR", "1.05"))
+LDT162_CONT_ALIGNED_LIVE_RR = float(os.getenv("LDT162_CONT_ALIGNED_LIVE_RR", "1.10"))
+LDT162_CONT_NEUTRAL_LIVE_RR = float(os.getenv("LDT162_CONT_NEUTRAL_LIVE_RR", "1.20"))
+LDT162_CONT_COUNTER_LIVE_RR = float(os.getenv("LDT162_CONT_COUNTER_LIVE_RR", "1.45"))
+LDT162_CONT_TRACK_RR = float(os.getenv("LDT162_CONT_TRACK_RR", "0.90"))
+LDT162_MOM_ALIGNED_LIVE_RR = float(os.getenv("LDT162_MOM_ALIGNED_LIVE_RR", "1.05"))
+LDT162_MOM_NEUTRAL_LIVE_RR = float(os.getenv("LDT162_MOM_NEUTRAL_LIVE_RR", "1.15"))
+LDT162_MOM_TRACK_RR = float(os.getenv("LDT162_MOM_TRACK_RR", "0.90"))
+LDT162_ACTIVE_LIVE_RR = float(os.getenv("LDT162_ACTIVE_LIVE_RR", "0.85"))
+LDT162_ACTIVE_TRACK_RR = float(os.getenv("LDT162_ACTIVE_TRACK_RR", "0.72"))
+LDT162_REV_MIN_MEANINGFUL_R = float(os.getenv("LDT162_REV_MIN_MEANINGFUL_R", "0.70"))
+LDT162_CONT_MIN_MEANINGFUL_R = float(os.getenv("LDT162_CONT_MIN_MEANINGFUL_R", "0.80"))
+LDT162_MOM_MIN_MEANINGFUL_R = float(os.getenv("LDT162_MOM_MIN_MEANINGFUL_R", "0.85"))
+
+
+def _ldt162_meaningful_target(symbol, side, live, stop, hard_target, tf, engine):
+    """Choose the first *meaningful* external liquidity level, not the nearest micro pivot."""
+    d = 1 if side == "long" else -1
+    risk = d * (live - stop)
+    if live <= 0 or risk <= 0:
+        return hard_target, "invalid-risk", 0.0
+    min_r = (LDT162_REV_MIN_MEANINGFUL_R if engine == "REVERSAL" else
+             LDT162_MOM_MIN_MEANINGFUL_R if engine == "MOMENTUM" else
+             LDT162_CONT_MIN_MEANINGFUL_R)
+    try:
+        df = _ldt_closed(_ldt_df(symbol, tf, 240))
+        highs, lows = _ldt_pivots(df, 2, 2)
+        vals = [v for _, v in (highs if d == 1 else lows)]
+        if d == 1:
+            vals = sorted(v for v in vals if v > live)
+        else:
+            vals = sorted((v for v in vals if v < live), reverse=True)
+        hard_valid = hard_target > 0 and d * (hard_target - live) > 0
+        for v in vals:
+            rr = d * (v - live) / risk
+            if rr < min_r:
+                continue  # micro-liquidity is an obstacle, not the final TP
+            if hard_valid and ((d == 1 and v > hard_target) or (d == -1 and v < hard_target)):
+                break
+            return v, "meaningful-swing-liquidity", rr
+    except Exception:
+        pass
+    if hard_target > 0 and d * (hard_target - live) > 0:
+        rr = d * (hard_target - live) / risk
+        return hard_target, "external/measured-target", rr
+    # No valid far target: use a conservative measured objective rather than a
+    # bogus first pivot behind price.
+    fallback_r = 1.35 if engine == "REVERSAL" else 1.25 if engine == "CONTINUATION" else 1.20
+    target = live + d * fallback_r * risk
+    return target, "measured-route-target", fallback_r
+
+
+def _ldt14_target(symbol, side, live, stop, hard_target, tf, engine):
+    return _ldt162_meaningful_target(symbol, side, live, stop, hard_target, tf, engine)
+
+
+def _ldt14_live_rr_min(signal):
+    if _ldt16_is_active(signal):
+        return LDT162_ACTIVE_LIVE_RR
+    e = _ldt14_engine(signal)
+    fit = int((signal or {}).get("regime_fit", 0))
+    card = int((signal or {}).get("card_score", 0))
+    if e == "REVERSAL":
+        return LDT162_REV_LIVE_RR
+    if e == "CONTINUATION":
+        if fit >= 2 and card >= 3:
+            return LDT162_CONT_ALIGNED_LIVE_RR
+        if fit <= -2:
+            return LDT162_CONT_COUNTER_LIVE_RR
+        return LDT162_CONT_NEUTRAL_LIVE_RR
+    if fit >= 2 and card >= 3:
+        return LDT162_MOM_ALIGNED_LIVE_RR
+    return LDT162_MOM_NEUTRAL_LIVE_RR
+
+
+def _ldt14_track_rr_min(signal):
+    if _ldt16_is_active(signal):
+        return LDT162_ACTIVE_TRACK_RR
+    e = _ldt14_engine(signal)
+    if e == "REVERSAL":
+        return LDT162_REV_TRACK_RR
+    if e == "MOMENTUM":
+        return LDT162_MOM_TRACK_RR
+    return LDT162_CONT_TRACK_RR
+
+
+# Re-annotate old v1.0 candidate diagnostics: the old RR-first-liq text is no
+# longer a hard gate in v1.6.2.  Keep a useful label without pretending that a
+# tiny internal pivot is the final target.
+_ldt162_annotate_base = _ldt14_annotate
+def _ldt14_annotate(signal):
+    s = _ldt162_annotate_base(signal)
+    if s and str(s.get("skip") or "").startswith("RR-first-liq"):
+        pr = safe_float(s.get("prospective_rr"), -99.0)
+        need = _ldt14_track_rr_min(s)
+        s["skip"] = (f"route-RR@zone-{pr:.2f}<{need:.2f}" if pr > -90 and pr < need
+                     else "route-target-qualified-wait-state")
+    return s
+
+
+# Current version in state-transition messages (old v1.4 text was cosmetic but confusing).
+def _ldt13_transition(st, new_state, note=""):
+    old = str(st.get("state") or "")
+    st["last_state"] = old; st["state"] = new_state; st["state_note"] = note; st["updated"] = time.time()
+    if old != new_state:
+        st["transitions"] = int(st.get("transitions", 0)) + 1
+        if LDT13_NOTIFY_TRANSITIONS and new_state in ("IN_ZONE", "TRIGGER_HOLD", "READY", "INVALIDATED", "EXPIRED"):
+            tg(f"🧭 LDT v1.6.2 {st.get('symbol')} {str(st.get('side','')).upper()} · {st.get('engine','-')} · {new_state}\n{note}")
+    return old != new_state
+
+
+# v1.6.2 report: keep all diagnostics but make the active thresholds visible.
+def maybe_score_report(rows):
+    global _ldt13_last_report
+    now = time.time()
+    if now - _ldt13_last_report < LDT_REPORT_MIN * 60 or not rows:
+        return
+    _ldt13_last_report = now; _ldt13_load()
+    ready = [r for r in rows if r.get('side') and not r.get('skip') and r.get('entry_route')]
+    counts = {}; engines = {}
+    for st in _ldt13_states.values():
+        k = str(st.get('state') or 'WAIT_RETRACE'); counts[k] = counts.get(k, 0) + 1
+        sig = st.get('signal') or {}; e = 'ACTIVE' if _ldt16_is_active(sig) else str(st.get('engine') or '-')
+        engines[e] = engines.get(e, 0) + 1
+    ranked = sorted(rows, key=lambda r:(1 if not r.get('skip') else 0, 1 if r.get('symbol') in _ldt13_states else 0, _ldt15_utility(r)), reverse=True)[:11]
+    state_text = ' · '.join(f'{k} {v}' for k,v in sorted(counts.items(), key=lambda x:x[1], reverse=True)[:5]) or 'none'
+    eng_text = ' · '.join(f'{k} {v}' for k,v in engines.items()) or 'none'
+    lines = ['🧠 LIQUIDITY DAYTRADER v1.6.2 · MEANINGFUL LIQUIDITY',
+             f"Ready {len(ready)} · Tracked {len(_ldt13_states)}/{LDT15_MAX_TRACKED} · scanned {len(rows)}",
+             f"Today {daily.get('trades',0)} trades · W/L {daily.get('wins',0)}/{daily.get('losses',0)} · Net ${safe_float(daily.get('net')):.2f}",
+             f'Engines: {eng_text}', f'States: {state_text}']
+    for r in ranked:
+        st = _ldt13_states.get(r.get('symbol'), {}); age = (now-safe_float(st.get('created'), now))/60 if st else 0
+        e = 'ACTIVE-'+str(r.get('active_mode','SCALP')) if _ldt16_is_active(r) else _ldt14_engine(r)
+        if not r.get('skip') and r.get('entry_route'): status = '🟢 EXECUTE'
+        elif st: status = f"🟠 {st.get('state','WAIT_RETRACE')} {age:.0f}m"
+        else: status = '🟡 '+str(r.get('skip') or 'candidate')
+        pr=safe_float(r.get('prospective_rr'),-99.0); prtxt='N/A' if pr<=-90 else f'{pr:.2f}'
+        fr=safe_float(r.get('prospective_fee_r',r.get('fee_drag_r',-1))); frtxt='-' if fr<0 or fr>10 else f'{fr:.2f}R'
+        lines.append(f"{r.get('symbol')} {str(r.get('side')).upper()} {e} · {r.get('regime','?')} fit{int(r.get('regime_fit',0)):+d} · C{int(r.get('card_score',0))} STR{safe_float(r.get('setup_quality')):.0f} EQ{safe_float(r.get('entry_quality')):.0f} RRnow{safe_float(r.get('net_rr')):.2f} RR@zone{prtxt} fee{frtxt} {status}")
+    tg('\n'.join(lines))
+
+
+def startup_diagnostics():
+    _ldt13_load(); _ldt15_load_dead(); acc=futures_account(); reset_daily_if_needed(acc['total_equity'])
+    tg('🧠 LIQUIDITY DAYTRADER STARTED v1.6.2 · MEANINGFUL LIQUIDITY\n'
+       'Most common live blocker changed after v1.6.1: tiny first-liquidity pivots are no longer a hard final-target gate.\n'
+       'Targets now skip insignificant internal pivots and use the first meaningful route liquidity.\n'
+       f'Live net RR: ACTIVE {LDT162_ACTIVE_LIVE_RR:.2f}R · REV {LDT162_REV_LIVE_RR:.2f}R · CONT aligned {LDT162_CONT_ALIGNED_LIVE_RR:.2f}R · MOM aligned {LDT162_MOM_ALIGNED_LIVE_RR:.2f}R.\n'
+       'Fee-drag, regime direction, entry trigger, daily loss cap, position sizing and verified SL/TP remain active.\n'
+       f'Core max positions {MAX_ACTIVE_POSITIONS} · max same side {LDT_MAX_SAME_SIDE} · Equity ${acc["total_equity"]:.2f} · Available ${acc["available"]:.2f}')
+
+
 if __name__ == "__main__":
     main()
