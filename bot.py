@@ -9553,17 +9553,17 @@ def open_trade(signal):
     if st:
         fresh=_ldt14_refresh_state(st); _ldt13_save()
         if not fresh or fresh.get('skip') or not fresh.get('entry_route'):
-            tg(f"⏭️ LDT v1.5 {symbol} {str(signal.get('side')).upper()} STATE CHANGED\n{(fresh or {}).get('skip') or st.get('state_note','not ready')}\nOrder cancelled before submission."); return False
+            tg(f"⏭️ LDT v1.6.1 {symbol} {str(signal.get('side')).upper()} STATE CHANGED\n{(fresh or {}).get('skip') or st.get('state_note','not ready')}\nOrder cancelled before submission."); return False
         signal=fresh
     side=signal.get('side'); live=safe_float(exchange.fetch_ticker(symbol).get('last'),signal.get('price')); stop=safe_float(signal.get('structural_stop')); d=1 if side=='long' else -1
     risk=d*(live-stop)
     if risk<=0: return False
     fee_r=live*(2*TAKER_FEE_RATE+SLIPPAGE_RATE)/max(risk,1e-12)
     if fee_r>LDT15_MAX_FEE_R:
-        tg(f"⏭️ LDT v1.5 {symbol} {str(side).upper()} FEE-DRAG VETO\nEstimated round-trip cost {fee_r:.2f}R > {LDT15_MAX_FEE_R:.2f}R"); return False
+        tg(f"⏭️ LDT v1.6.1 {symbol} {str(side).upper()} FEE-DRAG VETO\nEstimated round-trip cost {fee_r:.2f}R > {LDT15_MAX_FEE_R:.2f}R"); return False
     reg=_ldt15_regime(symbol,side); engine=_ldt14_engine(signal); card=int(signal.get('card_score',0)); fit=int(reg.get('fit',0))
     if (engine=='MOMENTUM' and fit<0) or (engine=='CONTINUATION' and fit<=-2 and card<4) or (engine=='REVERSAL' and fit>=2 and card<5):
-        tg(f"⏭️ LDT v1.5 {symbol} {str(side).upper()} REGIME VETO\n{engine} vs {reg.get('label')} · CARD C{card}"); return False
+        tg(f"⏭️ LDT v1.6.1 {symbol} {str(side).upper()} REGIME VETO\n{engine} vs {reg.get('label')} · CARD C{card}"); return False
     signal['regime']=reg.get('label'); signal['regime_fit']=fit; signal['fee_drag_r']=fee_r
     return _ldt15_base_open_trade(signal)
 
@@ -9595,7 +9595,7 @@ def manage_sniper_step_stops():
             if not safe_side:continue
             ok2,res=amend_tpsl_stop(p,desired); key=f'ldt15:{pid}:{stage}'
             if ok2 and not sniper_step_notified.get(key):
-                tg(f"🪜 LDT v1.5 PROFIT LOCK\n{symbol} {side.upper()}\n{stage} · MFE {best_r:.2f}R · fee drag {fee_r:.2f}R · SL {desired:.8g}"); sniper_step_notified[key]=True
+                tg(f"🪜 LDT v1.6.1 PROFIT LOCK\n{symbol} {side.upper()}\n{stage} · MFE {best_r:.2f}R · fee drag {fee_r:.2f}R · SL {desired:.8g}"); sniper_step_notified[key]=True
         except Exception as e:
             tg(f"⚠️ LDT v1.5 POSITION MANAGER\n{position_symbol(p) if isinstance(p,dict) else '-'}\n{type(e).__name__}: {e}")
 
@@ -9994,7 +9994,7 @@ def maybe_score_report(rows):
         sig=st.get('signal') or {}; e='ACTIVE' if _ldt16_is_active(sig) else str(st.get('engine') or '-'); engines[e]=engines.get(e,0)+1
     ranked=sorted(rows,key=lambda r:(1 if not r.get('skip') else 0,1 if r.get('symbol') in _ldt13_states else 0,_ldt15_utility(r)),reverse=True)[:11]
     state_text=' · '.join(f'{k} {v}' for k,v in sorted(counts.items(),key=lambda x:x[1],reverse=True)[:5]) or 'none'; eng_text=' · '.join(f'{k} {v}' for k,v in engines.items()) or 'none'
-    lines=['🧠 LIQUIDITY DAYTRADER v1.6 · ACTIVE DAYTRADER',f"Ready {len(ready)} · Tracked {len(_ldt13_states)}/{LDT15_MAX_TRACKED} · scanned {len(rows)}",f"Today {daily.get('trades',0)} trades · W/L {daily.get('wins',0)}/{daily.get('losses',0)} · Net ${safe_float(daily.get('net')):.2f}",f'Engines: {eng_text}',f'States: {state_text}']
+    lines=['🧠 LIQUIDITY DAYTRADER v1.6.1 · ACTIVE DAYTRADER',f"Ready {len(ready)} · Tracked {len(_ldt13_states)}/{LDT15_MAX_TRACKED} · scanned {len(rows)}",f"Today {daily.get('trades',0)} trades · W/L {daily.get('wins',0)}/{daily.get('losses',0)} · Net ${safe_float(daily.get('net')):.2f}",f'Engines: {eng_text}',f'States: {state_text}']
     for r in ranked:
         st=_ldt13_states.get(r.get('symbol'),{}); age=(now-safe_float(st.get('created'),now))/60 if st else 0
         e='ACTIVE-'+str(r.get('active_mode','SCALP')) if _ldt16_is_active(r) else _ldt14_engine(r)
@@ -10015,6 +10015,42 @@ def startup_diagnostics():
        f'Core protection unchanged: daily loss cap · max positions {MAX_ACTIVE_POSITIONS} · max same side {LDT_MAX_SAME_SIDE} · verified SL/TP.\n'
        f'Equity ${acc["total_equity"]:.2f} · Available ${acc["available"]:.2f}')
 
+
+
+# ============================================================
+# v1.6.1 - REMOVE DOMINANT WIDE-STOP ATR REJECTION
+# ============================================================
+# Review of the live Telegram recording showed that the most common HARD
+# rejection was the legacy upper stop-distance gate (1.45 ATR).  A wide
+# structural stop is not automatically a larger dollar risk because the
+# execution shell sizes contracts from the fixed equity-risk budget.
+#
+# Therefore core REVERSAL / CONTINUATION / MOMENTUM lanes no longer reject
+# a thesis solely because its structural stop is > 1.45 ATR.  All economic
+# gates remain: positive risk geometry, minimum stop, net RR, fee drag,
+# regime/card logic, entry zone/trigger, account risk budget, margin caps,
+# exchange minimum-size safety, daily loss cap and verified SL/TP.
+#
+# ACTIVE scalp keeps its own local 0.28-1.25 ATR stop window via the v1.6
+# wrapper, because that lane is explicitly designed around tight local stops.
+LDT161_REMOVE_MAX_STOP_GATE = os.getenv("LDT161_REMOVE_MAX_STOP_GATE", "True").lower() == "true"
+if LDT161_REMOVE_MAX_STOP_GATE:
+    LDT_MAX_STOP_ATR = 99.0
+
+# Cosmetic version labels for the current runtime.
+_ldt161_report_base = maybe_score_report
+def maybe_score_report(rows):
+    return _ldt161_report_base(rows)
+
+_ldt161_startup_base = startup_diagnostics
+def startup_diagnostics():
+    _ldt13_load(); _ldt15_load_dead(); acc=futures_account(); reset_daily_if_needed(acc['total_equity'])
+    tg('🧠 LIQUIDITY DAYTRADER STARTED v1.6.1 · ACTIVE / WIDE-STOP GATE REMOVED\n'
+       'Dominant legacy blocker removed: core setups are no longer rejected only because stop > 1.45 ATR.\n'
+       'Dollar risk is still capped by position sizing; RR, fee drag, regime, trigger, daily loss and SL/TP protection remain active.\n'
+       f'ACTIVE scalp keeps local stop {LDT16_ACTIVE_MIN_STOP_ATR:.2f}-{LDT16_ACTIVE_MAX_STOP_ATR:.2f} ATR · risk {LDT16_ACTIVE_RISK*100:.2f}%.\n'
+       f'Core max positions {MAX_ACTIVE_POSITIONS} · max same side {LDT_MAX_SAME_SIDE}.\n'
+       f'Equity ${acc["total_equity"]:.2f} · Available ${acc["available"]:.2f}')
 
 if __name__ == "__main__":
     main()
