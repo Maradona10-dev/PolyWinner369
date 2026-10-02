@@ -11628,5 +11628,372 @@ def main():
             if '152002' in msg: time.sleep(20); continue
             tg(f"⚠️ LDT v1.8.1 LOOP ERROR\n{msg}"); time.sleep(30)
 
+
+# ============================================================
+# V2.0 DIRECT INTRADAY — FRESH STRATEGY, NO WAIT_RETRACE ENGINE
+# ============================================================
+# Why this exists:
+# - V1.x proved that the exchange/execution shell can work, but the strategy
+#   accumulated too many WAIT_RETRACE / IN_ZONE / promotion gates.
+# - V2.0 does not persist a thesis and wait for a perfect old zone.
+# - Every scan asks one simple question: is there a tradeable intraday setup NOW?
+# - Three direct playbooks: 15m trend pullback, 5m breakout, 5m momentum continuation.
+# - 1m is a light timing trigger, not a second full strategy.
+# - Position risk remains small and every live order still carries attached SL/TP.
+# - IMPORTANT small-account fix: sizing no longer inherits MIN_NET_TP_USDT=$0.40.
+#   With ~50 USDT equity and sub-1% risk that old floor can mathematically make
+#   otherwise valid trades impossible. V2.0 uses its own adaptive $0.08 floor.
+
+LDT_VERSION = "2.0"
+V20_SCAN_SECONDS = int(os.getenv("V20_SCAN_SECONDS", "35"))
+V20_REPORT_SECONDS = int(os.getenv("V20_REPORT_SECONDS", "900"))
+V20_ENTRY_COOLDOWN_SECONDS = int(os.getenv("V20_ENTRY_COOLDOWN_SECONDS", "75"))
+V20_SYMBOL_COOLDOWN_SECONDS = int(os.getenv("V20_SYMBOL_COOLDOWN_SECONDS", "300"))
+V20_MAX_ATTEMPTS_PER_SCAN = int(os.getenv("V20_MAX_ATTEMPTS_PER_SCAN", "4"))
+V20_MIN_SCORE = int(os.getenv("V20_MIN_SCORE", "5"))
+V20_RISK_PCT = float(os.getenv("V20_RISK_PCT", "0.0045"))       # 0.45% equity
+V20_ELITE_RISK_PCT = float(os.getenv("V20_ELITE_RISK_PCT", "0.0060")) # 0.60%
+V20_MIN_STOP_ATR = float(os.getenv("V20_MIN_STOP_ATR", "0.45"))
+V20_MAX_STOP_ATR = float(os.getenv("V20_MAX_STOP_ATR", "1.20"))
+V20_TARGET_R = float(os.getenv("V20_TARGET_R", "1.40"))
+V20_ELITE_TARGET_R = float(os.getenv("V20_ELITE_TARGET_R", "1.65"))
+V20_MIN_NET_R = float(os.getenv("V20_MIN_NET_R", "0.85"))
+V20_MAX_FEE_R = float(os.getenv("V20_MAX_FEE_R", "0.45"))
+V20_MIN_NET_TP_USDT = float(os.getenv("V20_MIN_NET_TP_USDT", "0.08"))
+V20_MAX_LIVE_DRIFT_ATR = float(os.getenv("V20_MAX_LIVE_DRIFT_ATR", "0.45"))
+V20_MAX_SAME_SIDE = int(os.getenv("V20_MAX_SAME_SIDE", "1"))
+V20_MAX_POSITIONS = int(os.getenv("V20_MAX_POSITIONS", "2"))
+_v20_last_report = 0.0
+_v20_retry_after = {}
+
+
+def _v20_bar(row, d, atr):
+    body, close_loc, directional = _ldt11_bar_strength(row, d, atr)
+    c=safe_float(row['close']); ema=safe_float(row['ema21'])
+    ema_ok = c > ema if d == 1 else c < ema
+    return body, close_loc, directional, ema_ok
+
+
+def _v20_trend(df15):
+    """Return +1 / -1 / 0 using a deliberately simple 15m trend definition."""
+    if len(df15) < 30:
+        return 0, 0
+    a=df15.iloc[-1]; e0=safe_float(a['ema21']); e3=safe_float(df15.iloc[-4]['ema21'])
+    c=safe_float(a['close']); atr=safe_float(a['atr'])
+    if atr <= 0 or e0 <= 0:
+        return 0, 0
+    slope=(e0-e3)/atr
+    if c > e0 and slope > 0.04:
+        strength=2 if slope > 0.18 else 1
+        return 1, strength
+    if c < e0 and slope < -0.04:
+        strength=2 if slope < -0.18 else 1
+        return -1, strength
+    return 0, 0
+
+
+def _v20_local_stop(df5, side, entry, atr):
+    d=1 if side=='long' else -1
+    x=df5.tail(6)
+    raw=min(safe_float(v) for v in x['low']) if d==1 else max(safe_float(v) for v in x['high'])
+    dist=d*(entry-raw)
+    min_dist=V20_MIN_STOP_ATR*atr; max_dist=V20_MAX_STOP_ATR*atr
+    # Local structure is preferred, but clamp it to a practical intraday risk band.
+    if dist <= 0:
+        dist=min_dist
+    dist=max(min_dist,min(max_dist,dist))
+    return entry-d*dist, dist/max(atr,1e-12)
+
+
+def _v20_eval(symbol):
+    """Fresh direct signal. No thesis persistence and no WAIT_RETRACE state."""
+    try:
+        d15=_ldt_closed(_ldt_df(symbol,'15m',90))
+        d5=_ldt_closed(_ldt_df(symbol,'5m',120))
+        d1=_ldt_closed(_ldt_df(symbol,'1m',120))
+    except Exception:
+        return None
+    if min(len(d15),len(d5),len(d1)) < 30:
+        return None
+    trend,tstrength=_v20_trend(d15)
+    a5=d5.iloc[-1]; p5=d5.iloc[-2]; a1=d1.iloc[-1]; p1=d1.iloc[-2]
+    atr5=safe_float(a5['atr']); atr1=safe_float(a1['atr']); entry=safe_float(a5['close'])
+    if atr5<=0 or atr1<=0 or entry<=0:
+        return None
+
+    # If 15m is neutral, only a strong 5m breakout may define direction.
+    prior_hi=max(safe_float(v) for v in d5.iloc[-7:-1]['high'])
+    prior_lo=min(safe_float(v) for v in d5.iloc[-7:-1]['low'])
+    body_up,cl_up,dir_up,ema_up=_v20_bar(a5,1,atr5)
+    body_dn,cl_dn,dir_dn,ema_dn=_v20_bar(a5,-1,atr5)
+    breakout_long=dir_up and body_up>=0.18 and cl_up>=0.64 and entry>prior_hi
+    breakout_short=dir_dn and body_dn>=0.18 and cl_dn>=0.64 and entry<prior_lo
+    if trend==0:
+        if breakout_long: trend=1; tstrength=1
+        elif breakout_short: trend=-1; tstrength=1
+        else: return None
+
+    side='long' if trend==1 else 'short'; d=trend
+    body5,close5,dir5,ema5=_v20_bar(a5,d,atr5)
+    ema_prev=safe_float(p5['ema21']); touch_pad=0.28*atr5
+    touched = safe_float(p5['low']) <= ema_prev+touch_pad if d==1 else safe_float(p5['high']) >= ema_prev-touch_pad
+    reclaimed = safe_float(a5['close']) > safe_float(a5['ema21']) if d==1 else safe_float(a5['close']) < safe_float(a5['ema21'])
+    pullback=bool(touched and reclaimed and dir5 and body5>=0.10 and close5>=0.52)
+    breakout=breakout_long if d==1 else breakout_short
+    momentum=bool(dir5 and ema5 and body5>=0.16 and close5>=0.60)
+    if not (pullback or breakout or momentum):
+        return None
+    if breakout: setup='BREAKOUT'
+    elif pullback: setup='PULLBACK'
+    else: setup='MOMENTUM'
+
+    # Lightweight 1m timing: direction + reasonable close + one micro confirmation.
+    body1,close1,dir1,ema1=_v20_bar(a1,d,atr1)
+    prev_break=safe_float(a1['close'])>safe_float(p1['high']) if d==1 else safe_float(a1['close'])<safe_float(p1['low'])
+    impulse=body1>=0.16
+    trigger=bool(dir1 and body1>=0.055 and close1>=0.52 and (ema1 or prev_break or impulse))
+    if not trigger:
+        return None
+
+    stop,stop_atr=_v20_local_stop(d5,side,entry,atr5)
+    risk=abs(entry-stop)
+    if risk<=0:
+        return None
+    fee_r=entry*(2*TAKER_FEE_RATE+SLIPPAGE_RATE)/risk
+    if fee_r>V20_MAX_FEE_R:
+        return None
+
+    score=0
+    score += 2 if tstrength>=2 else 1
+    score += 2 if breakout else (2 if pullback else 1)
+    score += 1 if body5>=0.25 else 0
+    score += 1 if close5>=0.72 else 0
+    score += 1 if ema1 else 0
+    score += 1 if prev_break else 0
+    score += 1 if impulse else 0
+    volma=safe_float(a5.get('volma')); vol=safe_float(a5.get('volume'))
+    if volma>0 and vol>=volma: score+=1
+    if score<V20_MIN_SCORE:
+        return None
+    elite=score>=8
+    gross=V20_ELITE_TARGET_R if elite else V20_TARGET_R
+    net=gross-fee_r
+    if net<V20_MIN_NET_R:
+        return None
+    target=entry+d*risk*gross
+    return {
+        'symbol':symbol,'side':side,'price':entry,'atr':atr5,'structural_stop':stop,
+        'target_price':target,'far_target':target,'gross_rr':gross,'net_rr':net,
+        'fee_drag_r':fee_r,'score':score,'setup_quality':min(100,55+score*5),
+        'entry_quality':min(100,50+score*6),'quality':score,'confirmations':score,
+        'strategy':'V20-DIRECT','entry_route':f'DIRECT-{setup}','engine':'DIRECT',
+        'route':'DIRECT','signal_bar_ts':int(a1['ts']),'trend_strength':tstrength,
+        'setup':setup,'stop_atr':stop_atr,'elite':elite,
+        'note':f'{setup} 15m trend {"UP" if d==1 else "DOWN"} · 5m body {body5:.2f}ATR close {close5:.0%} · 1m body {body1:.2f}ATR close {close1:.0%}'
+    }
+
+
+def _v20_portfolio_allows(signal, positions):
+    if len(positions)>=V20_MAX_POSITIONS:
+        return False,'max positions'
+    sym=signal['symbol']; side=signal['side']
+    if any(position_symbol(p)==sym for p in positions):
+        return False,'symbol already open'
+    same=sum(1 for p in positions if position_side(p)==side)
+    if same>=V20_MAX_SAME_SIDE:
+        return False,'same-side cap'
+    return True,'ok'
+
+
+def _v20_size(symbol,entry,stop,equity,available,risk_pct,gross_r):
+    """Small-account sizing without the inherited hard $0.40 minimum-profit veto."""
+    meta=get_instrument(symbol); cv=safe_float(meta.get('contractValue')); min_size=safe_float(meta.get('minSize')); lot=safe_float(meta.get('lotSize')); max_market=safe_float(meta.get('maxMarketSize',0))
+    if cv<=0 or min_size<=0 or lot<=0 or entry<=0: return None
+    stop_pct=abs(entry-stop)/entry
+    if stop_pct<=0: return None
+    risk_budget=equity*risk_pct
+    risk_notional_cap=risk_budget/stop_pct
+    margin_cap=min(BASE_MARGIN_USDT,MAX_MARGIN_USDT,equity*MAX_MARGIN_EQUITY_PCT,max(0.0,available*AVAILABLE_MARGIN_BUFFER))
+    target_notional=min(risk_notional_cap,margin_cap*LEVERAGE)
+    contracts=floor_step(target_notional/(cv*entry),lot)
+    if contracts<min_size: contracts=min_size
+    if max_market>0: contracts=min(contracts,floor_step(max_market,lot))
+    if contracts<min_size: return None
+    notional=contracts*cv*entry; margin=notional/LEVERAGE
+    actual_risk=notional*stop_pct; cost=roundtrip_cost(notional); expected_tp=notional*gross_r*stop_pct; expected_net=expected_tp-cost
+    if actual_risk>risk_budget*1.03 or margin>margin_cap+1e-9: return None
+    if expected_net<V20_MIN_NET_TP_USDT: return None
+    return {'contracts':contracts,'notional':notional,'margin':margin,'risk_budget':risk_budget,
+            'expected_net_tp_usdt':expected_net,'expected_net_sl_usdt':actual_risk+cost}
+
+
+def _v20_execute(signal):
+    """One direct live precheck then order. No thesis/state refresh can cancel it."""
+    global protection_lock,_v62_last_entry_time
+    symbol=signal['symbol']; side=signal['side']; d=1 if side=='long' else -1
+    tg(f"🟠 LDT v2.0 {symbol} {side.upper()} DIRECT READY\n{signal['entry_route']} · score {signal['score']} · {signal['note']}")
+    acc=futures_account(); equity,available=acc['total_equity'],acc['available']; reset_daily_if_needed(equity)
+    if equity<MIN_EQUITY_USDT or available<=0: return False
+    if not PAPER_TRADING and protection_lock:
+        tg(f"🟠 LDT v2.0 {symbol} protection lock — retry later")
+        return False
+    since=time.time()-_v62_last_entry_time
+    if since<V20_ENTRY_COOLDOWN_SECONDS:
+        return False
+    try: live=safe_float(exchange.fetch_ticker(symbol).get('last'),signal['price'])
+    except Exception: live=safe_float(signal['price'])
+    atr=safe_float(signal['atr']); scan_price=safe_float(signal['price'])
+    if live<=0 or atr<=0: return False
+    if abs(live-scan_price)/atr>V20_MAX_LIVE_DRIFT_ATR:
+        tg(f"🟠 LDT v2.0 {symbol} price moved {abs(live-scan_price)/atr:.2f}ATR since scan — fresh scan required")
+        return False
+
+    # Preserve the local risk distance around the live fill estimate.
+    risk_dist=abs(scan_price-safe_float(signal['structural_stop']))
+    risk_dist=max(V20_MIN_STOP_ATR*atr,min(V20_MAX_STOP_ATR*atr,risk_dist))
+    stop=live-d*risk_dist
+    gross=V20_ELITE_TARGET_R if signal.get('elite') else V20_TARGET_R
+    target=live+d*risk_dist*gross
+    tick=safe_float(get_instrument(symbol).get('tickSize'),0.0001)
+    stop=round_trade_price(stop,tick,side,'sl'); target=round_trade_price(target,tick,side,'tp')
+    risk=abs(live-stop)
+    if risk<=0:return False
+    fee_r=live*(2*TAKER_FEE_RATE+SLIPPAGE_RATE)/risk; net=gross-fee_r
+    if fee_r>V20_MAX_FEE_R or net<V20_MIN_NET_R:
+        tg(f"🟠 LDT v2.0 {symbol} economics changed — net {net:.2f}R fee {fee_r:.2f}R; fresh scan")
+        return False
+    risk_pct=V20_ELITE_RISK_PCT if signal.get('elite') else V20_RISK_PCT
+    sizing=_v20_size(symbol,live,stop,equity,available,risk_pct,gross)
+    if not sizing:
+        tg(f"🟠 LDT v2.0 {symbol} SIZE BLOCK — contract minimum/margin/economics; candidate not burned")
+        return False
+    tg(f"📤 LDT v2.0 {symbol} ORDER SENT\n{side.upper()} {signal['setup']} · score {signal['score']} · net {net:.2f}R · fee {fee_r:.2f}R\nRisk {risk_pct*100:.2f}% · est net TP ${sizing['expected_net_tp_usdt']:.2f}")
+    if PAPER_TRADING:
+        _v62_last_entry_time=time.time(); tg(f"🟢 PAPER ORDER ACCEPTED · LDT v2.0\n{symbol} {side.upper()} · SL {stop:.8g} · TP {target:.8g}"); return True
+    oklev,levres=set_leverage(symbol,LEVERAGE)
+    if not oklev:
+        tg(f"❌ LDT v2.0 {symbol} LEVERAGE FAILED\n{levres}"); return False
+    before_ids={position_id(p) for p in get_positions() if position_id(p)}
+    payload={'instId':blofin_inst_id(symbol),'marginMode':MARGIN_MODE,'positionSide':'net','side':'buy' if side=='long' else 'sell','orderType':'market','size':str(sizing['contracts']),
+             'tpTriggerPrice':str(target),'tpOrderPrice':'-1','tpTriggerPriceType':'mark','slTriggerPrice':str(stop),'slOrderPrice':'-1','slTriggerPriceType':'mark',
+             'clientOrderId':f"ldt20{int(time.time()*1000)%1000000000}"}
+    if BROKER_ID: payload['brokerId']=BROKER_ID
+    resp=native('private_post_trade_order',payload)
+    if not native_ok(resp):
+        err=response_error(resp); tg(f"❌ LDT v2.0 {symbol} ORDER REJECTED\n{err}"); return False
+    _v62_last_entry_time=time.time()
+    tg(f"🟢 LDT v2.0 ORDER ACCEPTED\n{symbol} {side.upper()} · {signal['setup']} · score {signal['score']}\nEntry~{live:.8g} · SL {stop:.8g} · TP {target:.8g}\nNotional ${sizing['notional']:.2f} · Margin ${sizing['margin']:.2f} · {LEVERAGE}x")
+    new_pos=find_new_position(symbol,before_ids,timeout=10)
+    if new_pos is None:
+        tg(f"🟢 LDT v2.0 {symbol} ACK RECEIVED — position visibility pending; protection watcher will verify.")
+        return True
+    pid=position_id(new_pos); fill=position_entry(new_pos) or live
+    if pid:
+        sniper_managed_positions.add(pid)
+        _ldt_meta[pid]={'risk':risk,'entry':fill,'sl':stop,'tp':target,'final_r':gross,'side':side,'opened':time.time(),'strategy':'V20-DIRECT','route':signal['entry_route'],'engine':'DIRECT','mfe_price':fill,'mfe_r':0.0,'version':'2.0'}
+    if has_live_protection(new_pos)[0]:
+        tg(f"🛡️ LDT v2.0 PROTECTION CONFIRMED\n{symbol} {side.upper()} · SL/TP visible")
+    else:
+        last=safe_float(exchange.fetch_ticker(symbol).get('last'))
+        if tpsl_prices_valid(side,stop,target,last):
+            ok,res=place_tpsl_for_position(new_pos,stop,target,client_tag='ldt20')
+            if ok: tg(f"🛡️ LDT v2.0 FALLBACK PROTECTION CONFIRMED\n{symbol}")
+            else:
+                protection_lock=True; tg(f"🚨 LDT v2.0 PROTECTION FAILURE\n{symbol}\n{res}\nNEW TRADES PAUSED")
+        else:
+            protection_lock=True; tg(f"🚨 LDT v2.0 {symbol}: protection could not be verified. NEW TRADES PAUSED")
+    return True
+
+
+def _v20_report(rows):
+    global _v20_last_report
+    now=time.time()
+    if now-_v20_last_report<V20_REPORT_SECONDS:return
+    _v20_last_report=now
+    acc=futures_account(); daily=daily_closed_stats_v5()
+    ranked=sorted(rows,key=lambda r:(r['score'],r['net_rr']),reverse=True)[:8]
+    lines=[f"🧠 LIQUIDITY DAYTRADER v2.0 · DIRECT INTRADAY",f"Direct candidates {len(rows)} · scanned {len(SYMBOLS)}",f"Today {daily.get('trades',0)} trades · W/L {daily.get('wins',0)}/{daily.get('losses',0)} · Net ${safe_float(daily.get('net')):.2f}",f"No WAIT_RETRACE engine · fresh 15m/5m/1m setup every scan",f"Risk {V20_RISK_PCT*100:.2f}% / elite {V20_ELITE_RISK_PCT*100:.2f}% · max positions {V20_MAX_POSITIONS} · same side {V20_MAX_SAME_SIDE}"]
+    for r in ranked:
+        lines.append(f"🟠 {r['symbol']} {r['side'].upper()} {r['setup']} · score {r['score']} · net {r['net_rr']:.2f}R fee {r['fee_drag_r']:.2f}R")
+    tg('\n'.join(lines))
+
+
+def startup_diagnostics_v20():
+    global protection_lock
+    load_learning(); acc=futures_account(); reset_daily_if_needed(acc['total_equity'])
+    tg(f"🧠 LIQUIDITY DAYTRADER STARTED\nv2.0 · DIRECT INTRADAY\nFresh strategy: no frozen thesis, no WAIT_RETRACE, no card-promotion queue.\nPlaybooks: 15m trend pullback · 5m breakout · 5m momentum + light 1m trigger.\nSmall-account sizing fix: V2 min expected net TP ${V20_MIN_NET_TP_USDT:.2f} (does NOT inherit old ${MIN_NET_TP_USDT:.2f} floor).\nRisk {V20_RISK_PCT*100:.2f}% / elite {V20_ELITE_RISK_PCT*100:.2f}% · max positions {V20_MAX_POSITIONS} · max same side {V20_MAX_SAME_SIDE}.\nEquity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}")
+    if not PAPER_TRADING:
+        try: seed_closed_history_v5()
+        except Exception as e: tg(f"⚠️ V2.0 PNL seed warning\n{e}")
+        try:
+            inherited=get_positions(); protection_lock=not all_positions_protected() if inherited else False
+            if inherited: tg(f"ℹ️ V2.0 HANDOVER\n{len(inherited)} existing position(s)."+("\n⚠️ Unprotected position: entries locked." if protection_lock else "\n✅ Protection verified."))
+        except Exception as e:
+            protection_lock=True; tg(f"🚨 V2.0 STARTUP PROTECTION CHECK FAILED\n{e}")
+
+
+def main():
+    """V2.0 direct daytrader. Intentionally does not call V1.x evaluate_symbol()."""
+    global protection_lock,_v6_daily_risk_alerted,_v6_daily_risk_last_notice
+    startup_diagnostics_v20()
+    while True:
+        try:
+            if not PAPER_TRADING:
+                try: check_for_closed_positions()
+                except Exception as e: tg(f"⚠️ V2.0 PNL TRACKER ERROR\n{e}")
+                try: manage_sniper_step_stops()
+                except Exception as e: tg(f"⚠️ V2.0 MANAGER ERROR\n{e}")
+            acc=futures_account(); ok,reason=check_daily_risk(acc['total_equity'])
+            if not ok:
+                now_ts=time.time()
+                if (not _v6_daily_risk_alerted) or (now_ts-_v6_daily_risk_last_notice>=V6_DAILY_RISK_REMINDER_MIN*60):
+                    tg(f"🛑 {reason}\nV2.0 new entries paused; existing positions remain protected.")
+                    _v6_daily_risk_alerted=True; _v6_daily_risk_last_notice=now_ts
+                time.sleep(120); continue
+            elif _v6_daily_risk_alerted:
+                tg('🟢 DAILY RISK STOP CLEARED\nV2.0 entries allowed again.'); _v6_daily_risk_alerted=False; _v6_daily_risk_last_notice=0.0
+            if time.time()<loss_pause_until: time.sleep(V20_SCAN_SECONDS); continue
+            positions=get_positions()
+            if not PAPER_TRADING:
+                protection_watch(); positions=get_positions()
+            if protection_lock and not PAPER_TRADING:
+                time.sleep(V20_SCAN_SECONDS); continue
+
+            rows=[]; now=time.time(); existing={position_symbol(p) for p in positions}
+            for symbol in SYMBOLS:
+                if symbol in existing or now<safe_float(_v20_retry_after.get(symbol),0): continue
+                try:
+                    s=_v20_eval(symbol)
+                    if s: rows.append(s)
+                except Exception:
+                    continue
+            rows.sort(key=lambda r:(r['score'],r['net_rr'], -r['fee_drag_r']),reverse=True)
+            _v20_report(rows)
+            attempts=0
+            for sig in rows:
+                if attempts>=V20_MAX_ATTEMPTS_PER_SCAN: break
+                positions=get_positions()
+                allowed,why=_v20_portfolio_allows(sig,positions)
+                if not allowed: continue
+                key=int(sig.get('signal_bar_ts',0))
+                if sniper_last_signal_bar.get(sig['symbol'])==key: continue
+                attempts+=1
+                if _v20_execute(sig):
+                    sniper_last_signal_bar[sig['symbol']]=key
+                    symbol_last_trade[sig['symbol']]=time.time()
+                    _v20_retry_after[sig['symbol']]=time.time()+V20_SYMBOL_COOLDOWN_SECONDS
+                    # Continue only if portfolio still has room; opposite-side candidate may also qualify.
+                    if len(get_positions())>=V20_MAX_POSITIONS: break
+                else:
+                    _v20_retry_after[sig['symbol']]=time.time()+20
+            time.sleep(V20_SCAN_SECONDS)
+        except KeyboardInterrupt:
+            tg('🛑 Liquidity DayTrader v2.0 stopped.'); raise
+        except Exception as e:
+            msg=f"{type(e).__name__}: {e}"
+            if '152002' in msg: time.sleep(20); continue
+            tg(f"⚠️ LDT v2.0 LOOP ERROR\n{msg}"); time.sleep(30)
+
+
 if __name__ == "__main__":
     main()
