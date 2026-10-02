@@ -11226,20 +11226,20 @@ def _ldt180_order_shell(signal):
         return False
     d=1 if side=='long' else -1
     engine=_ldt14_engine(signal)
-    tg(f"🚦 LDT v1.8 {symbol} {side.upper()} EXECUTION START\n{engine} · {signal.get('entry_route')} · orange priority promoted to final precheck")
+    tg(f"🚦 LDT v1.8.1 {symbol} {side.upper()} EXECUTION START\n{engine} · {signal.get('entry_route')} · orange priority promoted to final precheck")
 
     acc=futures_account(); equity,available=acc['total_equity'],acc['available']
     reset_daily_if_needed(equity)
     if equity < MIN_EQUITY_USDT or available <= 0:
-        tg(f"🟠 LDT v1.8 {symbol} ACCOUNT BLOCK\nSignal stays retryable; equity/available insufficient.")
+        tg(f"🟠 LDT v1.8.1 {symbol} ACCOUNT BLOCK\nSignal stays retryable; equity/available insufficient.")
         return False
     if not PAPER_TRADING and protection_lock:
-        tg(f"🟠 LDT v1.8 {symbol} PROTECTION LOCK\nSignal stays retryable until protection is verified.")
+        tg(f"🟠 LDT v1.8.1 {symbol} PROTECTION LOCK\nSignal stays retryable until protection is verified.")
         return False
     since=time.time()-_v62_last_entry_time
     if since < LDT180_ENTRY_COOLDOWN_SECONDS:
         wait=max(1,int(LDT180_ENTRY_COOLDOWN_SECONDS-since))
-        tg(f"🟠 LDT v1.8 {symbol} ENTRY COOLDOWN\nRetry in ~{wait}s; signal NOT burned.")
+        tg(f"🟠 LDT v1.8.1 {symbol} ENTRY COOLDOWN\nRetry in ~{wait}s; signal NOT burned.")
         return False
 
     try:
@@ -11248,22 +11248,22 @@ def _ldt180_order_shell(signal):
         live=safe_float(signal.get('price'))
     atr=safe_float(signal.get('atr')); stop=safe_float(signal.get('structural_stop'))
     if live<=0 or atr<=0 or stop<=0:
-        tg(f"🟠 LDT v1.8 {symbol} GEOMETRY BLOCK\nMissing live price / ATR / stop; retryable.")
+        tg(f"🟠 LDT v1.8.1 {symbol} GEOMETRY BLOCK\nMissing live price / ATR / stop; retryable.")
         return False
 
     stop2,fee_r,widened_atr=_ldt173_fee_safe_stop(signal,live,stop,atr,side)
     if widened_atr>0: stop=stop2
     risk=d*(live-stop)
     if risk<=0:
-        tg(f"🟠 LDT v1.8 {symbol} INVALID LIVE STOP\nStop crossed entry geometry; retryable if price returns.")
+        tg(f"🟠 LDT v1.8.1 {symbol} INVALID LIVE STOP\nStop crossed entry geometry; retryable if price returns.")
         return False
     risk_atr=risk/max(atr,1e-12)
     if risk_atr<LDT_MIN_STOP_ATR:
-        tg(f"🟠 LDT v1.8 {symbol} STOP TOO TIGHT\n{risk_atr:.2f}ATR < {LDT_MIN_STOP_ATR:.2f}ATR; retryable.")
+        tg(f"🟠 LDT v1.8.1 {symbol} STOP TOO TIGHT\n{risk_atr:.2f}ATR < {LDT_MIN_STOP_ATR:.2f}ATR; retryable.")
         return False
     fee_cap=LDT173_ACTIVE_FEE_SAFE_CAP_R if _ldt16_is_active(signal) else LDT173_FEE_SAFE_CAP_R
     if fee_r>fee_cap+1e-9:
-        tg(f"🟠 LDT v1.8 {symbol} FEE BLOCK\nfee {fee_r:.2f}R > {fee_cap:.2f}R after fee-safe stop; retryable.")
+        tg(f"🟠 LDT v1.8.1 {symbol} FEE BLOCK\nfee {fee_r:.2f}R > {fee_cap:.2f}R after fee-safe stop; retryable.")
         return False
 
     hard=safe_float(signal.get('far_target') or signal.get('target_price'))
@@ -11273,29 +11273,29 @@ def _ldt180_order_shell(signal):
     stop=round_trade_price(stop,tick,side,'sl'); target=round_trade_price(target,tick,side,'tp')
     risk=abs(live-stop)
     if risk<=0 or target<=0:
-        tg(f"🟠 LDT v1.8 {symbol} TARGET/STOP BLOCK\nLive target geometry invalid; retryable.")
+        tg(f"🟠 LDT v1.8.1 {symbol} TARGET/STOP BLOCK\nLive target geometry invalid; retryable.")
         return False
     final_r=d*(target-live)/risk
     fee_r=live*(2*TAKER_FEE_RATE+SLIPPAGE_RATE)/risk
     net=final_r-fee_r; rrmin=_ldt14_live_rr_min(signal)
     if net<rrmin:
-        tg(f"🟠 LDT v1.8 {symbol} LIVE RR MOVED\n{target_kind} · net {net:.2f}R < {rrmin:.2f}R; stays priority/retryable.")
+        tg(f"🟠 LDT v1.8.1 {symbol} LIVE RR MOVED\n{target_kind} · net {net:.2f}R < {rrmin:.2f}R; stays priority/retryable.")
         return False
 
     profile=sizing_profile({**signal,'net_rr':net})
     sizing=calculate_contracts_v5(symbol,live,stop,equity,available,profile['risk_pct'],profile['target_net_tp'],final_r)
     if not sizing:
-        tg(f"🟠 LDT v1.8 {symbol} SIZE BLOCK\nNo valid contract size; signal NOT burned.")
+        tg(f"🟠 LDT v1.8.1 {symbol} SIZE BLOCK\nNo valid contract size; signal NOT burned.")
         return False
     if sizing['margin']>available*AVAILABLE_MARGIN_BUFFER:
-        tg(f"🟠 LDT v1.8 {symbol} MARGIN BLOCK\nNeed ${sizing['margin']:.2f}; buffer ${available*AVAILABLE_MARGIN_BUFFER:.2f}; retryable.")
+        tg(f"🟠 LDT v1.8.1 {symbol} MARGIN BLOCK\nNeed ${sizing['margin']:.2f}; buffer ${available*AVAILABLE_MARGIN_BUFFER:.2f}; retryable.")
         return False
 
-    tg(f"🟧 LDT v1.8 {symbol} PRECHECK PASSED\nnet {net:.2f}R · fee {fee_r:.2f}R · risk {profile['risk_pct']*100:.2f}% · preparing protected market order")
+    tg(f"🟧 LDT v1.8.1 {symbol} PRECHECK PASSED\nnet {net:.2f}R · fee {fee_r:.2f}R · risk {profile['risk_pct']*100:.2f}% · preparing protected market order")
     before_ids={position_id(p) for p in get_positions() if position_id(p)}
     oklev,levres=set_leverage(symbol,LEVERAGE)
     if not oklev:
-        tg(f"🟠 LDT v1.8 {symbol} LEVERAGE FAILED\n{levres}\nSignal remains retryable.")
+        tg(f"🟠 LDT v1.8.1 {symbol} LEVERAGE FAILED\n{levres}\nSignal remains retryable.")
         return False
 
     tag='ldt180'
@@ -11309,51 +11309,51 @@ def _ldt180_order_shell(signal):
 
     if PAPER_TRADING:
         _v62_last_entry_time=time.time()
-        tg(f"🟢 PAPER ORDER ACCEPTED · LDT v1.8\n{symbol} {side.upper()} · {engine}\nEntry {live:.8g} · SL {stop:.8g} · TP {target:.8g}\nnet {net:.2f}R · fee {fee_r:.2f}R{widened}")
+        tg(f"🟢 PAPER ORDER ACCEPTED · LDT v1.8.1\n{symbol} {side.upper()} · {engine}\nEntry {live:.8g} · SL {stop:.8g} · TP {target:.8g}\nnet {net:.2f}R · fee {fee_r:.2f}R{widened}")
         return True
 
-    tg(f"📤 LDT v1.8 {symbol} ORDER SENT\nMarket {side.upper()} · size {sizing['contracts']} · attached SL/TP")
+    tg(f"📤 LDT v1.8.1 {symbol} ORDER SENT\nMarket {side.upper()} · size {sizing['contracts']} · attached SL/TP")
     resp=native('private_post_trade_order',payload)
     if not native_ok(resp):
         err=response_error(resp)
         if '152012' in err: protection_lock=True
-        tg(f"❌ LDT v1.8 {symbol} ORDER REJECTED\n{err}\nOrange priority retained; signal NOT burned.")
+        tg(f"❌ LDT v1.8.1 {symbol} ORDER REJECTED\n{err}\nOrange priority retained; signal NOT burned.")
         return False
 
     # GREEN is emitted only after BloFin accepted the order.
     _v62_last_entry_time=time.time()
-    tg(f"🟢 LDT v1.8 ORDER ACCEPTED\n{symbol} {side.upper()} · {engine} · {signal.get('entry_route')}\nEntry~{live:.8g} · SL {stop:.8g} · TP {target:.8g}\nnet {net:.2f}R · fee {fee_r:.2f}R{widened}\nNotional ${sizing['notional']:.2f} · Margin ${sizing['margin']:.2f} · {LEVERAGE}x")
+    tg(f"🟢 LDT v1.8.1 ORDER ACCEPTED\n{symbol} {side.upper()} · {engine} · {signal.get('entry_route')}\nEntry~{live:.8g} · SL {stop:.8g} · TP {target:.8g}\nnet {net:.2f}R · fee {fee_r:.2f}R{widened}\nNotional ${sizing['notional']:.2f} · Margin ${sizing['margin']:.2f} · {LEVERAGE}x")
 
     new_pos=find_new_position(symbol,before_ids,timeout=10)
     if new_pos is None:
-        tg(f"🟢 LDT v1.8 {symbol} ACK RECEIVED\nOrder accepted; position not visible yet. Protection watcher will verify on next cycle.")
+        tg(f"🟢 LDT v1.8.1 {symbol} ACK RECEIVED\nOrder accepted; position not visible yet. Protection watcher will verify on next cycle.")
         return True
     pid=position_id(new_pos); fill=position_entry(new_pos) or live
     if pid:
         sniper_managed_positions.add(pid)
         _ldt_meta[pid]={'risk':risk,'entry':fill,'sl':stop,'tp':target,'final_r':final_r,'side':side,
                         'opened':time.time(),'strategy':signal.get('strategy'),'route':signal.get('entry_route'),
-                        'engine':engine,'mfe_price':fill,'mfe_r':0.0,'version':'1.8.0'}
+                        'engine':engine,'mfe_price':fill,'mfe_r':0.0,'version':'1.8.1'}
     if has_live_protection(new_pos)[0]:
-        tg(f"🛡️ LDT v1.8 PROTECTION CONFIRMED\n{symbol} {side.upper()} · SL/TP visible.")
+        tg(f"🛡️ LDT v1.8.1 PROTECTION CONFIRMED\n{symbol} {side.upper()} · SL/TP visible.")
     else:
         last=safe_float(exchange.fetch_ticker(symbol).get('last'))
         if tpsl_prices_valid(side,stop,target,last):
             ok,res=place_tpsl_for_position(new_pos,stop,target,client_tag=tag)
-            if ok: tg(f"🛡️ LDT v1.8 FALLBACK PROTECTION CONFIRMED\n{symbol}")
+            if ok: tg(f"🛡️ LDT v1.8.1 FALLBACK PROTECTION CONFIRMED\n{symbol}")
             else:
                 protection_lock=True
-                tg(f"🚨 LDT v1.8 PROTECTION FAILURE\n{symbol}\n{res}\nNEW TRADES PAUSED.")
+                tg(f"🚨 LDT v1.8.1 PROTECTION FAILURE\n{symbol}\n{res}\nNEW TRADES PAUSED.")
         else:
             protection_lock=True
-            tg(f"🚨 LDT v1.8 {symbol}: position exists but protection could not be verified.\nNEW TRADES PAUSED.")
+            tg(f"🚨 LDT v1.8.1 {symbol}: position exists but protection could not be verified.\nNEW TRADES PAUSED.")
     if symbol in _ldt13_states:
         _ldt13_states.pop(symbol,None); _ldt13_save()
     return True
 
 
 def open_trade(signal):
-    """v1.8: NO duplicate state-machine refresh after READY."""
+    """v1.8.1: NO duplicate state-machine refresh after READY."""
     return _ldt180_order_shell(signal)
 
 
@@ -11364,7 +11364,7 @@ def _ldt13_transition(st,new_state,note=''):
         noisy_mom_expiry=new_state=='EXPIRED' and str(st.get('engine'))=='MOMENTUM'
         if LDT13_NOTIFY_TRANSITIONS and not noisy_mom_expiry and new_state in ('IN_ZONE','TRIGGER_HOLD','READY','INVALIDATED','EXPIRED'):
             icon='🟠' if new_state in ('IN_ZONE','TRIGGER_HOLD','READY') else '🧭'
-            tg(f"{icon} LDT v1.8 {st.get('symbol')} {str(st.get('side','')).upper()} · {st.get('engine','-')} · {new_state}\n{note}")
+            tg(f"{icon} LDT v1.8.1 {st.get('symbol')} {str(st.get('side','')).upper()} · {st.get('engine','-')} · {new_state}\n{note}")
     return old!=new_state
 
 
@@ -11381,7 +11381,7 @@ def maybe_score_report(rows):
     ranked=sorted(rows,key=lambda r:(_ldt180_promotion_score(r.get('symbol'),r),_ldt15_utility(r)),reverse=True)[:12]
     state_text=' · '.join(f'{k} {v}' for k,v in sorted(counts.items(),key=lambda x:x[1],reverse=True)[:5]) or 'none'
     eng_text=' · '.join(f'{k} {v}' for k,v in engines.items()) or 'none'
-    lines=['🧠 LIQUIDITY DAYTRADER v1.8 · PRIORITY EXECUTION QUEUE',
+    lines=['🧠 LIQUIDITY DAYTRADER v1.8.1 · FAST PROMOTION + ANTI-RECYCLE',
            f"Pre-order ready {len(ready)} · Tracked {len(_ldt13_states)}/{LDT15_MAX_TRACKED} · scanned {len(rows)}",
            f"Today {daily.get('trades',0)} trades · W/L {daily.get('wins',0)}/{daily.get('losses',0)} · Net ${safe_float(daily.get('net')):.2f}",
            f'Engines: {eng_text}',f'States: {state_text}',
@@ -11400,7 +11400,7 @@ def maybe_score_report(rows):
 
 def startup_diagnostics():
     _ldt13_load(); _ldt15_load_dead(); acc=futures_account(); reset_daily_if_needed(acc['total_equity'])
-    tg('🧠 LIQUIDITY DAYTRADER STARTED v1.8 · PRIORITY EXECUTION QUEUE\n'
+    tg('🧠 LIQUIDITY DAYTRADER STARTED v1.8.1 · FAST PROMOTION + ANTI-RECYCLE\n'
        'GREEN semantics fixed: 🟢 is shown only AFTER the exchange accepts an order.\n'
        'Orange tracked/IN_ZONE/TRIGGER_HOLD/READY setups are evaluated first and hot-scanned.\n'
        'READY goes straight to one live safety pass; NO duplicate state/trigger refresh.\n'
@@ -11409,8 +11409,146 @@ def startup_diagnostics():
        f'Equity ${acc["total_equity"]:.2f} · Available ${acc["available"]:.2f}')
 
 
+# ============================================================
+# v1.8.1 - FAST PROMOTION + ANTI-RECYCLE
+# ============================================================
+# Two targeted fixes based on live v1.8 telemetry:
+# 1) Strong fit+2 CONTINUATION setups can promote from orange IN_ZONE with a
+#    2-of-4 fast trigger instead of requiring EMA reclaim as a mandatory gate.
+#    Core prerequisites still apply: directional candle, minimum body, zone held.
+# 2) An EXPIRED/INVALIDATED thesis cannot immediately respawn from essentially
+#    the same frozen geometry. Exact old signal bars remain blocked, and a newer
+#    signal bar is also blocked during a short cooldown when zone + stop geometry
+#    are materially the same. Truly new structure can still rearm.
+
+LDT181_FAST_CONT_CONFIRMATIONS = int(os.getenv("LDT181_FAST_CONT_CONFIRMATIONS", "2"))
+LDT181_GEOMETRY_REARM_MIN = int(os.getenv("LDT181_GEOMETRY_REARM_MIN", "12"))
+LDT181_ZONE_SAME_ATR = float(os.getenv("LDT181_ZONE_SAME_ATR", "0.35"))
+LDT181_STOP_SAME_ATR = float(os.getenv("LDT181_STOP_SAME_ATR", "0.50"))
+
+
+def _ldt181_zone_mid(zone):
+    zone = zone or {}
+    lo = safe_float(zone.get('lo')); hi = safe_float(zone.get('hi'))
+    if lo <= 0 or hi <= 0:
+        return 0.0
+    return (lo + hi) / 2.0
+
+
+def _ldt15_mark_dead(st, reason=''):
+    """v1.8.1 tombstone: persist enough frozen geometry to reject instant clones."""
+    if not st:
+        return
+    _ldt15_load_dead(); sym = str(st.get('symbol') or '')
+    if not sym:
+        return
+    sig = st.get('signal') or {}
+    zone = dict(st.get('frozen_zone') or sig.get('zone') or {})
+    _ldt15_dead[sym] = {
+        'ts': time.time(),
+        'side': st.get('side'),
+        'engine': st.get('engine'),
+        'signal_bar_ts': int(st.get('origin_signal_ts') or sig.get('signal_bar_ts') or 0),
+        'reason': reason or st.get('state_note',''),
+        'zone': _ldt13_jsonable(zone),
+        'zone_mid': _ldt181_zone_mid(zone),
+        'stop': safe_float(st.get('frozen_stop') or sig.get('structural_stop')),
+        'atr': safe_float(sig.get('atr')),
+    }
+    _ldt15_save_dead()
+
+
+def _ldt15_is_recycled(signal):
+    """Block exact stale signals and near-identical geometry during the rearm window."""
+    _ldt15_load_dead(); sym = str((signal or {}).get('symbol') or '')
+    x = _ldt15_dead.get(sym)
+    if not x:
+        return False
+    age = time.time() - safe_float(x.get('ts'))
+    if age > max(LDT15_REARM_COOLDOWN_MIN, LDT181_GEOMETRY_REARM_MIN) * 60:
+        return False
+    if str(x.get('side')) != str(signal.get('side')) or str(x.get('engine')) != _ldt14_engine(signal):
+        return False
+
+    old_ts = int(x.get('signal_bar_ts') or 0); new_ts = int(signal.get('signal_bar_ts') or 0)
+    # Same/older source structure is always recycled.
+    if new_ts <= old_ts:
+        return True
+
+    # A nominally newer candle is not enough if it points to essentially the same thesis.
+    atr = max(safe_float(signal.get('atr')), safe_float(x.get('atr')), 1e-12)
+    new_mid = _ldt181_zone_mid(signal.get('zone') or {})
+    old_mid = safe_float(x.get('zone_mid')) or _ldt181_zone_mid(x.get('zone') or {})
+    new_stop = safe_float(signal.get('structural_stop')); old_stop = safe_float(x.get('stop'))
+    zone_same = bool(new_mid > 0 and old_mid > 0 and abs(new_mid-old_mid) <= LDT181_ZONE_SAME_ATR * atr)
+    stop_same = bool(new_stop > 0 and old_stop > 0 and abs(new_stop-old_stop) <= LDT181_STOP_SAME_ATR * atr)
+    return zone_same and stop_same and age <= LDT181_GEOMETRY_REARM_MIN * 60
+
+
+def _ldt14_reclaim_trigger(symbol, side, tf, zone, engine):
+    """v1.8.1: fit+2 continuation uses a controlled 2-of-4 fast promotion trigger."""
+    if engine == 'REVERSAL':
+        st = _ldt12_structure_state(symbol, side, tf)
+        return bool(st.get('ok')), st
+
+    strict = _ldt12_structure_state(symbol, side, tf)
+    if strict.get('ok'):
+        return True, strict
+
+    try:
+        df = _ldt_closed(_ldt_df(symbol, tf, 120))
+        a = df.iloc[-1]; p = df.iloc[-2]
+        d = 1 if side == 'long' else -1
+        atr = safe_float(a['atr'])
+        if atr <= 0:
+            return False, strict
+
+        body, close_loc, directional = _ldt11_bar_strength(a, d, atr)
+        c = safe_float(a['close']); o = safe_float(a['open'])
+        ema_ok = c > safe_float(a['ema21']) if d == 1 else c < safe_float(a['ema21'])
+        prev_break = c > safe_float(p['high']) if d == 1 else c < safe_float(p['low'])
+        lo = safe_float(zone.get('lo')); hi = safe_float(zone.get('hi'))
+        held = c >= lo if d == 1 else c <= hi
+        wick = (min(o,c)-safe_float(a['low'])) if d == 1 else (safe_float(a['high'])-max(o,c))
+        reject = wick >= max(abs(c-o)*0.45, 0.04*atr)
+        reg = _ldt15_regime(symbol, side); fit = int(reg.get('fit',0))
+
+        if engine == 'CONTINUATION':
+            min_body = LDT17_FAST_CONT_BODY_ATR if fit >= 2 else 0.15
+            min_close = 0.55 if fit >= 2 else 0.62
+        else:
+            min_body = LDT17_FAST_MOM_BODY_ATR if fit >= 2 else 0.16
+            min_close = 0.58 if fit >= 2 else 0.65
+
+        impulse = body >= max(min_body*1.8, 0.20)
+        close_ok = close_loc >= min_close
+        structure_ok = prev_break or reject
+
+        # fit+2 continuation: body/direction/zone are prerequisites; then require
+        # any 2 of 4 confirmations: strong close, EMA alignment, local structure,
+        # impulse. This promotes cases like the live WLD example where close=100%
+        # and impulse=1 even though EMA/prev/reject had not yet flipped.
+        confirmations = int(close_ok) + int(ema_ok) + int(structure_ok) + int(impulse)
+        if engine == 'CONTINUATION' and fit >= 2:
+            ok = bool(directional and held and body >= min_body and confirmations >= LDT181_FAST_CONT_CONFIRMATIONS)
+            note = (f"{tf} CONT FAST {'CONFIRMED' if ok else 'WAIT'} fit{fit:+d} 2of4={confirmations}/4 "
+                    f"body={body:.2f}ATR close={close_loc:.0%} EMA={int(ema_ok)} "
+                    f"struct={int(structure_ok)} impulse={int(impulse)}")
+        else:
+            # Preserve v1.8 behavior for neutral/counter continuation and momentum.
+            ok = bool(directional and body >= min_body and close_ok and ema_ok and held and (prev_break or reject or impulse))
+            note = (f"{tf} {engine} FAST {'CONFIRMED' if ok else 'WAIT'} fit{fit:+d} "
+                    f"body={body:.2f}ATR close={close_loc:.0%} EMA={int(ema_ok)} "
+                    f"prev={int(prev_break)} reject={int(reject)} impulse={int(impulse)}")
+
+        strength = int(directional)+int(close_ok)+int(ema_ok)+int(structure_ok)+int(impulse)
+        return ok, {'ok':ok,'note':note,'strength':strength,'age':0,'invalidation':0.0,'atr':atr}
+    except Exception:
+        return False, strict
+
+
 def main():
-    """v1.8 main: orange promotion queue + green only after exchange ACK."""
+    """v1.8.1 main: orange promotion queue + green only after exchange ACK."""
     global protection_lock,_v6_daily_risk_alerted,_v6_daily_risk_last_notice
     load_learning(); startup_diagnostics()
     if not PAPER_TRADING:
@@ -11484,11 +11622,11 @@ def main():
             hot=any(str(st.get('state') or '') in ('IN_ZONE','TRIGGER_HOLD','READY') for st in _ldt13_states.values())
             time.sleep(LDT180_HOT_SCAN_SECONDS if hot and not opened_any else SCAN_SECONDS)
         except KeyboardInterrupt:
-            tg('🛑 Liquidity DayTrader v1.8 stopped.'); raise
+            tg('🛑 Liquidity DayTrader v1.8.1 stopped.'); raise
         except Exception as e:
             msg=f"{type(e).__name__}: {e}"
             if '152002' in msg: time.sleep(20); continue
-            tg(f"⚠️ LDT v1.8 LOOP ERROR\n{msg}"); time.sleep(30)
+            tg(f"⚠️ LDT v1.8.1 LOOP ERROR\n{msg}"); time.sleep(30)
 
 if __name__ == "__main__":
     main()
