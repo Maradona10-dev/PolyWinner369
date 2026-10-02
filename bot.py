@@ -11163,5 +11163,332 @@ def main():
             tg(f"⚠️ LDT v1.7.3 LOOP ERROR\n{msg}"); time.sleep(30)
 
 
+
+# ============================================================
+# v1.8.0 - PRIORITY EXECUTION QUEUE
+# ============================================================
+# Goals:
+# 1) A strategy-ready signal is no longer shown as GREEN before an order is
+#    actually accepted. Pre-order READY is ORANGE PRIORITY READY.
+# 2) The inherited open_trade() duplicate state refresh is bypassed completely.
+#    READY is validated once by evaluate_symbol(), then only live execution
+#    safeties are checked.
+# 3) Orange tracked setups are evaluated first and hot-scanned more frequently,
+#    so IN_ZONE/TRIGGER_HOLD/READY setups get the first chance to promote.
+# 4) A failed live attempt never burns the signal. It remains orange and retries.
+# 5) Every order attempt has a visible pipeline: START -> PRECHECK -> ORDER SENT ->
+#    ORDER ACCEPTED -> POSITION/PROTECTION. No silent green signal can disappear.
+
+LDT_VERSION = "1.8.0"
+LDT180_RETRY_SECONDS = int(os.getenv("LDT180_RETRY_SECONDS", "20"))
+LDT180_PORTFOLIO_RETRY_SECONDS = int(os.getenv("LDT180_PORTFOLIO_RETRY_SECONDS", "45"))
+LDT180_MAX_ATTEMPTS_PER_SCAN = int(os.getenv("LDT180_MAX_ATTEMPTS_PER_SCAN", "5"))
+LDT180_HOT_SCAN_SECONDS = int(os.getenv("LDT180_HOT_SCAN_SECONDS", "12"))
+LDT180_ENTRY_COOLDOWN_SECONDS = int(os.getenv("LDT180_ENTRY_COOLDOWN_SECONDS", "90"))
+LDT180_MAX_PRIORITY = int(os.getenv("LDT180_MAX_PRIORITY", "8"))
+_ldt180_retry_after = {}
+
+
+def _ldt180_state_rank(st):
+    state = str((st or {}).get('state') or '')
+    return {'READY': 6, 'TRIGGER_HOLD': 5, 'IN_ZONE': 4, 'WAIT_RETRACE': 2, 'TRACKING': 1}.get(state, 0)
+
+
+def _ldt180_promotion_score(symbol, row=None):
+    st = _ldt13_states.get(symbol, {})
+    sig = row or st.get('signal') or {}
+    score = 100.0 * _ldt180_state_rank(st)
+    score += 10.0 * max(-2, min(2, int(sig.get('regime_fit', 0) or 0)))
+    score += 0.8 * safe_float(sig.get('entry_quality'), 0)
+    score += 0.5 * safe_float(sig.get('setup_quality'), 0)
+    score += 8.0 * min(3.0, max(0.0, safe_float(sig.get('net_rr'), 0)))
+    score += 3.0 * min(8, int(sig.get('card_score', 0) or 0))
+    fee = safe_float(sig.get('fee_drag_r'), 9.0)
+    if 0 <= fee < 9: score -= 20.0 * fee
+    return score
+
+
+def _ldt180_priority_symbols():
+    items=[]
+    for sym, st in _ldt13_states.items():
+        if str(st.get('state') or '') in ('INVALIDATED','EXPIRED'):
+            continue
+        items.append((sym, _ldt180_promotion_score(sym)))
+    items.sort(key=lambda x:x[1], reverse=True)
+    return [x[0] for x in items[:LDT180_MAX_PRIORITY]]
+
+
+def _ldt180_order_shell(signal):
+    """Final single-pass live shell. GREEN exists only after exchange ACK."""
+    global protection_lock, _v62_last_entry_time
+    symbol=signal.get('symbol'); side=signal.get('side')
+    if not symbol or side not in ('long','short'):
+        return False
+    d=1 if side=='long' else -1
+    engine=_ldt14_engine(signal)
+    tg(f"🚦 LDT v1.8 {symbol} {side.upper()} EXECUTION START\n{engine} · {signal.get('entry_route')} · orange priority promoted to final precheck")
+
+    acc=futures_account(); equity,available=acc['total_equity'],acc['available']
+    reset_daily_if_needed(equity)
+    if equity < MIN_EQUITY_USDT or available <= 0:
+        tg(f"🟠 LDT v1.8 {symbol} ACCOUNT BLOCK\nSignal stays retryable; equity/available insufficient.")
+        return False
+    if not PAPER_TRADING and protection_lock:
+        tg(f"🟠 LDT v1.8 {symbol} PROTECTION LOCK\nSignal stays retryable until protection is verified.")
+        return False
+    since=time.time()-_v62_last_entry_time
+    if since < LDT180_ENTRY_COOLDOWN_SECONDS:
+        wait=max(1,int(LDT180_ENTRY_COOLDOWN_SECONDS-since))
+        tg(f"🟠 LDT v1.8 {symbol} ENTRY COOLDOWN\nRetry in ~{wait}s; signal NOT burned.")
+        return False
+
+    try:
+        live=safe_float(exchange.fetch_ticker(symbol).get('last'), signal.get('price'))
+    except Exception:
+        live=safe_float(signal.get('price'))
+    atr=safe_float(signal.get('atr')); stop=safe_float(signal.get('structural_stop'))
+    if live<=0 or atr<=0 or stop<=0:
+        tg(f"🟠 LDT v1.8 {symbol} GEOMETRY BLOCK\nMissing live price / ATR / stop; retryable.")
+        return False
+
+    stop2,fee_r,widened_atr=_ldt173_fee_safe_stop(signal,live,stop,atr,side)
+    if widened_atr>0: stop=stop2
+    risk=d*(live-stop)
+    if risk<=0:
+        tg(f"🟠 LDT v1.8 {symbol} INVALID LIVE STOP\nStop crossed entry geometry; retryable if price returns.")
+        return False
+    risk_atr=risk/max(atr,1e-12)
+    if risk_atr<LDT_MIN_STOP_ATR:
+        tg(f"🟠 LDT v1.8 {symbol} STOP TOO TIGHT\n{risk_atr:.2f}ATR < {LDT_MIN_STOP_ATR:.2f}ATR; retryable.")
+        return False
+    fee_cap=LDT173_ACTIVE_FEE_SAFE_CAP_R if _ldt16_is_active(signal) else LDT173_FEE_SAFE_CAP_R
+    if fee_r>fee_cap+1e-9:
+        tg(f"🟠 LDT v1.8 {symbol} FEE BLOCK\nfee {fee_r:.2f}R > {fee_cap:.2f}R after fee-safe stop; retryable.")
+        return False
+
+    hard=safe_float(signal.get('far_target') or signal.get('target_price'))
+    tf='1m' if str(signal.get('route'))=='FAST' else '5m'
+    target,target_kind,gross=_ldt14_target(symbol,side,live,stop,hard,tf,engine)
+    tick=safe_float(get_instrument(symbol).get('tickSize'),0.0001)
+    stop=round_trade_price(stop,tick,side,'sl'); target=round_trade_price(target,tick,side,'tp')
+    risk=abs(live-stop)
+    if risk<=0 or target<=0:
+        tg(f"🟠 LDT v1.8 {symbol} TARGET/STOP BLOCK\nLive target geometry invalid; retryable.")
+        return False
+    final_r=d*(target-live)/risk
+    fee_r=live*(2*TAKER_FEE_RATE+SLIPPAGE_RATE)/risk
+    net=final_r-fee_r; rrmin=_ldt14_live_rr_min(signal)
+    if net<rrmin:
+        tg(f"🟠 LDT v1.8 {symbol} LIVE RR MOVED\n{target_kind} · net {net:.2f}R < {rrmin:.2f}R; stays priority/retryable.")
+        return False
+
+    profile=sizing_profile({**signal,'net_rr':net})
+    sizing=calculate_contracts_v5(symbol,live,stop,equity,available,profile['risk_pct'],profile['target_net_tp'],final_r)
+    if not sizing:
+        tg(f"🟠 LDT v1.8 {symbol} SIZE BLOCK\nNo valid contract size; signal NOT burned.")
+        return False
+    if sizing['margin']>available*AVAILABLE_MARGIN_BUFFER:
+        tg(f"🟠 LDT v1.8 {symbol} MARGIN BLOCK\nNeed ${sizing['margin']:.2f}; buffer ${available*AVAILABLE_MARGIN_BUFFER:.2f}; retryable.")
+        return False
+
+    tg(f"🟧 LDT v1.8 {symbol} PRECHECK PASSED\nnet {net:.2f}R · fee {fee_r:.2f}R · risk {profile['risk_pct']*100:.2f}% · preparing protected market order")
+    before_ids={position_id(p) for p in get_positions() if position_id(p)}
+    oklev,levres=set_leverage(symbol,LEVERAGE)
+    if not oklev:
+        tg(f"🟠 LDT v1.8 {symbol} LEVERAGE FAILED\n{levres}\nSignal remains retryable.")
+        return False
+
+    tag='ldt180'
+    payload={'instId':blofin_inst_id(symbol),'marginMode':MARGIN_MODE,'positionSide':'net',
+             'side':'buy' if side=='long' else 'sell','orderType':'market','size':str(sizing['contracts']),
+             'tpTriggerPrice':str(target),'tpOrderPrice':'-1','tpTriggerPriceType':'mark',
+             'slTriggerPrice':str(stop),'slOrderPrice':'-1','slTriggerPriceType':'mark',
+             'clientOrderId':f"{tag}{int(time.time()*1000)%1000000000}"}
+    if BROKER_ID: payload['brokerId']=BROKER_ID
+    widened=f" · fee-safe SL +{widened_atr:.2f}ATR" if widened_atr>0 else ''
+
+    if PAPER_TRADING:
+        _v62_last_entry_time=time.time()
+        tg(f"🟢 PAPER ORDER ACCEPTED · LDT v1.8\n{symbol} {side.upper()} · {engine}\nEntry {live:.8g} · SL {stop:.8g} · TP {target:.8g}\nnet {net:.2f}R · fee {fee_r:.2f}R{widened}")
+        return True
+
+    tg(f"📤 LDT v1.8 {symbol} ORDER SENT\nMarket {side.upper()} · size {sizing['contracts']} · attached SL/TP")
+    resp=native('private_post_trade_order',payload)
+    if not native_ok(resp):
+        err=response_error(resp)
+        if '152012' in err: protection_lock=True
+        tg(f"❌ LDT v1.8 {symbol} ORDER REJECTED\n{err}\nOrange priority retained; signal NOT burned.")
+        return False
+
+    # GREEN is emitted only after BloFin accepted the order.
+    _v62_last_entry_time=time.time()
+    tg(f"🟢 LDT v1.8 ORDER ACCEPTED\n{symbol} {side.upper()} · {engine} · {signal.get('entry_route')}\nEntry~{live:.8g} · SL {stop:.8g} · TP {target:.8g}\nnet {net:.2f}R · fee {fee_r:.2f}R{widened}\nNotional ${sizing['notional']:.2f} · Margin ${sizing['margin']:.2f} · {LEVERAGE}x")
+
+    new_pos=find_new_position(symbol,before_ids,timeout=10)
+    if new_pos is None:
+        tg(f"🟢 LDT v1.8 {symbol} ACK RECEIVED\nOrder accepted; position not visible yet. Protection watcher will verify on next cycle.")
+        return True
+    pid=position_id(new_pos); fill=position_entry(new_pos) or live
+    if pid:
+        sniper_managed_positions.add(pid)
+        _ldt_meta[pid]={'risk':risk,'entry':fill,'sl':stop,'tp':target,'final_r':final_r,'side':side,
+                        'opened':time.time(),'strategy':signal.get('strategy'),'route':signal.get('entry_route'),
+                        'engine':engine,'mfe_price':fill,'mfe_r':0.0,'version':'1.8.0'}
+    if has_live_protection(new_pos)[0]:
+        tg(f"🛡️ LDT v1.8 PROTECTION CONFIRMED\n{symbol} {side.upper()} · SL/TP visible.")
+    else:
+        last=safe_float(exchange.fetch_ticker(symbol).get('last'))
+        if tpsl_prices_valid(side,stop,target,last):
+            ok,res=place_tpsl_for_position(new_pos,stop,target,client_tag=tag)
+            if ok: tg(f"🛡️ LDT v1.8 FALLBACK PROTECTION CONFIRMED\n{symbol}")
+            else:
+                protection_lock=True
+                tg(f"🚨 LDT v1.8 PROTECTION FAILURE\n{symbol}\n{res}\nNEW TRADES PAUSED.")
+        else:
+            protection_lock=True
+            tg(f"🚨 LDT v1.8 {symbol}: position exists but protection could not be verified.\nNEW TRADES PAUSED.")
+    if symbol in _ldt13_states:
+        _ldt13_states.pop(symbol,None); _ldt13_save()
+    return True
+
+
+def open_trade(signal):
+    """v1.8: NO duplicate state-machine refresh after READY."""
+    return _ldt180_order_shell(signal)
+
+
+def _ldt13_transition(st,new_state,note=''):
+    old=str(st.get('state') or ''); st['last_state']=old; st['state']=new_state; st['state_note']=note; st['updated']=time.time()
+    if old!=new_state:
+        st['transitions']=int(st.get('transitions',0))+1
+        noisy_mom_expiry=new_state=='EXPIRED' and str(st.get('engine'))=='MOMENTUM'
+        if LDT13_NOTIFY_TRANSITIONS and not noisy_mom_expiry and new_state in ('IN_ZONE','TRIGGER_HOLD','READY','INVALIDATED','EXPIRED'):
+            icon='🟠' if new_state in ('IN_ZONE','TRIGGER_HOLD','READY') else '🧭'
+            tg(f"{icon} LDT v1.8 {st.get('symbol')} {str(st.get('side','')).upper()} · {st.get('engine','-')} · {new_state}\n{note}")
+    return old!=new_state
+
+
+def maybe_score_report(rows):
+    global _ldt13_last_report
+    now=time.time()
+    if now-_ldt13_last_report<LDT_REPORT_MIN*60 or not rows:return
+    _ldt13_last_report=now; _ldt13_load()
+    ready=[r for r in rows if r.get('side') and not r.get('skip') and r.get('entry_route')]
+    counts={}; engines={}
+    for st in _ldt13_states.values():
+        k=str(st.get('state') or 'WAIT_RETRACE'); counts[k]=counts.get(k,0)+1
+        sig=st.get('signal') or {}; e='ACTIVE' if _ldt16_is_active(sig) else str(st.get('engine') or '-'); engines[e]=engines.get(e,0)+1
+    ranked=sorted(rows,key=lambda r:(_ldt180_promotion_score(r.get('symbol'),r),_ldt15_utility(r)),reverse=True)[:12]
+    state_text=' · '.join(f'{k} {v}' for k,v in sorted(counts.items(),key=lambda x:x[1],reverse=True)[:5]) or 'none'
+    eng_text=' · '.join(f'{k} {v}' for k,v in engines.items()) or 'none'
+    lines=['🧠 LIQUIDITY DAYTRADER v1.8 · PRIORITY EXECUTION QUEUE',
+           f"Pre-order ready {len(ready)} · Tracked {len(_ldt13_states)}/{LDT15_MAX_TRACKED} · scanned {len(rows)}",
+           f"Today {daily.get('trades',0)} trades · W/L {daily.get('wins',0)}/{daily.get('losses',0)} · Net ${safe_float(daily.get('net')):.2f}",
+           f'Engines: {eng_text}',f'States: {state_text}',
+           '🟢 = exchange accepted order · 🟠 = priority candidate being promoted']
+    for r in ranked:
+        st=_ldt13_states.get(r.get('symbol'),{}); age=(now-safe_float(st.get('created'),now))/60 if st else 0
+        e='ACTIVE-'+str(r.get('active_mode','SCALP')) if _ldt16_is_active(r) else _ldt14_engine(r)
+        if not r.get('skip') and r.get('entry_route'): status='🟠 PRIORITY READY'
+        elif st: status=f"🟠 {st.get('state','WAIT_RETRACE')} {age:.0f}m"
+        else: status='🟡 '+str(r.get('skip') or 'candidate')
+        pr=safe_float(r.get('prospective_rr'),-99.0); prtxt='N/A' if pr<=-90 else f'{pr:.2f}'
+        fr=safe_float(r.get('prospective_fee_r',r.get('fee_drag_r',-1))); frtxt='-' if fr<0 or fr>10 else f'{fr:.2f}R'
+        lines.append(f"{r.get('symbol')} {str(r.get('side')).upper()} {e} · {r.get('regime','?')} fit{int(r.get('regime_fit',0)):+d} · C{int(r.get('card_score',0))} STR{safe_float(r.get('setup_quality')):.0f} EQ{safe_float(r.get('entry_quality')):.0f} RRnow{safe_float(r.get('net_rr')):.2f} RR@zone{prtxt} fee{frtxt} {status}")
+    tg('\n'.join(lines))
+
+
+def startup_diagnostics():
+    _ldt13_load(); _ldt15_load_dead(); acc=futures_account(); reset_daily_if_needed(acc['total_equity'])
+    tg('🧠 LIQUIDITY DAYTRADER STARTED v1.8 · PRIORITY EXECUTION QUEUE\n'
+       'GREEN semantics fixed: 🟢 is shown only AFTER the exchange accepts an order.\n'
+       'Orange tracked/IN_ZONE/TRIGGER_HOLD/READY setups are evaluated first and hot-scanned.\n'
+       'READY goes straight to one live safety pass; NO duplicate state/trigger refresh.\n'
+       f'Failed attempts retry after {LDT180_RETRY_SECONDS}s · hot scan {LDT180_HOT_SCAN_SECONDS}s · entry cooldown {LDT180_ENTRY_COOLDOWN_SECONDS}s.\n'
+       'Risk safeties unchanged: sizing, daily loss cap, max positions, same-side cap and verified SL/TP.\n'
+       f'Equity ${acc["total_equity"]:.2f} · Available ${acc["available"]:.2f}')
+
+
+def main():
+    """v1.8 main: orange promotion queue + green only after exchange ACK."""
+    global protection_lock,_v6_daily_risk_alerted,_v6_daily_risk_last_notice
+    load_learning(); startup_diagnostics()
+    if not PAPER_TRADING:
+        try: seed_closed_history_v5()
+        except Exception as e: tg(f"⚠️ V1.8 PNL seed warning\n{e}")
+        try:
+            inherited=get_positions(); protection_lock=not all_positions_protected() if inherited else False
+            if inherited: tg(f"ℹ️ V1.8 HANDOVER\n{len(inherited)} existing position(s)."+("\n⚠️ Unprotected position detected: entries locked." if protection_lock else "\n✅ Protection verified."))
+        except Exception as e:
+            protection_lock=True; tg(f"🚨 V1.8 STARTUP PROTECTION CHECK FAILED\n{e}")
+    while True:
+        try:
+            if not PAPER_TRADING:
+                try: check_for_closed_positions()
+                except Exception as e: tg(f"⚠️ V1.8 PNL TRACKER ERROR\n{e}")
+                try: manage_sniper_step_stops()
+                except Exception as e: tg(f"⚠️ V1.8 MANAGER ERROR\n{e}")
+            acc=futures_account(); ok,reason=check_daily_risk(acc['total_equity'])
+            if not ok:
+                now_ts=time.time()
+                if (not _v6_daily_risk_alerted) or (now_ts-_v6_daily_risk_last_notice>=V6_DAILY_RISK_REMINDER_MIN*60):
+                    tg(f"🛑 {reason}\nNew entries paused. Existing positions remain protected.")
+                    _v6_daily_risk_alerted=True; _v6_daily_risk_last_notice=now_ts
+                time.sleep(120); continue
+            elif _v6_daily_risk_alerted:
+                tg('🟢 DAILY RISK STOP CLEARED\nNew entries are allowed again.'); _v6_daily_risk_alerted=False; _v6_daily_risk_last_notice=0.0
+            if time.time()<loss_pause_until:
+                time.sleep(SCAN_SECONDS); continue
+            positions=get_positions()
+            if not PAPER_TRADING:
+                protection_watch(); positions=get_positions()
+            if protection_lock and not PAPER_TRADING:
+                time.sleep(SCAN_SECONDS); continue
+
+            # Orange priority symbols are scanned first, then the rest of the market.
+            priority=_ldt180_priority_symbols()
+            order=priority+[s for s in SYMBOLS if s not in set(priority)]
+            scanned=[]; candidates=[]; existing={position_symbol(p) for p in positions}; now=time.time()
+            for symbol in order:
+                if not cooldown_ok(symbol): continue
+                try:
+                    s=evaluate_symbol(symbol)
+                    if not s: continue
+                    scanned.append(s)
+                    if s.get('side') and not s.get('skip') and s.get('entry_route') not in ('WAIT',None):
+                        key=int(s.get('signal_bar_ts',0))
+                        if sniper_last_signal_bar.get(symbol)==key: continue
+                        if symbol in existing: continue
+                        if now<safe_float(_ldt180_retry_after.get(symbol),0): continue
+                        candidates.append(s)
+                except Exception:
+                    continue
+            maybe_score_report(scanned)
+            candidates.sort(key=lambda x:(_ldt180_promotion_score(x.get('symbol'),x),safe_float(x.get('quality')),int(x.get('confirmations',0)),safe_float(x.get('net_rr'))),reverse=True)
+            attempts=0; opened_any=False
+            for sig in candidates:
+                if len(get_positions())>=MAX_ACTIVE_POSITIONS or attempts>=LDT180_MAX_ATTEMPTS_PER_SCAN: break
+                allowed,why=sniper_portfolio_allows(sig,get_positions())
+                if not allowed:
+                    _ldt180_retry_after[sig['symbol']]=time.time()+LDT180_PORTFOLIO_RETRY_SECONDS
+                    continue
+                attempts+=1
+                opened=open_trade(sig)
+                if opened:
+                    sniper_last_signal_bar[sig['symbol']]=int(sig.get('signal_bar_ts',0))
+                    symbol_last_trade[sig['symbol']]=time.time(); _ldt180_retry_after.pop(sig['symbol'],None)
+                    opened_any=True; break
+                _ldt180_retry_after[sig['symbol']]=time.time()+LDT180_RETRY_SECONDS
+
+            # If orange setups are close to promotion, scan faster than the normal loop.
+            hot=any(str(st.get('state') or '') in ('IN_ZONE','TRIGGER_HOLD','READY') for st in _ldt13_states.values())
+            time.sleep(LDT180_HOT_SCAN_SECONDS if hot and not opened_any else SCAN_SECONDS)
+        except KeyboardInterrupt:
+            tg('🛑 Liquidity DayTrader v1.8 stopped.'); raise
+        except Exception as e:
+            msg=f"{type(e).__name__}: {e}"
+            if '152002' in msg: time.sleep(20); continue
+            tg(f"⚠️ LDT v1.8 LOOP ERROR\n{msg}"); time.sleep(30)
+
 if __name__ == "__main__":
     main()
