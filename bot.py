@@ -7392,6 +7392,8 @@ def notify_closed_trade(record):
         daily["losses"]+=1;consecutive_losses+=1;sniper_side_loss_streak[bucket]=sniper_side_loss_streak.get(bucket,0)+1;symbol_last_result[symbol]="loss";symbol_loss_streak[symbol]=symbol_loss_streak.get(symbol,0)+1
         if consecutive_losses>=MAX_CONSECUTIVE_LOSSES:loss_pause_until=time.time()+LOSS_PAUSE_MIN*60
     symbol_last_trade[symbol]=time.time();update_learning(record,net)
+    try: _v21_learn_close(symbol,side,net)
+    except Exception: pass
     tg(f"{'🟢' if net>=0 else '🔴'} LIQUIDITY DAYTRADER CLOSED\n{symbol} {side.upper()}\n"
        f"Entry {entry:.8g} → Exit {exit_price:.8g}\nGross ${gross:+.2f} · Fee -${fee:.2f} · Net ${net:+.2f}\n"
        f"{reason} · {duration}\nTODAY: {daily['trades']} trades · W/L {daily['wins']}/{daily['losses']} · Net ${daily['net']:.2f}\n"
@@ -9610,7 +9612,7 @@ def maybe_score_report(rows):
         k=str(st.get('state') or 'WAIT_RETRACE'); counts[k]=counts.get(k,0)+1; e=str(st.get('engine') or '-'); engines[e]=engines.get(e,0)+1
     ranked=sorted(rows,key=lambda r:(1 if not r.get('skip') else 0,1 if r.get('symbol') in _ldt13_states else 0,_ldt15_utility(r)),reverse=True)[:10]
     state_text=' · '.join(f'{k} {v}' for k,v in sorted(counts.items(),key=lambda x:x[1],reverse=True)[:5]) or 'none'; eng_text=' · '.join(f'{k} {v}' for k,v in engines.items()) or 'none'
-    lines=['🧠 LIQUIDITY DAYTRADER v1.5 · ADAPTIVE TRADING CARD',f"Ready {len(ready)} · Tracked {len(_ldt13_states)}/{LDT15_MAX_TRACKED} · scanned {len(rows)}",f"Today {daily.get('trades',0)} trades · W/L {daily.get('wins',0)}/{daily.get('losses',0)} · Net ${safe_float(daily.get('net')):.2f}",f'Engines: {eng_text}',f'States: {state_text}']
+    lines=['🧠 LIQUIDITY DAYTRADER v1.5 · ADAPTIVE TRADING CARD',f"Ready {len(ready)} · Tracked {len(_ldt13_states)}/{LDT15_MAX_TRACKED} · scanned {len(rows)}",f"Today {dstat.get('trades',0)} trades · W/L {dstat.get('wins',0)}/{dstat.get('losses',0)} · Net ${safe_float(dstat.get('net')):.2f}",f'Engines: {eng_text}',f'States: {state_text}']
     for r in ranked:
         st=_ldt13_states.get(r.get('symbol'),{}); age=(now-safe_float(st.get('created'),now))/60 if st else 0; e=_ldt14_engine(r)
         if not r.get('skip'):status='🟢 EXECUTE'
@@ -11630,21 +11632,21 @@ def main():
 
 
 # ============================================================
-# V2.0 DIRECT INTRADAY — FRESH STRATEGY, NO WAIT_RETRACE ENGINE
+# V2.1 EDGE LEARNER — FRESH STRATEGY, NO WAIT_RETRACE ENGINE
 # ============================================================
 # Why this exists:
 # - V1.x proved that the exchange/execution shell can work, but the strategy
 #   accumulated too many WAIT_RETRACE / IN_ZONE / promotion gates.
-# - V2.0 does not persist a thesis and wait for a perfect old zone.
+# - V2.1 does not persist a thesis and wait for a perfect old zone.
 # - Every scan asks one simple question: is there a tradeable intraday setup NOW?
 # - Three direct playbooks: 15m trend pullback, 5m breakout, 5m momentum continuation.
 # - 1m is a light timing trigger, not a second full strategy.
 # - Position risk remains small and every live order still carries attached SL/TP.
 # - IMPORTANT small-account fix: sizing no longer inherits MIN_NET_TP_USDT=$0.40.
 #   With ~50 USDT equity and sub-1% risk that old floor can mathematically make
-#   otherwise valid trades impossible. V2.0 uses its own adaptive $0.08 floor.
+#   otherwise valid trades impossible. V2.1 uses its own adaptive $0.08 floor.
 
-LDT_VERSION = "2.0"
+LDT_VERSION = "2.1.1"
 V20_SCAN_SECONDS = int(os.getenv("V20_SCAN_SECONDS", "35"))
 V20_REPORT_SECONDS = int(os.getenv("V20_REPORT_SECONDS", "900"))
 V20_ENTRY_COOLDOWN_SECONDS = int(os.getenv("V20_ENTRY_COOLDOWN_SECONDS", "75"))
@@ -11665,6 +11667,90 @@ V20_MAX_SAME_SIDE = int(os.getenv("V20_MAX_SAME_SIDE", "1"))
 V20_MAX_POSITIONS = int(os.getenv("V20_MAX_POSITIONS", "2"))
 _v20_last_report = 0.0
 _v20_retry_after = {}
+
+# V2.1 live edge learner + anti-chase. A losing signal is NOT blindly inverted:
+# costs and timing mean the opposite trade is not automatically profitable.
+V21_JOURNAL_FILE = os.getenv("V21_JOURNAL_FILE", "v21_edge_journal.json")
+V21_MAX_5M_BODY_ATR = float(os.getenv("V21_MAX_5M_BODY_ATR", "0.95"))
+V21_HARD_MAX_5M_BODY_ATR = float(os.getenv("V21_HARD_MAX_5M_BODY_ATR", "1.80"))
+V21_MAX_EMA_EXTENSION_ATR = float(os.getenv("V21_MAX_EMA_EXTENSION_ATR", "1.20"))
+V211_MAX_1M_BODY_ATR = float(os.getenv("V211_MAX_1M_BODY_ATR", "0.85"))
+V211_HARD_MAX_1M_BODY_ATR = float(os.getenv("V211_HARD_MAX_1M_BODY_ATR", "1.50"))
+V211_SEED_SIDE_FROM_CURRENT_RISK_WINDOW = os.getenv("V211_SEED_SIDE_FROM_CURRENT_RISK_WINDOW", "True").lower() == "true"
+V21_STREAK_TIGHTEN_AFTER = int(os.getenv("V21_STREAK_TIGHTEN_AFTER", "2"))
+V21_STREAK_MIN_SCORE = int(os.getenv("V21_STREAK_MIN_SCORE", "8"))
+V21_STREAK_RISK_MULT = float(os.getenv("V21_STREAK_RISK_MULT", "0.65"))
+V21_LEARN_MIN_TRADES = int(os.getenv("V21_LEARN_MIN_TRADES", "4"))
+V21_LEARN_BAD_WR = float(os.getenv("V21_LEARN_BAD_WR", "0.40"))
+V21_LEARN_GOOD_WR = float(os.getenv("V21_LEARN_GOOD_WR", "0.60"))
+_v21_journal = {"open": [], "stats": {}}
+
+def _v21_load():
+    global _v21_journal
+    try:
+        if os.path.exists(V21_JOURNAL_FILE):
+            with open(V21_JOURNAL_FILE,"r",encoding="utf-8") as f: d=json.load(f)
+            if isinstance(d,dict): _v21_journal.update(d)
+    except Exception as e: tg(f"⚠️ V2.1 learner file ignored: {e}")
+
+def _v21_save():
+    try:
+        tmp=V21_JOURNAL_FILE+".tmp"
+        with open(tmp,"w",encoding="utf-8") as f: json.dump(_v21_journal,f,indent=2)
+        os.replace(tmp,V21_JOURNAL_FILE)
+    except Exception: pass
+
+def _v21_stat_keys(side,setup): return (f"side:{side}",f"setup:{setup}",f"combo:{side}|{setup}")
+
+def _v21_edge_adjust(side,setup):
+    adj=0; notes=[]
+    for key in _v21_stat_keys(side,setup):
+        r=_v21_journal.get("stats",{}).get(key,{})
+        n=int(r.get("trades",0)); net=safe_float(r.get("net")); wins=int(r.get("wins",0))
+        if n<V21_LEARN_MIN_TRADES: continue
+        wr=wins/max(n,1)
+        if net<0 and wr<=V21_LEARN_BAD_WR: adj-=1; notes.append(f"{key} cold {wins}/{n} ${net:+.2f}")
+        elif net>0 and wr>=V21_LEARN_GOOD_WR: adj+=1; notes.append(f"{key} hot {wins}/{n} ${net:+.2f}")
+    return max(-2,min(2,adj)),notes
+
+def _v21_record_open(signal,entry):
+    _v21_journal.setdefault("open",[]).append({"symbol":signal.get("symbol"),"side":signal.get("side"),"setup":signal.get("setup"),"score":signal.get("score"),"entry":entry,"ts":time.time(),"body5":signal.get("body5_atr"),"ema_ext":signal.get("ema_ext_atr")})
+    _v21_journal["open"]=_v21_journal["open"][-100:]; _v21_save()
+
+def _v21_learn_close(symbol,side,net):
+    opens=_v21_journal.setdefault("open",[])
+    matches=[(idx,x) for idx,x in enumerate(opens) if x.get("symbol")==symbol and x.get("side")==side]
+    if not matches: return
+    idx,rec=max(matches,key=lambda z:safe_float(z[1].get("ts"))); opens.pop(idx); setup=str(rec.get("setup") or "UNKNOWN")
+    for key in _v21_stat_keys(side,setup):
+        st=_v21_journal.setdefault("stats",{}).setdefault(key,{"trades":0,"wins":0,"losses":0,"net":0.0})
+        st["trades"]+=1; st["net"]+=net; st["wins" if net>=0 else "losses"]+=1
+    _v21_save()
+
+
+def _v211_seed_side_from_daily():
+    """Carry the already-observed current risk-window side results into a fresh v2.1 journal.
+
+    V2.0 did not store setup labels in the v2.1 journal, so we deliberately seed ONLY
+    long/short aggregate evidence. We never invent BREAKOUT/PULLBACK/MOMENTUM labels.
+    Existing learner stats are not overwritten.
+    """
+    if not V211_SEED_SIDE_FROM_CURRENT_RISK_WINDOW:
+        return
+    stats=_v21_journal.setdefault("stats",{})
+    changed=False
+    for side in ("long","short"):
+        key=f"side:{side}"
+        if int(stats.get(key,{}).get("trades",0))>0:
+            continue
+        trades=int(daily.get(f"{side}_trades",0)); wins=int(daily.get(f"{side}_wins",0)); net=safe_float(daily.get(f"{side}_net"))
+        if trades<=0:
+            continue
+        stats[key]={"trades":trades,"wins":wins,"losses":max(0,trades-wins),"net":net,"seeded_from_risk_window":True}
+        changed=True
+    if changed:
+        _v21_journal["seed_date"]=str(daily.get("date") or amsterdam_today())
+        _v21_save()
 
 
 def _v20_bar(row, d, atr):
@@ -11749,6 +11835,12 @@ def _v20_eval(symbol):
 
     # Lightweight 1m timing: direction + reasonable close + one micro confirmation.
     body1,close1,dir1,ema1=_v20_bar(a1,d,atr1)
+    # v2.1.1 video lesson: a huge CLOSED 1m impulse is often the end of the move, not the start.
+    # Do not chase it. Because the bot rescans every ~35s this simply waits for the next calmer 1m close.
+    if body1 > V211_HARD_MAX_1M_BODY_ATR:
+        return None
+    if body1 > V211_MAX_1M_BODY_ATR:
+        return None
     prev_break=safe_float(a1['close'])>safe_float(p1['high']) if d==1 else safe_float(a1['close'])<safe_float(p1['low'])
     impulse=body1>=0.16
     trigger=bool(dir1 and body1>=0.055 and close1>=0.52 and (ema1 or prev_break or impulse))
@@ -11773,6 +11865,16 @@ def _v20_eval(symbol):
     score += 1 if impulse else 0
     volma=safe_float(a5.get('volma')); vol=safe_float(a5.get('volume'))
     if volma>0 and vol>=volma: score+=1
+    ema_ext=abs(entry-safe_float(a5['ema21']))/max(atr5,1e-12)
+    if body5>V21_HARD_MAX_5M_BODY_ATR:
+        return None
+    extended=(body5>V21_MAX_5M_BODY_ATR or ema_ext>V21_MAX_EMA_EXTENSION_ATR)
+    if extended:
+        p1_against=(safe_float(p1['close'])<safe_float(p1['open'])) if d==1 else (safe_float(p1['close'])>safe_float(p1['open']))
+        micro_reclaim=bool(p1_against and dir1 and close1>=0.60 and ema1)
+        if not micro_reclaim: return None
+        score-=1
+    edge_adj,edge_notes=_v21_edge_adjust(side,setup); score+=edge_adj
     if score<V20_MIN_SCORE:
         return None
     elite=score>=8
@@ -11788,8 +11890,9 @@ def _v20_eval(symbol):
         'entry_quality':min(100,50+score*6),'quality':score,'confirmations':score,
         'strategy':'V20-DIRECT','entry_route':f'DIRECT-{setup}','engine':'DIRECT',
         'route':'DIRECT','signal_bar_ts':int(a1['ts']),'trend_strength':tstrength,
-        'setup':setup,'stop_atr':stop_atr,'elite':elite,
-        'note':f'{setup} 15m trend {"UP" if d==1 else "DOWN"} · 5m body {body5:.2f}ATR close {close5:.0%} · 1m body {body1:.2f}ATR close {close1:.0%}'
+        'setup':setup,'stop_atr':stop_atr,'elite':elite,'body5_atr':body5,'body1_atr':body1,'ema_ext_atr':ema_ext,
+        'edge_adjust':edge_adj,'edge_notes':edge_notes,'extended_reset':extended,
+        'note':f'{setup} 15m trend {"UP" if d==1 else "DOWN"} · 5m body {body5:.2f}ATR ext {ema_ext:.2f}ATR close {close5:.0%} · 1m body {body1:.2f}ATR close {close1:.0%} · learn {edge_adj:+d}'
     }
 
 
@@ -11831,11 +11934,11 @@ def _v20_execute(signal):
     """One direct live precheck then order. No thesis/state refresh can cancel it."""
     global protection_lock,_v62_last_entry_time
     symbol=signal['symbol']; side=signal['side']; d=1 if side=='long' else -1
-    tg(f"🟠 LDT v2.0 {symbol} {side.upper()} DIRECT READY\n{signal['entry_route']} · score {signal['score']} · {signal['note']}")
+    tg(f"🟠 LDT v2.1.1 {symbol} {side.upper()} DIRECT READY\n{signal['entry_route']} · score {signal['score']} · {signal['note']}")
     acc=futures_account(); equity,available=acc['total_equity'],acc['available']; reset_daily_if_needed(equity)
     if equity<MIN_EQUITY_USDT or available<=0: return False
     if not PAPER_TRADING and protection_lock:
-        tg(f"🟠 LDT v2.0 {symbol} protection lock — retry later")
+        tg(f"🟠 LDT v2.1.1 {symbol} protection lock — retry later")
         return False
     since=time.time()-_v62_last_entry_time
     if since<V20_ENTRY_COOLDOWN_SECONDS:
@@ -11845,7 +11948,7 @@ def _v20_execute(signal):
     atr=safe_float(signal['atr']); scan_price=safe_float(signal['price'])
     if live<=0 or atr<=0: return False
     if abs(live-scan_price)/atr>V20_MAX_LIVE_DRIFT_ATR:
-        tg(f"🟠 LDT v2.0 {symbol} price moved {abs(live-scan_price)/atr:.2f}ATR since scan — fresh scan required")
+        tg(f"🟠 LDT v2.1.1 {symbol} price moved {abs(live-scan_price)/atr:.2f}ATR since scan — fresh scan required")
         return False
 
     # Preserve the local risk distance around the live fill estimate.
@@ -11860,19 +11963,24 @@ def _v20_execute(signal):
     if risk<=0:return False
     fee_r=live*(2*TAKER_FEE_RATE+SLIPPAGE_RATE)/risk; net=gross-fee_r
     if fee_r>V20_MAX_FEE_R or net<V20_MIN_NET_R:
-        tg(f"🟠 LDT v2.0 {symbol} economics changed — net {net:.2f}R fee {fee_r:.2f}R; fresh scan")
+        tg(f"🟠 LDT v2.1.1 {symbol} economics changed — net {net:.2f}R fee {fee_r:.2f}R; fresh scan")
+        return False
+    streak=int(sniper_side_loss_streak.get(side,0))
+    if streak>=V21_STREAK_TIGHTEN_AFTER and (int(signal.get('score',0))<V21_STREAK_MIN_SCORE or signal.get('setup')=='MOMENTUM'):
+        tg(f"🧠 LDT v2.1.1 {symbol} {side.upper()} LOSS-ADAPT BLOCK · side streak {streak} · needs score {V21_STREAK_MIN_SCORE}+ and non-MOMENTUM")
         return False
     risk_pct=V20_ELITE_RISK_PCT if signal.get('elite') else V20_RISK_PCT
+    if streak>0: risk_pct*=V21_STREAK_RISK_MULT
     sizing=_v20_size(symbol,live,stop,equity,available,risk_pct,gross)
     if not sizing:
-        tg(f"🟠 LDT v2.0 {symbol} SIZE BLOCK — contract minimum/margin/economics; candidate not burned")
+        tg(f"🟠 LDT v2.1.1 {symbol} SIZE BLOCK — contract minimum/margin/economics; candidate not burned")
         return False
-    tg(f"📤 LDT v2.0 {symbol} ORDER SENT\n{side.upper()} {signal['setup']} · score {signal['score']} · net {net:.2f}R · fee {fee_r:.2f}R\nRisk {risk_pct*100:.2f}% · est net TP ${sizing['expected_net_tp_usdt']:.2f}")
+    tg(f"📤 LDT v2.1.1 {symbol} ORDER SENT\n{side.upper()} {signal['setup']} · score {signal['score']} · net {net:.2f}R · fee {fee_r:.2f}R\nRisk {risk_pct*100:.2f}% · est net TP ${sizing['expected_net_tp_usdt']:.2f}")
     if PAPER_TRADING:
-        _v62_last_entry_time=time.time(); tg(f"🟢 PAPER ORDER ACCEPTED · LDT v2.0\n{symbol} {side.upper()} · SL {stop:.8g} · TP {target:.8g}"); return True
+        _v62_last_entry_time=time.time(); tg(f"🟢 PAPER ORDER ACCEPTED · LDT v2.1.1\n{symbol} {side.upper()} · SL {stop:.8g} · TP {target:.8g}"); return True
     oklev,levres=set_leverage(symbol,LEVERAGE)
     if not oklev:
-        tg(f"❌ LDT v2.0 {symbol} LEVERAGE FAILED\n{levres}"); return False
+        tg(f"❌ LDT v2.1.1 {symbol} LEVERAGE FAILED\n{levres}"); return False
     before_ids={position_id(p) for p in get_positions() if position_id(p)}
     payload={'instId':blofin_inst_id(symbol),'marginMode':MARGIN_MODE,'positionSide':'net','side':'buy' if side=='long' else 'sell','orderType':'market','size':str(sizing['contracts']),
              'tpTriggerPrice':str(target),'tpOrderPrice':'-1','tpTriggerPriceType':'mark','slTriggerPrice':str(stop),'slOrderPrice':'-1','slTriggerPriceType':'mark',
@@ -11880,28 +11988,29 @@ def _v20_execute(signal):
     if BROKER_ID: payload['brokerId']=BROKER_ID
     resp=native('private_post_trade_order',payload)
     if not native_ok(resp):
-        err=response_error(resp); tg(f"❌ LDT v2.0 {symbol} ORDER REJECTED\n{err}"); return False
+        err=response_error(resp); tg(f"❌ LDT v2.1.1 {symbol} ORDER REJECTED\n{err}"); return False
     _v62_last_entry_time=time.time()
-    tg(f"🟢 LDT v2.0 ORDER ACCEPTED\n{symbol} {side.upper()} · {signal['setup']} · score {signal['score']}\nEntry~{live:.8g} · SL {stop:.8g} · TP {target:.8g}\nNotional ${sizing['notional']:.2f} · Margin ${sizing['margin']:.2f} · {LEVERAGE}x")
+    _v21_record_open(signal,live)
+    tg(f"🟢 LDT v2.1.1 ORDER ACCEPTED\n{symbol} {side.upper()} · {signal['setup']} · score {signal['score']}\nEntry~{live:.8g} · SL {stop:.8g} · TP {target:.8g}\nNotional ${sizing['notional']:.2f} · Margin ${sizing['margin']:.2f} · {LEVERAGE}x")
     new_pos=find_new_position(symbol,before_ids,timeout=10)
     if new_pos is None:
-        tg(f"🟢 LDT v2.0 {symbol} ACK RECEIVED — position visibility pending; protection watcher will verify.")
+        tg(f"🟢 LDT v2.1.1 {symbol} ACK RECEIVED — position visibility pending; protection watcher will verify.")
         return True
     pid=position_id(new_pos); fill=position_entry(new_pos) or live
     if pid:
         sniper_managed_positions.add(pid)
-        _ldt_meta[pid]={'risk':risk,'entry':fill,'sl':stop,'tp':target,'final_r':gross,'side':side,'opened':time.time(),'strategy':'V20-DIRECT','route':signal['entry_route'],'engine':'DIRECT','mfe_price':fill,'mfe_r':0.0,'version':'2.0'}
+        _ldt_meta[pid]={'risk':risk,'entry':fill,'sl':stop,'tp':target,'final_r':gross,'side':side,'opened':time.time(),'strategy':'V20-DIRECT','route':signal['entry_route'],'engine':'DIRECT','mfe_price':fill,'mfe_r':0.0,'version':'2.1'}
     if has_live_protection(new_pos)[0]:
-        tg(f"🛡️ LDT v2.0 PROTECTION CONFIRMED\n{symbol} {side.upper()} · SL/TP visible")
+        tg(f"🛡️ LDT v2.1.1 PROTECTION CONFIRMED\n{symbol} {side.upper()} · SL/TP visible")
     else:
         last=safe_float(exchange.fetch_ticker(symbol).get('last'))
         if tpsl_prices_valid(side,stop,target,last):
             ok,res=place_tpsl_for_position(new_pos,stop,target,client_tag='ldt20')
-            if ok: tg(f"🛡️ LDT v2.0 FALLBACK PROTECTION CONFIRMED\n{symbol}")
+            if ok: tg(f"🛡️ LDT v2.1.1 FALLBACK PROTECTION CONFIRMED\n{symbol}")
             else:
-                protection_lock=True; tg(f"🚨 LDT v2.0 PROTECTION FAILURE\n{symbol}\n{res}\nNEW TRADES PAUSED")
+                protection_lock=True; tg(f"🚨 LDT v2.1.1 PROTECTION FAILURE\n{symbol}\n{res}\nNEW TRADES PAUSED")
         else:
-            protection_lock=True; tg(f"🚨 LDT v2.0 {symbol}: protection could not be verified. NEW TRADES PAUSED")
+            protection_lock=True; tg(f"🚨 LDT v2.1.1 {symbol}: protection could not be verified. NEW TRADES PAUSED")
     return True
 
 
@@ -11910,9 +12019,9 @@ def _v20_report(rows):
     now=time.time()
     if now-_v20_last_report<V20_REPORT_SECONDS:return
     _v20_last_report=now
-    acc=futures_account(); daily=daily_closed_stats_v5()
+    acc=futures_account(); dstat=dict(daily)
     ranked=sorted(rows,key=lambda r:(r['score'],r['net_rr']),reverse=True)[:8]
-    lines=[f"🧠 LIQUIDITY DAYTRADER v2.0 · DIRECT INTRADAY",f"Direct candidates {len(rows)} · scanned {len(SYMBOLS)}",f"Today {daily.get('trades',0)} trades · W/L {daily.get('wins',0)}/{daily.get('losses',0)} · Net ${safe_float(daily.get('net')):.2f}",f"No WAIT_RETRACE engine · fresh 15m/5m/1m setup every scan",f"Risk {V20_RISK_PCT*100:.2f}% / elite {V20_ELITE_RISK_PCT*100:.2f}% · max positions {V20_MAX_POSITIONS} · same side {V20_MAX_SAME_SIDE}"]
+    lines=[f"🧠 LIQUIDITY DAYTRADER v2.1.1 · VIDEO-LEARNED DIRECT",f"Direct candidates {len(rows)} · scanned {len(SYMBOLS)}",f"Today {daily.get('trades',0)} trades · W/L {daily.get('wins',0)}/{daily.get('losses',0)} · Net ${safe_float(daily.get('net')):.2f}",f"No WAIT_RETRACE engine · fresh 15m/5m/1m setup every scan",f"Risk {V20_RISK_PCT*100:.2f}% / elite {V20_ELITE_RISK_PCT*100:.2f}% · max positions {V20_MAX_POSITIONS} · same side {V20_MAX_SAME_SIDE}"]
     for r in ranked:
         lines.append(f"🟠 {r['symbol']} {r['side'].upper()} {r['setup']} · score {r['score']} · net {r['net_rr']:.2f}R fee {r['fee_drag_r']:.2f}R")
     tg('\n'.join(lines))
@@ -11920,38 +12029,40 @@ def _v20_report(rows):
 
 def startup_diagnostics_v20():
     global protection_lock
-    load_learning(); acc=futures_account(); reset_daily_if_needed(acc['total_equity'])
-    tg(f"🧠 LIQUIDITY DAYTRADER STARTED\nv2.0 · DIRECT INTRADAY\nFresh strategy: no frozen thesis, no WAIT_RETRACE, no card-promotion queue.\nPlaybooks: 15m trend pullback · 5m breakout · 5m momentum + light 1m trigger.\nSmall-account sizing fix: V2 min expected net TP ${V20_MIN_NET_TP_USDT:.2f} (does NOT inherit old ${MIN_NET_TP_USDT:.2f} floor).\nRisk {V20_RISK_PCT*100:.2f}% / elite {V20_ELITE_RISK_PCT*100:.2f}% · max positions {V20_MAX_POSITIONS} · max same side {V20_MAX_SAME_SIDE}.\nEquity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}")
+    load_learning(); _v21_load(); acc=futures_account(); reset_daily_if_needed(acc['total_equity'])
+    tg(f"🧠 LIQUIDITY DAYTRADER STARTED\nv2.1.1 · VIDEO-LEARNED DIRECT\nEdge learner: direct entries + anti-chase + live setup/side learning; no WAIT_RETRACE.\nPlaybooks: 15m trend pullback · 5m breakout · 5m momentum + light 1m trigger.\nAnti-chase: 5m >0.95ATR needs reset; closed 1m >0.85ATR is not chased.\nLearner: losing side/setup combinations are tightened; winning combinations earn score, never blind-inverted.\nSmall-account sizing fix: V2 min expected net TP ${V20_MIN_NET_TP_USDT:.2f} (does NOT inherit old ${MIN_NET_TP_USDT:.2f} floor).\nRisk {V20_RISK_PCT*100:.2f}% / elite {V20_ELITE_RISK_PCT*100:.2f}% · max positions {V20_MAX_POSITIONS} · max same side {V20_MAX_SAME_SIDE}.\nEquity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}")
     if not PAPER_TRADING:
-        try: seed_closed_history_v5()
-        except Exception as e: tg(f"⚠️ V2.0 PNL seed warning\n{e}")
+        try:
+            seed_closed_history_v5()
+            _v211_seed_side_from_daily()
+        except Exception as e: tg(f"⚠️ V2.1.1 PNL/learner seed warning\n{e}")
         try:
             inherited=get_positions(); protection_lock=not all_positions_protected() if inherited else False
-            if inherited: tg(f"ℹ️ V2.0 HANDOVER\n{len(inherited)} existing position(s)."+("\n⚠️ Unprotected position: entries locked." if protection_lock else "\n✅ Protection verified."))
+            if inherited: tg(f"ℹ️ V2.1 HANDOVER\n{len(inherited)} existing position(s)."+("\n⚠️ Unprotected position: entries locked." if protection_lock else "\n✅ Protection verified."))
         except Exception as e:
-            protection_lock=True; tg(f"🚨 V2.0 STARTUP PROTECTION CHECK FAILED\n{e}")
+            protection_lock=True; tg(f"🚨 V2.1 STARTUP PROTECTION CHECK FAILED\n{e}")
 
 
 def main():
-    """V2.0 direct daytrader. Intentionally does not call V1.x evaluate_symbol()."""
+    """V2.1 direct daytrader. Intentionally does not call V1.x evaluate_symbol()."""
     global protection_lock,_v6_daily_risk_alerted,_v6_daily_risk_last_notice
     startup_diagnostics_v20()
     while True:
         try:
             if not PAPER_TRADING:
                 try: check_for_closed_positions()
-                except Exception as e: tg(f"⚠️ V2.0 PNL TRACKER ERROR\n{e}")
+                except Exception as e: tg(f"⚠️ V2.1 PNL TRACKER ERROR\n{e}")
                 try: manage_sniper_step_stops()
-                except Exception as e: tg(f"⚠️ V2.0 MANAGER ERROR\n{e}")
+                except Exception as e: tg(f"⚠️ V2.1 MANAGER ERROR\n{e}")
             acc=futures_account(); ok,reason=check_daily_risk(acc['total_equity'])
             if not ok:
                 now_ts=time.time()
                 if (not _v6_daily_risk_alerted) or (now_ts-_v6_daily_risk_last_notice>=V6_DAILY_RISK_REMINDER_MIN*60):
-                    tg(f"🛑 {reason}\nV2.0 new entries paused; existing positions remain protected.")
+                    tg(f"🛑 {reason}\nV2.1.1 new entries paused; existing positions remain protected.")
                     _v6_daily_risk_alerted=True; _v6_daily_risk_last_notice=now_ts
                 time.sleep(120); continue
             elif _v6_daily_risk_alerted:
-                tg('🟢 DAILY RISK STOP CLEARED\nV2.0 entries allowed again.'); _v6_daily_risk_alerted=False; _v6_daily_risk_last_notice=0.0
+                tg('🟢 DAILY RISK STOP CLEARED\nV2.1.1 entries allowed again.'); _v6_daily_risk_alerted=False; _v6_daily_risk_last_notice=0.0
             if time.time()<loss_pause_until: time.sleep(V20_SCAN_SECONDS); continue
             positions=get_positions()
             if not PAPER_TRADING:
@@ -11988,11 +12099,11 @@ def main():
                     _v20_retry_after[sig['symbol']]=time.time()+20
             time.sleep(V20_SCAN_SECONDS)
         except KeyboardInterrupt:
-            tg('🛑 Liquidity DayTrader v2.0 stopped.'); raise
+            tg('🛑 Liquidity DayTrader v2.1.1 stopped.'); raise
         except Exception as e:
             msg=f"{type(e).__name__}: {e}"
             if '152002' in msg: time.sleep(20); continue
-            tg(f"⚠️ LDT v2.0 LOOP ERROR\n{msg}"); time.sleep(30)
+            tg(f"⚠️ LDT v2.1.1 LOOP ERROR\n{msg}"); time.sleep(30)
 
 
 if __name__ == "__main__":
