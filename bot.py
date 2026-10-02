@@ -10879,5 +10879,289 @@ def startup_diagnostics():
        f'Equity ${acc["total_equity"]:.2f} · Available ${acc["available"]:.2f}')
 
 
+
+# ============================================================
+# v1.7.3 - EXECUTION RELIABILITY
+# ============================================================
+# Live audit found a critical last-mile issue: the scan loop marked a signal_bar
+# as "used" even when open_trade() returned False. A READY setup could therefore
+# get exactly one execution attempt; any transient state/price/cooldown failure
+# burned that signal forever. In addition, the inherited hardened shell refreshed
+# the state machine a second time, so a setup shown as EXECUTE in the report could
+# be cancelled milliseconds later by a duplicate trigger/zone check.
+#
+# v1.7.3 fixes the execution path rather than merely lowering more strategy gates:
+#   1) failed attempts DO NOT burn the signal bar;
+#   2) failed READY setups retry after a short per-symbol cooldown;
+#   3) up to 5 different READY candidates can be attempted per scan;
+#   4) the order shell does NOT run the state machine a second time;
+#   5) tiny stops are widened, when possible, to a fee-safe stop distance instead
+#      of rejecting an otherwise valid setup solely because costs dominate risk;
+#   6) all real-money safeties remain: daily loss cap, max positions, same-side
+#      cap, positive risk geometry, live RR, sizing, leverage and verified SL/TP.
+
+LDT_VERSION = "1.7.3"
+LDT173_RETRY_SECONDS = int(os.getenv("LDT173_RETRY_SECONDS", "60"))
+LDT173_PORTFOLIO_RETRY_SECONDS = int(os.getenv("LDT173_PORTFOLIO_RETRY_SECONDS", "90"))
+LDT173_MAX_ATTEMPTS_PER_SCAN = int(os.getenv("LDT173_MAX_ATTEMPTS_PER_SCAN", "5"))
+LDT173_FEE_SAFE_CAP_R = float(os.getenv("LDT173_FEE_SAFE_CAP_R", "0.45"))
+LDT173_ACTIVE_FEE_SAFE_CAP_R = float(os.getenv("LDT173_ACTIVE_FEE_SAFE_CAP_R", "0.35"))
+LDT173_MAX_STOP_WIDEN_ATR = float(os.getenv("LDT173_MAX_STOP_WIDEN_ATR", "0.60"))
+_ldt173_retry_after = {}
+
+
+def _ldt173_fee_safe_stop(signal, live, stop, atr, side):
+    """Widen an overly tight stop only enough to keep round-trip cost sane.
+
+    This never moves a stop closer to entry. It can only move it farther away,
+    reducing position size through the existing dollar-risk sizing engine.
+    """
+    d = 1 if side == 'long' else -1
+    risk = d * (live - stop)
+    if live <= 0 or atr <= 0 or risk <= 0:
+        return stop, 99.0, 0.0
+    cap = LDT173_ACTIVE_FEE_SAFE_CAP_R if _ldt16_is_active(signal) else LDT173_FEE_SAFE_CAP_R
+    cost_px = live * (2 * TAKER_FEE_RATE + SLIPPAGE_RATE)
+    fee_r = cost_px / max(risk, 1e-12)
+    if fee_r <= cap:
+        return stop, fee_r, 0.0
+    needed_risk = cost_px / max(cap, 1e-9)
+    extra = needed_risk - risk
+    if extra <= 0 or extra / atr > LDT173_MAX_STOP_WIDEN_ATR:
+        return stop, fee_r, 0.0
+    new_stop = live - d * needed_risk
+    new_fee_r = cost_px / max(needed_risk, 1e-12)
+    return new_stop, new_fee_r, extra / atr
+
+
+def _ldt173_order_shell(signal):
+    """Single-pass protected order shell. Strategy was already validated once."""
+    global protection_lock, _v62_last_entry_time
+    symbol = signal.get('symbol'); side = signal.get('side')
+    if not symbol or side not in ('long', 'short'):
+        return False
+    d = 1 if side == 'long' else -1
+    engine = _ldt14_engine(signal)
+
+    acc = futures_account(); equity, available = acc['total_equity'], acc['available']
+    reset_daily_if_needed(equity)
+    if equity < MIN_EQUITY_USDT or available <= 0:
+        tg(f"⏭️ LDT v1.7.3 {symbol} {side.upper()} ACCOUNT BLOCK\nEquity/available balance not sufficient for a new protected position.")
+        return False
+    if not PAPER_TRADING and protection_lock:
+        tg(f"⏭️ LDT v1.7.3 {symbol} {side.upper()} PROTECTION LOCK\nNew entries paused until existing protection is verified.")
+        return False
+    since = time.time() - _v62_last_entry_time
+    if since < 4 * 60:
+        tg(f"⏳ LDT v1.7.3 {symbol} {side.upper()} ENTRY COOLDOWN\nRetry allowed in {max(1,int((4*60-since)/60)+1)} min; signal is NOT burned.")
+        return False
+
+    try:
+        live = safe_float(exchange.fetch_ticker(symbol).get('last'), signal.get('price'))
+    except Exception:
+        live = safe_float(signal.get('price'))
+    atr = safe_float(signal.get('atr')); stop = safe_float(signal.get('structural_stop'))
+    if live <= 0 or atr <= 0 or stop <= 0:
+        tg(f"⏭️ LDT v1.7.3 {symbol} {side.upper()} GEOMETRY BLOCK\nMissing live price / ATR / stop; signal will retry if still READY.")
+        return False
+
+    stop2, fee_r, widened_atr = _ldt173_fee_safe_stop(signal, live, stop, atr, side)
+    if widened_atr > 0:
+        stop = stop2
+    risk = d * (live - stop)
+    if risk <= 0:
+        return False
+    risk_atr = risk / max(atr, 1e-12)
+    if risk_atr < LDT_MIN_STOP_ATR:
+        tg(f"⏭️ LDT v1.7.3 {symbol} {side.upper()} STOP TOO TIGHT\n{risk_atr:.2f}ATR < {LDT_MIN_STOP_ATR:.2f}ATR; signal not burned.")
+        return False
+
+    fee_cap = LDT173_ACTIVE_FEE_SAFE_CAP_R if _ldt16_is_active(signal) else LDT173_FEE_SAFE_CAP_R
+    if fee_r > fee_cap + 1e-9:
+        tg(f"⏭️ LDT v1.7.3 {symbol} {side.upper()} FEE BLOCK\nfee {fee_r:.2f}R > {fee_cap:.2f}R after fee-safe stop check; signal not burned.")
+        return False
+
+    hard = safe_float(signal.get('far_target') or signal.get('target_price'))
+    tf = '1m' if str(signal.get('route')) == 'FAST' else '5m'
+    target, target_kind, gross = _ldt14_target(symbol, side, live, stop, hard, tf, engine)
+    tick = safe_float(get_instrument(symbol).get('tickSize'), 0.0001)
+    stop = round_trade_price(stop, tick, side, 'sl')
+    target = round_trade_price(target, tick, side, 'tp')
+    risk = abs(live - stop)
+    if risk <= 0:
+        return False
+    final_r = d * (target - live) / risk
+    fee_r = live * (2 * TAKER_FEE_RATE + SLIPPAGE_RATE) / risk
+    net = final_r - fee_r
+    rrmin = _ldt14_live_rr_min(signal)
+    if net < rrmin:
+        tg(f"⏭️ LDT v1.7.3 {symbol} {side.upper()} LIVE RR MOVED\n{target_kind} · net {net:.2f}R < {rrmin:.2f}R; signal will retry if price improves.")
+        return False
+
+    profile = sizing_profile({**signal, 'net_rr': net})
+    sizing = calculate_contracts_v5(symbol, live, stop, equity, available, profile['risk_pct'], profile['target_net_tp'], final_r)
+    if not sizing:
+        tg(f"⏭️ LDT v1.7.3 {symbol} {side.upper()} SIZE BLOCK\nNo valid contract size at current equity/risk; signal not burned.")
+        return False
+    if sizing['margin'] > available * AVAILABLE_MARGIN_BUFFER:
+        tg(f"⏭️ LDT v1.7.3 {symbol} {side.upper()} MARGIN BLOCK\nNeed ${sizing['margin']:.2f}; available buffer ${available*AVAILABLE_MARGIN_BUFFER:.2f}.")
+        return False
+
+    before_ids = {position_id(p) for p in get_positions() if position_id(p)}
+    oklev, levres = set_leverage(symbol, LEVERAGE)
+    if not oklev:
+        tg(f"⛔ LDT v1.7.3 LEVERAGE FAILED\n{symbol}\n{levres}")
+        return False
+
+    tag = 'ldt173'
+    payload = {
+        'instId': blofin_inst_id(symbol), 'marginMode': MARGIN_MODE, 'positionSide': 'net',
+        'side': 'buy' if side == 'long' else 'sell', 'orderType': 'market', 'size': str(sizing['contracts']),
+        'tpTriggerPrice': str(target), 'tpOrderPrice': '-1', 'tpTriggerPriceType': 'mark',
+        'slTriggerPrice': str(stop), 'slOrderPrice': '-1', 'slTriggerPriceType': 'mark',
+        'clientOrderId': f"{tag}{int(time.time()*1000)%1000000000}"
+    }
+    if BROKER_ID: payload['brokerId'] = BROKER_ID
+    widened = f" · fee-safe SL +{widened_atr:.2f}ATR" if widened_atr > 0 else ''
+    msg = (f"🎯 {'PAPER ' if PAPER_TRADING else ''}LDT v1.7.3 EXECUTED\n"
+           f"{symbol} {side.upper()} · {engine} · {signal.get('entry_route')}\n"
+           f"STR {safe_float(signal.get('setup_quality')):.0f} · EQ {safe_float(signal.get('entry_quality')):.0f} · net RR {net:.2f}R · fee {fee_r:.2f}R{widened}\n"
+           f"Entry {live:.8g} · SL {stop:.8g} · TP {target:.8g}\n"
+           f"Risk {profile['risk_pct']*100:.2f}% · Notional ${sizing['notional']:.2f} · Margin ${sizing['margin']:.2f} · {LEVERAGE}x")
+    if PAPER_TRADING:
+        tg(msg); _v62_last_entry_time = time.time(); return True
+
+    resp = native('private_post_trade_order', payload)
+    if not native_ok(resp):
+        err = response_error(resp)
+        if '152012' in err: protection_lock = True
+        tg(f"❌ LDT v1.7.3 ORDER FAILED\n{symbol} {side.upper()}\n{err}\nSignal not burned; retry is possible.")
+        return False
+
+    _v62_last_entry_time = time.time(); tg(msg)
+    new_pos = find_new_position(symbol, before_ids, timeout=8)
+    if new_pos is None:
+        tg(f"⚠️ {symbol}: v1.7.3 order accepted, position not visible yet.")
+        return True
+    pid = position_id(new_pos); fill = position_entry(new_pos) or live
+    if pid:
+        sniper_managed_positions.add(pid)
+        _ldt_meta[pid] = {'risk': risk, 'entry': fill, 'sl': stop, 'tp': target, 'final_r': final_r,
+                          'side': side, 'opened': time.time(), 'strategy': signal.get('strategy'),
+                          'route': signal.get('entry_route'), 'engine': engine, 'mfe_price': fill,
+                          'mfe_r': 0.0, 'version': '1.7.3'}
+    if has_live_protection(new_pos)[0]:
+        tg(f"🛡️ LDT v1.7.3 PROTECTION CONFIRMED\n{symbol} {side.upper()}\nSL/TP visible.")
+    else:
+        last = safe_float(exchange.fetch_ticker(symbol).get('last'))
+        if tpsl_prices_valid(side, stop, target, last):
+            ok, res = place_tpsl_for_position(new_pos, stop, target, client_tag=tag)
+            if ok: tg(f"🛡️ LDT v1.7.3 FALLBACK PROTECTION CONFIRMED\n{symbol}")
+            else:
+                protection_lock = True
+                tg(f"🚨 LDT v1.7.3 PROTECTION FAILURE\n{symbol}\n{res}\nNEW TRADES PAUSED.")
+        else:
+            protection_lock = True
+            tg(f"🚨 {symbol}: v1.7.3 position exists but protection could not be verified.\nNEW TRADES PAUSED.")
+    if symbol in _ldt13_states:
+        _ldt13_states.pop(symbol, None); _ldt13_save()
+    return True
+
+
+# The v1.7 open_trade wrapper will now call this single-pass shell.
+_ldt17_hardened_open = _ldt173_order_shell
+
+
+def startup_diagnostics():
+    _ldt13_load(); _ldt15_load_dead(); acc=futures_account(); reset_daily_if_needed(acc['total_equity'])
+    tg('🧠 LIQUIDITY DAYTRADER STARTED v1.7.3 · EXECUTION RELIABILITY\n'
+       'Critical fix: a failed order attempt no longer burns a READY signal.\n'
+       f'Retry {LDT173_RETRY_SECONDS}s · up to {LDT173_MAX_ATTEMPTS_PER_SCAN} READY candidates/scan.\n'
+       'Single-pass execution: no duplicate state/trigger refresh after READY.\n'
+       f'Fee-safe stop may widen by max {LDT173_MAX_STOP_WIDEN_ATR:.2f}ATR; dollar risk is reduced by position sizing.\n'
+       f'Max positions {MAX_ACTIVE_POSITIONS} · max same side {LDT_MAX_SAME_SIDE} · daily loss protection unchanged.\n'
+       f'Equity ${acc["total_equity"]:.2f} · Available ${acc["available"]:.2f}')
+
+
+def main():
+    """v1.7.3 main loop: retry READY setups instead of permanently burning them."""
+    global protection_lock, _v6_daily_risk_alerted, _v6_daily_risk_last_notice
+    load_learning(); startup_diagnostics()
+    if not PAPER_TRADING:
+        try: seed_closed_history_v5()
+        except Exception as e: tg(f"⚠️ V1.7.3 PNL seed warning\n{e}")
+        try:
+            inherited=get_positions(); protection_lock=not all_positions_protected() if inherited else False
+            if inherited: tg(f"ℹ️ V1.7.3 HANDOVER\n{len(inherited)} existing position(s)." + ("\n⚠️ Unprotected position detected: entries locked." if protection_lock else "\n✅ Protection verified."))
+        except Exception as e:
+            protection_lock=True; tg(f"🚨 STARTUP PROTECTION CHECK FAILED\n{e}")
+    while True:
+        try:
+            if not PAPER_TRADING:
+                try: check_for_closed_positions()
+                except Exception as e: tg(f"⚠️ PNL TRACKER ERROR\n{e}")
+                try: manage_sniper_step_stops()
+                except Exception as e: tg(f"⚠️ V1.7.3 MANAGER ERROR\n{e}")
+            acc=futures_account(); ok,reason=check_daily_risk(acc['total_equity'])
+            if not ok:
+                now_ts=time.time()
+                if (not _v6_daily_risk_alerted) or (now_ts-_v6_daily_risk_last_notice >= V6_DAILY_RISK_REMINDER_MIN*60):
+                    tg(f"🛑 {reason}\nNew entries paused. Existing positions remain protected.")
+                    _v6_daily_risk_alerted=True; _v6_daily_risk_last_notice=now_ts
+                time.sleep(120); continue
+            elif _v6_daily_risk_alerted:
+                tg('🟢 DAILY RISK STOP CLEARED\nNew entries are allowed again.')
+                _v6_daily_risk_alerted=False; _v6_daily_risk_last_notice=0.0
+            if time.time() < loss_pause_until:
+                time.sleep(SCAN_SECONDS); continue
+            positions=get_positions()
+            if not PAPER_TRADING:
+                protection_watch(); positions=get_positions()
+            if protection_lock and not PAPER_TRADING:
+                time.sleep(SCAN_SECONDS); continue
+
+            scanned=[]; candidates=[]; existing={position_symbol(p) for p in positions}; now=time.time()
+            for symbol in SYMBOLS:
+                if not cooldown_ok(symbol): continue
+                try:
+                    s=evaluate_symbol(symbol)
+                    if not s: continue
+                    scanned.append(s)
+                    if s.get('side') and not s.get('skip') and s.get('entry_route') not in ('WAIT',None):
+                        key=int(s.get('signal_bar_ts',0))
+                        # Only a SUCCESSFUL trade consumes the signal bar.
+                        if sniper_last_signal_bar.get(symbol)==key: continue
+                        if symbol in existing: continue
+                        if now < safe_float(_ldt173_retry_after.get(symbol),0): continue
+                        candidates.append(s)
+                except Exception:
+                    continue
+            maybe_score_report(scanned)
+            candidates.sort(key=lambda x:(safe_float(x.get('quality')), int(x.get('confirmations',0)), safe_float(x.get('net_rr'))), reverse=True)
+            attempts=0
+            for sig in candidates:
+                if len(get_positions())>=MAX_ACTIVE_POSITIONS or attempts>=LDT173_MAX_ATTEMPTS_PER_SCAN: break
+                allowed,why=sniper_portfolio_allows(sig,get_positions())
+                if not allowed:
+                    _ldt173_retry_after[sig['symbol']]=time.time()+LDT173_PORTFOLIO_RETRY_SECONDS
+                    continue
+                attempts+=1
+                opened=open_trade(sig)
+                if opened:
+                    sniper_last_signal_bar[sig['symbol']]=int(sig.get('signal_bar_ts',0))
+                    symbol_last_trade[sig['symbol']]=time.time()
+                    _ldt173_retry_after.pop(sig['symbol'],None)
+                    break
+                # Critical fix: DO NOT set sniper_last_signal_bar here.
+                _ldt173_retry_after[sig['symbol']]=time.time()+LDT173_RETRY_SECONDS
+            time.sleep(SCAN_SECONDS)
+        except KeyboardInterrupt:
+            tg('🛑 Liquidity DayTrader v1.7.3 stopped.'); raise
+        except Exception as e:
+            msg=f"{type(e).__name__}: {e}"
+            if '152002' in msg: time.sleep(20); continue
+            tg(f"⚠️ LDT v1.7.3 LOOP ERROR\n{msg}"); time.sleep(30)
+
+
 if __name__ == "__main__":
     main()
