@@ -12106,5 +12106,506 @@ def main():
             tg(f"⚠️ LDT v2.1.1 LOOP ERROR\n{msg}"); time.sleep(30)
 
 
+
+# ============================================================
+# V2.2 COUNTERFACTUAL GATES
+# ============================================================
+# Design goals learned from V2.0/V2.1.1 live trades:
+# 1) One impulse must not earn many correlated "confidence" points.
+# 2) Market, location, trigger and economics are independent gates.
+# 3) A reset can repair timing, but cannot repair a terrible location.
+# 4) Stops respect 5m structure. If structure is too far away, skip or size down;
+#    never drag a valid structural stop inward merely to fit an ATR cap.
+# 5) Every accepted real trade launches paper-only counterfactual twins so the
+#    bot can learn whether pullback entries, smaller targets, or the opposite
+#    direction would have behaved better. Opposite-control is NEVER auto-traded.
+# 6) V2.2 profit management uses the real stored R-distance; it does not assume
+#    an inherited 3R target.
+
+LDT_VERSION = "2.2"
+V22_JOURNAL_FILE = os.getenv("V22_JOURNAL_FILE", "v22_counterfactual_journal.json")
+V22_SHADOW_TTL_MIN = int(os.getenv("V22_SHADOW_TTL_MIN", "45"))
+V22_SHADOW_UPDATE_SECONDS = int(os.getenv("V22_SHADOW_UPDATE_SECONDS", "60"))
+V22_SHADOW_LEARN_MIN = int(os.getenv("V22_SHADOW_LEARN_MIN", "12"))
+V22_STRUCT_BUFFER_ATR = float(os.getenv("V22_STRUCT_BUFFER_ATR", "0.06"))
+V22_MAX_STRUCT_STOP_ATR = float(os.getenv("V22_MAX_STRUCT_STOP_ATR", "2.20"))
+V22_HARD_MAX_EMA_EXT_ATR = float(os.getenv("V22_HARD_MAX_EMA_EXT_ATR", "1.55"))
+V22_MAX_1M_BODY_ATR = float(os.getenv("V22_MAX_1M_BODY_ATR", "0.70"))
+V22_BTC_CONTEXT = os.getenv("V22_BTC_CONTEXT", "True").lower() == "true"
+V22_PROFIT_LOCK_1_R = float(os.getenv("V22_PROFIT_LOCK_1_R", "0.90"))
+V22_PROFIT_LOCK_1_TO = float(os.getenv("V22_PROFIT_LOCK_1_TO", "0.08"))
+V22_PROFIT_LOCK_2_R = float(os.getenv("V22_PROFIT_LOCK_2_R", "1.20"))
+V22_PROFIT_LOCK_2_TO = float(os.getenv("V22_PROFIT_LOCK_2_TO", "0.55"))
+V22_NORMAL_TARGET_R = float(os.getenv("V22_NORMAL_TARGET_R", "1.30"))
+V22_ELITE_TARGET_R = float(os.getenv("V22_ELITE_TARGET_R", "1.55"))
+V22_MIN_QUALITY = int(os.getenv("V22_MIN_QUALITY", "5"))
+V22_ELITE_QUALITY = int(os.getenv("V22_ELITE_QUALITY", "7"))
+_v22_last_shadow_update = 0.0
+_v22_last_report = 0.0
+_v22_journal = {"real_open": [], "real_closed": [], "shadows": [], "shadow_stats": {}}
+_v22_profit_notices = set()
+
+
+def _v22_load():
+    global _v22_journal
+    try:
+        if os.path.exists(V22_JOURNAL_FILE):
+            with open(V22_JOURNAL_FILE, "r", encoding="utf-8") as f:
+                d=json.load(f)
+            if isinstance(d,dict):
+                for k in _v22_journal: _v22_journal[k]=d.get(k,_v22_journal[k])
+    except Exception as e:
+        tg(f"⚠️ V2.2 learner file ignored: {e}")
+
+
+def _v22_save():
+    try:
+        tmp=V22_JOURNAL_FILE+".tmp"
+        with open(tmp,"w",encoding="utf-8") as f: json.dump(_v22_journal,f,indent=2)
+        os.replace(tmp,V22_JOURNAL_FILE)
+    except Exception:
+        pass
+
+
+def _v22_stat_update(variant, outcome_r, win=None, ambiguous=False, no_entry=False):
+    st=_v22_journal.setdefault("shadow_stats",{}).setdefault(variant,{"n":0,"wins":0,"losses":0,"sum_r":0.0,"ambiguous":0,"no_entry":0})
+    if ambiguous:
+        st["ambiguous"]+=1; return
+    if no_entry:
+        st["no_entry"]+=1; return
+    st["n"]+=1; st["sum_r"]+=safe_float(outcome_r)
+    if win is None: win=outcome_r>0
+    st["wins" if win else "losses"]+=1
+
+
+def _v22_stat(variant):
+    st=_v22_journal.get("shadow_stats",{}).get(variant,{})
+    n=int(st.get("n",0)); avg=safe_float(st.get("sum_r"))/max(n,1)
+    return n,avg,int(st.get("wins",0)),int(st.get("losses",0))
+
+
+def _v22_target_r(elite=False):
+    """Use shadow evidence only after a meaningful sample; otherwise fixed V2.2 defaults."""
+    base=V22_ELITE_TARGET_R if elite else V22_NORMAL_TARGET_R
+    candidates=[]
+    for name,r in (("tp100",1.00),("tp120",1.20),("tp140",1.40)):
+        n,avg,_,_=_v22_stat(name)
+        if n>=V22_SHADOW_LEARN_MIN: candidates.append((avg,r,n))
+    if not candidates: return base
+    candidates.sort(reverse=True)
+    best_avg,best_r,_=candidates[0]
+    # Do not let a small paper sample radically alter the live target.
+    if best_avg <= -0.05: return base
+    if elite: return min(1.65,max(1.20,best_r+0.15))
+    return min(1.45,max(1.00,best_r))
+
+
+def _v22_pullback_evidence():
+    ni,ai,_,_=_v22_stat("immediate")
+    np,ap,_,_=_v22_stat("pullback020")
+    return ni>=V22_SHADOW_LEARN_MIN and np>=V22_SHADOW_LEARN_MIN and ap>ai+0.25
+
+
+def _v22_btc_context(d):
+    if not V22_BTC_CONTEXT: return True,0,"BTC context off"
+    try:
+        b=_ldt_closed(_ldt_df('BTC/USDT:USDT','15m',90))
+        bt,bs=_v20_trend(b)
+        if bt==-d and bs>=2: return False,bs,f"BTC strong {'DOWN' if bt<0 else 'UP'} opposite"
+        if bt==d and bs>=1: return True,bs,f"BTC aligned strength {bs}"
+        return True,0,"BTC neutral/mixed"
+    except Exception:
+        return True,0,"BTC unavailable"
+
+
+def _v22_structural_stop(df5,side,entry,atr):
+    """Respect local 5m structure. Never clamp a distant swing inward to 1.2 ATR."""
+    d=1 if side=='long' else -1
+    x=df5.tail(7)
+    if d==1:
+        swing=min(safe_float(v) for v in x['low'])
+        stop=swing-V22_STRUCT_BUFFER_ATR*atr
+    else:
+        swing=max(safe_float(v) for v in x['high'])
+        stop=swing+V22_STRUCT_BUFFER_ATR*atr
+    dist=d*(entry-stop)
+    min_dist=V20_MIN_STOP_ATR*atr
+    if dist<=0: dist=min_dist; stop=entry-d*dist
+    elif dist<min_dist: dist=min_dist; stop=entry-d*dist
+    stop_atr=dist/max(atr,1e-12)
+    if stop_atr>V22_MAX_STRUCT_STOP_ATR: return None,None
+    return stop,stop_atr
+
+
+def _v22_setup_location_limits(setup):
+    if setup=='PULLBACK': return 1.10,0.90
+    if setup=='BREAKOUT': return 1.20,1.25
+    return 0.95,1.00
+
+
+def _v20_eval(symbol):
+    """V2.2: fresh setup with four independent gates: MARKET, LOCATION, TRIGGER, ECONOMICS."""
+    try:
+        d15=_ldt_closed(_ldt_df(symbol,'15m',90)); d5=_ldt_closed(_ldt_df(symbol,'5m',120)); d1=_ldt_closed(_ldt_df(symbol,'1m',120))
+    except Exception:
+        return None
+    if min(len(d15),len(d5),len(d1))<30: return None
+    trend,tstrength=_v20_trend(d15)
+    a5=d5.iloc[-1]; p5=d5.iloc[-2]; a1=d1.iloc[-1]; p1=d1.iloc[-2]
+    atr5=safe_float(a5['atr']); atr1=safe_float(a1['atr']); entry=safe_float(a5['close'])
+    if atr5<=0 or atr1<=0 or entry<=0: return None
+
+    prior_hi=max(safe_float(v) for v in d5.iloc[-7:-1]['high']); prior_lo=min(safe_float(v) for v in d5.iloc[-7:-1]['low'])
+    bu,cu,du,eu=_v20_bar(a5,1,atr5); bd,cd,dd,ed=_v20_bar(a5,-1,atr5)
+    breakout_long=du and bu>=0.18 and cu>=0.64 and entry>prior_hi
+    breakout_short=dd and bd>=0.18 and cd>=0.64 and entry<prior_lo
+    if trend==0:
+        if breakout_long: trend,tstrength=1,1
+        elif breakout_short: trend,tstrength=-1,1
+        else: return None
+    side='long' if trend==1 else 'short'; d=trend
+
+    # GATE 1 — MARKET: own 15m trend plus broad BTC veto only when BTC is strongly opposite.
+    market_ok,btc_strength,btc_note=_v22_btc_context(d) if not symbol.startswith('BTC/') else (True,0,'BTC self')
+    if not market_ok: return None
+
+    body5,close5,dir5,ema5=_v20_bar(a5,d,atr5)
+    ema_prev=safe_float(p5['ema21']); touch_pad=0.28*atr5
+    touched=safe_float(p5['low'])<=ema_prev+touch_pad if d==1 else safe_float(p5['high'])>=ema_prev-touch_pad
+    reclaimed=safe_float(a5['close'])>safe_float(a5['ema21']) if d==1 else safe_float(a5['close'])<safe_float(a5['ema21'])
+    pullback=bool(touched and reclaimed and dir5 and body5>=0.10 and close5>=0.52)
+    breakout=breakout_long if d==1 else breakout_short
+    momentum=bool(dir5 and ema5 and body5>=0.16 and close5>=0.60)
+    if not (pullback or breakout or momentum): return None
+    setup='BREAKOUT' if breakout else ('PULLBACK' if pullback else 'MOMENTUM')
+
+    # GATE 2 — LOCATION: a reset cannot excuse an entry that is already far from value.
+    ema_ext=abs(entry-safe_float(a5['ema21']))/max(atr5,1e-12)
+    max_body,max_ext=_v22_setup_location_limits(setup)
+    if ema_ext>V22_HARD_MAX_EMA_EXT_ATR or ema_ext>max_ext: return None
+    if body5>1.80: return None
+    needs_reset=body5>max_body
+
+    # GATE 3 — TRIGGER: one compact 1m timing decision; correlated subfeatures do not each become global score points.
+    body1,close1,dir1,ema1=_v20_bar(a1,d,atr1)
+    if body1<V20_MIN_STOP_ATR*0.10 or body1>V22_MAX_1M_BODY_ATR or not dir1 or close1<0.52: return None
+    prev_break=safe_float(a1['close'])>safe_float(p1['high']) if d==1 else safe_float(a1['close'])<safe_float(p1['low'])
+    p1_against=safe_float(p1['close'])<safe_float(p1['open']) if d==1 else safe_float(p1['close'])>safe_float(p1['open'])
+    reclaim=bool(p1_against and ema1 and close1>=0.60)
+    trigger_points=int(ema1)+int(prev_break)+int(close1>=0.68)+int(0.08<=body1<=0.45)
+    if trigger_points<2: return None
+    if needs_reset and not reclaim: return None
+    # Once paper evidence strongly prefers a small pullback, chase-prone MOMENTUM/BREAKOUT must show reclaim.
+    if _v22_pullback_evidence() and setup in ('MOMENTUM','BREAKOUT') and body5>0.65 and not reclaim: return None
+
+    # GATE 4 — ECONOMICS: true structural stop, then let position sizing absorb the wider risk distance.
+    stop,stop_atr=_v22_structural_stop(d5,side,entry,atr5)
+    if stop is None: return None
+    risk=abs(entry-stop)
+    fee_r=entry*(2*TAKER_FEE_RATE+SLIPPAGE_RATE)/max(risk,1e-12)
+    if fee_r>V20_MAX_FEE_R: return None
+
+    # Quality is deliberately categorical, not nine correlated momentum points.
+    market_q=2 if tstrength>=2 else 1
+    if btc_strength>0: market_q=min(2,market_q+1)
+    location_q=2 if ema_ext<=max_ext*0.55 and body5<=max_body*0.75 else 1
+    trigger_q=2 if trigger_points>=3 and 0.08<=body1<=0.45 else 1
+    setup_q=2 if setup in ('PULLBACK','BREAKOUT') else 1
+    quality=market_q+location_q+trigger_q+setup_q
+    edge_adj,edge_notes=_v21_edge_adjust(side,setup)
+    # Learner can move quality by only one category point; it cannot overpower a failed gate.
+    if edge_adj>=2: quality+=1
+    elif edge_adj<=-2: quality-=1
+    if quality<V22_MIN_QUALITY: return None
+    elite=quality>=V22_ELITE_QUALITY
+    gross=_v22_target_r(elite)
+    net=gross-fee_r
+    if net<V20_MIN_NET_R: return None
+    target=entry+d*risk*gross
+    return {
+        'symbol':symbol,'side':side,'price':entry,'atr':atr5,'structural_stop':stop,'target_price':target,'far_target':target,
+        'gross_rr':gross,'net_rr':net,'fee_drag_r':fee_r,'score':quality,'quality':quality,'confirmations':trigger_points,
+        'setup_quality':min(100,55+quality*6),'entry_quality':min(100,50+quality*6),'strategy':'V22-GATED',
+        'entry_route':f'GATED-{setup}','engine':'DIRECT','route':'DIRECT','signal_bar_ts':int(a1['ts']),'trend_strength':tstrength,
+        'setup':setup,'stop_atr':stop_atr,'elite':elite,'body5_atr':body5,'body1_atr':body1,'ema_ext_atr':ema_ext,
+        'edge_adjust':edge_adj,'edge_notes':edge_notes,'extended_reset':needs_reset,'trigger_points':trigger_points,
+        'gate_market':market_q,'gate_location':location_q,'gate_trigger':trigger_q,'gate_economics':1,'btc_note':btc_note,
+        'note':f'{setup} · gates M{market_q}/L{location_q}/T{trigger_q}/E1 · Q{quality} · ext {ema_ext:.2f}ATR · 5m {body5:.2f}ATR · 1m {body1:.2f}ATR · stop {stop_atr:.2f}ATR · {btc_note}'
+    }
+
+
+def _v22_record_real_open(signal,entry,stop,target,sizing):
+    rec={
+        'symbol':signal['symbol'],'side':signal['side'],'setup':signal['setup'],'quality':signal['quality'],'entry':entry,'stop':stop,'target':target,
+        'risk_price':abs(entry-stop),'notional':safe_float(sizing.get('notional')),'ts':time.time(),'body5':signal.get('body5_atr'),'body1':signal.get('body1_atr'),
+        'ema_ext':signal.get('ema_ext_atr'),'stop_atr':signal.get('stop_atr'),'gates':{'market':signal.get('gate_market'),'location':signal.get('gate_location'),'trigger':signal.get('gate_trigger')}
+    }
+    _v22_journal.setdefault('real_open',[]).append(rec); _v22_journal['real_open']=_v22_journal['real_open'][-150:]
+    _v22_launch_shadows(signal,entry,stop)
+    _v22_save()
+
+
+def _v22_shadow_item(signal,variant,side,entry,stop,target,activation='active'):
+    return {'id':f"{int(time.time()*1000)}:{signal['symbol']}:{variant}",'symbol':signal['symbol'],'setup':signal['setup'],'variant':variant,'side':side,
+            'entry':entry,'stop':stop,'target':target,'status':activation,'created_ms':int(time.time()*1000),'last_ts':0,'expires_ms':int((time.time()+V22_SHADOW_TTL_MIN*60)*1000)}
+
+
+def _v22_launch_shadows(signal,entry,stop):
+    side=signal['side']; d=1 if side=='long' else -1; risk=abs(entry-stop); atr=safe_float(signal.get('atr'))
+    if risk<=0 or atr<=0: return
+    sh=_v22_journal.setdefault('shadows',[])
+    for name,r in [('immediate',safe_float(signal.get('gross_rr'),V22_NORMAL_TARGET_R)),('tp100',1.0),('tp120',1.2),('tp140',1.4)]:
+        sh.append(_v22_shadow_item(signal,name,side,entry,stop,entry+d*risk*r,'active'))
+    for name,pb in [('pullback020',0.20),('pullback035',0.35)]:
+        pe=entry-d*pb*atr; pr=abs(pe-stop)
+        if pr>0: sh.append(_v22_shadow_item(signal,name,side,pe,stop,pe+d*pr*1.30,'pending'))
+    opp='short' if side=='long' else 'long'; od=-d; os=entry-od*risk; ot=entry+od*risk*1.20
+    sh.append(_v22_shadow_item(signal,'opposite_control',opp,entry,os,ot,'active'))
+    _v22_journal['shadows']=sh[-400:]
+
+
+def _v22_finish_shadow(x,outcome_r,ambiguous=False,no_entry=False):
+    x['status']='ambiguous' if ambiguous else ('no_entry' if no_entry else 'done'); x['outcome_r']=outcome_r; x['closed_ms']=int(time.time()*1000)
+    _v22_stat_update(x['variant'],outcome_r,ambiguous=ambiguous,no_entry=no_entry)
+
+
+def _v22_shadow_update():
+    global _v22_last_shadow_update
+    now=time.time()
+    if now-_v22_last_shadow_update<V22_SHADOW_UPDATE_SECONDS: return
+    _v22_last_shadow_update=now
+    active=[x for x in _v22_journal.get('shadows',[]) if x.get('status') in ('active','pending')]
+    if not active: return
+    bysym={}
+    for x in active: bysym.setdefault(x['symbol'],[]).append(x)
+    changed=False; nowms=int(now*1000)
+    for sym,items in bysym.items():
+        try: df=_ldt_closed(_ldt_df(sym,'1m',90))
+        except Exception: continue
+        for x in items:
+            if nowms>int(x.get('expires_ms',0)):
+                _v22_finish_shadow(x,0.0,no_entry=(x.get('status')=='pending')); changed=True; continue
+            last=int(x.get('last_ts',0)); created=int(x.get('created_ms',0))
+            rows=df[(df['ts']>max(last,created))] if 'ts' in df.columns else df.tail(3)
+            if rows.empty: continue
+            d=1 if x['side']=='long' else -1; ent=safe_float(x['entry']); sl=safe_float(x['stop']); tp=safe_float(x['target']); risk=abs(ent-sl)
+            for _,bar in rows.iterrows():
+                hi=safe_float(bar['high']); lo=safe_float(bar['low']); ts=int(bar.get('ts',0)); x['last_ts']=max(int(x.get('last_ts',0)),ts)
+                if x.get('status')=='pending':
+                    touched=(lo<=ent if d==1 else hi>=ent)
+                    if not touched: continue
+                    x['status']='active'; x['activated_ts']=ts; changed=True
+                hit_tp=hi>=tp if d==1 else lo<=tp; hit_sl=lo<=sl if d==1 else hi>=sl
+                if hit_tp and hit_sl:
+                    _v22_finish_shadow(x,0.0,ambiguous=True); changed=True; break
+                if hit_tp:
+                    rr=abs(tp-ent)/max(risk,1e-12); _v22_finish_shadow(x,rr); changed=True; break
+                if hit_sl:
+                    _v22_finish_shadow(x,-1.0); changed=True; break
+    if changed: _v22_save()
+
+
+def _v22_learn_real_close(symbol,side,net):
+    opens=_v22_journal.setdefault('real_open',[]); matches=[(i,x) for i,x in enumerate(opens) if x.get('symbol')==symbol and x.get('side')==side]
+    if not matches: return
+    idx,rec=max(matches,key=lambda z:safe_float(z[1].get('ts'))); opens.pop(idx)
+    rec['net_usdt']=net; rec['closed_ts']=time.time(); rec['win']=net>=0
+    risk_usdt=safe_float(rec.get('notional'))*(safe_float(rec.get('risk_price'))/max(safe_float(rec.get('entry')),1e-12))
+    rec['net_r']=net/max(risk_usdt,1e-12) if risk_usdt>0 else 0.0
+    _v22_journal.setdefault('real_closed',[]).append(rec); _v22_journal['real_closed']=_v22_journal['real_closed'][-300:]; _v22_save()
+
+
+def notify_closed_trade(record):
+    """V2.2 close accounting + both legacy and counterfactual learning hooks."""
+    global consecutive_losses, loss_pause_until
+    reset_daily_if_needed()
+    symbol=str(record.get('instId','')).replace('-USDT','/USDT:USDT'); side=infer_side(record)
+    entry=safe_float(record.get('openAveragePrice')); exit_price=safe_float(record.get('closeAveragePrice'))
+    gross=safe_float(record.get('realizedPnl')); fee=abs(safe_float(record.get('fee'))); net=gross-fee
+    duration=fmt_duration(record.get('createTime'),record.get('updateTime')); reason=close_reason(record); bucket='short' if side=='short' else 'long'
+    daily['trades']+=1; daily['net']+=net; daily[f'{bucket}_trades']+=1; daily[f'{bucket}_net']+=net
+    if net>=0:
+        daily['wins']+=1; daily[f'{bucket}_wins']+=1; consecutive_losses=0; sniper_side_loss_streak[bucket]=0; symbol_last_result[symbol]='win'; symbol_loss_streak[symbol]=0
+    else:
+        daily['losses']+=1; consecutive_losses+=1; sniper_side_loss_streak[bucket]=sniper_side_loss_streak.get(bucket,0)+1; symbol_last_result[symbol]='loss'; symbol_loss_streak[symbol]=symbol_loss_streak.get(symbol,0)+1
+        if consecutive_losses>=MAX_CONSECUTIVE_LOSSES: loss_pause_until=time.time()+LOSS_PAUSE_MIN*60
+    symbol_last_trade[symbol]=time.time(); update_learning(record,net)
+    try: _v21_learn_close(symbol,side,net)
+    except Exception: pass
+    try: _v22_learn_real_close(symbol,side,net)
+    except Exception: pass
+    tg(f"{'🟢' if net>=0 else '🔴'} LIQUIDITY DAYTRADER v2.2 CLOSED\n{symbol} {side.upper()}\nEntry {entry:.8g} → Exit {exit_price:.8g}\nGross ${gross:+.2f} · Fee -${fee:.2f} · Net ${net:+.2f}\n{reason} · {duration}\nTODAY: {daily['trades']} trades · W/L {daily['wins']}/{daily['losses']} · Net ${daily['net']:.2f}\nSide loss streak L/S {sniper_side_loss_streak.get('long',0)}/{sniper_side_loss_streak.get('short',0)}" + (f"\n⏸ {MAX_CONSECUTIVE_LOSSES} losses → pause {LOSS_PAUSE_MIN} min" if consecutive_losses>=MAX_CONSECUTIVE_LOSSES else ''))
+
+
+def manage_sniper_step_stops():
+    """V2.2 R-aware profit lock. Does not assume TP is 3R."""
+    if PAPER_TRADING: return
+    for p in get_positions():
+        pid=position_id(p); meta=_ldt_meta.get(pid,{}) if pid else {}
+        if str(meta.get('version'))!='2.2': continue
+        symbol=position_symbol(p); side=position_side(p); entry=safe_float(meta.get('entry') or position_entry(p)); risk=safe_float(meta.get('risk'))
+        if entry<=0 or risk<=0: continue
+        try: extreme=sniper_recent_extreme(symbol,side)
+        except Exception: continue
+        d=1 if side=='long' else -1; mfe=d*(extreme-entry)/risk
+        desired_r=None; stage=None
+        if mfe>=V22_PROFIT_LOCK_2_R: desired_r=V22_PROFIT_LOCK_2_TO; stage='LOCK2'
+        elif mfe>=V22_PROFIT_LOCK_1_R: desired_r=V22_PROFIT_LOCK_1_TO; stage='LOCK1'
+        if desired_r is None: continue
+        desired=entry+d*risk*desired_r; tick=safe_float(get_instrument(symbol).get('tickSize'),0.0001); desired=round_trade_price(desired,tick,side,'sl')
+        ok,order=has_live_protection(p)
+        if not ok or not order: continue
+        current=safe_float(order.get('slTriggerPrice')); improves=desired>current+tick*0.1 if side=='long' else desired<current-tick*0.1
+        if not improves: continue
+        key=f'v22:{pid}:{stage}'
+        if key in _v22_profit_notices: continue
+        ok2,res=amend_tpsl_stop(p,desired)
+        if ok2:
+            _v22_profit_notices.add(key); tg(f"🔒 LDT v2.2 {symbol} {stage}\nMFE {mfe:.2f}R · stop → {desired_r:+.2f}R")
+
+
+def _v20_execute(signal):
+    """V2.2 live execution: preserve structural stop distance and launch shadow twins only after exchange acceptance."""
+    global protection_lock,_v62_last_entry_time
+    symbol=signal['symbol']; side=signal['side']; d=1 if side=='long' else -1
+    tg(f"🟠 LDT v2.2 {symbol} {side.upper()} GATED READY\n{signal['entry_route']} · Q{signal['quality']} · {signal['note']}")
+    acc=futures_account(); equity,available=acc['total_equity'],acc['available']; reset_daily_if_needed(equity)
+    if equity<MIN_EQUITY_USDT or available<=0: return False
+    if not PAPER_TRADING and protection_lock: return False
+    if time.time()-_v62_last_entry_time<V20_ENTRY_COOLDOWN_SECONDS: return False
+    try: live=safe_float(exchange.fetch_ticker(symbol).get('last'),signal['price'])
+    except Exception: live=safe_float(signal['price'])
+    atr=safe_float(signal['atr']); scan=safe_float(signal['price'])
+    if live<=0 or atr<=0: return False
+    drift=abs(live-scan)/atr
+    if drift>V20_MAX_LIVE_DRIFT_ATR:
+        tg(f"🟠 LDT v2.2 {symbol} drift {drift:.2f}ATR — fresh scan"); return False
+    # Preserve the real structural distance. No V20_MAX_STOP_ATR clamp.
+    risk_dist=abs(scan-safe_float(signal['structural_stop']))
+    if risk_dist<=0 or risk_dist/atr>V22_MAX_STRUCT_STOP_ATR: return False
+    stop=live-d*risk_dist; gross=_v22_target_r(bool(signal.get('elite'))); target=live+d*risk_dist*gross
+    tick=safe_float(get_instrument(symbol).get('tickSize'),0.0001); stop=round_trade_price(stop,tick,side,'sl'); target=round_trade_price(target,tick,side,'tp')
+    risk=abs(live-stop); fee_r=live*(2*TAKER_FEE_RATE+SLIPPAGE_RATE)/max(risk,1e-12); net=gross-fee_r
+    if fee_r>V20_MAX_FEE_R or net<V20_MIN_NET_R: return False
+    streak=int(sniper_side_loss_streak.get(side,0))
+    if streak>=V21_STREAK_TIGHTEN_AFTER and (int(signal.get('quality',0))<V22_ELITE_QUALITY or signal.get('setup')=='MOMENTUM'):
+        tg(f"🧠 LDT v2.2 {symbol} LOSS-ADAPT BLOCK · {side} streak {streak} · needs elite non-MOMENTUM"); return False
+    risk_pct=V20_ELITE_RISK_PCT if signal.get('elite') else V20_RISK_PCT
+    if streak>0: risk_pct*=V21_STREAK_RISK_MULT
+    sizing=_v20_size(symbol,live,stop,equity,available,risk_pct,gross)
+    if not sizing:
+        tg(f"🟠 LDT v2.2 {symbol} SIZE/ECONOMICS BLOCK"); return False
+    tg(f"📤 LDT v2.2 {symbol} ORDER SENT\n{side.upper()} {signal['setup']} · Q{signal['quality']} · gates M{signal['gate_market']}/L{signal['gate_location']}/T{signal['gate_trigger']}/E1 · net {net:.2f}R\nRisk {risk_pct*100:.2f}% · stop {risk/atr:.2f}ATR · target {gross:.2f}R · est net TP ${sizing['expected_net_tp_usdt']:.2f}")
+    if PAPER_TRADING:
+        _v62_last_entry_time=time.time(); _v22_record_real_open(signal,live,stop,target,sizing); tg(f"🟢 PAPER ORDER ACCEPTED · LDT v2.2\n{symbol} {side.upper()} · SL {stop:.8g} · TP {target:.8g}"); return True
+    oklev,levres=set_leverage(symbol,LEVERAGE)
+    if not oklev: tg(f"❌ LDT v2.2 {symbol} LEVERAGE FAILED\n{levres}"); return False
+    before_ids={position_id(p) for p in get_positions() if position_id(p)}
+    payload={'instId':blofin_inst_id(symbol),'marginMode':MARGIN_MODE,'positionSide':'net','side':'buy' if side=='long' else 'sell','orderType':'market','size':str(sizing['contracts']),
+             'tpTriggerPrice':str(target),'tpOrderPrice':'-1','tpTriggerPriceType':'mark','slTriggerPrice':str(stop),'slOrderPrice':'-1','slTriggerPriceType':'mark','clientOrderId':f"ldt22{int(time.time()*1000)%1000000000}"}
+    if BROKER_ID: payload['brokerId']=BROKER_ID
+    resp=native('private_post_trade_order',payload)
+    if not native_ok(resp): tg(f"❌ LDT v2.2 {symbol} ORDER REJECTED\n{response_error(resp)}"); return False
+    _v62_last_entry_time=time.time(); _v21_record_open(signal,live); _v22_record_real_open(signal,live,stop,target,sizing)
+    tg(f"🟢 LDT v2.2 ORDER ACCEPTED\n{symbol} {side.upper()} · {signal['setup']} · Q{signal['quality']}\nEntry~{live:.8g} · SL {stop:.8g} · TP {target:.8g}\nNotional ${sizing['notional']:.2f} · Margin ${sizing['margin']:.2f} · {LEVERAGE}x")
+    new_pos=find_new_position(symbol,before_ids,timeout=10)
+    if new_pos is None: tg(f"🟢 LDT v2.2 {symbol} ACK RECEIVED — position visibility pending"); return True
+    pid=position_id(new_pos); fill=position_entry(new_pos) or live
+    if pid:
+        sniper_managed_positions.add(pid); _ldt_meta[pid]={'risk':risk,'entry':fill,'sl':stop,'tp':target,'final_r':gross,'side':side,'opened':time.time(),'strategy':'V22-GATED','route':signal['entry_route'],'engine':'DIRECT','mfe_price':fill,'mfe_r':0.0,'version':'2.2'}
+    if has_live_protection(new_pos)[0]: tg(f"🛡️ LDT v2.2 PROTECTION CONFIRMED\n{symbol} {side.upper()} · SL/TP visible")
+    else:
+        last=safe_float(exchange.fetch_ticker(symbol).get('last'))
+        if tpsl_prices_valid(side,stop,target,last):
+            ok,res=place_tpsl_for_position(new_pos,stop,target,client_tag='ldt22')
+            if ok: tg(f"🛡️ LDT v2.2 FALLBACK PROTECTION CONFIRMED\n{symbol}")
+            else: protection_lock=True; tg(f"🚨 LDT v2.2 PROTECTION FAILURE\n{symbol}\n{res}\nNEW TRADES PAUSED")
+        else: protection_lock=True; tg(f"🚨 LDT v2.2 {symbol}: protection could not be verified. NEW TRADES PAUSED")
+    return True
+
+
+def _v20_report(rows):
+    global _v20_last_report
+    now=time.time()
+    if now-_v20_last_report<V20_REPORT_SECONDS: return
+    _v20_last_report=now
+    ranked=sorted(rows,key=lambda r:(r['quality'],r['net_rr'],-r['fee_drag_r']),reverse=True)[:8]
+    shadow=[]
+    for name in ('immediate','pullback020','pullback035','tp100','tp120','tp140','opposite_control'):
+        n,avg,w,l=_v22_stat(name)
+        if n: shadow.append(f"{name} {w}/{n} avg {avg:+.2f}R")
+    lines=["🧠 LIQUIDITY DAYTRADER v2.2 · COUNTERFACTUAL GATES",f"Candidates {len(rows)} · scanned {len(SYMBOLS)}",f"Today {daily.get('trades',0)} trades · W/L {daily.get('wins',0)}/{daily.get('losses',0)} · Net ${safe_float(daily.get('net')):.2f}","4 gates: MARKET → LOCATION → TRIGGER → ECONOMICS",f"Target now {_v22_target_r(False):.2f}R / elite {_v22_target_r(True):.2f}R · shadow learner min {V22_SHADOW_LEARN_MIN}"]
+    if shadow: lines.append("Paper twins: " + " · ".join(shadow[:5]))
+    for r in ranked: lines.append(f"🟠 {r['symbol']} {r['side'].upper()} {r['setup']} · Q{r['quality']} · M{r['gate_market']}/L{r['gate_location']}/T{r['gate_trigger']}/E1 · ext {r['ema_ext_atr']:.2f} · stop {r['stop_atr']:.2f}ATR")
+    tg('\n'.join(lines))
+
+
+def startup_diagnostics_v20():
+    global protection_lock
+    load_learning(); _v21_load(); _v22_load(); acc=futures_account(); reset_daily_if_needed(acc['total_equity'])
+    tg(f"🧠 LIQUIDITY DAYTRADER STARTED\nv2.2 · COUNTERFACTUAL GATES\nDirect daytrader: no WAIT_RETRACE.\nIndependent gates: MARKET → LOCATION → TRIGGER → ECONOMICS.\nLocation cannot be rescued by one late reset; hard EMA extension {V22_HARD_MAX_EMA_EXT_ATR:.2f}ATR.\nStructural stops are respected up to {V22_MAX_STRUCT_STOP_ATR:.2f}ATR and position size absorbs the distance.\nPaper twins: immediate, pullback 0.20/0.35ATR, TP 1.0/1.2/1.4R and opposite-control. Opposite is diagnostic only, never auto-traded.\nR-aware profit locks: at {V22_PROFIT_LOCK_1_R:.2f}R → {V22_PROFIT_LOCK_1_TO:+.2f}R; at {V22_PROFIT_LOCK_2_R:.2f}R → {V22_PROFIT_LOCK_2_TO:+.2f}R.\nRisk {V20_RISK_PCT*100:.2f}% / elite {V20_ELITE_RISK_PCT*100:.2f}% · max positions {V20_MAX_POSITIONS} · max same side {V20_MAX_SAME_SIDE}.\nEquity ${acc['total_equity']:.2f} · Available ${acc['available']:.2f}")
+    if not PAPER_TRADING:
+        try: seed_closed_history_v5(); _v211_seed_side_from_daily()
+        except Exception as e: tg(f"⚠️ V2.2 PNL seed warning\n{e}")
+        try:
+            inherited=get_positions(); protection_lock=not all_positions_protected() if inherited else False
+            if inherited: tg(f"ℹ️ V2.2 HANDOVER\n{len(inherited)} existing position(s)."+("\n⚠️ Unprotected position: entries locked." if protection_lock else "\n✅ Protection verified."))
+        except Exception as e: protection_lock=True; tg(f"🚨 V2.2 STARTUP PROTECTION CHECK FAILED\n{e}")
+
+
+def main():
+    global protection_lock,_v6_daily_risk_alerted,_v6_daily_risk_last_notice
+    startup_diagnostics_v20()
+    while True:
+        try:
+            if not PAPER_TRADING:
+                try: check_for_closed_positions()
+                except Exception as e: tg(f"⚠️ V2.2 PNL TRACKER ERROR\n{e}")
+                try: manage_sniper_step_stops()
+                except Exception as e: tg(f"⚠️ V2.2 MANAGER ERROR\n{e}")
+            try: _v22_shadow_update()
+            except Exception: pass
+            acc=futures_account(); ok,reason=check_daily_risk(acc['total_equity'])
+            if not ok:
+                now_ts=time.time()
+                if (not _v6_daily_risk_alerted) or (now_ts-_v6_daily_risk_last_notice>=V6_DAILY_RISK_REMINDER_MIN*60):
+                    tg(f"🛑 {reason}\nV2.2 new entries paused; existing positions and paper twins remain monitored."); _v6_daily_risk_alerted=True; _v6_daily_risk_last_notice=now_ts
+                time.sleep(120); continue
+            elif _v6_daily_risk_alerted:
+                tg('🟢 DAILY RISK STOP CLEARED\nV2.2 entries allowed again.'); _v6_daily_risk_alerted=False; _v6_daily_risk_last_notice=0.0
+            if time.time()<loss_pause_until:
+                time.sleep(V20_SCAN_SECONDS); continue
+            positions=get_positions()
+            if not PAPER_TRADING: protection_watch(); positions=get_positions()
+            if protection_lock and not PAPER_TRADING: time.sleep(V20_SCAN_SECONDS); continue
+            rows=[]; now=time.time(); existing={position_symbol(p) for p in positions}
+            for symbol in SYMBOLS:
+                if symbol in existing or now<safe_float(_v20_retry_after.get(symbol),0): continue
+                try:
+                    s=_v20_eval(symbol)
+                    if s: rows.append(s)
+                except Exception: continue
+            rows.sort(key=lambda r:(r['quality'],r['net_rr'],-r['fee_drag_r']),reverse=True); _v20_report(rows)
+            attempts=0
+            for sig in rows:
+                if attempts>=V20_MAX_ATTEMPTS_PER_SCAN: break
+                positions=get_positions(); allowed,_=_v20_portfolio_allows(sig,positions)
+                if not allowed: continue
+                key=int(sig.get('signal_bar_ts',0))
+                if sniper_last_signal_bar.get(sig['symbol'])==key: continue
+                attempts+=1
+                if _v20_execute(sig):
+                    sniper_last_signal_bar[sig['symbol']]=key; symbol_last_trade[sig['symbol']]=time.time(); _v20_retry_after[sig['symbol']]=time.time()+V20_SYMBOL_COOLDOWN_SECONDS
+                    if len(get_positions())>=V20_MAX_POSITIONS: break
+                else: _v20_retry_after[sig['symbol']]=time.time()+20
+            time.sleep(V20_SCAN_SECONDS)
+        except KeyboardInterrupt:
+            tg('🛑 Liquidity DayTrader v2.2 stopped.'); raise
+        except Exception as e:
+            msg=f"{type(e).__name__}: {e}"
+            if '152002' in msg: time.sleep(20); continue
+            tg(f"⚠️ LDT v2.2 LOOP ERROR\n{msg}"); time.sleep(30)
+
+
 if __name__ == "__main__":
     main()
