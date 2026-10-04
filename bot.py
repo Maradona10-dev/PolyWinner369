@@ -50,8 +50,8 @@ except Exception:
 # CONFIG
 # ============================================================
 
-VERSION = "1.0"
-BOT_NAME = "BNF Pure Mean-Reversion"
+VERSION = "2.0"
+BOT_NAME = "BNF DayTrader Mean-Reversion"
 
 API_KEY = os.getenv("EXCHANGE_API_KEY", "").strip()
 API_SECRET = os.getenv("EXCHANGE_SECRET", "").strip()
@@ -71,26 +71,44 @@ BASE_URL = (
     else "https://openapi.blofin.com"
 )
 
-# Exact supplied strategy defaults
+# Daytrade translation of the BNF core
+SIGNAL_BAR = os.getenv("BNF_SIGNAL_BAR", "15m").strip()
+TRIGGER_BAR = os.getenv("BNF_TRIGGER_BAR", "5m").strip()
 MA_PERIOD = int(os.getenv("BNF_MA_PERIOD", "25"))
-DROP_THRESHOLD = float(os.getenv("BNF_DROP_THRESHOLD", "0.20"))
-EXIT_MA_FACTOR = float(os.getenv("BNF_EXIT_MA_FACTOR", "0.98"))
+ATR_PERIOD = int(os.getenv("BNF_ATR_PERIOD", "14"))
+
+# Adaptive oversold threshold: never easier than 4%, never stricter than 7%.
+DROP_MIN = float(os.getenv("BNF_DROP_MIN", "0.04"))
+DROP_MAX = float(os.getenv("BNF_DROP_MAX", "0.07"))
+DROP_ATR_MULT = float(os.getenv("BNF_DROP_ATR_MULT", "1.50"))
+
+# BNF-style equity risk, translated to intraday crypto.
 RISK_PER_TRADE = float(os.getenv("BNF_RISK_PER_TRADE", "0.02"))
-STOP_LOSS_PCT = float(os.getenv("BNF_STOP_LOSS_PCT", "0.08"))
-HOLD_MAX_DAYS = int(os.getenv("BNF_HOLD_MAX_DAYS", "5"))
+STOP_LOSS_PCT = float(os.getenv("BNF_STOP_LOSS_PCT", "0.025"))
+
+# Intraday profit management.
+FIXED_TP_R = float(os.getenv("BNF_FIXED_TP_R", "1.25"))
+TRAIL_ACTIVATE_R = float(os.getenv("BNF_TRAIL_ACTIVATE_R", "0.75"))
+TRAIL_DISTANCE_R = float(os.getenv("BNF_TRAIL_DISTANCE_R", "0.45"))
+MEAN_REVERSION_MA_FACTOR = float(os.getenv("BNF_MEAN_REVERSION_MA_FACTOR", "0.995"))
+HOLD_MAX_HOURS = float(os.getenv("BNF_HOLD_MAX_HOURS", "6"))
+REENTRY_COOLDOWN_MIN = int(os.getenv("BNF_REENTRY_COOLDOWN_MIN", "60"))
+
+# 5m rebound confirmation. This does not change the BNF setup; it only avoids
+# buying while the short-term candle is still accelerating downward.
+TRIGGER_MIN_CLOSE_LOCATION = float(os.getenv("BNF_TRIGGER_MIN_CLOSE_LOCATION", "0.55"))
 
 # Execution
 LEVERAGE = int(os.getenv("BNF_LEVERAGE", "10"))
 MARGIN_MODE = os.getenv("BNF_MARGIN_MODE", "isolated").strip().lower()
-MAX_ACTIVE_POSITIONS = int(os.getenv("BNF_MAX_ACTIVE_POSITIONS", "1"))
+MAX_ACTIVE_POSITIONS = int(os.getenv("BNF_MAX_ACTIVE_POSITIONS", "2"))
 AVAILABLE_MARGIN_BUFFER = float(os.getenv("BNF_AVAILABLE_MARGIN_BUFFER", "0.90"))
-SCAN_SECONDS = int(os.getenv("BNF_SCAN_SECONDS", "900"))  # 15 min
-STATUS_HOURS = float(os.getenv("BNF_STATUS_HOURS", "6"))
+SCAN_SECONDS = int(os.getenv("BNF_SCAN_SECONDS", "75"))
+STATUS_HOURS = float(os.getenv("BNF_STATUS_HOURS", "2"))
 REQUEST_TIMEOUT = int(os.getenv("BNF_REQUEST_TIMEOUT", "15"))
 
-# If current price has moved enormously away from the just-closed daily signal,
-# do not blindly submit. 5% is only an execution sanity guard, not a strategy filter.
-MAX_ENTRY_DRIFT_PCT = float(os.getenv("BNF_MAX_ENTRY_DRIFT_PCT", "0.05"))
+# Do not chase a signal if price already bounced too far between scan and order.
+MAX_ENTRY_DRIFT_PCT = float(os.getenv("BNF_MAX_ENTRY_DRIFT_PCT", "0.012"))
 
 STATE_FILE = os.getenv("BNF_STATE_FILE", "bnf_mean_reversion_state.json")
 
@@ -126,6 +144,7 @@ state = {
     "managed": {},              # symbol -> entry metadata
     "last_entry_candle": {},    # symbol -> candle timestamp
     "last_exit_candle": {},     # symbol -> candle timestamp
+    "last_exit_ts": {},         # symbol -> unix ms for re-entry cooldown
 }
 
 
@@ -312,19 +331,18 @@ def instrument(symbol):
     return x
 
 
-def candles_1d(symbol, limit=80):
+def candles(symbol, bar, limit=120):
     data = public_get(
         "/api/v1/market/candles",
-        {"instId": symbol, "bar": "1D", "limit": str(limit)}
+        {"instId": symbol, "bar": bar, "limit": str(limit)}
     ).get("data", [])
 
     rows = []
     for c in data:
         if not isinstance(c, list) or len(c) < 6:
             continue
-        # Futures candles include confirm as the last field.
-        confirm = str(c[-1])
-        if confirm != "1":
+        # Use only confirmed/closed candles.
+        if str(c[-1]) != "1":
             continue
         rows.append({
             "ts": int(c[0]),
@@ -332,9 +350,27 @@ def candles_1d(symbol, limit=80):
             "high": fnum(c[2]),
             "low": fnum(c[3]),
             "close": fnum(c[4]),
+            "volume": fnum(c[5]),
         })
     rows.sort(key=lambda x: x["ts"])
     return rows
+
+
+def true_range(rows, i):
+    cur = rows[i]
+    prev_close = rows[i - 1]["close"]
+    return max(
+        cur["high"] - cur["low"],
+        abs(cur["high"] - prev_close),
+        abs(cur["low"] - prev_close),
+    )
+
+
+def atr_value(rows, period=14):
+    if len(rows) < period + 1:
+        return 0.0
+    trs = [true_range(rows, i) for i in range(len(rows) - period, len(rows))]
+    return sum(trs) / len(trs) if trs else 0.0
 
 
 def last_price(symbol):
@@ -412,36 +448,66 @@ def set_leverage(symbol):
 # ============================================================
 
 def strategy_snapshot(symbol):
-    rows = candles_1d(symbol, max(80, MA_PERIOD + 10))
-    if len(rows) < MA_PERIOD:
+    """
+    15m setup + 5m rebound trigger.
+
+    The setup is still pure BNF:
+        price is abnormally far below its short moving average.
+    The 5m trigger only waits for evidence that the intraday fall has started
+    to rebound before committing capital.
+    """
+    setup_rows = candles(symbol, SIGNAL_BAR, max(100, MA_PERIOD + ATR_PERIOD + 10))
+    trigger_rows = candles(symbol, TRIGGER_BAR, 40)
+
+    if len(setup_rows) < max(MA_PERIOD, ATR_PERIOD + 1) or len(trigger_rows) < 3:
         return None
 
-    closes = [r["close"] for r in rows]
-    last = rows[-1]
-    ma25 = sum(closes[-MA_PERIOD:]) / MA_PERIOD
-    if ma25 <= 0:
+    closes = [r["close"] for r in setup_rows]
+    last = setup_rows[-1]
+    ma = sum(closes[-MA_PERIOD:]) / MA_PERIOD
+    atr = atr_value(setup_rows, ATR_PERIOD)
+    if ma <= 0 or atr <= 0 or last["close"] <= 0:
         return None
 
-    pct_below = (ma25 - last["close"]) / ma25
-    entry_signal = pct_below >= DROP_THRESHOLD
-    exit_signal = last["close"] >= ma25 * EXIT_MA_FACTOR
+    atr_pct = atr / last["close"]
+    adaptive_drop = min(DROP_MAX, max(DROP_MIN, DROP_MIN + DROP_ATR_MULT * atr_pct))
+    pct_below = (ma - last["close"]) / ma
+
+    # 5m rebound: green candle, higher close than prior 5m close, and closes
+    # in the upper portion of its own range.
+    t = trigger_rows[-1]
+    p = trigger_rows[-2]
+    rng = max(t["high"] - t["low"], 1e-12)
+    close_location = (t["close"] - t["low"]) / rng
+    rebound = (
+        t["close"] > t["open"]
+        and t["close"] > p["close"]
+        and close_location >= TRIGGER_MIN_CLOSE_LOCATION
+    )
+
+    entry_signal = pct_below >= adaptive_drop and rebound
 
     return {
         "symbol": symbol,
         "candle_ts": last["ts"],
+        "trigger_ts": t["ts"],
         "close": last["close"],
-        "ma25": ma25,
+        "ma25": ma,
+        "atr": atr,
+        "atr_pct": atr_pct,
+        "drop_threshold": adaptive_drop,
         "pct_below_ma": pct_below,
+        "rebound": rebound,
+        "trigger_close_location": close_location,
         "entry_signal": entry_signal,
-        "exit_signal": exit_signal,
     }
 
 
 def rank_entries(snapshots):
-    # Deepest discount first. No extra strategy filter.
+    # Prefer the largest excess discount beyond that symbol's own threshold.
     return sorted(
         [s for s in snapshots if s and s["entry_signal"]],
-        key=lambda s: s["pct_below_ma"],
+        key=lambda s: (s["pct_below_ma"] - s["drop_threshold"]),
         reverse=True,
     )
 
@@ -452,9 +518,9 @@ def rank_entries(snapshots):
 
 def calculate_size(symbol, entry_price, equity, available):
     """
-    Original sizing:
-        risk_amount = equity * 2%
-        notional = risk_amount / 8%
+    BNF sizing:
+        risk_amount = equity * configured risk %
+        notional = risk_amount / intraday hard-stop %
 
     BloFin order size is contracts, so translate notional to contracts using
     contractValue. Margin availability is only a hard feasibility cap.
@@ -514,58 +580,74 @@ def open_long(snapshot):
     if live <= 0:
         return False
 
-    drift = abs(live - signal_close) / signal_close
-    if drift > MAX_ENTRY_DRIFT_PCT:
+    # Re-entry cooldown after any exit in this symbol.
+    last_exit = int(state.get("last_exit_ts", {}).get(symbol, 0) or 0)
+    if last_exit and now_ms() - last_exit < REENTRY_COOLDOWN_MIN * 60_000:
+        return False
+
+    # For a dip-buy we only reject an UPWARD chase. A slightly deeper dip can
+    # still be valid, provided the hard stop/risk sizing remains intact.
+    upward_drift = (live - signal_close) / signal_close
+    if upward_drift > MAX_ENTRY_DRIFT_PCT:
         tg(
-            f"🟠 {BOT_NAME} {symbol}\n"
-            f"Signaal is geldig, maar live prijs is {drift*100:.1f}% van de "
-            f"daily close verschoven. Geen chase; volgende daily close opnieuw beoordelen."
+            f"🟠 BNF DAYTRADE {symbol}\n"
+            f"Rebound liep al {upward_drift*100:.2f}% weg sinds de 15m close — geen chase."
         )
         return False
 
     sizing = calculate_size(symbol, live, equity, available)
     if not sizing:
         tg(
-            f"🟠 {BOT_NAME} {symbol} SIZE BLOCK\n"
+            f"🟠 BNF DAYTRADE {symbol} SIZE BLOCK\n"
             f"Contract minimum/marge past niet binnen {RISK_PER_TRADE*100:.1f}% risico."
         )
         return False
 
     stop = live * (1.0 - STOP_LOSS_PCT)
+    risk_price = live - stop
+    fixed_tp = live + risk_price * FIXED_TP_R
 
     meta = instrument(symbol)
     tick = fnum(meta.get("tickSize"))
     if tick > 0:
         stop = floor_step(stop, tick)
+        fixed_tp = floor_step(fixed_tp, tick)
 
     tg(
-        f"🟠 BNF ENTRY READY\n"
+        f"🟠 BNF DAYTRADE READY\n"
         f"{symbol} LONG\n"
-        f"Daily close {fmt_price(snapshot['close'])}\n"
-        f"MA25 {fmt_price(snapshot['ma25'])}\n"
-        f"Onder MA: {snapshot['pct_below_ma']*100:.2f}% ≥ {DROP_THRESHOLD*100:.0f}%\n"
-        f"Live ~{fmt_price(live)} · SL {fmt_price(stop)}\n"
-        f"Risk budget ${sizing['risk_budget']:.2f} · "
-        f"verwacht stop-risico ${sizing['risk_usdt']:.2f}\n"
-        f"Notional ${sizing['notional']:.2f} · margin ~${sizing['margin']:.2f}"
+        f"15m close {fmt_price(snapshot['close'])} · MA25 {fmt_price(snapshot['ma25'])}\n"
+        f"Discount {snapshot['pct_below_ma']*100:.2f}% · nodig {snapshot['drop_threshold']*100:.2f}%\n"
+        f"5m rebound bevestigd · close-loc {snapshot['trigger_close_location']*100:.0f}%\n"
+        f"Live ~{fmt_price(live)} · SL {fmt_price(stop)} · TP {fmt_price(fixed_tp)} ({FIXED_TP_R:.2f}R)\n"
+        f"Risk budget ${sizing['risk_budget']:.2f} · notional ${sizing['notional']:.2f} · "
+        f"margin ~${sizing['margin']:.2f}"
     )
+
+    record = {
+        "entry_ts": now_ms(),
+        "entry_price": live,
+        "entry_candle_ts": snapshot["candle_ts"],
+        "trigger_ts": snapshot["trigger_ts"],
+        "contracts": sizing["contracts"],
+        "initial_stop": stop,
+        "risk_price": max(live - stop, 1e-12),
+        "fixed_tp": fixed_tp,
+        "highest_price": live,
+        "paper": PAPER_TRADING,
+    }
 
     if PAPER_TRADING:
         with state_lock:
-            state["managed"][symbol] = {
-                "entry_ts": now_ms(),
-                "entry_price": live,
-                "entry_candle_ts": snapshot["candle_ts"],
-                "contracts": sizing["contracts"],
-                "paper": True,
-            }
+            state["managed"][symbol] = record
             state["last_entry_candle"][symbol] = snapshot["candle_ts"]
         save_state()
-        tg(f"🟢 PAPER BNF OPEN\n{symbol} LONG @ ~{fmt_price(live)}")
+        tg(f"🟢 PAPER BNF DAYTRADE OPEN\n{symbol} LONG @ ~{fmt_price(live)}")
         return True
 
     set_leverage(symbol)
 
+    # Hard SL is exchange-side. Profit exits are actively managed every ~75 sec.
     body = {
         "instId": symbol,
         "marginMode": MARGIN_MODE,
@@ -574,7 +656,7 @@ def open_long(snapshot):
         "orderType": "market",
         "size": decimal_str(sizing["contracts"]),
         "reduceOnly": "false",
-        "clientOrderId": f"bnf{int(time.time())}{symbol.split('-')[0]}"[:32],
+        "clientOrderId": f"bnfd{int(time.time())}{symbol.split('-')[0]}"[:32],
         "slTriggerPrice": decimal_str(stop),
         "slOrderPrice": "-1",
         "slTriggerPriceType": "mark",
@@ -584,7 +666,6 @@ def open_long(snapshot):
     data = resp.get("data", [])
     order_id = data[0].get("orderId", "") if data else ""
 
-    # Verify position became visible.
     pos = None
     for _ in range(10):
         time.sleep(1)
@@ -592,32 +673,26 @@ def open_long(snapshot):
         if pos and pos.get("_is_long"):
             break
 
-    if not pos:
-        tg(
-            f"🚨 BNF ORDER ACK MAAR POSITIE NOG NIET ZICHTBAAR\n"
-            f"{symbol} · order {order_id}\n"
-            f"Controleer BloFin handmatig; geen tweede entry wordt op deze candle geprobeerd."
-        )
-
     actual_entry = fnum(pos.get("averagePrice")) if pos else live
+    # Recalculate management levels from actual fill.
+    record["entry_price"] = actual_entry
+    record["initial_stop"] = actual_entry * (1.0 - STOP_LOSS_PCT)
+    record["risk_price"] = actual_entry - record["initial_stop"]
+    record["fixed_tp"] = actual_entry + record["risk_price"] * FIXED_TP_R
+    record["highest_price"] = actual_entry
+    record["paper"] = False
+    record["order_id"] = order_id
+
     with state_lock:
-        state["managed"][symbol] = {
-            "entry_ts": int(fnum(pos.get("createTime"), now_ms())) if pos else now_ms(),
-            "entry_price": actual_entry,
-            "entry_candle_ts": snapshot["candle_ts"],
-            "contracts": sizing["contracts"],
-            "paper": False,
-            "order_id": order_id,
-        }
+        state["managed"][symbol] = record
         state["last_entry_candle"][symbol] = snapshot["candle_ts"]
     save_state()
 
     tg(
-        f"🟢 BNF ORDER ACCEPTED\n"
-        f"{symbol} LONG\n"
-        f"Entry ~{fmt_price(actual_entry)} · hard SL {fmt_price(stop)}\n"
-        f"Order {order_id}\n"
-        f"Exit verder alleen: daily close ≥ 98% MA25 of max {HOLD_MAX_DAYS} dagen."
+        f"🟢 BNF DAYTRADE ORDER ACCEPTED\n"
+        f"{symbol} LONG · entry ~{fmt_price(actual_entry)}\n"
+        f"Hard SL ~{fmt_price(record['initial_stop'])} · fixed TP ~{fmt_price(record['fixed_tp'])}\n"
+        f"Trailing active vanaf +{TRAIL_ACTIVATE_R:.2f}R · max hold {HOLD_MAX_HOURS:g}h"
     )
     return True
 
@@ -642,73 +717,95 @@ def close_live_position(symbol, reason):
     return True
 
 
+def _finish_local_position(symbol):
+    with state_lock:
+        state["managed"].pop(symbol, None)
+        state["last_exit_ts"][symbol] = now_ms()
+    save_state()
+
+
 def manage_open_position(symbol, snapshot):
+    """
+    Intraday exit manager.
+
+    Exchange always owns the emergency hard stop. This loop manages:
+    - fast fixed R target,
+    - return toward MA25,
+    - trailing profit after +0.75R,
+    - six-hour time stop.
+    """
     managed = state.get("managed", {}).get(symbol, {})
     paper = bool(managed.get("paper", False))
 
+    entry = fnum(managed.get("entry_price"))
+    risk = fnum(managed.get("risk_price"))
+    if entry <= 0 or risk <= 0:
+        return False
+
+    live = last_price(symbol)
+    high = max(fnum(managed.get("highest_price"), entry), live)
+    managed["highest_price"] = high
+    state["managed"][symbol] = managed
+    save_state()
+
+    r_now = (live - entry) / risk
+    high_r = (high - entry) / risk
+    age_hours = (now_ms() - int(managed.get("entry_ts", now_ms()))) / 3_600_000
+
+    mean_exit = bool(
+        snapshot
+        and live >= fnum(snapshot.get("ma25")) * MEAN_REVERSION_MA_FACTOR
+    )
+    fixed_tp = r_now >= FIXED_TP_R
+    max_hold = age_hours >= HOLD_MAX_HOURS
+
+    trail_level = None
+    trail_hit = False
+    if high_r >= TRAIL_ACTIVATE_R:
+        trail_level = high - TRAIL_DISTANCE_R * risk
+        # Never let the profit trail sit below entry once activated.
+        trail_level = max(trail_level, entry)
+        trail_hit = live <= trail_level
+
+    reason = None
+    if fixed_tp:
+        reason = f"FIXED TP {FIXED_TP_R:.2f}R"
+    elif mean_exit:
+        reason = "MEAN REVERSION → MA25"
+    elif trail_hit:
+        reason = f"TRAIL EXIT · high {high_r:.2f}R"
+    elif max_hold:
+        reason = f"MAX HOLD {HOLD_MAX_HOURS:g}h"
+
     if paper:
-        entry = fnum(managed.get("entry_price"))
-        entry_ts = int(managed.get("entry_ts", now_ms()))
-        live = last_price(symbol)
+        # Also emulate the hard stop in paper mode.
+        if live <= entry * (1.0 - STOP_LOSS_PCT):
+            reason = "HARD STOP"
 
-        # Paper mode cannot emulate exchange intraday stop perfectly with only
-        # a periodic loop, but it can detect the current-price breach.
-        stop_hit = live <= entry * (1.0 - STOP_LOSS_PCT)
-        age_days = (now_ms() - entry_ts) / 86_400_000
-        max_hold = age_days >= HOLD_MAX_DAYS
-        ma_exit = bool(snapshot and snapshot["exit_signal"])
-
-        if stop_hit or ma_exit or max_hold:
-            reason = (
-                "HARD STOP"
-                if stop_hit
-                else ("MA25 MEAN REVERSION" if ma_exit else "MAX HOLD")
-            )
-            pnl_pct = (live - entry) / entry * 100 if entry > 0 else 0
+        if reason:
+            pnl_pct = (live - entry) / entry * 100
             tg(
-                f"{'🟢' if pnl_pct >= 0 else '🔴'} PAPER BNF CLOSED\n"
+                f"{'🟢' if pnl_pct >= 0 else '🔴'} PAPER BNF DAYTRADE CLOSED\n"
                 f"{symbol} · {reason}\n"
-                f"{fmt_price(entry)} → {fmt_price(live)} · {pnl_pct:+.2f}%"
+                f"{fmt_price(entry)} → {fmt_price(live)} · {pnl_pct:+.2f}% · {r_now:+.2f}R"
             )
-            with state_lock:
-                state["managed"].pop(symbol, None)
-                if snapshot:
-                    state["last_exit_candle"][symbol] = snapshot["candle_ts"]
-            save_state()
+            _finish_local_position(symbol)
             return True
         return False
 
     pos = get_position(symbol)
     if not pos:
-        # The exchange SL may already have closed it.
-        tg(f"ℹ️ BNF {symbol} positie is gesloten op BloFin. Lokale state opgeschoond.")
-        with state_lock:
-            state["managed"].pop(symbol, None)
-        save_state()
+        # Most likely exchange-side hard SL.
+        tg(f"ℹ️ BNF DAYTRADE {symbol} positie is gesloten op BloFin; state opgeschoond.")
+        _finish_local_position(symbol)
         return True
 
-    if not snapshot:
-        return False
-
-    entry_ts = int(fnum(pos.get("createTime"), managed.get("entry_ts", now_ms())))
-    age_days = (now_ms() - entry_ts) / 86_400_000
-    ma_exit = snapshot["exit_signal"]
-    max_hold = age_days >= HOLD_MAX_DAYS
-
-    if ma_exit or max_hold:
-        # Only one exit attempt per closed daily candle.
-        if state.get("last_exit_candle", {}).get(symbol) == snapshot["candle_ts"]:
-            return False
-        reason = (
-            f"daily close {fmt_price(snapshot['close'])} ≥ "
-            f"98% MA25 ({fmt_price(snapshot['ma25'] * EXIT_MA_FACTOR)})"
-            if ma_exit
-            else f"max hold {HOLD_MAX_DAYS} dagen"
-        )
+    if reason:
         ok = close_live_position(symbol, reason)
         if ok:
+            # Do not immediately re-enter while the exchange is processing close.
             with state_lock:
-                state["last_exit_candle"][symbol] = snapshot["candle_ts"]
+                state["last_exit_ts"][symbol] = now_ms()
             save_state()
         return ok
 
@@ -775,6 +872,7 @@ def scan_once():
         if sym not in occupied
         and s
         and state.get("last_entry_candle", {}).get(sym) != s["candle_ts"]
+        and (now_ms() - int(state.get("last_exit_ts", {}).get(sym, 0) or 0) >= REENTRY_COOLDOWN_MIN * 60_000)
     ])
 
     opened = 0
@@ -800,19 +898,19 @@ def scan_once():
 
         lines = [
             f"📊 {BOT_NAME} v{VERSION}",
-            f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'} · 1D / MA{MA_PERIOD}",
-            f"Entry: ≥{DROP_THRESHOLD*100:.0f}% onder MA · SL {STOP_LOSS_PCT*100:.0f}% · "
-            f"exit ≥{EXIT_MA_FACTOR*100:.0f}% MA · max {HOLD_MAX_DAYS}d",
+            f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'} · setup {SIGNAL_BAR}/MA{MA_PERIOD} · trigger {TRIGGER_BAR}",
+            f"Adaptive dip {DROP_MIN*100:.0f}–{DROP_MAX*100:.0f}% · SL {STOP_LOSS_PCT*100:.1f}% · "
+            f"TP {FIXED_TP_R:.2f}R · trail +{TRAIL_ACTIVATE_R:.2f}R · max {HOLD_MAX_HOURS:g}h",
             f"Scanned {len(snapshots)}/{len(symbols)} · errors {errors} · "
             f"active {active_count}/{MAX_ACTIVE_POSITIONS}",
             f"Entry candidates nu: {len(candidates)}",
-            "Meest oversold:",
+            "Diepste dips:",
         ]
         for s in top:
             lines.append(
                 f"{s['symbol'].split('-')[0]} "
-                f"{s['pct_below_ma']*100:+.1f}% onder MA25"
-                + (" 🔥 SIGNAL" if s["entry_signal"] else "")
+                f"{s['pct_below_ma']*100:.1f}% onder MA25 · trigger {s['drop_threshold']*100:.1f}%"
+                + (" 🔥 READY" if s["entry_signal"] else (" · rebound" if s["rebound"] else ""))
             )
         tg("\n".join(lines))
 
@@ -836,10 +934,12 @@ def startup():
     tg(
         f"🧠 {BOT_NAME} STARTED\n"
         f"v{VERSION} · {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
-        f"Strategie: LONG mean reversion op CLOSED 1D candles\n"
-        f"Entry ≥ {DROP_THRESHOLD*100:.0f}% onder MA{MA_PERIOD}\n"
-        f"Hard SL {STOP_LOSS_PCT*100:.0f}% · risk {RISK_PER_TRADE*100:.1f}% equity\n"
-        f"Exit: daily close ≥ {EXIT_MA_FACTOR*100:.0f}% MA{MA_PERIOD} of {HOLD_MAX_DAYS} dagen\n"
+        f"BNF core: BUY THE DIP → SELL THE MEAN REVERSION\n"
+        f"Setup {SIGNAL_BAR}: MA{MA_PERIOD} · adaptive dip {DROP_MIN*100:.0f}–{DROP_MAX*100:.0f}%\n"
+        f"Trigger {TRIGGER_BAR}: green rebound + higher close\n"
+        f"Hard SL {STOP_LOSS_PCT*100:.1f}% · equity risk {RISK_PER_TRADE*100:.1f}%\n"
+        f"Profit: MA25 return / {FIXED_TP_R:.2f}R / trailing vanaf +{TRAIL_ACTIVATE_R:.2f}R\n"
+        f"Max hold {HOLD_MAX_HOURS:g}h · scan iedere {SCAN_SECONDS}s · cooldown {REENTRY_COOLDOWN_MIN}m\n"
         f"Leverage {LEVERAGE}x · {MARGIN_MODE} · max posities {MAX_ACTIVE_POSITIONS}\n"
         f"Scant {len(symbols)} BloFin USDT perpetuals"
         + (
