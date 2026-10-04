@@ -50,8 +50,8 @@ except Exception:
 # CONFIG
 # ============================================================
 
-VERSION = "2.0"
-BOT_NAME = "BNF DayTrader Mean-Reversion"
+VERSION = "2.1"
+BOT_NAME = "BNF DayTrader Mean-Reversion AGGRESSIVE"
 
 API_KEY = os.getenv("EXCHANGE_API_KEY", "").strip()
 API_SECRET = os.getenv("EXCHANGE_SECRET", "").strip()
@@ -72,15 +72,15 @@ BASE_URL = (
 )
 
 # Daytrade translation of the BNF core
-SIGNAL_BAR = os.getenv("BNF_SIGNAL_BAR", "15m").strip()
+SIGNAL_BAR = os.getenv("BNF_SIGNAL_BAR", "5m").strip()
 TRIGGER_BAR = os.getenv("BNF_TRIGGER_BAR", "5m").strip()
 MA_PERIOD = int(os.getenv("BNF_MA_PERIOD", "25"))
 ATR_PERIOD = int(os.getenv("BNF_ATR_PERIOD", "14"))
 
 # Adaptive oversold threshold: never easier than 4%, never stricter than 7%.
-DROP_MIN = float(os.getenv("BNF_DROP_MIN", "0.04"))
-DROP_MAX = float(os.getenv("BNF_DROP_MAX", "0.07"))
-DROP_ATR_MULT = float(os.getenv("BNF_DROP_ATR_MULT", "1.50"))
+DROP_MIN = float(os.getenv("BNF_DROP_MIN", "0.028"))
+DROP_MAX = float(os.getenv("BNF_DROP_MAX", "0.055"))
+DROP_ATR_MULT = float(os.getenv("BNF_DROP_ATR_MULT", "1.15"))
 
 # BNF-style equity risk, translated to intraday crypto.
 RISK_PER_TRADE = float(os.getenv("BNF_RISK_PER_TRADE", "0.02"))
@@ -91,19 +91,19 @@ FIXED_TP_R = float(os.getenv("BNF_FIXED_TP_R", "1.25"))
 TRAIL_ACTIVATE_R = float(os.getenv("BNF_TRAIL_ACTIVATE_R", "0.75"))
 TRAIL_DISTANCE_R = float(os.getenv("BNF_TRAIL_DISTANCE_R", "0.45"))
 MEAN_REVERSION_MA_FACTOR = float(os.getenv("BNF_MEAN_REVERSION_MA_FACTOR", "0.995"))
-HOLD_MAX_HOURS = float(os.getenv("BNF_HOLD_MAX_HOURS", "6"))
-REENTRY_COOLDOWN_MIN = int(os.getenv("BNF_REENTRY_COOLDOWN_MIN", "60"))
+HOLD_MAX_HOURS = float(os.getenv("BNF_HOLD_MAX_HOURS", "4.5"))
+REENTRY_COOLDOWN_MIN = int(os.getenv("BNF_REENTRY_COOLDOWN_MIN", "25"))
 
 # 5m rebound confirmation. This does not change the BNF setup; it only avoids
 # buying while the short-term candle is still accelerating downward.
-TRIGGER_MIN_CLOSE_LOCATION = float(os.getenv("BNF_TRIGGER_MIN_CLOSE_LOCATION", "0.55"))
+TRIGGER_MIN_CLOSE_LOCATION = float(os.getenv("BNF_TRIGGER_MIN_CLOSE_LOCATION", "0.45"))
 
 # Execution
 LEVERAGE = int(os.getenv("BNF_LEVERAGE", "10"))
 MARGIN_MODE = os.getenv("BNF_MARGIN_MODE", "isolated").strip().lower()
-MAX_ACTIVE_POSITIONS = int(os.getenv("BNF_MAX_ACTIVE_POSITIONS", "2"))
+MAX_ACTIVE_POSITIONS = int(os.getenv("BNF_MAX_ACTIVE_POSITIONS", "3"))
 AVAILABLE_MARGIN_BUFFER = float(os.getenv("BNF_AVAILABLE_MARGIN_BUFFER", "0.90"))
-SCAN_SECONDS = int(os.getenv("BNF_SCAN_SECONDS", "75"))
+SCAN_SECONDS = int(os.getenv("BNF_SCAN_SECONDS", "45"))
 STATUS_HOURS = float(os.getenv("BNF_STATUS_HOURS", "2"))
 REQUEST_TIMEOUT = int(os.getenv("BNF_REQUEST_TIMEOUT", "15"))
 
@@ -449,7 +449,7 @@ def set_leverage(symbol):
 
 def strategy_snapshot(symbol):
     """
-    15m setup + 5m rebound trigger.
+    5m setup + 5m rebound trigger.
 
     The setup is still pure BNF:
         price is abnormally far below its short moving average.
@@ -591,7 +591,7 @@ def open_long(snapshot):
     if upward_drift > MAX_ENTRY_DRIFT_PCT:
         tg(
             f"🟠 BNF DAYTRADE {symbol}\n"
-            f"Rebound liep al {upward_drift*100:.2f}% weg sinds de 15m close — geen chase."
+            f"Rebound liep al {upward_drift*100:.2f}% weg sinds de {SIGNAL_BAR} close — geen chase."
         )
         return False
 
@@ -616,7 +616,7 @@ def open_long(snapshot):
     tg(
         f"🟠 BNF DAYTRADE READY\n"
         f"{symbol} LONG\n"
-        f"15m close {fmt_price(snapshot['close'])} · MA25 {fmt_price(snapshot['ma25'])}\n"
+        f"{SIGNAL_BAR} close {fmt_price(snapshot['close'])} · MA25 {fmt_price(snapshot['ma25'])}\n"
         f"Discount {snapshot['pct_below_ma']*100:.2f}% · nodig {snapshot['drop_threshold']*100:.2f}%\n"
         f"5m rebound bevestigd · close-loc {snapshot['trigger_close_location']*100:.0f}%\n"
         f"Live ~{fmt_price(live)} · SL {fmt_price(stop)} · TP {fmt_price(fixed_tp)} ({FIXED_TP_R:.2f}R)\n"
@@ -941,6 +941,7 @@ def startup():
         f"Profit: MA25 return / {FIXED_TP_R:.2f}R / trailing vanaf +{TRAIL_ACTIVATE_R:.2f}R\n"
         f"Max hold {HOLD_MAX_HOURS:g}h · scan iedere {SCAN_SECONDS}s · cooldown {REENTRY_COOLDOWN_MIN}m\n"
         f"Leverage {LEVERAGE}x · {MARGIN_MODE} · max posities {MAX_ACTIVE_POSITIONS}\n"
+        f"Max gepland gelijktijdig stop-risico ~{MAX_ACTIVE_POSITIONS * RISK_PER_TRADE * 100:.1f}% equity\n"
         f"Scant {len(symbols)} BloFin USDT perpetuals"
         + (
             f"\nEquity ${equity:.2f} · Available ${available:.2f}"
