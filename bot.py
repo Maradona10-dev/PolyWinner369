@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-JJ SIMON - FAIR PRICING THEORY BOT v1.2
+JJ SIMON - FAIR PRICING THEORY BOT v1.4 GLOBAL SESSIONS
 BloFin Futures - AGGRESSIVE
 ========================================
 
@@ -17,7 +17,7 @@ Aggressieve instellingen behouden:
 Gerichte verbeteringen:
 1) Open posities worden ALTIJD beheerd, ook buiten de entry-sessie.
 2) Fair Value komt van de echte 1m session-open candle, nooit van "last price" bij restart.
-3) Displacement wordt gemeten tegen de mediane body van recente candles + BOS.
+3) Displacement wordt gemeten tegen de mediane body van recente candles + BOS.\n4) Global sessions: China, London, Nederland, Zuid-Amerika en New York.
 """
 
 import os
@@ -32,6 +32,7 @@ from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 from statistics import median
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -44,8 +45,8 @@ except Exception:
 # CONFIG - AGGRESSIEVE VERSIE
 # ============================================================
 
-VERSION = "1.3-Aggressive-EdgeFix"
-BOT_NAME = "JJ Fair Pricing Aggressive"
+VERSION = "1.4-Global-Sessions"
+BOT_NAME = "JJ Fair Pricing Aggressive Global"
 
 API_KEY = os.getenv("EXCHANGE_API_KEY", "").strip()
 API_SECRET = os.getenv("EXCHANGE_SECRET", "").strip()
@@ -83,35 +84,47 @@ USE_ATR_STOPS = os.getenv("JJ_USE_ATR_STOPS", "True").lower() == "true"
 ATR_PERIOD = int(os.getenv("JJ_ATR_PERIOD", "14"))
 ATR_SL_MULT = float(os.getenv("JJ_ATR_SL_MULT", "1.1"))
 
-# EDGE FIX v1.3:
-# 1m ATR kan extreem klein worden. Dan wordt een normale tik + taker fees
-# al een stop. We houden ATR, maar leggen een agressieve minimumvloer.
-MIN_STOP_PCT = float(os.getenv("JJ_MIN_STOP_PCT", "0.0035"))  # 0.35%
-
-# Market entry + market exit zijn doorgaans taker fills.
-# Standaard rekenen we conservatief met 0.06% per kant = 0.12% round-trip.
-# Dit is instelbaar als jouw BloFin fee tier anders is.
-ROUND_TRIP_COST_PCT = float(os.getenv("JJ_ROUND_TRIP_COST_PCT", "0.0012"))
-
-# Reversion naar fair value moet genoeg ruimte hebben om niet voor centen
-# te handelen. Vereiste netto reward t.o.v. geplande netto stop-risk.
-MIN_REVERSION_NET_R = float(os.getenv("JJ_MIN_REVERSION_NET_R", "1.0"))
-
-# Fair-value exit pas vlak bij fair value; oude 0.30% marge nam te vroeg winst.
-FAIR_EXIT_TOLERANCE_PCT = float(os.getenv("JJ_FAIR_EXIT_TOLERANCE_PCT", "0.0005"))
-
-# Geen achter een al weggeschoten 1m signal candle aanjagen.
-MAX_ENTRY_CHASE_PCT = float(os.getenv("JJ_MAX_ENTRY_CHASE_PCT", "0.0025"))
-
 LEVERAGE = int(os.getenv("JJ_LEVERAGE", "12"))
 MARGIN_MODE = os.getenv("JJ_MARGIN_MODE", "isolated").strip().lower()
 MAX_ACTIVE_POSITIONS = int(os.getenv("JJ_MAX_ACTIVE_POSITIONS", "4"))
 SCAN_SECONDS = int(os.getenv("JJ_SCAN_SECONDS", "15"))
 REENTRY_COOLDOWN_MIN = int(os.getenv("JJ_REENTRY_COOLDOWN_MIN", "2"))
 
-# Sessie-opens (UTC)
-SESSION_OPENS_UTC = [
-    {"hour": 13, "minute": 30},   # New York open
+# Wereldwijde sessie-opens.
+# Lokale beursuren + ZoneInfo zorgen automatisch voor zomer-/wintertijd.
+# London en Nederland vallen vaak op exact hetzelfde UTC-moment; die worden
+# tijdens het scannen samengevoegd zodat dezelfde setup niet dubbel opent.
+MARKET_SESSIONS = [
+    {
+        "name": "China",
+        "timezone": "Asia/Shanghai",
+        "hour": 9,
+        "minute": 30,
+    },
+    {
+        "name": "London",
+        "timezone": "Europe/London",
+        "hour": 8,
+        "minute": 0,
+    },
+    {
+        "name": "Nederland",
+        "timezone": "Europe/Amsterdam",
+        "hour": 9,
+        "minute": 0,
+    },
+    {
+        "name": "Zuid-Amerika",
+        "timezone": "America/Sao_Paulo",
+        "hour": 10,
+        "minute": 0,
+    },
+    {
+        "name": "New York",
+        "timezone": "America/New_York",
+        "hour": 9,
+        "minute": 30,
+    },
 ]
 
 STATE_FILE = "jj_fair_pricing_aggressive_v12_state.json"
@@ -406,20 +419,56 @@ def set_leverage(symbol):
 # STRATEGY LOGIC
 # ============================================================
 
-def get_current_session_open():
+def get_active_sessions():
+    """
+    Geeft alle wereldwijde marktsessies terug die NU binnen de ingestelde
+    entry-window vallen.
+
+    De tijden zijn lokale beurs-openingen en worden via ZoneInfo automatisch
+    naar UTC omgerekend. Alleen maandag t/m vrijdag.
+
+    Als twee markten exact tegelijk openen (bijv. London + Nederland), worden
+    ze gecombineerd tot één fair-value moment om dubbele orders te voorkomen.
+    """
     now = now_utc()
-    candidates = []
-    for s in SESSION_OPENS_UTC:
-        open_time = now.replace(
-            hour=s["hour"],
-            minute=s["minute"],
+    by_timestamp = {}
+
+    for cfg in MARKET_SESSIONS:
+        tz = ZoneInfo(cfg["timezone"])
+        local_now = now.astimezone(tz)
+
+        # Geen officiële weekday-session in het weekend.
+        if local_now.weekday() >= 5:
+            continue
+
+        local_open = local_now.replace(
+            hour=cfg["hour"],
+            minute=cfg["minute"],
             second=0,
             microsecond=0,
         )
-        if open_time > now:
-            open_time -= timedelta(days=1)
-        candidates.append(open_time)
-    return max(candidates)
+        session_open = local_open.astimezone(timezone.utc)
+        minutes_since = (now - session_open).total_seconds() / 60
+
+        if not (0 <= minutes_since <= SESSION_LENGTH_MINUTES):
+            continue
+
+        ts = int(session_open.timestamp())
+        if ts not in by_timestamp:
+            by_timestamp[ts] = {
+                "name": cfg["name"],
+                "names": [cfg["name"]],
+                "open": session_open,
+                "minutes_since_open": minutes_since,
+            }
+        else:
+            by_timestamp[ts]["names"].append(cfg["name"])
+            by_timestamp[ts]["name"] = " + ".join(by_timestamp[ts]["names"])
+
+    return sorted(
+        by_timestamp.values(),
+        key=lambda x: x["open"],
+    )
 
 def is_in_session_window(session_open):
     minutes_since = (now_utc() - session_open).total_seconds() / 60
@@ -490,7 +539,7 @@ def detect_displacement_and_bos(rows):
         "body_multiple": body_curr / baseline_body if baseline_body > 0 else 0,
     }
 
-def strategy_snapshot(symbol, session_open, fair_value):
+def strategy_snapshot(symbol, session_open, fair_value, session_name):
     rows = candles(symbol, SIGNAL_BAR, limit=50, confirmed_only=True)
     if len(rows) < max(DISPLACEMENT_LOOKBACK + 1, BOS_LOOKBACK + 1, 8):
         return None
@@ -529,6 +578,8 @@ def strategy_snapshot(symbol, session_open, fair_value):
         "symbol": symbol,
         "direction": signal["direction"],
         "phase": phase,
+        "session_name": session_name,
+        "session_open_ts": int(session_open.timestamp() * 1000),
         "fair_value": fair_value,
         "close": signal["close"],
         "minutes_since_open": minutes_since,
@@ -556,13 +607,7 @@ def calculate_size(symbol, entry_price, equity, available, stop_distance):
         return None
 
     risk_amount = equity * RISK_PER_TRADE
-
-    # Fee-aware sizing: een stop kost niet alleen de prijsbeweging maar ook
-    # ongeveer de round-trip transactiekosten. Zo wordt een piepkleine stop
-    # niet stiekem méér account-risk dan bedoeld.
-    stop_pct = stop_distance / entry_price
-    effective_loss_pct = stop_pct + ROUND_TRIP_COST_PCT
-    notional = risk_amount / effective_loss_pct
+    notional = risk_amount / (stop_distance / entry_price)
 
     # Agressieve bestaande cap behouden.
     max_notional = available * 0.88 * LEVERAGE
@@ -597,23 +642,7 @@ def open_position(snapshot):
     ):
         return False
 
-    # Voorkom chase: het signaal is gebaseerd op een gesloten 1m candle.
-    # Als de prijs in onze richting al te ver is weggelopen, slaan we hem over.
-    signal_close = fnum(snapshot.get("close"))
-    if signal_close > 0:
-        if direction == "long":
-            chase_pct = max(0.0, (live - signal_close) / signal_close)
-        else:
-            chase_pct = max(0.0, (signal_close - live) / signal_close)
-        if chase_pct > MAX_ENTRY_CHASE_PCT:
-            print(
-                f"Skip chase {symbol}: {chase_pct*100:.2f}% > "
-                f"{MAX_ENTRY_CHASE_PCT*100:.2f}%",
-                flush=True,
-            )
-            return False
-
-    # ATR stop blijft agressief, maar krijgt een noise-floor.
+    # Stop distance - agressieve bestaande instellingen behouden.
     if USE_ATR_STOPS:
         rows = candles(
             symbol,
@@ -640,42 +669,6 @@ def open_position(snapshot):
     else:
         stop_dist = live * 0.007
 
-    # Cruciaal: geen 0.05%-0.20% micro-stops meer op 1m noise.
-    stop_dist = max(stop_dist, live * MIN_STOP_PCT)
-    stop_pct = stop_dist / live
-
-    # Fee-aware target: behoud 1.25R NA geschatte round-trip kosten.
-    # Voorbeeld bij 0.35% stop en 0.12% kosten:
-    # target move ~= 0.7075%, i.p.v. slechts 0.4375%.
-    target_move_pct = (
-        (stop_pct + ROUND_TRIP_COST_PCT) * FIXED_RR
-        + ROUND_TRIP_COST_PCT
-    )
-    target_dist = live * target_move_pct
-
-    # Reversion trade alleen als de fair-value beweging zelf genoeg netto edge
-    # biedt. Zo voorkomen we snelle FAIR VALUE exits van enkele centen.
-    if snapshot.get("phase") == "reversion":
-        fair = fnum(snapshot.get("fair_value"))
-        if fair <= 0:
-            return False
-        if direction == "long":
-            fair_move_pct = max(0.0, (fair - live) / live)
-        else:
-            fair_move_pct = max(0.0, (live - fair) / live)
-
-        net_reward_pct = max(0.0, fair_move_pct - ROUND_TRIP_COST_PCT)
-        net_loss_pct = stop_pct + ROUND_TRIP_COST_PCT
-        fair_net_r = net_reward_pct / net_loss_pct if net_loss_pct > 0 else 0.0
-
-        if fair_net_r < MIN_REVERSION_NET_R:
-            print(
-                f"Skip weak reversion {symbol}: fair edge {fair_net_r:.2f}R "
-                f"< {MIN_REVERSION_NET_R:.2f}R",
-                flush=True,
-            )
-            return False
-
     sizing = calculate_size(
         symbol,
         live,
@@ -688,21 +681,20 @@ def open_position(snapshot):
 
     if direction == "long":
         stop = live - stop_dist
-        tp = live + target_dist
+        tp = live + stop_dist * FIXED_RR
         side = "buy"
     else:
         stop = live + stop_dist
-        tp = live - target_dist
+        tp = live - stop_dist * FIXED_RR
         side = "sell"
 
     tg(
         f"🟠 JJ AGGRESSIVE READY\n"
         f"{symbol} {direction.upper()} · {snapshot['phase'].upper()}\n"
+        f"Sessie: {snapshot.get('session_name', 'Onbekend')}\n"
         f"Fair Value: {fmt_price(snapshot['fair_value'])}\n"
         f"Entry ~{fmt_price(live)} | SL {fmt_price(stop)} | "
-        f"TP {fmt_price(tp)} (~{FIXED_RR}R netto na geschatte kosten)\n"
-        f"Stop afstand: {stop_pct*100:.3f}% | "
-        f"TP afstand: {target_move_pct*100:.3f}%\n"
+        f"TP {fmt_price(tp)} ({FIXED_RR}R)\n"
         f"Displacement: {snapshot.get('body_multiple', 0):.2f}x median body\n"
         f"Minuten open: {snapshot['minutes_since_open']:.1f}"
     )
@@ -714,15 +706,14 @@ def open_position(snapshot):
         "stop": stop,
         "tp": tp,
         "phase": snapshot["phase"],
+        "session_name": snapshot.get("session_name", "Onbekend"),
+        "session_open_ts": snapshot.get("session_open_ts", 0),
         "fair_value": snapshot["fair_value"],
         "contracts": sizing["contracts"],
         "risk_usdt": sizing["risk_usdt"],
         "notional": sizing["notional"],
         "signal_ts": snapshot["ts"],
         "body_multiple": snapshot.get("body_multiple", 0),
-        "stop_pct": stop_pct,
-        "target_move_pct": target_move_pct,
-        "estimated_round_trip_cost_pct": ROUND_TRIP_COST_PCT,
         "paper": PAPER_TRADING,
     }
 
@@ -795,11 +786,9 @@ def manage_position(symbol):
 
     reached_fair = False
     if managed["phase"] == "reversion" and fair > 0:
-        # Oude code sloot al 0.30% vóór fair value. Op kleine 1m trades
-        # betekende dat vaak: winst te vroeg afkappen. Nu slechts 0.05%.
-        if direction == "long" and live >= fair * (1 - FAIR_EXIT_TOLERANCE_PCT):
+        if direction == "long" and live >= fair * 0.997:
             reached_fair = True
-        elif direction == "short" and live <= fair * (1 + FAIR_EXIT_TOLERANCE_PCT):
+        elif direction == "short" and live <= fair * 1.003:
             reached_fair = True
 
     if not (hit_stop or hit_tp or reached_fair):
@@ -897,68 +886,105 @@ def ensure_fair_values(session_open, symbols):
 def scan_once():
     symbols = valid_symbols()
 
-    # ========================================================
-    # FIX 1: POSITIES ALTIJD BEHEREN
-    # Dit gebeurt vóór de session-window check.
-    # ========================================================
+    # Open posities ALTIJD beheren, onafhankelijk van de wereldsessies.
     for symbol in list(state.get("managed", {}).keys()):
         try:
             manage_position(symbol)
         except Exception as e:
             tg(f"⚠️ Manage error {symbol}: {e}")
 
-    # Alleen NIEUWE ENTRIES zijn beperkt tot de JJ sessie.
-    session_open = get_current_session_open()
-    if not is_in_session_window(session_open):
+    # Meerdere wereldsessies kunnen tegelijk actief zijn.
+    active_sessions = get_active_sessions()
+    if not active_sessions:
         return
-
-    # ========================================================
-    # FIX 2: ECHTE SESSION-OPEN FAIR VALUE
-    # ========================================================
-    ensure_fair_values(session_open, symbols)
 
     active = len(state.get("managed", {}))
     free_slots = max(0, MAX_ACTIVE_POSITIONS - active)
     if free_slots <= 0:
         return
 
-    session_id = session_open.strftime("%Y%m%d_%H%M")
     candidates = []
 
-    for symbol in symbols:
-        if symbol in state.get("managed", {}):
+    for sess in active_sessions:
+        session_open = sess["open"]
+        session_name = sess["name"]
+
+        # Echte 1m openprijs van DEZE sessie vastleggen.
+        ensure_fair_values(session_open, symbols)
+        session_id = session_open.strftime("%Y%m%d_%H%M")
+
+        for symbol in symbols:
+            if symbol in state.get("managed", {}):
+                continue
+
+            key = f"{symbol}_{session_id}"
+            fv_data = state.get("fair_values", {}).get(key)
+            if not fv_data:
+                continue
+
+            try:
+                snap = strategy_snapshot(
+                    symbol,
+                    session_open,
+                    fv_data["price"],
+                    session_name,
+                )
+                if snap:
+                    candidates.append(snap)
+            except Exception as e:
+                print(
+                    f"Signal error {symbol} [{session_name}]: {e}",
+                    flush=True,
+                )
+
+            time.sleep(0.04)
+
+    # Een symbool kan tijdens overlappende sessies meerdere geldige setups
+    # hebben (bijv. Zuid-Amerika + New York). Open nooit twee keer hetzelfde
+    # symbool in dezelfde scan. De meest recent geopende sessie krijgt voorrang;
+    # daarna het meest recente signaal.
+    best_by_symbol = {}
+    for snap in candidates:
+        symbol = snap["symbol"]
+        rank = (snap.get("session_open_ts", 0), snap.get("ts", 0))
+        current = best_by_symbol.get(symbol)
+        if current is None:
+            best_by_symbol[symbol] = snap
             continue
+        current_rank = (
+            current.get("session_open_ts", 0),
+            current.get("ts", 0),
+        )
+        if rank > current_rank:
+            best_by_symbol[symbol] = snap
 
-        key = f"{symbol}_{session_id}"
-        fv_data = state.get("fair_values", {}).get(key)
-        if not fv_data:
-            continue
-
-        try:
-            snap = strategy_snapshot(
-                symbol,
-                session_open,
-                fv_data["price"],
-            )
-            if snap:
-                candidates.append(snap)
-        except Exception as e:
-            print(f"Signal error {symbol}: {e}", flush=True)
-
-        time.sleep(0.04)
-
-    # Meest recente bevestigde signalen eerst.
-    candidates.sort(key=lambda x: x["ts"], reverse=True)
+    candidates = list(best_by_symbol.values())
+    candidates.sort(
+        key=lambda x: (
+            x.get("ts", 0),
+            x.get("session_open_ts", 0),
+        ),
+        reverse=True,
+    )
 
     opened = 0
     for snap in candidates:
         if opened >= free_slots:
             break
+
+        # Extra bescherming tegen een tweede order voor hetzelfde symbool
+        # wanneer een eerdere kandidaat in deze scan al is geopend.
+        if snap["symbol"] in state.get("managed", {}):
+            continue
+
         try:
             if open_position(snap):
                 opened += 1
         except Exception as e:
-            tg(f"❌ Entry error {snap['symbol']}: {e}")
+            tg(
+                f"❌ Entry error {snap['symbol']} "
+                f"[{snap.get('session_name', '?')}]: {e}"
+            )
 
 def startup():
     load_state()
@@ -971,18 +997,17 @@ def startup():
         f"Fair Pricing Aggressive\n"
         f"Continuation: {CONTINUATION_MINUTES} min | "
         f"Sessie: {SESSION_LENGTH_MINUTES} min\n"
-        f"Risk {RISK_PER_TRADE*100:.1f}% | RR {FIXED_RR} netto-doel | "
+        f"Risk {RISK_PER_TRADE*100:.1f}% | RR {FIXED_RR} | "
         f"ATR stops: {USE_ATR_STOPS}\n"
-        f"Noise floor SL: {MIN_STOP_PCT*100:.2f}% | "
-        f"Kostenmodel: {ROUND_TRIP_COST_PCT*100:.2f}% round-trip\n"
-        f"Reversion min edge: {MIN_REVERSION_NET_R:.2f}R | "
-        f"Max chase: {MAX_ENTRY_CHASE_PCT*100:.2f}%\n"
         f"Displacement >= {DISPLACEMENT_BODY_MULT:.2f}x "
         f"median body ({DISPLACEMENT_LOOKBACK} candles) + "
         f"BOS({BOS_LOOKBACK})\n"
         f"Max posities: {MAX_ACTIVE_POSITIONS} | "
         f"Leverage: {LEVERAGE}x | Scan: {SCAN_SECONDS}s\n"
         f"Fair value: echte 1m session-open candle\n"
+        f"Wereldsessies: China 09:30 | London 08:00 | "
+        f"Nederland 09:00 | Zuid-Amerika 10:00 | New York 09:30 (lokale tijd)\n"
+        f"Timezone/DST: automatisch\n"
         f"Position management: 24/7\n"
         f"Symbolen: {len(symbols)}"
     )
