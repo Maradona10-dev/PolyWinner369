@@ -1,42 +1,37 @@
 #!/usr/bin/env python3
 """
-BNF MEAN-REVERSION SCALPER v2.2 — BLOFIN FUTURES
-==================================================
+JJ SIMON - FAIR PRICING THEORY BOT v1.2
+BloFin Futures - AGGRESSIVE
+========================================
 
-Scalping translation of the supplied BNF buy-the-dip / mean-reversion strategy:
+Aggressieve instellingen behouden:
+- Risk 1.8% per trade
+- 1.25R targets
+- 12x isolated
+- Max 4 posities
+- Scan elke 15 sec
+- 2 min re-entry cooldown
+- 12 min continuation / 100 min sessie
+- 1m signalen
 
-LONG ONLY
----------
-1. Use CLOSED 3m candles for the dip setup and CLOSED 1m candles for rebound timing.
-2. Calculate a fast 10-period simple moving average (MA10) on 3m candles.
-3. Entry when price is adaptively 0.8%–2.2% below MA10:
-       (MA10 - close) / MA10 >= adaptive threshold (0.8%–2.2%)
-4. Risk sizing and the existing exchange-side hard stop remain unchanged from v2.1.
-5. Exit on fast mean reversion, fixed R target, trailing profit, or time stop.
-6. Exit after max 2 hours.
-7. The existing 2.5% hard stop is attached at BloFin immediately on entry.
-
-Important:
-- This is deliberately NOT the old V2/V6 strategy.
-- No momentum score, no BTC filter, no ATR gates, no learner.
-- Long-only, preserving the supplied BNF direction.
-- Default MAX_ACTIVE_POSITIONS=3 as in the aggressive daytrade version.
-- It scans multiple BloFin USDT perpetuals and selects the deepest qualifying relative dip.
-- PAPER_TRADING=True by default. Set False only when you intentionally want live orders.
+Gerichte verbeteringen:
+1) Open posities worden ALTIJD beheerd, ook buiten de entry-sessie.
+2) Fair Value komt van de echte 1m session-open candle, nooit van "last price" bij restart.
+3) Displacement wordt gemeten tegen de mediane body van recente candles + BOS.
 """
 
 import os
 import time
 import json
-import math
 import hmac
 import base64
 import hashlib
 import threading
 from uuid import uuid4
 from decimal import Decimal, ROUND_DOWN
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
+from statistics import median
 
 import requests
 
@@ -45,13 +40,12 @@ try:
 except Exception:
     Flask = None
 
-
 # ============================================================
-# CONFIG
+# CONFIG - AGGRESSIEVE VERSIE
 # ============================================================
 
-VERSION = "2.2"
-BOT_NAME = "BNF Mean-Reversion SCALPER"
+VERSION = "1.2-Aggressive"
+BOT_NAME = "JJ Fair Pricing Aggressive"
 
 API_KEY = os.getenv("EXCHANGE_API_KEY", "").strip()
 API_SECRET = os.getenv("EXCHANGE_SECRET", "").strip()
@@ -71,82 +65,64 @@ BASE_URL = (
     else "https://openapi.blofin.com"
 )
 
-# Daytrade translation of the BNF core
-SIGNAL_BAR = os.getenv("BNF_SIGNAL_BAR", "3m").strip()
-TRIGGER_BAR = os.getenv("BNF_TRIGGER_BAR", "1m").strip()
-MA_PERIOD = int(os.getenv("BNF_MA_PERIOD", "10"))
-ATR_PERIOD = int(os.getenv("BNF_ATR_PERIOD", "14"))
+# ----- Agressieve strategie parameters -----
+SIGNAL_BAR = os.getenv("JJ_SIGNAL_BAR", "1m")
+CONTINUATION_MINUTES = int(os.getenv("JJ_CONTINUATION_MINUTES", "12"))
+SESSION_LENGTH_MINUTES = int(os.getenv("JJ_SESSION_LENGTH_MINUTES", "100"))
 
-# Adaptive oversold threshold: never easier than 4%, never stricter than 7%.
-DROP_MIN = float(os.getenv("BNF_DROP_MIN", "0.008"))
-DROP_MAX = float(os.getenv("BNF_DROP_MAX", "0.022"))
-DROP_ATR_MULT = float(os.getenv("BNF_DROP_ATR_MULT", "1.15"))
+# Verbeterde displacement:
+# huidige candle-body moet >= 1.25x de mediane body van de vorige 12 candles zijn.
+# 1.25 houdt hem bewust agressief; hoger = selectiever.
+DISPLACEMENT_BODY_MULT = float(os.getenv("JJ_DISPLACEMENT_BODY_MULT", "1.25"))
+DISPLACEMENT_LOOKBACK = int(os.getenv("JJ_DISPLACEMENT_LOOKBACK", "12"))
+BOS_LOOKBACK = int(os.getenv("JJ_BOS_LOOKBACK", "4"))
 
-# BNF-style equity risk, translated to intraday crypto.
-RISK_PER_TRADE = float(os.getenv("BNF_RISK_PER_TRADE", "0.02"))
-STOP_LOSS_PCT = float(os.getenv("BNF_STOP_LOSS_PCT", "0.025"))
+RISK_PER_TRADE = float(os.getenv("JJ_RISK_PER_TRADE", "0.018"))
+FIXED_RR = float(os.getenv("JJ_FIXED_RR", "1.25"))
+USE_ATR_STOPS = os.getenv("JJ_USE_ATR_STOPS", "True").lower() == "true"
+ATR_PERIOD = int(os.getenv("JJ_ATR_PERIOD", "14"))
+ATR_SL_MULT = float(os.getenv("JJ_ATR_SL_MULT", "1.1"))
 
-# Intraday profit management.
-FIXED_TP_R = float(os.getenv("BNF_FIXED_TP_R", "1.25"))
-TRAIL_ACTIVATE_R = float(os.getenv("BNF_TRAIL_ACTIVATE_R", "0.75"))
-TRAIL_DISTANCE_R = float(os.getenv("BNF_TRAIL_DISTANCE_R", "0.45"))
-MEAN_REVERSION_MA_FACTOR = float(os.getenv("BNF_MEAN_REVERSION_MA_FACTOR", "0.995"))
-HOLD_MAX_HOURS = float(os.getenv("BNF_HOLD_MAX_HOURS", "2.0"))
-REENTRY_COOLDOWN_MIN = int(os.getenv("BNF_REENTRY_COOLDOWN_MIN", "15"))
+LEVERAGE = int(os.getenv("JJ_LEVERAGE", "12"))
+MARGIN_MODE = os.getenv("JJ_MARGIN_MODE", "isolated").strip().lower()
+MAX_ACTIVE_POSITIONS = int(os.getenv("JJ_MAX_ACTIVE_POSITIONS", "4"))
+SCAN_SECONDS = int(os.getenv("JJ_SCAN_SECONDS", "15"))
+REENTRY_COOLDOWN_MIN = int(os.getenv("JJ_REENTRY_COOLDOWN_MIN", "2"))
 
-# 5m rebound confirmation. This does not change the BNF setup; it only avoids
-# buying while the short-term candle is still accelerating downward.
-TRIGGER_MIN_CLOSE_LOCATION = float(os.getenv("BNF_TRIGGER_MIN_CLOSE_LOCATION", "0.35"))
-
-# Execution
-LEVERAGE = int(os.getenv("BNF_LEVERAGE", "10"))
-MARGIN_MODE = os.getenv("BNF_MARGIN_MODE", "isolated").strip().lower()
-MAX_ACTIVE_POSITIONS = int(os.getenv("BNF_MAX_ACTIVE_POSITIONS", "3"))
-AVAILABLE_MARGIN_BUFFER = float(os.getenv("BNF_AVAILABLE_MARGIN_BUFFER", "0.90"))
-SCAN_SECONDS = int(os.getenv("BNF_SCAN_SECONDS", "30"))
-STATUS_HOURS = float(os.getenv("BNF_STATUS_HOURS", "2"))
-REQUEST_TIMEOUT = int(os.getenv("BNF_REQUEST_TIMEOUT", "15"))
-
-# Do not chase a signal if price already bounced too far between scan and order.
-MAX_ENTRY_DRIFT_PCT = float(os.getenv("BNF_MAX_ENTRY_DRIFT_PCT", "0.012"))
-
-STATE_FILE = os.getenv("BNF_STATE_FILE", "bnf_mean_reversion_state.json")
-
-DEFAULT_SYMBOLS = [
-    "BTC-USDT","ETH-USDT","SOL-USDT","BNB-USDT","XRP-USDT","DOGE-USDT",
-    "ADA-USDT","TRX-USDT","LTC-USDT","BCH-USDT","AVAX-USDT","LINK-USDT",
-    "DOT-USDT","SUI-USDT","NEAR-USDT","APT-USDT","ARB-USDT","OP-USDT",
-    "INJ-USDT","SEI-USDT","TIA-USDT","ATOM-USDT","HBAR-USDT","FIL-USDT",
-    "UNI-USDT","AAVE-USDT","ONDO-USDT","ENA-USDT","CRV-USDT","RUNE-USDT",
-    "RENDER-USDT","FET-USDT","TAO-USDT","WLD-USDT","JUP-USDT",
-    "PEPE-USDT","WIF-USDT","BONK-USDT","FLOKI-USDT","SHIB-USDT",
-    "ORDI-USDT","GALA-USDT","ETC-USDT","XLM-USDT","ALGO-USDT",
-    "SAND-USDT","APE-USDT","IMX-USDT","STX-USDT","POL-USDT"
+# Sessie-opens (UTC)
+SESSION_OPENS_UTC = [
+    {"hour": 13, "minute": 30},   # New York open
 ]
 
-_env_symbols = os.getenv("BNF_SYMBOLS", "").strip()
+STATE_FILE = "jj_fair_pricing_aggressive_v12_state.json"
+
+DEFAULT_SYMBOLS = [
+    "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT",
+    "DOGE-USDT", "ADA-USDT", "AVAX-USDT", "LINK-USDT", "DOT-USDT",
+    "SUI-USDT", "NEAR-USDT", "APT-USDT", "ARB-USDT", "OP-USDT",
+    "INJ-USDT", "TIA-USDT", "FET-USDT", "RENDER-USDT", "WIF-USDT",
+    "PEPE-USDT", "WLD-USDT", "JUP-USDT", "ORDI-USDT"
+]
+
+_env_symbols = os.getenv("JJ_SYMBOLS", "").strip()
 SYMBOLS = (
     [x.strip().upper() for x in _env_symbols.split(",") if x.strip()]
     if _env_symbols else DEFAULT_SYMBOLS
 )
 
-
 # ============================================================
-# SMALL HELPERS
+# HELPERS
 # ============================================================
 
 session = requests.Session()
 instrument_cache = {}
 state_lock = threading.Lock()
-last_status_ts = 0.0
 
 state = {
-    "managed": {},              # symbol -> entry metadata
-    "last_entry_candle": {},    # symbol -> candle timestamp
-    "last_exit_candle": {},     # symbol -> candle timestamp
-    "last_exit_ts": {},         # symbol -> unix ms for re-entry cooldown
+    "managed": {},
+    "fair_values": {},
+    "last_exit_ts": {},
 }
-
 
 def fnum(v, default=0.0):
     try:
@@ -154,18 +130,18 @@ def fnum(v, default=0.0):
     except Exception:
         return default
 
-
 def now_ms():
     return int(time.time() * 1000)
 
+def now_utc():
+    return datetime.now(timezone.utc)
 
 def fmt_price(v):
     if v >= 1000:
         return f"{v:.2f}"
     if v >= 1:
         return f"{v:.5f}".rstrip("0").rstrip(".")
-    return f"{v:.10f}".rstrip("0").rstrip(".")
-
+    return f"{v:.8f}".rstrip("0").rstrip(".")
 
 def tg(message):
     print(message, flush=True)
@@ -184,7 +160,6 @@ def tg(message):
     except Exception as e:
         print(f"Telegram error: {e}", flush=True)
 
-
 def load_state():
     global state
     try:
@@ -197,7 +172,6 @@ def load_state():
     except Exception as e:
         print(f"State load error: {e}", flush=True)
 
-
 def save_state():
     try:
         with state_lock:
@@ -208,7 +182,6 @@ def save_state():
     except Exception as e:
         print(f"State save error: {e}", flush=True)
 
-
 def floor_step(value, step):
     if step <= 0:
         return value
@@ -217,52 +190,38 @@ def floor_step(value, step):
     units = (d_value / d_step).to_integral_value(rounding=ROUND_DOWN)
     return float(units * d_step)
 
-
 def decimal_str(value):
-    # Avoid scientific notation in API payloads.
     d = Decimal(str(value))
     s = format(d, "f")
     return s.rstrip("0").rstrip(".") if "." in s else s
 
-
 # ============================================================
-# BLOFIN REST
+# BLOFIN API
 # ============================================================
 
 def _check_api_response(data, where):
     if not isinstance(data, dict):
-        raise RuntimeError(f"{where}: invalid response {data!r}")
+        raise RuntimeError(f"{where}: invalid response")
     if str(data.get("code", "")) != "0":
         raise RuntimeError(f"{where}: {data.get('code')} {data.get('msg')}")
-    # Some trade endpoints return top-level code 0 but a nested rejection.
-    payload = data.get("data")
-    if isinstance(payload, list):
-        for item in payload:
-            if isinstance(item, dict) and item.get("code") not in (None, "", "0", 0):
-                raise RuntimeError(
-                    f"{where}: nested {item.get('code')} {item.get('msg')}"
-                )
     return data
-
 
 def public_get(path, params=None):
     params = params or {}
-    url = BASE_URL + path
-    r = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+    r = session.get(BASE_URL + path, params=params, timeout=15)
     r.raise_for_status()
     return _check_api_response(r.json(), path)
 
-
 def _signed_headers(method, request_path, body_str=""):
     if not API_KEY or not API_SECRET or not API_PASSPHRASE:
-        raise RuntimeError("BloFin API credentials ontbreken in environment variables.")
+        raise RuntimeError("BloFin API credentials ontbreken")
     timestamp = str(now_ms())
     nonce = str(uuid4())
     prehash = f"{request_path}{method.upper()}{timestamp}{nonce}{body_str}"
     hex_sig = hmac.new(
         API_SECRET.encode(),
         prehash.encode(),
-        hashlib.sha256
+        hashlib.sha256,
     ).hexdigest().encode()
     signature = base64.b64encode(hex_sig).decode()
     return {
@@ -274,20 +233,14 @@ def _signed_headers(method, request_path, body_str=""):
         "Content-Type": "application/json",
     }
 
-
 def private_get(path, params=None):
     params = params or {}
     query = urlencode(params)
     request_path = path + (f"?{query}" if query else "")
     headers = _signed_headers("GET", request_path, "")
-    r = session.get(
-        BASE_URL + request_path,
-        headers=headers,
-        timeout=REQUEST_TIMEOUT,
-    )
+    r = session.get(BASE_URL + request_path, headers=headers, timeout=15)
     r.raise_for_status()
     return _check_api_response(r.json(), path)
-
 
 def private_post(path, body):
     body_str = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
@@ -295,55 +248,59 @@ def private_post(path, body):
     r = session.post(
         BASE_URL + path,
         headers=headers,
-        data=body_str.encode("utf-8"),
-        timeout=REQUEST_TIMEOUT,
+        data=body_str.encode(),
+        timeout=15,
     )
     r.raise_for_status()
     return _check_api_response(r.json(), path)
 
-
 # ============================================================
-# MARKET / ACCOUNT
+# MARKET DATA
 # ============================================================
 
 def load_instruments():
     global instrument_cache
     data = public_get("/api/v1/market/instruments").get("data", [])
     instrument_cache = {
-        x.get("instId"): x for x in data
+        x.get("instId"): x
+        for x in data
         if isinstance(x, dict) and x.get("instId")
     }
     return instrument_cache
-
 
 def valid_symbols():
     if not instrument_cache:
         load_instruments()
     return [s for s in SYMBOLS if s in instrument_cache]
 
-
 def instrument(symbol):
     if symbol not in instrument_cache:
         load_instruments()
     x = instrument_cache.get(symbol)
     if not x:
-        raise RuntimeError(f"Instrument niet beschikbaar op BloFin: {symbol}")
+        raise RuntimeError(f"Instrument niet beschikbaar: {symbol}")
     return x
 
-
-def candles(symbol, bar, limit=120):
+def candles(symbol, bar, limit=50, confirmed_only=True):
+    """
+    BloFin candles. Voor signalen gebruiken we alleen gesloten candles.
+    Voor de exacte session-open mogen we ook de lopende 1m candle lezen,
+    omdat de OPEN-prijs vanaf het begin van die candle vaststaat.
+    """
     data = public_get(
         "/api/v1/market/candles",
-        {"instId": symbol, "bar": bar, "limit": str(limit)}
+        {"instId": symbol, "bar": bar, "limit": str(limit)},
     ).get("data", [])
 
     rows = []
     for c in data:
         if not isinstance(c, list) or len(c) < 6:
             continue
-        # Use only confirmed/closed candles.
-        if str(c[-1]) != "1":
+
+        confirm = str(c[-1])
+        if confirmed_only and confirm != "1":
             continue
+
         rows.append({
             "ts": int(c[0]),
             "open": fnum(c[1]),
@@ -351,37 +308,39 @@ def candles(symbol, bar, limit=120):
             "low": fnum(c[3]),
             "close": fnum(c[4]),
             "volume": fnum(c[5]),
+            "confirm": confirm,
         })
+
     rows.sort(key=lambda x: x["ts"])
     return rows
 
+def session_open_price(symbol, session_open):
+    """
+    Haalt de ECHTE open-prijs van de 1m candle waarvan ts exact gelijk is
+    aan de ingestelde sessie-open.
 
-def true_range(rows, i):
-    cur = rows[i]
-    prev_close = rows[i - 1]["close"]
-    return max(
-        cur["high"] - cur["low"],
-        abs(cur["high"] - prev_close),
-        abs(cur["low"] - prev_close),
-    )
+    Belangrijk: bij een Railway restart om bv. 14:05 UTC blijft de fair value
+    dus de 13:30 candle-open en wordt NIET de actuele tickerprijs gebruikt.
+    """
+    target_ts = int(session_open.timestamp() * 1000)
 
+    # Sessie duurt 100 min; 180 recente 1m candles geeft ruime marge.
+    rows = candles(symbol, "1m", limit=180, confirmed_only=False)
 
-def atr_value(rows, period=14):
-    if len(rows) < period + 1:
-        return 0.0
-    trs = [true_range(rows, i) for i in range(len(rows) - period, len(rows))]
-    return sum(trs) / len(trs) if trs else 0.0
+    for row in rows:
+        if row["ts"] == target_ts:
+            return row["open"]
 
+    return None
 
 def last_price(symbol):
     data = public_get(
         "/api/v1/market/tickers",
-        {"instId": symbol}
+        {"instId": symbol},
     ).get("data", [])
     if not data:
         raise RuntimeError(f"Geen ticker voor {symbol}")
     return fnum(data[0].get("last"))
-
 
 def account():
     data = private_get("/api/v1/account/balance").get("data", {})
@@ -393,7 +352,6 @@ def account():
             break
     return equity, available
 
-
 def positions():
     data = private_get("/api/v1/account/positions").get("data", [])
     out = []
@@ -404,35 +362,17 @@ def positions():
         p = dict(p)
         p["_qty"] = qty
         p["_is_long"] = (
-            str(p.get("positionSide", "")).lower() == "long"
-            or (
-                str(p.get("positionSide", "")).lower() == "net"
-                and qty > 0
-            )
+            str(p.get("positionSide", "")).lower() in ("long", "net")
+            and qty > 0
         )
         out.append(p)
     return out
-
 
 def get_position(symbol):
     for p in positions():
         if p.get("instId") == symbol:
             return p
     return None
-
-
-def startup_account_checks():
-    mode = private_get("/api/v1/account/position-mode").get("data", {})
-    position_mode = str(mode.get("positionMode", ""))
-    multi = str(mode.get("multiPosition", "false")).lower()
-    if position_mode != "net_mode":
-        raise RuntimeError(
-            f"Deze bot verwacht BloFin One-way/net mode. Huidig: {position_mode}, "
-            f"multiPosition={multi}."
-        )
-    if MARGIN_MODE not in ("isolated", "cross"):
-        raise RuntimeError("BNF_MARGIN_MODE moet isolated of cross zijn.")
-
 
 def set_leverage(symbol):
     body = {
@@ -442,531 +382,541 @@ def set_leverage(symbol):
     }
     return private_post("/api/v1/account/set-leverage", body)
 
-
 # ============================================================
-# STRATEGY — EXACT CORE LOGIC
+# STRATEGY LOGIC
 # ============================================================
 
-def strategy_snapshot(symbol):
-    """
-    5m setup + 5m rebound trigger.
+def get_current_session_open():
+    now = now_utc()
+    candidates = []
+    for s in SESSION_OPENS_UTC:
+        open_time = now.replace(
+            hour=s["hour"],
+            minute=s["minute"],
+            second=0,
+            microsecond=0,
+        )
+        if open_time > now:
+            open_time -= timedelta(days=1)
+        candidates.append(open_time)
+    return max(candidates)
 
-    The setup is still pure BNF:
-        price is abnormally far below its short moving average.
-    The 5m trigger only waits for evidence that the intraday fall has started
-    to rebound before committing capital.
-    """
-    setup_rows = candles(symbol, SIGNAL_BAR, max(100, MA_PERIOD + ATR_PERIOD + 10))
-    trigger_rows = candles(symbol, TRIGGER_BAR, 40)
+def is_in_session_window(session_open):
+    minutes_since = (now_utc() - session_open).total_seconds() / 60
+    return 0 <= minutes_since <= SESSION_LENGTH_MINUTES
 
-    if len(setup_rows) < max(MA_PERIOD, ATR_PERIOD + 1) or len(trigger_rows) < 3:
+def get_phase(session_open):
+    minutes_since = (now_utc() - session_open).total_seconds() / 60
+    if minutes_since <= CONTINUATION_MINUTES:
+        return "continuation"
+    return "reversion"
+
+def detect_displacement_and_bos(rows):
+    """
+    Aggressieve maar robuustere displacement:
+    - huidige body >= DISPLACEMENT_BODY_MULT * median body van vorige N candles
+    - candle moet BOS maken over de vorige BOS_LOOKBACK highs/lows
+
+    Dit voorkomt dat een relatief kleine candle al displacement heet alleen
+    omdat de direct voorgaande candle toevallig nóg kleiner was.
+    """
+    need = max(DISPLACEMENT_LOOKBACK + 1, BOS_LOOKBACK + 1, 6)
+    if len(rows) < need:
         return None
 
-    closes = [r["close"] for r in setup_rows]
-    last = setup_rows[-1]
-    ma = sum(closes[-MA_PERIOD:]) / MA_PERIOD
-    atr = atr_value(setup_rows, ATR_PERIOD)
-    if ma <= 0 or atr <= 0 or last["close"] <= 0:
+    curr = rows[-1]
+    history = rows[-(DISPLACEMENT_LOOKBACK + 1):-1]
+
+    historical_bodies = [
+        abs(r["close"] - r["open"])
+        for r in history
+        if abs(r["close"] - r["open"]) > 0
+    ]
+    if not historical_bodies:
         return None
 
-    atr_pct = atr / last["close"]
-    adaptive_drop = min(DROP_MAX, max(DROP_MIN, DROP_MIN + DROP_ATR_MULT * atr_pct))
-    pct_below = (ma - last["close"]) / ma
+    baseline_body = median(historical_bodies)
+    body_curr = abs(curr["close"] - curr["open"])
 
-    # 5m rebound: green candle, higher close than prior 5m close, and closes
-    # in the upper portion of its own range.
-    t = trigger_rows[-1]
-    p = trigger_rows[-2]
-    rng = max(t["high"] - t["low"], 1e-12)
-    close_location = (t["close"] - t["low"]) / rng
-    rebound = (
-        t["close"] > t["open"]
-        and t["close"] > p["close"]
-        and close_location >= TRIGGER_MIN_CLOSE_LOCATION
+    is_displacement = (
+        baseline_body > 0
+        and body_curr >= baseline_body * DISPLACEMENT_BODY_MULT
     )
+    if not is_displacement:
+        return None
 
-    entry_signal = pct_below >= adaptive_drop and rebound
+    bos_rows = rows[-(BOS_LOOKBACK + 1):-1]
+    recent_high = max(r["high"] for r in bos_rows)
+    recent_low = min(r["low"] for r in bos_rows)
+
+    bullish_bos = curr["close"] > recent_high
+    bearish_bos = curr["close"] < recent_low
+
+    if bullish_bos:
+        direction = "long"
+    elif bearish_bos:
+        direction = "short"
+    else:
+        return None
+
+    return {
+        "displacement": True,
+        "bos": True,
+        "direction": direction,
+        "close": curr["close"],
+        "ts": curr["ts"],
+        "body": body_curr,
+        "median_body": baseline_body,
+        "body_multiple": body_curr / baseline_body if baseline_body > 0 else 0,
+    }
+
+def strategy_snapshot(symbol, session_open, fair_value):
+    rows = candles(symbol, SIGNAL_BAR, limit=50, confirmed_only=True)
+    if len(rows) < max(DISPLACEMENT_LOOKBACK + 1, BOS_LOOKBACK + 1, 8):
+        return None
+
+    signal = detect_displacement_and_bos(rows)
+    if not signal:
+        return None
+
+    phase = get_phase(session_open)
+    minutes_since = (now_utc() - session_open).total_seconds() / 60
+
+    valid = False
+
+    # Continuation:
+    # boven fair value + bullish displacement/BOS -> long
+    # onder fair value + bearish displacement/BOS -> short
+    if phase == "continuation":
+        if signal["direction"] == "long" and signal["close"] > fair_value:
+            valid = True
+        elif signal["direction"] == "short" and signal["close"] < fair_value:
+            valid = True
+
+    # Reversion:
+    # onder fair value + bullish displacement/BOS -> long terug naar fair
+    # boven fair value + bearish displacement/BOS -> short terug naar fair
+    else:
+        if signal["direction"] == "long" and signal["close"] < fair_value:
+            valid = True
+        elif signal["direction"] == "short" and signal["close"] > fair_value:
+            valid = True
+
+    if not valid:
+        return None
 
     return {
         "symbol": symbol,
-        "candle_ts": last["ts"],
-        "trigger_ts": t["ts"],
-        "close": last["close"],
-        "ma25": ma,
-        "atr": atr,
-        "atr_pct": atr_pct,
-        "drop_threshold": adaptive_drop,
-        "pct_below_ma": pct_below,
-        "rebound": rebound,
-        "trigger_close_location": close_location,
-        "entry_signal": entry_signal,
+        "direction": signal["direction"],
+        "phase": phase,
+        "fair_value": fair_value,
+        "close": signal["close"],
+        "minutes_since_open": minutes_since,
+        "ts": signal["ts"],
+        "body_multiple": signal["body_multiple"],
     }
 
-
-def rank_entries(snapshots):
-    # Prefer the largest excess discount beyond that symbol's own threshold.
-    return sorted(
-        [s for s in snapshots if s and s["entry_signal"]],
-        key=lambda s: (s["pct_below_ma"] - s["drop_threshold"]),
-        reverse=True,
-    )
-
-
 # ============================================================
-# POSITION SIZING
+# SIZING & ORDERS
 # ============================================================
 
-def calculate_size(symbol, entry_price, equity, available):
-    """
-    BNF sizing:
-        risk_amount = equity * configured risk %
-        notional = risk_amount / intraday hard-stop %
-
-    BloFin order size is contracts, so translate notional to contracts using
-    contractValue. Margin availability is only a hard feasibility cap.
-    """
+def calculate_size(symbol, entry_price, equity, available, stop_distance):
     meta = instrument(symbol)
     contract_value = fnum(meta.get("contractValue"))
     min_size = fnum(meta.get("minSize"))
     lot_size = fnum(meta.get("lotSize"))
-    max_market = fnum(meta.get("maxMarketSize"))
 
-    if min(contract_value, min_size, lot_size, entry_price) <= 0:
-        raise RuntimeError(f"Ongeldige contract metadata voor {symbol}: {meta}")
-
-    risk_amount = equity * RISK_PER_TRADE
-    desired_notional = risk_amount / STOP_LOSS_PCT
-
-    # Cannot use more isolated margin than is reasonably available.
-    max_notional_by_margin = max(0.0, available * AVAILABLE_MARGIN_BUFFER * LEVERAGE)
-    notional = min(desired_notional, max_notional_by_margin)
-
-    raw_contracts = notional / (contract_value * entry_price)
-    contracts = floor_step(raw_contracts, lot_size)
-
-    if max_market > 0:
-        contracts = min(contracts, floor_step(max_market, lot_size))
-
-    if contracts < min_size:
-        # Do NOT round up if that would exceed the intended risk budget.
+    if min(
+        contract_value,
+        min_size,
+        lot_size,
+        entry_price,
+        stop_distance,
+    ) <= 0:
         return None
 
-    actual_notional = contracts * contract_value * entry_price
-    actual_risk = actual_notional * STOP_LOSS_PCT
-    margin = actual_notional / LEVERAGE
+    risk_amount = equity * RISK_PER_TRADE
+    notional = risk_amount / (stop_distance / entry_price)
 
-    if actual_risk > risk_amount * 1.02:
+    # Agressieve bestaande cap behouden.
+    max_notional = available * 0.88 * LEVERAGE
+    notional = min(notional, max_notional)
+
+    contracts = floor_step(
+        notional / (contract_value * entry_price),
+        lot_size,
+    )
+    if contracts < min_size:
         return None
 
     return {
         "contracts": contracts,
-        "notional": actual_notional,
-        "risk_usdt": actual_risk,
-        "risk_budget": risk_amount,
-        "margin": margin,
+        "notional": contracts * contract_value * entry_price,
+        "risk_usdt": risk_amount,
     }
 
-
-# ============================================================
-# ORDERS
-# ============================================================
-
-def open_long(snapshot):
+def open_position(snapshot):
     symbol = snapshot["symbol"]
+    direction = snapshot["direction"]
+
     equity, available = account()
     live = last_price(symbol)
-    signal_close = snapshot["close"]
 
-    if live <= 0:
+    last_exit = int(
+        state.get("last_exit_ts", {}).get(symbol, 0) or 0
+    )
+    if (
+        last_exit
+        and now_ms() - last_exit < REENTRY_COOLDOWN_MIN * 60_000
+    ):
         return False
 
-    # Re-entry cooldown after any exit in this symbol.
-    last_exit = int(state.get("last_exit_ts", {}).get(symbol, 0) or 0)
-    if last_exit and now_ms() - last_exit < REENTRY_COOLDOWN_MIN * 60_000:
-        return False
-
-    # For a dip-buy we only reject an UPWARD chase. A slightly deeper dip can
-    # still be valid, provided the hard stop/risk sizing remains intact.
-    upward_drift = (live - signal_close) / signal_close
-    if upward_drift > MAX_ENTRY_DRIFT_PCT:
-        tg(
-            f"🟠 BNF DAYTRADE {symbol}\n"
-            f"Rebound liep al {upward_drift*100:.2f}% weg sinds de {SIGNAL_BAR} close — geen chase."
+    # Stop distance - agressieve bestaande instellingen behouden.
+    if USE_ATR_STOPS:
+        rows = candles(
+            symbol,
+            SIGNAL_BAR,
+            40,
+            confirmed_only=True,
         )
-        return False
+        trs = []
+        for i in range(1, len(rows)):
+            tr = max(
+                rows[i]["high"] - rows[i]["low"],
+                abs(rows[i]["high"] - rows[i - 1]["close"]),
+                abs(rows[i]["low"] - rows[i - 1]["close"]),
+            )
+            trs.append(tr)
 
-    sizing = calculate_size(symbol, live, equity, available)
+        atr_slice = trs[-ATR_PERIOD:]
+        atr = (
+            sum(atr_slice) / len(atr_slice)
+            if atr_slice
+            else live * 0.01
+        )
+        stop_dist = atr * ATR_SL_MULT
+    else:
+        stop_dist = live * 0.007
+
+    sizing = calculate_size(
+        symbol,
+        live,
+        equity,
+        available,
+        stop_dist,
+    )
     if not sizing:
-        tg(
-            f"🟠 BNF DAYTRADE {symbol} SIZE BLOCK\n"
-            f"Contract minimum/marge past niet binnen {RISK_PER_TRADE*100:.1f}% risico."
-        )
         return False
 
-    stop = live * (1.0 - STOP_LOSS_PCT)
-    risk_price = live - stop
-    fixed_tp = live + risk_price * FIXED_TP_R
-
-    meta = instrument(symbol)
-    tick = fnum(meta.get("tickSize"))
-    if tick > 0:
-        stop = floor_step(stop, tick)
-        fixed_tp = floor_step(fixed_tp, tick)
+    if direction == "long":
+        stop = live - stop_dist
+        tp = live + stop_dist * FIXED_RR
+        side = "buy"
+    else:
+        stop = live + stop_dist
+        tp = live - stop_dist * FIXED_RR
+        side = "sell"
 
     tg(
-        f"🟠 BNF DAYTRADE READY\n"
-        f"{symbol} LONG\n"
-        f"{SIGNAL_BAR} close {fmt_price(snapshot['close'])} · MA{MA_PERIOD} {fmt_price(snapshot['ma25'])}\n"
-        f"Discount {snapshot['pct_below_ma']*100:.2f}% · nodig {snapshot['drop_threshold']*100:.2f}%\n"
-        f"5m rebound bevestigd · close-loc {snapshot['trigger_close_location']*100:.0f}%\n"
-        f"Live ~{fmt_price(live)} · SL {fmt_price(stop)} · TP {fmt_price(fixed_tp)} ({FIXED_TP_R:.2f}R)\n"
-        f"Risk budget ${sizing['risk_budget']:.2f} · notional ${sizing['notional']:.2f} · "
-        f"margin ~${sizing['margin']:.2f}"
+        f"🟠 JJ AGGRESSIVE READY\n"
+        f"{symbol} {direction.upper()} · {snapshot['phase'].upper()}\n"
+        f"Fair Value: {fmt_price(snapshot['fair_value'])}\n"
+        f"Entry ~{fmt_price(live)} | SL {fmt_price(stop)} | "
+        f"TP {fmt_price(tp)} ({FIXED_RR}R)\n"
+        f"Displacement: {snapshot.get('body_multiple', 0):.2f}x median body\n"
+        f"Minuten open: {snapshot['minutes_since_open']:.1f}"
     )
 
     record = {
         "entry_ts": now_ms(),
         "entry_price": live,
-        "entry_candle_ts": snapshot["candle_ts"],
-        "trigger_ts": snapshot["trigger_ts"],
+        "direction": direction,
+        "stop": stop,
+        "tp": tp,
+        "phase": snapshot["phase"],
+        "fair_value": snapshot["fair_value"],
         "contracts": sizing["contracts"],
-        "initial_stop": stop,
-        "risk_price": max(live - stop, 1e-12),
-        "fixed_tp": fixed_tp,
-        "highest_price": live,
+        "risk_usdt": sizing["risk_usdt"],
+        "notional": sizing["notional"],
+        "signal_ts": snapshot["ts"],
+        "body_multiple": snapshot.get("body_multiple", 0),
         "paper": PAPER_TRADING,
     }
 
     if PAPER_TRADING:
         with state_lock:
             state["managed"][symbol] = record
-            state["last_entry_candle"][symbol] = snapshot["candle_ts"]
         save_state()
-        tg(f"🟢 PAPER BNF DAYTRADE OPEN\n{symbol} LONG @ ~{fmt_price(live)}")
+        tg(
+            f"🟢 PAPER OPEN {symbol} {direction.upper()} "
+            f"@ {fmt_price(live)}"
+        )
         return True
 
     set_leverage(symbol)
 
-    # Hard SL is exchange-side. Profit exits are actively managed every ~75 sec.
     body = {
         "instId": symbol,
         "marginMode": MARGIN_MODE,
         "positionSide": "net",
-        "side": "buy",
+        "side": side,
         "orderType": "market",
         "size": decimal_str(sizing["contracts"]),
         "reduceOnly": "false",
-        "clientOrderId": f"bnfd{int(time.time())}{symbol.split('-')[0]}"[:32],
+        "clientOrderId": (
+            f"jja{int(time.time())}{symbol.split('-')[0]}"
+        )[:32],
         "slTriggerPrice": decimal_str(stop),
         "slOrderPrice": "-1",
         "slTriggerPriceType": "mark",
     }
 
-    resp = private_post("/api/v1/trade/order", body)
-    data = resp.get("data", [])
-    order_id = data[0].get("orderId", "") if data else ""
-
-    pos = None
-    for _ in range(10):
-        time.sleep(1)
-        pos = get_position(symbol)
-        if pos and pos.get("_is_long"):
-            break
-
-    actual_entry = fnum(pos.get("averagePrice")) if pos else live
-    # Recalculate management levels from actual fill.
-    record["entry_price"] = actual_entry
-    record["initial_stop"] = actual_entry * (1.0 - STOP_LOSS_PCT)
-    record["risk_price"] = actual_entry - record["initial_stop"]
-    record["fixed_tp"] = actual_entry + record["risk_price"] * FIXED_TP_R
-    record["highest_price"] = actual_entry
-    record["paper"] = False
-    record["order_id"] = order_id
+    private_post("/api/v1/trade/order", body)
 
     with state_lock:
         state["managed"][symbol] = record
-        state["last_entry_candle"][symbol] = snapshot["candle_ts"]
     save_state()
 
     tg(
-        f"🟢 BNF DAYTRADE ORDER ACCEPTED\n"
-        f"{symbol} LONG · entry ~{fmt_price(actual_entry)}\n"
-        f"Hard SL ~{fmt_price(record['initial_stop'])} · fixed TP ~{fmt_price(record['fixed_tp'])}\n"
-        f"Trailing active vanaf +{TRAIL_ACTIVATE_R:.2f}R · max hold {HOLD_MAX_HOURS:g}h"
+        f"🟢 LIVE OPEN {symbol} {direction.upper()} "
+        f"@ ~{fmt_price(live)}"
     )
     return True
 
+def manage_position(symbol):
+    """
+    BELANGRIJK:
+    Deze functie wordt voortaan altijd aangeroepen, óók buiten de 100-min
+    entry-sessie. Daardoor blijven TP / fair-value exits actief.
+    De exchange-side hard SL blijft daarnaast de noodbeveiliging.
+    """
+    managed = state.get("managed", {}).get(symbol)
+    if not managed:
+        return
 
-def close_live_position(symbol, reason):
+    live = last_price(symbol)
+    direction = managed["direction"]
+    entry = managed["entry_price"]
+    stop = managed["stop"]
+    tp = managed["tp"]
+    fair = managed.get("fair_value", 0)
+
+    hit_stop = (
+        (direction == "long" and live <= stop)
+        or (direction == "short" and live >= stop)
+    )
+    hit_tp = (
+        (direction == "long" and live >= tp)
+        or (direction == "short" and live <= tp)
+    )
+
+    reached_fair = False
+    if managed["phase"] == "reversion" and fair > 0:
+        if direction == "long" and live >= fair * 0.997:
+            reached_fair = True
+        elif direction == "short" and live <= fair * 1.003:
+            reached_fair = True
+
+    if not (hit_stop or hit_tp or reached_fair):
+        return
+
+    reason = (
+        "STOP"
+        if hit_stop
+        else ("TP" if hit_tp else "FAIR VALUE")
+    )
+
+    if PAPER_TRADING:
+        pnl_pct = (
+            ((live - entry) / entry * 100)
+            if direction == "long"
+            else ((entry - live) / entry * 100)
+        )
+
+        # Indicatieve bruto PnL op opgeslagen notional.
+        pnl_usdt = (
+            managed.get("notional", 0.0)
+            * (pnl_pct / 100.0)
+        )
+
+        tg(
+            f"{'🟢' if pnl_pct >= 0 else '🔴'} "
+            f"PAPER CLOSE {symbol} · {reason}\n"
+            f"{pnl_pct:+.2f}% · ~{pnl_usdt:+.3f} USDT bruto"
+        )
+
+        with state_lock:
+            state["managed"].pop(symbol, None)
+            state["last_exit_ts"][symbol] = now_ms()
+        save_state()
+        return
+
     pos = get_position(symbol)
-    if not pos:
-        return False
+    if pos:
+        body = {
+            "instId": symbol,
+            "marginMode": MARGIN_MODE,
+            "positionSide": "net",
+            "clientOrderId": f"jjax{int(time.time())}"[:32],
+        }
+        private_post("/api/v1/trade/close-position", body)
+        tg(f"📤 LIVE CLOSE {symbol} · {reason}")
 
-    body = {
-        "instId": symbol,
-        "marginMode": str(pos.get("marginMode") or MARGIN_MODE),
-        "positionSide": str(pos.get("positionSide") or "net"),
-        "clientOrderId": f"bnfx{int(time.time())}{symbol.split('-')[0]}"[:32],
-    }
-    pid = str(pos.get("positionId") or "")
-    if pid:
-        body["positionId"] = pid
-
-    private_post("/api/v1/trade/close-position", body)
-    tg(f"📤 BNF EXIT SENT\n{symbol} · {reason}")
-    return True
-
-
-def _finish_local_position(symbol):
     with state_lock:
         state["managed"].pop(symbol, None)
         state["last_exit_ts"][symbol] = now_ms()
     save_state()
 
-
-def manage_open_position(symbol, snapshot):
-    """
-    Intraday exit manager.
-
-    Exchange always owns the emergency hard stop. This loop manages:
-    - fast fixed R target,
-    - return toward MA25,
-    - trailing profit after +0.75R,
-    - six-hour time stop.
-    """
-    managed = state.get("managed", {}).get(symbol, {})
-    paper = bool(managed.get("paper", False))
-
-    entry = fnum(managed.get("entry_price"))
-    risk = fnum(managed.get("risk_price"))
-    if entry <= 0 or risk <= 0:
-        return False
-
-    live = last_price(symbol)
-    high = max(fnum(managed.get("highest_price"), entry), live)
-    managed["highest_price"] = high
-    state["managed"][symbol] = managed
-    save_state()
-
-    r_now = (live - entry) / risk
-    high_r = (high - entry) / risk
-    age_hours = (now_ms() - int(managed.get("entry_ts", now_ms()))) / 3_600_000
-
-    mean_exit = bool(
-        snapshot
-        and live >= fnum(snapshot.get("ma25")) * MEAN_REVERSION_MA_FACTOR
-    )
-    fixed_tp = r_now >= FIXED_TP_R
-    max_hold = age_hours >= HOLD_MAX_HOURS
-
-    trail_level = None
-    trail_hit = False
-    if high_r >= TRAIL_ACTIVATE_R:
-        trail_level = high - TRAIL_DISTANCE_R * risk
-        # Never let the profit trail sit below entry once activated.
-        trail_level = max(trail_level, entry)
-        trail_hit = live <= trail_level
-
-    reason = None
-    if fixed_tp:
-        reason = f"FIXED TP {FIXED_TP_R:.2f}R"
-    elif mean_exit:
-        reason = f"MEAN REVERSION → MA{MA_PERIOD}"
-    elif trail_hit:
-        reason = f"TRAIL EXIT · high {high_r:.2f}R"
-    elif max_hold:
-        reason = f"MAX HOLD {HOLD_MAX_HOURS:g}h"
-
-    if paper:
-        # Also emulate the hard stop in paper mode.
-        if live <= entry * (1.0 - STOP_LOSS_PCT):
-            reason = "HARD STOP"
-
-        if reason:
-            pnl_pct = (live - entry) / entry * 100
-            tg(
-                f"{'🟢' if pnl_pct >= 0 else '🔴'} PAPER BNF DAYTRADE CLOSED\n"
-                f"{symbol} · {reason}\n"
-                f"{fmt_price(entry)} → {fmt_price(live)} · {pnl_pct:+.2f}% · {r_now:+.2f}R"
-            )
-            _finish_local_position(symbol)
-            return True
-        return False
-
-    pos = get_position(symbol)
-    if not pos:
-        # Most likely exchange-side hard SL.
-        tg(f"ℹ️ BNF DAYTRADE {symbol} positie is gesloten op BloFin; state opgeschoond.")
-        _finish_local_position(symbol)
-        return True
-
-    if reason:
-        ok = close_live_position(symbol, reason)
-        if ok:
-            # Do not immediately re-enter while the exchange is processing close.
-            with state_lock:
-                state["last_exit_ts"][symbol] = now_ms()
-            save_state()
-        return ok
-
-    return False
-
-
 # ============================================================
-# SCAN / REPORT
+# MAIN LOOP
 # ============================================================
+
+def ensure_fair_values(session_open, symbols):
+    """
+    Leg fair value vast vanaf de echte 1m session-open candle.
+    Geen fallback naar last_price: liever geen entry dan een verkeerde fair value.
+    """
+    session_id = session_open.strftime("%Y%m%d_%H%M")
+    changed = False
+
+    for symbol in symbols:
+        key = f"{symbol}_{session_id}"
+        if key in state.get("fair_values", {}):
+            continue
+
+        try:
+            price = session_open_price(symbol, session_open)
+            if price is None or price <= 0:
+                print(
+                    f"Fair value nog niet gevonden voor {symbol} "
+                    f"op {session_open.isoformat()}",
+                    flush=True,
+                )
+                continue
+
+            state.setdefault("fair_values", {})[key] = {
+                "price": price,
+                "ts": int(session_open.timestamp() * 1000),
+                "source": "1m_session_open_candle",
+            }
+            changed = True
+
+        except Exception as e:
+            print(f"Fair value error {symbol}: {e}", flush=True)
+
+        time.sleep(0.03)
+
+    if changed:
+        save_state()
 
 def scan_once():
-    global last_status_ts
-
     symbols = valid_symbols()
-    if not symbols:
-        raise RuntimeError("Geen geconfigureerde symbolen beschikbaar op BloFin.")
 
-    # Build snapshots once.
-    snapshots = {}
-    errors = 0
-    for symbol in symbols:
-        try:
-            snapshots[symbol] = strategy_snapshot(symbol)
-        except Exception as e:
-            errors += 1
-            print(f"{symbol} data error: {e}", flush=True)
-        time.sleep(0.08)
-
-    if PAPER_TRADING:
-        open_symbols = list(state.get("managed", {}).keys())
-        live_positions = []
-    else:
-        live_positions = positions()
-        open_symbols = [p.get("instId") for p in live_positions]
-
-        # If our state says we manage something that has disappeared, clean it.
-        for symbol in list(state.get("managed", {}).keys()):
-            if symbol not in open_symbols:
-                tg(f"ℹ️ BNF {symbol}: geen open positie meer; state opgeschoond.")
-                with state_lock:
-                    state["managed"].pop(symbol, None)
-                save_state()
-
-    # Manage only positions opened by this bot/state.
+    # ========================================================
+    # FIX 1: POSITIES ALTIJD BEHEREN
+    # Dit gebeurt vóór de session-window check.
+    # ========================================================
     for symbol in list(state.get("managed", {}).keys()):
         try:
-            manage_open_position(symbol, snapshots.get(symbol))
+            manage_position(symbol)
         except Exception as e:
-            tg(f"⚠️ BNF MANAGE ERROR {symbol}\n{type(e).__name__}: {e}")
+            tg(f"⚠️ Manage error {symbol}: {e}")
 
-    # Refresh after possible exits.
-    if PAPER_TRADING:
-        active_count = len(state.get("managed", {}))
-        occupied = set(state.get("managed", {}).keys())
-    else:
-        live_positions = positions()
-        active_count = len(live_positions)
-        occupied = {p.get("instId") for p in live_positions}
+    # Alleen NIEUWE ENTRIES zijn beperkt tot de JJ sessie.
+    session_open = get_current_session_open()
+    if not is_in_session_window(session_open):
+        return
 
-    free_slots = max(0, MAX_ACTIVE_POSITIONS - active_count)
+    # ========================================================
+    # FIX 2: ECHTE SESSION-OPEN FAIR VALUE
+    # ========================================================
+    ensure_fair_values(session_open, symbols)
 
-    candidates = rank_entries([
-        s for sym, s in snapshots.items()
-        if sym not in occupied
-        and s
-        and state.get("last_entry_candle", {}).get(sym) != s["candle_ts"]
-        and (now_ms() - int(state.get("last_exit_ts", {}).get(sym, 0) or 0) >= REENTRY_COOLDOWN_MIN * 60_000)
-    ])
+    active = len(state.get("managed", {}))
+    free_slots = max(0, MAX_ACTIVE_POSITIONS - active)
+    if free_slots <= 0:
+        return
+
+    session_id = session_open.strftime("%Y%m%d_%H%M")
+    candidates = []
+
+    for symbol in symbols:
+        if symbol in state.get("managed", {}):
+            continue
+
+        key = f"{symbol}_{session_id}"
+        fv_data = state.get("fair_values", {}).get(key)
+        if not fv_data:
+            continue
+
+        try:
+            snap = strategy_snapshot(
+                symbol,
+                session_open,
+                fv_data["price"],
+            )
+            if snap:
+                candidates.append(snap)
+        except Exception as e:
+            print(f"Signal error {symbol}: {e}", flush=True)
+
+        time.sleep(0.04)
+
+    # Meest recente bevestigde signalen eerst.
+    candidates.sort(key=lambda x: x["ts"], reverse=True)
 
     opened = 0
     for snap in candidates:
         if opened >= free_slots:
             break
         try:
-            if open_long(snap):
+            if open_position(snap):
                 opened += 1
         except Exception as e:
-            tg(
-                f"❌ BNF ENTRY ERROR {snap['symbol']}\n"
-                f"{type(e).__name__}: {e}"
-            )
-
-    if time.time() - last_status_ts >= STATUS_HOURS * 3600:
-        last_status_ts = time.time()
-        top = sorted(
-            [s for s in snapshots.values() if s],
-            key=lambda x: x["pct_below_ma"],
-            reverse=True,
-        )[:6]
-
-        lines = [
-            f"📊 {BOT_NAME} v{VERSION}",
-            f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'} · setup {SIGNAL_BAR}/MA{MA_PERIOD} · trigger {TRIGGER_BAR}",
-            f"Adaptive dip {DROP_MIN*100:.1f}–{DROP_MAX*100:.1f}% · SL {STOP_LOSS_PCT*100:.1f}% · "
-            f"TP {FIXED_TP_R:.2f}R · trail +{TRAIL_ACTIVATE_R:.2f}R · max {HOLD_MAX_HOURS:g}h",
-            f"Scanned {len(snapshots)}/{len(symbols)} · errors {errors} · "
-            f"active {active_count}/{MAX_ACTIVE_POSITIONS}",
-            f"Entry candidates nu: {len(candidates)}",
-            "Diepste dips:",
-        ]
-        for s in top:
-            lines.append(
-                f"{s['symbol'].split('-')[0]} "
-                f"{s['pct_below_ma']*100:.1f}% onder MA{MA_PERIOD} · trigger {s['drop_threshold']*100:.1f}%"
-                + (" 🔥 READY" if s["entry_signal"] else (" · rebound" if s["rebound"] else ""))
-            )
-        tg("\n".join(lines))
-
-
-# ============================================================
-# STARTUP / HEALTH
-# ============================================================
+            tg(f"❌ Entry error {snap['symbol']}: {e}")
 
 def startup():
     load_state()
     load_instruments()
-
-    if not PAPER_TRADING:
-        startup_account_checks()
-        equity, available = account()
-    else:
-        equity = available = 0.0
-
     symbols = valid_symbols()
 
     tg(
-        f"🧠 {BOT_NAME} STARTED\n"
-        f"v{VERSION} · {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
-        f"BNF core: BUY THE DIP → SELL THE MEAN REVERSION\n"
-        f"Setup {SIGNAL_BAR}: MA{MA_PERIOD} · adaptive dip {DROP_MIN*100:.1f}–{DROP_MAX*100:.1f}%\n"
-        f"Trigger {TRIGGER_BAR}: green rebound + higher close\n"
-        f"Hard SL {STOP_LOSS_PCT*100:.1f}% · equity risk {RISK_PER_TRADE*100:.1f}%\n"
-        f"Profit: MA{MA_PERIOD} return / {FIXED_TP_R:.2f}R / trailing vanaf +{TRAIL_ACTIVATE_R:.2f}R\n"
-        f"Max hold {HOLD_MAX_HOURS:g}h · scan iedere {SCAN_SECONDS}s · cooldown {REENTRY_COOLDOWN_MIN}m\n"
-        f"Leverage {LEVERAGE}x · {MARGIN_MODE} · max posities {MAX_ACTIVE_POSITIONS}\n"
-        f"Max gepland gelijktijdig stop-risico ~{MAX_ACTIVE_POSITIONS * RISK_PER_TRADE * 100:.1f}% equity\n"
-        f"Scant {len(symbols)} BloFin USDT perpetuals"
-        + (
-            f"\nEquity ${equity:.2f} · Available ${available:.2f}"
-            if not PAPER_TRADING else
-            "\nPAPER_TRADING=True — geen echte orders."
-        )
+        f"🧠 {BOT_NAME} v{VERSION} STARTED\n"
+        f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
+        f"Fair Pricing Aggressive\n"
+        f"Continuation: {CONTINUATION_MINUTES} min | "
+        f"Sessie: {SESSION_LENGTH_MINUTES} min\n"
+        f"Risk {RISK_PER_TRADE*100:.1f}% | RR {FIXED_RR} | "
+        f"ATR stops: {USE_ATR_STOPS}\n"
+        f"Displacement >= {DISPLACEMENT_BODY_MULT:.2f}x "
+        f"median body ({DISPLACEMENT_LOOKBACK} candles) + "
+        f"BOS({BOS_LOOKBACK})\n"
+        f"Max posities: {MAX_ACTIVE_POSITIONS} | "
+        f"Leverage: {LEVERAGE}x | Scan: {SCAN_SECONDS}s\n"
+        f"Fair value: echte 1m session-open candle\n"
+        f"Position management: 24/7\n"
+        f"Symbolen: {len(symbols)}"
     )
-
-
-def health_server():
-    if Flask is None:
-        return
-    app = Flask(__name__)
-
-    @app.route("/")
-    def health():
-        return f"{BOT_NAME} v{VERSION} is running!", 200
-
-    port = int(os.getenv("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port, use_reloader=False)
-
 
 def main():
     if Flask is not None:
-        threading.Thread(target=health_server, daemon=True).start()
+        def run_health():
+            app = Flask(__name__)
+
+            @app.route("/")
+            def home():
+                return f"{BOT_NAME} v{VERSION} is running", 200
+
+            app.run(
+                host="0.0.0.0",
+                port=int(os.getenv("PORT", 8080)),
+                use_reloader=False,
+            )
+
+        threading.Thread(
+            target=run_health,
+            daemon=True,
+        ).start()
 
     startup()
 
@@ -974,12 +924,12 @@ def main():
         try:
             scan_once()
         except KeyboardInterrupt:
-            tg(f"🛑 {BOT_NAME} stopped.")
-            raise
+            tg(f"🛑 {BOT_NAME} gestopt")
+            break
         except Exception as e:
-            tg(f"⚠️ BNF LOOP ERROR\n{type(e).__name__}: {e}")
-        time.sleep(SCAN_SECONDS)
+            tg(f"⚠️ Loop error: {e}")
 
+        time.sleep(SCAN_SECONDS)
 
 if __name__ == "__main__":
     main()
