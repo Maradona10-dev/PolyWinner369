@@ -11,12 +11,12 @@ Aggressieve instellingen behouden:
 - Max 4 posities
 - Scan elke 15 sec
 - 2 min re-entry cooldown
-- 12 min continuation / 100 min sessie
+- 24/7 doorhandelend in 100-min fair-pricing cycles\n- Per cycle: 12 min continuation, daarna reversion
 - 1m signalen
 
 Gerichte verbeteringen:
 1) Open posities worden ALTIJD beheerd, ook buiten de entry-sessie.
-2) Fair Value komt van de echte 1m session-open candle, nooit van "last price" bij restart.
+2) Fair Value komt van de echte 1m cycle-open candle, nooit van "last price" bij restart.
 3) Displacement wordt gemeten tegen de mediane body van recente candles + BOS.
 """
 
@@ -44,7 +44,7 @@ except Exception:
 # CONFIG - AGGRESSIEVE VERSIE
 # ============================================================
 
-VERSION = "1.3-Aggressive-59"
+VERSION = "1.3-Continuous-Aggressive"
 BOT_NAME = "JJ Fair Pricing Aggressive"
 
 API_KEY = os.getenv("EXCHANGE_API_KEY", "").strip()
@@ -68,7 +68,7 @@ BASE_URL = (
 # ----- Agressieve strategie parameters -----
 SIGNAL_BAR = os.getenv("JJ_SIGNAL_BAR", "1m")
 CONTINUATION_MINUTES = int(os.getenv("JJ_CONTINUATION_MINUTES", "12"))
-SESSION_LENGTH_MINUTES = int(os.getenv("JJ_SESSION_LENGTH_MINUTES", "100"))
+SESSION_LENGTH_MINUTES = int(os.getenv("JJ_SESSION_LENGTH_MINUTES", "100"))  # legacy; geen entry-stop meer
 
 # Verbeterde displacement:
 # huidige candle-body moet >= 1.25x de mediane body van de vorige 12 candles zijn.
@@ -89,26 +89,20 @@ MAX_ACTIVE_POSITIONS = int(os.getenv("JJ_MAX_ACTIVE_POSITIONS", "4"))
 SCAN_SECONDS = int(os.getenv("JJ_SCAN_SECONDS", "15"))
 REENTRY_COOLDOWN_MIN = int(os.getenv("JJ_REENTRY_COOLDOWN_MIN", "2"))
 
-# Sessie-opens (UTC)
-SESSION_OPENS_UTC = [
-    {"hour": 13, "minute": 30},   # New York open
-]
+# 24/7 FAIR-PRICING CYCLES
+# Elke 100 minuten start direct een nieuwe cycle met een nieuwe fair value.
+# Eerste 12 minuten = continuation; daarna = reversion.
+CYCLE_LENGTH_MINUTES = int(os.getenv("JJ_CYCLE_LENGTH_MINUTES", "100"))
+CYCLE_ANCHOR_UTC = datetime(2026, 1, 1, 13, 30, tzinfo=timezone.utc)
 
-STATE_FILE = "jj_fair_pricing_aggressive_v12_state.json"
+STATE_FILE = "jj_fair_pricing_aggressive_v13_continuous_state.json"
 
 DEFAULT_SYMBOLS = [
     "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT",
     "DOGE-USDT", "ADA-USDT", "AVAX-USDT", "LINK-USDT", "DOT-USDT",
     "SUI-USDT", "NEAR-USDT", "APT-USDT", "ARB-USDT", "OP-USDT",
     "INJ-USDT", "TIA-USDT", "FET-USDT", "RENDER-USDT", "WIF-USDT",
-    "PEPE-USDT", "WLD-USDT", "JUP-USDT", "ORDI-USDT", "TRX-USDT",
-    "LTC-USDT", "BCH-USDT", "ATOM-USDT", "HBAR-USDT", "FIL-USDT",
-    "STX-USDT", "IMX-USDT", "POL-USDT", "UNI-USDT", "AAVE-USDT",
-    "LDO-USDT", "ONDO-USDT", "ENA-USDT", "CRV-USDT", "RUNE-USDT",
-    "TAO-USDT", "BONK-USDT", "FLOKI-USDT", "SHIB-USDT", "GALA-USDT",
-    "ETC-USDT", "XLM-USDT", "ALGO-USDT", "SAND-USDT", "APE-USDT",
-    "SEI-USDT", "MKR-USDT", "STRK-USDT", "TON-USDT", "KAITO-USDT",
-    "PENDLE-USDT", "W-USDT", "DYDX-USDT", "ZRO-USDT",
+    "PEPE-USDT", "WLD-USDT", "JUP-USDT", "ORDI-USDT"
 ]
 
 _env_symbols = os.getenv("JJ_SYMBOLS", "").strip()
@@ -324,14 +318,14 @@ def candles(symbol, bar, limit=50, confirmed_only=True):
 def session_open_price(symbol, session_open):
     """
     Haalt de ECHTE open-prijs van de 1m candle waarvan ts exact gelijk is
-    aan de ingestelde sessie-open.
+    aan de start van de huidige fair-pricing cycle.
 
     Belangrijk: bij een Railway restart om bv. 14:05 UTC blijft de fair value
     dus de 13:30 candle-open en wordt NIET de actuele tickerprijs gebruikt.
     """
     target_ts = int(session_open.timestamp() * 1000)
 
-    # Sessie duurt 100 min; 180 recente 1m candles geeft ruime marge.
+    # Cycle duurt standaard 100 min; 180 recente 1m candles geeft ruime marge.
     rows = candles(symbol, "1m", limit=180, confirmed_only=False)
 
     for row in rows:
@@ -394,23 +388,16 @@ def set_leverage(symbol):
 # ============================================================
 
 def get_current_session_open():
+    """Start van de huidige 24/7 fair-pricing cycle."""
     now = now_utc()
-    candidates = []
-    for s in SESSION_OPENS_UTC:
-        open_time = now.replace(
-            hour=s["hour"],
-            minute=s["minute"],
-            second=0,
-            microsecond=0,
-        )
-        if open_time > now:
-            open_time -= timedelta(days=1)
-        candidates.append(open_time)
-    return max(candidates)
+    cycle_seconds = max(60, CYCLE_LENGTH_MINUTES * 60)
+    elapsed = (now - CYCLE_ANCHOR_UTC).total_seconds()
+    cycles = int(elapsed // cycle_seconds)
+    return CYCLE_ANCHOR_UTC + timedelta(seconds=cycles * cycle_seconds)
 
 def is_in_session_window(session_open):
     minutes_since = (now_utc() - session_open).total_seconds() / 60
-    return 0 <= minutes_since <= SESSION_LENGTH_MINUTES
+    return 0 <= minutes_since < CYCLE_LENGTH_MINUTES
 
 def get_phase(session_open):
     minutes_since = (now_utc() - session_open).total_seconds() / 60
@@ -780,7 +767,7 @@ def manage_position(symbol):
 
 def ensure_fair_values(session_open, symbols):
     """
-    Leg fair value vast vanaf de echte 1m session-open candle.
+    Leg fair value vast vanaf de echte 1m cycle-open candle.
     Geen fallback naar last_price: liever geen entry dan een verkeerde fair value.
     """
     session_id = session_open.strftime("%Y%m%d_%H%M")
@@ -804,7 +791,7 @@ def ensure_fair_values(session_open, symbols):
             state.setdefault("fair_values", {})[key] = {
                 "price": price,
                 "ts": int(session_open.timestamp() * 1000),
-                "source": "1m_session_open_candle",
+                "source": "1m_cycle_open_candle",
             }
             changed = True
 
@@ -829,13 +816,11 @@ def scan_once():
         except Exception as e:
             tg(f"⚠️ Manage error {symbol}: {e}")
 
-    # Alleen NIEUWE ENTRIES zijn beperkt tot de JJ sessie.
+    # 24/7: zodra een 100-min cycle eindigt, begint direct de volgende.
     session_open = get_current_session_open()
-    if not is_in_session_window(session_open):
-        return
 
     # ========================================================
-    # FIX 2: ECHTE SESSION-OPEN FAIR VALUE
+    # ECHTE CYCLE-OPEN FAIR VALUE
     # ========================================================
     ensure_fair_values(session_open, symbols)
 
@@ -891,8 +876,8 @@ def startup():
         f"🧠 {BOT_NAME} v{VERSION} STARTED\n"
         f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
         f"Fair Pricing Aggressive\n"
-        f"Continuation: {CONTINUATION_MINUTES} min | "
-        f"Sessie: {SESSION_LENGTH_MINUTES} min\n"
+        f"24/7 cycles: {CYCLE_LENGTH_MINUTES} min | "
+        f"Continuation eerste {CONTINUATION_MINUTES} min | daarna reversion\n"
         f"Risk {RISK_PER_TRADE*100:.1f}% | RR {FIXED_RR} | "
         f"ATR stops: {USE_ATR_STOPS}\n"
         f"Displacement >= {DISPLACEMENT_BODY_MULT:.2f}x "
@@ -900,7 +885,8 @@ def startup():
         f"BOS({BOS_LOOKBACK})\n"
         f"Max posities: {MAX_ACTIVE_POSITIONS} | "
         f"Leverage: {LEVERAGE}x | Scan: {SCAN_SECONDS}s\n"
-        f"Fair value: echte 1m session-open candle\n"
+        f"Fair value: nieuwe echte 1m cycle-open elke {CYCLE_LENGTH_MINUTES} min\n"
+        f"Nieuwe entries: 24/7 · geen dagelijkse wachttijd\n"
         f"Position management: 24/7\n"
         f"Symbolen: {len(symbols)}"
     )
