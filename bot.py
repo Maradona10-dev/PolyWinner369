@@ -44,7 +44,7 @@ except Exception:
 # CONFIG - AGGRESSIEVE VERSIE
 # ============================================================
 
-VERSION = "1.2-Aggressive"
+VERSION = "1.3-Aggressive-59"
 BOT_NAME = "JJ Fair Pricing Aggressive"
 
 API_KEY = os.getenv("EXCHANGE_API_KEY", "").strip()
@@ -101,7 +101,14 @@ DEFAULT_SYMBOLS = [
     "DOGE-USDT", "ADA-USDT", "AVAX-USDT", "LINK-USDT", "DOT-USDT",
     "SUI-USDT", "NEAR-USDT", "APT-USDT", "ARB-USDT", "OP-USDT",
     "INJ-USDT", "TIA-USDT", "FET-USDT", "RENDER-USDT", "WIF-USDT",
-    "PEPE-USDT", "WLD-USDT", "JUP-USDT", "ORDI-USDT"
+    "PEPE-USDT", "WLD-USDT", "JUP-USDT", "ORDI-USDT", "TRX-USDT",
+    "LTC-USDT", "BCH-USDT", "ATOM-USDT", "HBAR-USDT", "FIL-USDT",
+    "STX-USDT", "IMX-USDT", "POL-USDT", "UNI-USDT", "AAVE-USDT",
+    "LDO-USDT", "ONDO-USDT", "ENA-USDT", "CRV-USDT", "RUNE-USDT",
+    "TAO-USDT", "BONK-USDT", "FLOKI-USDT", "SHIB-USDT", "GALA-USDT",
+    "ETC-USDT", "XLM-USDT", "ALGO-USDT", "SAND-USDT", "APE-USDT",
+    "SEI-USDT", "MKR-USDT", "STRK-USDT", "TON-USDT", "KAITO-USDT",
+    "PENDLE-USDT", "W-USDT", "DYDX-USDT", "ZRO-USDT",
 ]
 
 _env_symbols = os.getenv("JJ_SYMBOLS", "").strip()
