@@ -11,12 +11,12 @@ Aggressieve instellingen behouden:
 - Max 4 posities
 - Scan elke 15 sec
 - 2 min re-entry cooldown
-- 24/7 doorhandelend in 100-min fair-pricing cycles\n- Per cycle: 12 min continuation, daarna reversion
+- 12 min continuation / 100 min sessie
 - 1m signalen
 
 Gerichte verbeteringen:
 1) Open posities worden ALTIJD beheerd, ook buiten de entry-sessie.
-2) Fair Value komt van de echte 1m cycle-open candle, nooit van "last price" bij restart.
+2) Fair Value komt van de echte 1m session-open candle, nooit van "last price" bij restart.
 3) Displacement wordt gemeten tegen de mediane body van recente candles + BOS.
 """
 
@@ -44,7 +44,7 @@ except Exception:
 # CONFIG - AGGRESSIEVE VERSIE
 # ============================================================
 
-VERSION = "1.3-Continuous-Aggressive"
+VERSION = "1.3-Aggressive-EdgeFix"
 BOT_NAME = "JJ Fair Pricing Aggressive"
 
 API_KEY = os.getenv("EXCHANGE_API_KEY", "").strip()
@@ -68,7 +68,7 @@ BASE_URL = (
 # ----- Agressieve strategie parameters -----
 SIGNAL_BAR = os.getenv("JJ_SIGNAL_BAR", "1m")
 CONTINUATION_MINUTES = int(os.getenv("JJ_CONTINUATION_MINUTES", "12"))
-SESSION_LENGTH_MINUTES = int(os.getenv("JJ_SESSION_LENGTH_MINUTES", "100"))  # legacy; geen entry-stop meer
+SESSION_LENGTH_MINUTES = int(os.getenv("JJ_SESSION_LENGTH_MINUTES", "100"))
 
 # Verbeterde displacement:
 # huidige candle-body moet >= 1.25x de mediane body van de vorige 12 candles zijn.
@@ -83,19 +83,38 @@ USE_ATR_STOPS = os.getenv("JJ_USE_ATR_STOPS", "True").lower() == "true"
 ATR_PERIOD = int(os.getenv("JJ_ATR_PERIOD", "14"))
 ATR_SL_MULT = float(os.getenv("JJ_ATR_SL_MULT", "1.1"))
 
+# EDGE FIX v1.3:
+# 1m ATR kan extreem klein worden. Dan wordt een normale tik + taker fees
+# al een stop. We houden ATR, maar leggen een agressieve minimumvloer.
+MIN_STOP_PCT = float(os.getenv("JJ_MIN_STOP_PCT", "0.0035"))  # 0.35%
+
+# Market entry + market exit zijn doorgaans taker fills.
+# Standaard rekenen we conservatief met 0.06% per kant = 0.12% round-trip.
+# Dit is instelbaar als jouw BloFin fee tier anders is.
+ROUND_TRIP_COST_PCT = float(os.getenv("JJ_ROUND_TRIP_COST_PCT", "0.0012"))
+
+# Reversion naar fair value moet genoeg ruimte hebben om niet voor centen
+# te handelen. Vereiste netto reward t.o.v. geplande netto stop-risk.
+MIN_REVERSION_NET_R = float(os.getenv("JJ_MIN_REVERSION_NET_R", "1.0"))
+
+# Fair-value exit pas vlak bij fair value; oude 0.30% marge nam te vroeg winst.
+FAIR_EXIT_TOLERANCE_PCT = float(os.getenv("JJ_FAIR_EXIT_TOLERANCE_PCT", "0.0005"))
+
+# Geen achter een al weggeschoten 1m signal candle aanjagen.
+MAX_ENTRY_CHASE_PCT = float(os.getenv("JJ_MAX_ENTRY_CHASE_PCT", "0.0025"))
+
 LEVERAGE = int(os.getenv("JJ_LEVERAGE", "12"))
 MARGIN_MODE = os.getenv("JJ_MARGIN_MODE", "isolated").strip().lower()
 MAX_ACTIVE_POSITIONS = int(os.getenv("JJ_MAX_ACTIVE_POSITIONS", "4"))
 SCAN_SECONDS = int(os.getenv("JJ_SCAN_SECONDS", "15"))
 REENTRY_COOLDOWN_MIN = int(os.getenv("JJ_REENTRY_COOLDOWN_MIN", "2"))
 
-# 24/7 FAIR-PRICING CYCLES
-# Elke 100 minuten start direct een nieuwe cycle met een nieuwe fair value.
-# Eerste 12 minuten = continuation; daarna = reversion.
-CYCLE_LENGTH_MINUTES = int(os.getenv("JJ_CYCLE_LENGTH_MINUTES", "100"))
-CYCLE_ANCHOR_UTC = datetime(2026, 1, 1, 13, 30, tzinfo=timezone.utc)
+# Sessie-opens (UTC)
+SESSION_OPENS_UTC = [
+    {"hour": 13, "minute": 30},   # New York open
+]
 
-STATE_FILE = "jj_fair_pricing_aggressive_v13_continuous_state.json"
+STATE_FILE = "jj_fair_pricing_aggressive_v12_state.json"
 
 DEFAULT_SYMBOLS = [
     "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT",
@@ -318,14 +337,14 @@ def candles(symbol, bar, limit=50, confirmed_only=True):
 def session_open_price(symbol, session_open):
     """
     Haalt de ECHTE open-prijs van de 1m candle waarvan ts exact gelijk is
-    aan de start van de huidige fair-pricing cycle.
+    aan de ingestelde sessie-open.
 
     Belangrijk: bij een Railway restart om bv. 14:05 UTC blijft de fair value
     dus de 13:30 candle-open en wordt NIET de actuele tickerprijs gebruikt.
     """
     target_ts = int(session_open.timestamp() * 1000)
 
-    # Cycle duurt standaard 100 min; 180 recente 1m candles geeft ruime marge.
+    # Sessie duurt 100 min; 180 recente 1m candles geeft ruime marge.
     rows = candles(symbol, "1m", limit=180, confirmed_only=False)
 
     for row in rows:
@@ -388,16 +407,23 @@ def set_leverage(symbol):
 # ============================================================
 
 def get_current_session_open():
-    """Start van de huidige 24/7 fair-pricing cycle."""
     now = now_utc()
-    cycle_seconds = max(60, CYCLE_LENGTH_MINUTES * 60)
-    elapsed = (now - CYCLE_ANCHOR_UTC).total_seconds()
-    cycles = int(elapsed // cycle_seconds)
-    return CYCLE_ANCHOR_UTC + timedelta(seconds=cycles * cycle_seconds)
+    candidates = []
+    for s in SESSION_OPENS_UTC:
+        open_time = now.replace(
+            hour=s["hour"],
+            minute=s["minute"],
+            second=0,
+            microsecond=0,
+        )
+        if open_time > now:
+            open_time -= timedelta(days=1)
+        candidates.append(open_time)
+    return max(candidates)
 
 def is_in_session_window(session_open):
     minutes_since = (now_utc() - session_open).total_seconds() / 60
-    return 0 <= minutes_since < CYCLE_LENGTH_MINUTES
+    return 0 <= minutes_since <= SESSION_LENGTH_MINUTES
 
 def get_phase(session_open):
     minutes_since = (now_utc() - session_open).total_seconds() / 60
@@ -530,7 +556,13 @@ def calculate_size(symbol, entry_price, equity, available, stop_distance):
         return None
 
     risk_amount = equity * RISK_PER_TRADE
-    notional = risk_amount / (stop_distance / entry_price)
+
+    # Fee-aware sizing: een stop kost niet alleen de prijsbeweging maar ook
+    # ongeveer de round-trip transactiekosten. Zo wordt een piepkleine stop
+    # niet stiekem méér account-risk dan bedoeld.
+    stop_pct = stop_distance / entry_price
+    effective_loss_pct = stop_pct + ROUND_TRIP_COST_PCT
+    notional = risk_amount / effective_loss_pct
 
     # Agressieve bestaande cap behouden.
     max_notional = available * 0.88 * LEVERAGE
@@ -565,7 +597,23 @@ def open_position(snapshot):
     ):
         return False
 
-    # Stop distance - agressieve bestaande instellingen behouden.
+    # Voorkom chase: het signaal is gebaseerd op een gesloten 1m candle.
+    # Als de prijs in onze richting al te ver is weggelopen, slaan we hem over.
+    signal_close = fnum(snapshot.get("close"))
+    if signal_close > 0:
+        if direction == "long":
+            chase_pct = max(0.0, (live - signal_close) / signal_close)
+        else:
+            chase_pct = max(0.0, (signal_close - live) / signal_close)
+        if chase_pct > MAX_ENTRY_CHASE_PCT:
+            print(
+                f"Skip chase {symbol}: {chase_pct*100:.2f}% > "
+                f"{MAX_ENTRY_CHASE_PCT*100:.2f}%",
+                flush=True,
+            )
+            return False
+
+    # ATR stop blijft agressief, maar krijgt een noise-floor.
     if USE_ATR_STOPS:
         rows = candles(
             symbol,
@@ -592,6 +640,42 @@ def open_position(snapshot):
     else:
         stop_dist = live * 0.007
 
+    # Cruciaal: geen 0.05%-0.20% micro-stops meer op 1m noise.
+    stop_dist = max(stop_dist, live * MIN_STOP_PCT)
+    stop_pct = stop_dist / live
+
+    # Fee-aware target: behoud 1.25R NA geschatte round-trip kosten.
+    # Voorbeeld bij 0.35% stop en 0.12% kosten:
+    # target move ~= 0.7075%, i.p.v. slechts 0.4375%.
+    target_move_pct = (
+        (stop_pct + ROUND_TRIP_COST_PCT) * FIXED_RR
+        + ROUND_TRIP_COST_PCT
+    )
+    target_dist = live * target_move_pct
+
+    # Reversion trade alleen als de fair-value beweging zelf genoeg netto edge
+    # biedt. Zo voorkomen we snelle FAIR VALUE exits van enkele centen.
+    if snapshot.get("phase") == "reversion":
+        fair = fnum(snapshot.get("fair_value"))
+        if fair <= 0:
+            return False
+        if direction == "long":
+            fair_move_pct = max(0.0, (fair - live) / live)
+        else:
+            fair_move_pct = max(0.0, (live - fair) / live)
+
+        net_reward_pct = max(0.0, fair_move_pct - ROUND_TRIP_COST_PCT)
+        net_loss_pct = stop_pct + ROUND_TRIP_COST_PCT
+        fair_net_r = net_reward_pct / net_loss_pct if net_loss_pct > 0 else 0.0
+
+        if fair_net_r < MIN_REVERSION_NET_R:
+            print(
+                f"Skip weak reversion {symbol}: fair edge {fair_net_r:.2f}R "
+                f"< {MIN_REVERSION_NET_R:.2f}R",
+                flush=True,
+            )
+            return False
+
     sizing = calculate_size(
         symbol,
         live,
@@ -604,11 +688,11 @@ def open_position(snapshot):
 
     if direction == "long":
         stop = live - stop_dist
-        tp = live + stop_dist * FIXED_RR
+        tp = live + target_dist
         side = "buy"
     else:
         stop = live + stop_dist
-        tp = live - stop_dist * FIXED_RR
+        tp = live - target_dist
         side = "sell"
 
     tg(
@@ -616,7 +700,9 @@ def open_position(snapshot):
         f"{symbol} {direction.upper()} · {snapshot['phase'].upper()}\n"
         f"Fair Value: {fmt_price(snapshot['fair_value'])}\n"
         f"Entry ~{fmt_price(live)} | SL {fmt_price(stop)} | "
-        f"TP {fmt_price(tp)} ({FIXED_RR}R)\n"
+        f"TP {fmt_price(tp)} (~{FIXED_RR}R netto na geschatte kosten)\n"
+        f"Stop afstand: {stop_pct*100:.3f}% | "
+        f"TP afstand: {target_move_pct*100:.3f}%\n"
         f"Displacement: {snapshot.get('body_multiple', 0):.2f}x median body\n"
         f"Minuten open: {snapshot['minutes_since_open']:.1f}"
     )
@@ -634,6 +720,9 @@ def open_position(snapshot):
         "notional": sizing["notional"],
         "signal_ts": snapshot["ts"],
         "body_multiple": snapshot.get("body_multiple", 0),
+        "stop_pct": stop_pct,
+        "target_move_pct": target_move_pct,
+        "estimated_round_trip_cost_pct": ROUND_TRIP_COST_PCT,
         "paper": PAPER_TRADING,
     }
 
@@ -706,9 +795,11 @@ def manage_position(symbol):
 
     reached_fair = False
     if managed["phase"] == "reversion" and fair > 0:
-        if direction == "long" and live >= fair * 0.997:
+        # Oude code sloot al 0.30% vóór fair value. Op kleine 1m trades
+        # betekende dat vaak: winst te vroeg afkappen. Nu slechts 0.05%.
+        if direction == "long" and live >= fair * (1 - FAIR_EXIT_TOLERANCE_PCT):
             reached_fair = True
-        elif direction == "short" and live <= fair * 1.003:
+        elif direction == "short" and live <= fair * (1 + FAIR_EXIT_TOLERANCE_PCT):
             reached_fair = True
 
     if not (hit_stop or hit_tp or reached_fair):
@@ -767,7 +858,7 @@ def manage_position(symbol):
 
 def ensure_fair_values(session_open, symbols):
     """
-    Leg fair value vast vanaf de echte 1m cycle-open candle.
+    Leg fair value vast vanaf de echte 1m session-open candle.
     Geen fallback naar last_price: liever geen entry dan een verkeerde fair value.
     """
     session_id = session_open.strftime("%Y%m%d_%H%M")
@@ -791,7 +882,7 @@ def ensure_fair_values(session_open, symbols):
             state.setdefault("fair_values", {})[key] = {
                 "price": price,
                 "ts": int(session_open.timestamp() * 1000),
-                "source": "1m_cycle_open_candle",
+                "source": "1m_session_open_candle",
             }
             changed = True
 
@@ -816,11 +907,13 @@ def scan_once():
         except Exception as e:
             tg(f"⚠️ Manage error {symbol}: {e}")
 
-    # 24/7: zodra een 100-min cycle eindigt, begint direct de volgende.
+    # Alleen NIEUWE ENTRIES zijn beperkt tot de JJ sessie.
     session_open = get_current_session_open()
+    if not is_in_session_window(session_open):
+        return
 
     # ========================================================
-    # ECHTE CYCLE-OPEN FAIR VALUE
+    # FIX 2: ECHTE SESSION-OPEN FAIR VALUE
     # ========================================================
     ensure_fair_values(session_open, symbols)
 
@@ -876,17 +969,20 @@ def startup():
         f"🧠 {BOT_NAME} v{VERSION} STARTED\n"
         f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
         f"Fair Pricing Aggressive\n"
-        f"24/7 cycles: {CYCLE_LENGTH_MINUTES} min | "
-        f"Continuation eerste {CONTINUATION_MINUTES} min | daarna reversion\n"
-        f"Risk {RISK_PER_TRADE*100:.1f}% | RR {FIXED_RR} | "
+        f"Continuation: {CONTINUATION_MINUTES} min | "
+        f"Sessie: {SESSION_LENGTH_MINUTES} min\n"
+        f"Risk {RISK_PER_TRADE*100:.1f}% | RR {FIXED_RR} netto-doel | "
         f"ATR stops: {USE_ATR_STOPS}\n"
+        f"Noise floor SL: {MIN_STOP_PCT*100:.2f}% | "
+        f"Kostenmodel: {ROUND_TRIP_COST_PCT*100:.2f}% round-trip\n"
+        f"Reversion min edge: {MIN_REVERSION_NET_R:.2f}R | "
+        f"Max chase: {MAX_ENTRY_CHASE_PCT*100:.2f}%\n"
         f"Displacement >= {DISPLACEMENT_BODY_MULT:.2f}x "
         f"median body ({DISPLACEMENT_LOOKBACK} candles) + "
         f"BOS({BOS_LOOKBACK})\n"
         f"Max posities: {MAX_ACTIVE_POSITIONS} | "
         f"Leverage: {LEVERAGE}x | Scan: {SCAN_SECONDS}s\n"
-        f"Fair value: nieuwe echte 1m cycle-open elke {CYCLE_LENGTH_MINUTES} min\n"
-        f"Nieuwe entries: 24/7 · geen dagelijkse wachttijd\n"
+        f"Fair value: echte 1m session-open candle\n"
         f"Position management: 24/7\n"
         f"Symbolen: {len(symbols)}"
     )
