@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-JJ SIMON - FAIR PRICING THEORY BOT v1.2
+JJ SIMON - FAIR PRICING THEORY BOT v1.3 REVERSE
 BloFin Futures - AGGRESSIVE
 ========================================
 
@@ -11,12 +11,16 @@ Aggressieve instellingen behouden:
 - Max 4 posities
 - Scan elke 15 sec
 - 2 min re-entry cooldown
-- 24/7 doorhandelend in 100-min fair-pricing cycles\n- Per cycle: 12 min continuation, daarna reversion
+- 12 min continuation / 100 min sessie
 - 1m signalen
 
-Gerichte verbeteringen:
+REVERSE TEST:
+- Exact dezelfde JJ setup/filter, maar de trade-richting wordt omgedraaid.
+- Reverse reversion gebruikt geen Fair Value exit; alleen ATR-SL + 1.25R TP.
+
+Gerichte verbeteringen uit v1.2:
 1) Open posities worden ALTIJD beheerd, ook buiten de entry-sessie.
-2) Fair Value komt van de echte 1m cycle-open candle, nooit van "last price" bij restart.
+2) Fair Value komt van de echte 1m session-open candle, nooit van "last price" bij restart.
 3) Displacement wordt gemeten tegen de mediane body van recente candles + BOS.
 """
 
@@ -44,8 +48,8 @@ except Exception:
 # CONFIG - AGGRESSIEVE VERSIE
 # ============================================================
 
-VERSION = "1.3.1-Continuous-Aggressive-PnL"
-BOT_NAME = "JJ Fair Pricing Aggressive"
+VERSION = "1.3-Reverse-Aggressive"
+BOT_NAME = "JJ Fair Pricing REVERSE Aggressive"
 
 API_KEY = os.getenv("EXCHANGE_API_KEY", "").strip()
 API_SECRET = os.getenv("EXCHANGE_SECRET", "").strip()
@@ -68,7 +72,7 @@ BASE_URL = (
 # ----- Agressieve strategie parameters -----
 SIGNAL_BAR = os.getenv("JJ_SIGNAL_BAR", "1m")
 CONTINUATION_MINUTES = int(os.getenv("JJ_CONTINUATION_MINUTES", "12"))
-SESSION_LENGTH_MINUTES = int(os.getenv("JJ_SESSION_LENGTH_MINUTES", "100"))  # legacy; geen entry-stop meer
+SESSION_LENGTH_MINUTES = int(os.getenv("JJ_SESSION_LENGTH_MINUTES", "100"))
 
 # Verbeterde displacement:
 # huidige candle-body moet >= 1.25x de mediane body van de vorige 12 candles zijn.
@@ -89,13 +93,16 @@ MAX_ACTIVE_POSITIONS = int(os.getenv("JJ_MAX_ACTIVE_POSITIONS", "4"))
 SCAN_SECONDS = int(os.getenv("JJ_SCAN_SECONDS", "15"))
 REENTRY_COOLDOWN_MIN = int(os.getenv("JJ_REENTRY_COOLDOWN_MIN", "2"))
 
-# 24/7 FAIR-PRICING CYCLES
-# Elke 100 minuten start direct een nieuwe cycle met een nieuwe fair value.
-# Eerste 12 minuten = continuation; daarna = reversion.
-CYCLE_LENGTH_MINUTES = int(os.getenv("JJ_CYCLE_LENGTH_MINUTES", "100"))
-CYCLE_ANCHOR_UTC = datetime(2026, 1, 1, 13, 30, tzinfo=timezone.utc)
+# REVERSE MODE: elk geldig JJ-signaal wordt exact tegengesteld uitgevoerd.
+# Origineel LONG -> REVERSE SHORT; origineel SHORT -> REVERSE LONG.
+REVERSE_MODE = os.getenv("JJ_REVERSE_MODE", "True").lower() == "true"
 
-STATE_FILE = "jj_fair_pricing_aggressive_v13_continuous_state.json"
+# Sessie-opens (UTC)
+SESSION_OPENS_UTC = [
+    {"hour": 13, "minute": 30},   # New York open
+]
+
+STATE_FILE = "jj_fair_pricing_reverse_aggressive_v13_state.json"
 
 DEFAULT_SYMBOLS = [
     "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT",
@@ -204,11 +211,7 @@ def _check_api_response(data, where):
     if not isinstance(data, dict):
         raise RuntimeError(f"{where}: invalid response")
     if str(data.get("code", "")) != "0":
-        detail = data.get("data")
-        detail_txt = f" | data={detail}" if detail not in (None, [], {}) else ""
-        raise RuntimeError(
-            f"{where}: {data.get('code')} {data.get('msg')}{detail_txt}"
-        )
+        raise RuntimeError(f"{where}: {data.get('code')} {data.get('msg')}")
     return data
 
 def public_get(path, params=None):
@@ -322,14 +325,14 @@ def candles(symbol, bar, limit=50, confirmed_only=True):
 def session_open_price(symbol, session_open):
     """
     Haalt de ECHTE open-prijs van de 1m candle waarvan ts exact gelijk is
-    aan de start van de huidige fair-pricing cycle.
+    aan de ingestelde sessie-open.
 
     Belangrijk: bij een Railway restart om bv. 14:05 UTC blijft de fair value
     dus de 13:30 candle-open en wordt NIET de actuele tickerprijs gebruikt.
     """
     target_ts = int(session_open.timestamp() * 1000)
 
-    # Cycle duurt standaard 100 min; 180 recente 1m candles geeft ruime marge.
+    # Sessie duurt 100 min; 180 recente 1m candles geeft ruime marge.
     rows = candles(symbol, "1m", limit=180, confirmed_only=False)
 
     for row in rows:
@@ -392,16 +395,23 @@ def set_leverage(symbol):
 # ============================================================
 
 def get_current_session_open():
-    """Start van de huidige 24/7 fair-pricing cycle."""
     now = now_utc()
-    cycle_seconds = max(60, CYCLE_LENGTH_MINUTES * 60)
-    elapsed = (now - CYCLE_ANCHOR_UTC).total_seconds()
-    cycles = int(elapsed // cycle_seconds)
-    return CYCLE_ANCHOR_UTC + timedelta(seconds=cycles * cycle_seconds)
+    candidates = []
+    for s in SESSION_OPENS_UTC:
+        open_time = now.replace(
+            hour=s["hour"],
+            minute=s["minute"],
+            second=0,
+            microsecond=0,
+        )
+        if open_time > now:
+            open_time -= timedelta(days=1)
+        candidates.append(open_time)
+    return max(candidates)
 
 def is_in_session_window(session_open):
     minutes_since = (now_utc() - session_open).total_seconds() / 60
-    return 0 <= minutes_since < CYCLE_LENGTH_MINUTES
+    return 0 <= minutes_since <= SESSION_LENGTH_MINUTES
 
 def get_phase(session_open):
     minutes_since = (now_utc() - session_open).total_seconds() / 60
@@ -514,113 +524,6 @@ def strategy_snapshot(symbol, session_open, fair_value):
         "body_multiple": signal["body_multiple"],
     }
 
-def latest_closed_position(symbol, entry_ts, attempts=1, delay=0.0):
-    """
-    Haal de meest recente gesloten BloFin-positie op die bij deze bot-entry past.
-    BloFin positions-history levert o.a. realizedPnl, fee, openAveragePrice
-    en closeAveragePrice. Na een market-close kan history heel kort achterlopen,
-    daarom kan deze functie een paar keer proberen.
-    """
-    entry_ts = int(entry_ts or 0)
-
-    for attempt in range(max(1, attempts)):
-        try:
-            data = private_get(
-                "/api/v1/account/positions-history",
-                {"instId": symbol, "state": "closed"},
-            ).get("data", [])
-
-            matches = []
-            for row in data or []:
-                if not isinstance(row, dict):
-                    continue
-                update_ts = int(fnum(row.get("updateTime"), 0))
-                create_ts = int(fnum(row.get("createTime"), 0))
-
-                # Ruime marge voor exchange timestamps / snelle fills,
-                # maar voorkom dat een oude trade als de huidige wordt gemeld.
-                if update_ts >= entry_ts - 60_000 and create_ts >= entry_ts - 300_000:
-                    matches.append(row)
-
-            if matches:
-                matches.sort(
-                    key=lambda r: int(fnum(r.get("updateTime"), 0)),
-                    reverse=True,
-                )
-                return matches[0]
-        except Exception as e:
-            print(f"PnL history error {symbol}: {e}", flush=True)
-
-        if attempt < attempts - 1 and delay > 0:
-            time.sleep(delay)
-
-    return None
-
-
-def report_live_result(symbol, managed, reason, history=None, fallback_price=None):
-    """
-    Telegram-resultaat per gesloten LIVE trade.
-    Voorkeur: echte BloFin realizedPnl uit positions-history.
-    Fallback: indicatieve bruto PnL op basis van de laatst geziene prijs.
-    """
-    entry = fnum(managed.get("entry_price"))
-    direction = managed.get("direction", "")
-    risk_usdt = fnum(managed.get("risk_usdt"))
-    notional = fnum(managed.get("notional"))
-
-    if history:
-        realized = fnum(history.get("realizedPnl"))
-        fee = fnum(history.get("fee"))
-        open_avg = fnum(history.get("openAveragePrice"), entry)
-        close_avg = fnum(history.get("closeAveragePrice"))
-        r_mult = realized / risk_usdt if risk_usdt > 0 else 0.0
-
-        if realized > 0:
-            verdict = "WIN"
-            icon = "✅"
-        elif realized < 0:
-            verdict = "LOSS"
-            icon = "❌"
-        else:
-            verdict = "BREAK-EVEN"
-            icon = "➖"
-
-        tg(
-            f"{icon} LIVE RESULT {symbol} · {verdict}\\n"
-            f"Exit: {reason} · {direction.upper()}\\n"
-            f"BloFin realized PnL: {realized:+.4f} USDT\\n"
-            f"Fee (BloFin): {fee:+.4f} USDT\\n"
-            f"R: {r_mult:+.2f}R\\n"
-            f"Open avg: {fmt_price(open_avg)} | "
-            f"Close avg: {fmt_price(close_avg) if close_avg > 0 else 'n/a'}"
-        )
-        return
-
-    # Alleen als BloFin history nog niet beschikbaar is.
-    live = fnum(fallback_price)
-    if entry > 0 and live > 0:
-        pnl_pct = (
-            ((live - entry) / entry * 100)
-            if direction == "long"
-            else ((entry - live) / entry * 100)
-        )
-        pnl_usdt = notional * (pnl_pct / 100.0)
-        verdict = "WIN" if pnl_usdt > 0 else ("LOSS" if pnl_usdt < 0 else "BREAK-EVEN")
-        icon = "🟢" if pnl_usdt > 0 else ("🔴" if pnl_usdt < 0 else "➖")
-        tg(
-            f"{icon} LIVE RESULT {symbol} · {verdict}\\n"
-            f"Exit: {reason}\\n"
-            f"PnL schatting: ~{pnl_usdt:+.4f} USDT bruto "
-            f"({pnl_pct:+.3f}%)\\n"
-            f"⚠️ BloFin realized PnL was nog niet beschikbaar."
-        )
-    else:
-        tg(
-            f"📤 LIVE CLOSE {symbol} · {reason}\\n"
-            f"PnL kon nog niet uit BloFin history worden opgehaald."
-        )
-
-
 # ============================================================
 # SIZING & ORDERS
 # ============================================================
@@ -662,7 +565,15 @@ def calculate_size(symbol, entry_price, equity, available, stop_distance):
 
 def open_position(snapshot):
     symbol = snapshot["symbol"]
-    direction = snapshot["direction"]
+    signal_direction = snapshot["direction"]
+
+    # Pure reverse: we keep the exact same JJ setup/filter and trade the
+    # opposite side. This lets us test whether the original signal has
+    # negative expectancy without changing when/where signals occur.
+    if REVERSE_MODE:
+        direction = "short" if signal_direction == "long" else "long"
+    else:
+        direction = signal_direction
 
     equity, available = account()
     live = last_price(symbol)
@@ -723,8 +634,9 @@ def open_position(snapshot):
         side = "sell"
 
     tg(
-        f"🟠 JJ AGGRESSIVE READY\n"
+        f"🟣 JJ REVERSE AGGRESSIVE READY\n"
         f"{symbol} {direction.upper()} · {snapshot['phase'].upper()}\n"
+        f"Origineel JJ-signaal: {signal_direction.upper()} -> uitgevoerd: {direction.upper()}\n"
         f"Fair Value: {fmt_price(snapshot['fair_value'])}\n"
         f"Entry ~{fmt_price(live)} | SL {fmt_price(stop)} | "
         f"TP {fmt_price(tp)} ({FIXED_RR}R)\n"
@@ -736,6 +648,8 @@ def open_position(snapshot):
         "entry_ts": now_ms(),
         "entry_price": live,
         "direction": direction,
+        "signal_direction": signal_direction,
+        "reverse_mode": REVERSE_MODE,
         "stop": stop,
         "tp": tp,
         "phase": snapshot["phase"],
@@ -790,12 +704,10 @@ def open_position(snapshot):
 
 def manage_position(symbol):
     """
-    Posities worden 24/7 beheerd.
-
-    Extra in v1.3.1:
-    - Detecteert ook wanneer de exchange-side hard SL de positie al heeft gesloten.
-    - Rapporteert na iedere LIVE close WIN/LOSS + echte BloFin realized PnL,
-      fee, R-multiple en gemiddelde open/close prijs.
+    BELANGRIJK:
+    Deze functie wordt voortaan altijd aangeroepen, óók buiten de 100-min
+    entry-sessie. Daardoor blijven TP / fair-value exits actief.
+    De exchange-side hard SL blijft daarnaast de noodbeveiliging.
     """
     managed = state.get("managed", {}).get(symbol)
     if not managed:
@@ -808,30 +720,6 @@ def manage_position(symbol):
     tp = managed["tp"]
     fair = managed.get("fair_value", 0)
 
-    # In LIVE mode eerst controleren of BloFin de positie al heeft gesloten,
-    # bijvoorbeeld door de exchange-side hard SL.
-    if not PAPER_TRADING:
-        pos = get_position(symbol)
-        if not pos:
-            history = latest_closed_position(
-                symbol,
-                managed.get("entry_ts", 0),
-                attempts=3,
-                delay=0.35,
-            )
-            report_live_result(
-                symbol,
-                managed,
-                "EXCHANGE SL / EXTERNAL CLOSE",
-                history=history,
-                fallback_price=live,
-            )
-            with state_lock:
-                state["managed"].pop(symbol, None)
-                state["last_exit_ts"][symbol] = now_ms()
-            save_state()
-            return
-
     hit_stop = (
         (direction == "long" and live <= stop)
         or (direction == "short" and live >= stop)
@@ -842,7 +730,15 @@ def manage_position(symbol):
     )
 
     reached_fair = False
-    if managed["phase"] == "reversion" and fair > 0:
+    # In pure reverse mode is Fair Value geen logisch winstdoel: bij een
+    # omgekeerde reversion-entry ligt Fair Value juist aan de verkeerde kant
+    # van de trade en kan de oude voorwaarde direct waar zijn. Reverse trades
+    # gebruiken daarom de vaste 1.25R TP + ATR stop.
+    if (
+        not managed.get("reverse_mode", REVERSE_MODE)
+        and managed["phase"] == "reversion"
+        and fair > 0
+    ):
         if direction == "long" and live >= fair * 0.997:
             reached_fair = True
         elif direction == "short" and live <= fair * 1.003:
@@ -863,21 +759,17 @@ def manage_position(symbol):
             if direction == "long"
             else ((entry - live) / entry * 100)
         )
+
+        # Indicatieve bruto PnL op opgeslagen notional.
         pnl_usdt = (
             managed.get("notional", 0.0)
             * (pnl_pct / 100.0)
         )
-        risk_usdt = fnum(managed.get("risk_usdt"))
-        r_mult = pnl_usdt / risk_usdt if risk_usdt > 0 else 0.0
-
-        verdict = "WIN" if pnl_usdt > 0 else ("LOSS" if pnl_usdt < 0 else "BREAK-EVEN")
-        icon = "✅" if pnl_usdt > 0 else ("❌" if pnl_usdt < 0 else "➖")
 
         tg(
-            f"{icon} PAPER RESULT {symbol} · {verdict}\\n"
-            f"Exit: {reason} · {direction.upper()}\\n"
-            f"PnL: ~{pnl_usdt:+.4f} USDT bruto ({pnl_pct:+.3f}%)\\n"
-            f"R: {r_mult:+.2f}R"
+            f"{'🟢' if pnl_pct >= 0 else '🔴'} "
+            f"PAPER CLOSE {symbol} · {reason}\n"
+            f"{pnl_pct:+.2f}% · ~{pnl_usdt:+.3f} USDT bruto"
         )
 
         with state_lock:
@@ -886,30 +778,16 @@ def manage_position(symbol):
         save_state()
         return
 
-    # LIVE: positie bestaat nog (boven al gecontroleerd), dus nu sluiten.
-    body = {
-        "instId": symbol,
-        "marginMode": MARGIN_MODE,
-        "positionSide": "net",
-        "clientOrderId": f"jjax{int(time.time())}"[:32],
-    }
-    private_post("/api/v1/trade/close-position", body)
-
-    # Wacht heel kort tot BloFin de gesloten positie in history heeft verwerkt,
-    # zodat Telegram het echte gerealiseerde resultaat toont.
-    history = latest_closed_position(
-        symbol,
-        managed.get("entry_ts", 0),
-        attempts=6,
-        delay=0.45,
-    )
-    report_live_result(
-        symbol,
-        managed,
-        reason,
-        history=history,
-        fallback_price=live,
-    )
+    pos = get_position(symbol)
+    if pos:
+        body = {
+            "instId": symbol,
+            "marginMode": MARGIN_MODE,
+            "positionSide": "net",
+            "clientOrderId": f"jjax{int(time.time())}"[:32],
+        }
+        private_post("/api/v1/trade/close-position", body)
+        tg(f"📤 LIVE CLOSE {symbol} · {reason}")
 
     with state_lock:
         state["managed"].pop(symbol, None)
@@ -922,7 +800,7 @@ def manage_position(symbol):
 
 def ensure_fair_values(session_open, symbols):
     """
-    Leg fair value vast vanaf de echte 1m cycle-open candle.
+    Leg fair value vast vanaf de echte 1m session-open candle.
     Geen fallback naar last_price: liever geen entry dan een verkeerde fair value.
     """
     session_id = session_open.strftime("%Y%m%d_%H%M")
@@ -946,7 +824,7 @@ def ensure_fair_values(session_open, symbols):
             state.setdefault("fair_values", {})[key] = {
                 "price": price,
                 "ts": int(session_open.timestamp() * 1000),
-                "source": "1m_cycle_open_candle",
+                "source": "1m_session_open_candle",
             }
             changed = True
 
@@ -971,11 +849,13 @@ def scan_once():
         except Exception as e:
             tg(f"⚠️ Manage error {symbol}: {e}")
 
-    # 24/7: zodra een 100-min cycle eindigt, begint direct de volgende.
+    # Alleen NIEUWE ENTRIES zijn beperkt tot de JJ sessie.
     session_open = get_current_session_open()
+    if not is_in_session_window(session_open):
+        return
 
     # ========================================================
-    # ECHTE CYCLE-OPEN FAIR VALUE
+    # FIX 2: ECHTE SESSION-OPEN FAIR VALUE
     # ========================================================
     ensure_fair_values(session_open, symbols)
 
@@ -1030,9 +910,10 @@ def startup():
     tg(
         f"🧠 {BOT_NAME} v{VERSION} STARTED\n"
         f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
-        f"Fair Pricing Aggressive\n"
-        f"24/7 cycles: {CYCLE_LENGTH_MINUTES} min | "
-        f"Continuation eerste {CONTINUATION_MINUTES} min | daarna reversion\n"
+        f"Fair Pricing REVERSE Aggressive\n"
+        f"Reverse mode: {REVERSE_MODE} (JJ LONG -> SHORT / JJ SHORT -> LONG)\n"
+        f"Continuation: {CONTINUATION_MINUTES} min | "
+        f"Sessie: {SESSION_LENGTH_MINUTES} min\n"
         f"Risk {RISK_PER_TRADE*100:.1f}% | RR {FIXED_RR} | "
         f"ATR stops: {USE_ATR_STOPS}\n"
         f"Displacement >= {DISPLACEMENT_BODY_MULT:.2f}x "
@@ -1040,10 +921,8 @@ def startup():
         f"BOS({BOS_LOOKBACK})\n"
         f"Max posities: {MAX_ACTIVE_POSITIONS} | "
         f"Leverage: {LEVERAGE}x | Scan: {SCAN_SECONDS}s\n"
-        f"Fair value: nieuwe echte 1m cycle-open elke {CYCLE_LENGTH_MINUTES} min\n"
-        f"Nieuwe entries: 24/7 · geen dagelijkse wachttijd\n"
+        f"Fair value: echte 1m session-open candle\n"
         f"Position management: 24/7\n"
-        f"PnL reporting: BloFin realized PnL + fee + R\n"
         f"Symbolen: {len(symbols)}"
     )
 
