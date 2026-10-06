@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-JJ SIMON - FAIR PRICING THEORY BOT v1.4 GLOBAL SESSIONS
+JJ SIMON - FAIR PRICING THEORY BOT v1.2
 BloFin Futures - AGGRESSIVE
 ========================================
 
@@ -11,13 +11,13 @@ Aggressieve instellingen behouden:
 - Max 4 posities
 - Scan elke 15 sec
 - 2 min re-entry cooldown
-- 12 min continuation / 100 min sessie
+- 24/7 doorhandelend in 100-min fair-pricing cycles\n- Per cycle: 12 min continuation, daarna reversion
 - 1m signalen
 
 Gerichte verbeteringen:
 1) Open posities worden ALTIJD beheerd, ook buiten de entry-sessie.
-2) Fair Value komt van de echte 1m session-open candle, nooit van "last price" bij restart.
-3) Displacement wordt gemeten tegen de mediane body van recente candles + BOS.\n4) Global sessions: China, London, Nederland, Zuid-Amerika en New York.
+2) Fair Value komt van de echte 1m cycle-open candle, nooit van "last price" bij restart.
+3) Displacement wordt gemeten tegen de mediane body van recente candles + BOS.
 """
 
 import os
@@ -32,7 +32,6 @@ from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 from statistics import median
-from zoneinfo import ZoneInfo
 
 import requests
 
@@ -45,8 +44,8 @@ except Exception:
 # CONFIG - AGGRESSIEVE VERSIE
 # ============================================================
 
-VERSION = "1.4-Global-Sessions"
-BOT_NAME = "JJ Fair Pricing Aggressive Global"
+VERSION = "1.3.1-Continuous-Aggressive-PnL"
+BOT_NAME = "JJ Fair Pricing Aggressive"
 
 API_KEY = os.getenv("EXCHANGE_API_KEY", "").strip()
 API_SECRET = os.getenv("EXCHANGE_SECRET", "").strip()
@@ -69,7 +68,7 @@ BASE_URL = (
 # ----- Agressieve strategie parameters -----
 SIGNAL_BAR = os.getenv("JJ_SIGNAL_BAR", "1m")
 CONTINUATION_MINUTES = int(os.getenv("JJ_CONTINUATION_MINUTES", "12"))
-SESSION_LENGTH_MINUTES = int(os.getenv("JJ_SESSION_LENGTH_MINUTES", "100"))
+SESSION_LENGTH_MINUTES = int(os.getenv("JJ_SESSION_LENGTH_MINUTES", "100"))  # legacy; geen entry-stop meer
 
 # Verbeterde displacement:
 # huidige candle-body moet >= 1.25x de mediane body van de vorige 12 candles zijn.
@@ -90,44 +89,13 @@ MAX_ACTIVE_POSITIONS = int(os.getenv("JJ_MAX_ACTIVE_POSITIONS", "4"))
 SCAN_SECONDS = int(os.getenv("JJ_SCAN_SECONDS", "15"))
 REENTRY_COOLDOWN_MIN = int(os.getenv("JJ_REENTRY_COOLDOWN_MIN", "2"))
 
-# Wereldwijde sessie-opens.
-# Lokale beursuren + ZoneInfo zorgen automatisch voor zomer-/wintertijd.
-# London en Nederland vallen vaak op exact hetzelfde UTC-moment; die worden
-# tijdens het scannen samengevoegd zodat dezelfde setup niet dubbel opent.
-MARKET_SESSIONS = [
-    {
-        "name": "China",
-        "timezone": "Asia/Shanghai",
-        "hour": 9,
-        "minute": 30,
-    },
-    {
-        "name": "London",
-        "timezone": "Europe/London",
-        "hour": 8,
-        "minute": 0,
-    },
-    {
-        "name": "Nederland",
-        "timezone": "Europe/Amsterdam",
-        "hour": 9,
-        "minute": 0,
-    },
-    {
-        "name": "Zuid-Amerika",
-        "timezone": "America/Sao_Paulo",
-        "hour": 10,
-        "minute": 0,
-    },
-    {
-        "name": "New York",
-        "timezone": "America/New_York",
-        "hour": 9,
-        "minute": 30,
-    },
-]
+# 24/7 FAIR-PRICING CYCLES
+# Elke 100 minuten start direct een nieuwe cycle met een nieuwe fair value.
+# Eerste 12 minuten = continuation; daarna = reversion.
+CYCLE_LENGTH_MINUTES = int(os.getenv("JJ_CYCLE_LENGTH_MINUTES", "100"))
+CYCLE_ANCHOR_UTC = datetime(2026, 1, 1, 13, 30, tzinfo=timezone.utc)
 
-STATE_FILE = "jj_fair_pricing_aggressive_v12_state.json"
+STATE_FILE = "jj_fair_pricing_aggressive_v13_continuous_state.json"
 
 DEFAULT_SYMBOLS = [
     "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT",
@@ -236,7 +204,11 @@ def _check_api_response(data, where):
     if not isinstance(data, dict):
         raise RuntimeError(f"{where}: invalid response")
     if str(data.get("code", "")) != "0":
-        raise RuntimeError(f"{where}: {data.get('code')} {data.get('msg')}")
+        detail = data.get("data")
+        detail_txt = f" | data={detail}" if detail not in (None, [], {}) else ""
+        raise RuntimeError(
+            f"{where}: {data.get('code')} {data.get('msg')}{detail_txt}"
+        )
     return data
 
 def public_get(path, params=None):
@@ -350,14 +322,14 @@ def candles(symbol, bar, limit=50, confirmed_only=True):
 def session_open_price(symbol, session_open):
     """
     Haalt de ECHTE open-prijs van de 1m candle waarvan ts exact gelijk is
-    aan de ingestelde sessie-open.
+    aan de start van de huidige fair-pricing cycle.
 
     Belangrijk: bij een Railway restart om bv. 14:05 UTC blijft de fair value
     dus de 13:30 candle-open en wordt NIET de actuele tickerprijs gebruikt.
     """
     target_ts = int(session_open.timestamp() * 1000)
 
-    # Sessie duurt 100 min; 180 recente 1m candles geeft ruime marge.
+    # Cycle duurt standaard 100 min; 180 recente 1m candles geeft ruime marge.
     rows = candles(symbol, "1m", limit=180, confirmed_only=False)
 
     for row in rows:
@@ -419,60 +391,17 @@ def set_leverage(symbol):
 # STRATEGY LOGIC
 # ============================================================
 
-def get_active_sessions():
-    """
-    Geeft alle wereldwijde marktsessies terug die NU binnen de ingestelde
-    entry-window vallen.
-
-    De tijden zijn lokale beurs-openingen en worden via ZoneInfo automatisch
-    naar UTC omgerekend. Alleen maandag t/m vrijdag.
-
-    Als twee markten exact tegelijk openen (bijv. London + Nederland), worden
-    ze gecombineerd tot één fair-value moment om dubbele orders te voorkomen.
-    """
+def get_current_session_open():
+    """Start van de huidige 24/7 fair-pricing cycle."""
     now = now_utc()
-    by_timestamp = {}
-
-    for cfg in MARKET_SESSIONS:
-        tz = ZoneInfo(cfg["timezone"])
-        local_now = now.astimezone(tz)
-
-        # Geen officiële weekday-session in het weekend.
-        if local_now.weekday() >= 5:
-            continue
-
-        local_open = local_now.replace(
-            hour=cfg["hour"],
-            minute=cfg["minute"],
-            second=0,
-            microsecond=0,
-        )
-        session_open = local_open.astimezone(timezone.utc)
-        minutes_since = (now - session_open).total_seconds() / 60
-
-        if not (0 <= minutes_since <= SESSION_LENGTH_MINUTES):
-            continue
-
-        ts = int(session_open.timestamp())
-        if ts not in by_timestamp:
-            by_timestamp[ts] = {
-                "name": cfg["name"],
-                "names": [cfg["name"]],
-                "open": session_open,
-                "minutes_since_open": minutes_since,
-            }
-        else:
-            by_timestamp[ts]["names"].append(cfg["name"])
-            by_timestamp[ts]["name"] = " + ".join(by_timestamp[ts]["names"])
-
-    return sorted(
-        by_timestamp.values(),
-        key=lambda x: x["open"],
-    )
+    cycle_seconds = max(60, CYCLE_LENGTH_MINUTES * 60)
+    elapsed = (now - CYCLE_ANCHOR_UTC).total_seconds()
+    cycles = int(elapsed // cycle_seconds)
+    return CYCLE_ANCHOR_UTC + timedelta(seconds=cycles * cycle_seconds)
 
 def is_in_session_window(session_open):
     minutes_since = (now_utc() - session_open).total_seconds() / 60
-    return 0 <= minutes_since <= SESSION_LENGTH_MINUTES
+    return 0 <= minutes_since < CYCLE_LENGTH_MINUTES
 
 def get_phase(session_open):
     minutes_since = (now_utc() - session_open).total_seconds() / 60
@@ -539,7 +468,7 @@ def detect_displacement_and_bos(rows):
         "body_multiple": body_curr / baseline_body if baseline_body > 0 else 0,
     }
 
-def strategy_snapshot(symbol, session_open, fair_value, session_name):
+def strategy_snapshot(symbol, session_open, fair_value):
     rows = candles(symbol, SIGNAL_BAR, limit=50, confirmed_only=True)
     if len(rows) < max(DISPLACEMENT_LOOKBACK + 1, BOS_LOOKBACK + 1, 8):
         return None
@@ -578,14 +507,119 @@ def strategy_snapshot(symbol, session_open, fair_value, session_name):
         "symbol": symbol,
         "direction": signal["direction"],
         "phase": phase,
-        "session_name": session_name,
-        "session_open_ts": int(session_open.timestamp() * 1000),
         "fair_value": fair_value,
         "close": signal["close"],
         "minutes_since_open": minutes_since,
         "ts": signal["ts"],
         "body_multiple": signal["body_multiple"],
     }
+
+def latest_closed_position(symbol, entry_ts, attempts=1, delay=0.0):
+    """
+    Haal de meest recente gesloten BloFin-positie op die bij deze bot-entry past.
+    BloFin positions-history levert o.a. realizedPnl, fee, openAveragePrice
+    en closeAveragePrice. Na een market-close kan history heel kort achterlopen,
+    daarom kan deze functie een paar keer proberen.
+    """
+    entry_ts = int(entry_ts or 0)
+
+    for attempt in range(max(1, attempts)):
+        try:
+            data = private_get(
+                "/api/v1/account/positions-history",
+                {"instId": symbol, "state": "closed"},
+            ).get("data", [])
+
+            matches = []
+            for row in data or []:
+                if not isinstance(row, dict):
+                    continue
+                update_ts = int(fnum(row.get("updateTime"), 0))
+                create_ts = int(fnum(row.get("createTime"), 0))
+
+                # Ruime marge voor exchange timestamps / snelle fills,
+                # maar voorkom dat een oude trade als de huidige wordt gemeld.
+                if update_ts >= entry_ts - 60_000 and create_ts >= entry_ts - 300_000:
+                    matches.append(row)
+
+            if matches:
+                matches.sort(
+                    key=lambda r: int(fnum(r.get("updateTime"), 0)),
+                    reverse=True,
+                )
+                return matches[0]
+        except Exception as e:
+            print(f"PnL history error {symbol}: {e}", flush=True)
+
+        if attempt < attempts - 1 and delay > 0:
+            time.sleep(delay)
+
+    return None
+
+
+def report_live_result(symbol, managed, reason, history=None, fallback_price=None):
+    """
+    Telegram-resultaat per gesloten LIVE trade.
+    Voorkeur: echte BloFin realizedPnl uit positions-history.
+    Fallback: indicatieve bruto PnL op basis van de laatst geziene prijs.
+    """
+    entry = fnum(managed.get("entry_price"))
+    direction = managed.get("direction", "")
+    risk_usdt = fnum(managed.get("risk_usdt"))
+    notional = fnum(managed.get("notional"))
+
+    if history:
+        realized = fnum(history.get("realizedPnl"))
+        fee = fnum(history.get("fee"))
+        open_avg = fnum(history.get("openAveragePrice"), entry)
+        close_avg = fnum(history.get("closeAveragePrice"))
+        r_mult = realized / risk_usdt if risk_usdt > 0 else 0.0
+
+        if realized > 0:
+            verdict = "WIN"
+            icon = "✅"
+        elif realized < 0:
+            verdict = "LOSS"
+            icon = "❌"
+        else:
+            verdict = "BREAK-EVEN"
+            icon = "➖"
+
+        tg(
+            f"{icon} LIVE RESULT {symbol} · {verdict}\\n"
+            f"Exit: {reason} · {direction.upper()}\\n"
+            f"BloFin realized PnL: {realized:+.4f} USDT\\n"
+            f"Fee (BloFin): {fee:+.4f} USDT\\n"
+            f"R: {r_mult:+.2f}R\\n"
+            f"Open avg: {fmt_price(open_avg)} | "
+            f"Close avg: {fmt_price(close_avg) if close_avg > 0 else 'n/a'}"
+        )
+        return
+
+    # Alleen als BloFin history nog niet beschikbaar is.
+    live = fnum(fallback_price)
+    if entry > 0 and live > 0:
+        pnl_pct = (
+            ((live - entry) / entry * 100)
+            if direction == "long"
+            else ((entry - live) / entry * 100)
+        )
+        pnl_usdt = notional * (pnl_pct / 100.0)
+        verdict = "WIN" if pnl_usdt > 0 else ("LOSS" if pnl_usdt < 0 else "BREAK-EVEN")
+        icon = "🟢" if pnl_usdt > 0 else ("🔴" if pnl_usdt < 0 else "➖")
+        tg(
+            f"{icon} LIVE RESULT {symbol} · {verdict}\\n"
+            f"Exit: {reason}\\n"
+            f"PnL schatting: ~{pnl_usdt:+.4f} USDT bruto "
+            f"({pnl_pct:+.3f}%)\\n"
+            f"⚠️ BloFin realized PnL was nog niet beschikbaar."
+        )
+    else:
+        tg(
+            f"📤 LIVE CLOSE {symbol} · {reason}\\n"
+            f"PnL kon nog niet uit BloFin history worden opgehaald."
+        )
+
 
 # ============================================================
 # SIZING & ORDERS
@@ -691,7 +725,6 @@ def open_position(snapshot):
     tg(
         f"🟠 JJ AGGRESSIVE READY\n"
         f"{symbol} {direction.upper()} · {snapshot['phase'].upper()}\n"
-        f"Sessie: {snapshot.get('session_name', 'Onbekend')}\n"
         f"Fair Value: {fmt_price(snapshot['fair_value'])}\n"
         f"Entry ~{fmt_price(live)} | SL {fmt_price(stop)} | "
         f"TP {fmt_price(tp)} ({FIXED_RR}R)\n"
@@ -706,8 +739,6 @@ def open_position(snapshot):
         "stop": stop,
         "tp": tp,
         "phase": snapshot["phase"],
-        "session_name": snapshot.get("session_name", "Onbekend"),
-        "session_open_ts": snapshot.get("session_open_ts", 0),
         "fair_value": snapshot["fair_value"],
         "contracts": sizing["contracts"],
         "risk_usdt": sizing["risk_usdt"],
@@ -759,10 +790,12 @@ def open_position(snapshot):
 
 def manage_position(symbol):
     """
-    BELANGRIJK:
-    Deze functie wordt voortaan altijd aangeroepen, óók buiten de 100-min
-    entry-sessie. Daardoor blijven TP / fair-value exits actief.
-    De exchange-side hard SL blijft daarnaast de noodbeveiliging.
+    Posities worden 24/7 beheerd.
+
+    Extra in v1.3.1:
+    - Detecteert ook wanneer de exchange-side hard SL de positie al heeft gesloten.
+    - Rapporteert na iedere LIVE close WIN/LOSS + echte BloFin realized PnL,
+      fee, R-multiple en gemiddelde open/close prijs.
     """
     managed = state.get("managed", {}).get(symbol)
     if not managed:
@@ -774,6 +807,30 @@ def manage_position(symbol):
     stop = managed["stop"]
     tp = managed["tp"]
     fair = managed.get("fair_value", 0)
+
+    # In LIVE mode eerst controleren of BloFin de positie al heeft gesloten,
+    # bijvoorbeeld door de exchange-side hard SL.
+    if not PAPER_TRADING:
+        pos = get_position(symbol)
+        if not pos:
+            history = latest_closed_position(
+                symbol,
+                managed.get("entry_ts", 0),
+                attempts=3,
+                delay=0.35,
+            )
+            report_live_result(
+                symbol,
+                managed,
+                "EXCHANGE SL / EXTERNAL CLOSE",
+                history=history,
+                fallback_price=live,
+            )
+            with state_lock:
+                state["managed"].pop(symbol, None)
+                state["last_exit_ts"][symbol] = now_ms()
+            save_state()
+            return
 
     hit_stop = (
         (direction == "long" and live <= stop)
@@ -806,17 +863,21 @@ def manage_position(symbol):
             if direction == "long"
             else ((entry - live) / entry * 100)
         )
-
-        # Indicatieve bruto PnL op opgeslagen notional.
         pnl_usdt = (
             managed.get("notional", 0.0)
             * (pnl_pct / 100.0)
         )
+        risk_usdt = fnum(managed.get("risk_usdt"))
+        r_mult = pnl_usdt / risk_usdt if risk_usdt > 0 else 0.0
+
+        verdict = "WIN" if pnl_usdt > 0 else ("LOSS" if pnl_usdt < 0 else "BREAK-EVEN")
+        icon = "✅" if pnl_usdt > 0 else ("❌" if pnl_usdt < 0 else "➖")
 
         tg(
-            f"{'🟢' if pnl_pct >= 0 else '🔴'} "
-            f"PAPER CLOSE {symbol} · {reason}\n"
-            f"{pnl_pct:+.2f}% · ~{pnl_usdt:+.3f} USDT bruto"
+            f"{icon} PAPER RESULT {symbol} · {verdict}\\n"
+            f"Exit: {reason} · {direction.upper()}\\n"
+            f"PnL: ~{pnl_usdt:+.4f} USDT bruto ({pnl_pct:+.3f}%)\\n"
+            f"R: {r_mult:+.2f}R"
         )
 
         with state_lock:
@@ -825,16 +886,30 @@ def manage_position(symbol):
         save_state()
         return
 
-    pos = get_position(symbol)
-    if pos:
-        body = {
-            "instId": symbol,
-            "marginMode": MARGIN_MODE,
-            "positionSide": "net",
-            "clientOrderId": f"jjax{int(time.time())}"[:32],
-        }
-        private_post("/api/v1/trade/close-position", body)
-        tg(f"📤 LIVE CLOSE {symbol} · {reason}")
+    # LIVE: positie bestaat nog (boven al gecontroleerd), dus nu sluiten.
+    body = {
+        "instId": symbol,
+        "marginMode": MARGIN_MODE,
+        "positionSide": "net",
+        "clientOrderId": f"jjax{int(time.time())}"[:32],
+    }
+    private_post("/api/v1/trade/close-position", body)
+
+    # Wacht heel kort tot BloFin de gesloten positie in history heeft verwerkt,
+    # zodat Telegram het echte gerealiseerde resultaat toont.
+    history = latest_closed_position(
+        symbol,
+        managed.get("entry_ts", 0),
+        attempts=6,
+        delay=0.45,
+    )
+    report_live_result(
+        symbol,
+        managed,
+        reason,
+        history=history,
+        fallback_price=live,
+    )
 
     with state_lock:
         state["managed"].pop(symbol, None)
@@ -847,7 +922,7 @@ def manage_position(symbol):
 
 def ensure_fair_values(session_open, symbols):
     """
-    Leg fair value vast vanaf de echte 1m session-open candle.
+    Leg fair value vast vanaf de echte 1m cycle-open candle.
     Geen fallback naar last_price: liever geen entry dan een verkeerde fair value.
     """
     session_id = session_open.strftime("%Y%m%d_%H%M")
@@ -871,7 +946,7 @@ def ensure_fair_values(session_open, symbols):
             state.setdefault("fair_values", {})[key] = {
                 "price": price,
                 "ts": int(session_open.timestamp() * 1000),
-                "source": "1m_session_open_candle",
+                "source": "1m_cycle_open_candle",
             }
             changed = True
 
@@ -886,105 +961,66 @@ def ensure_fair_values(session_open, symbols):
 def scan_once():
     symbols = valid_symbols()
 
-    # Open posities ALTIJD beheren, onafhankelijk van de wereldsessies.
+    # ========================================================
+    # FIX 1: POSITIES ALTIJD BEHEREN
+    # Dit gebeurt vóór de session-window check.
+    # ========================================================
     for symbol in list(state.get("managed", {}).keys()):
         try:
             manage_position(symbol)
         except Exception as e:
             tg(f"⚠️ Manage error {symbol}: {e}")
 
-    # Meerdere wereldsessies kunnen tegelijk actief zijn.
-    active_sessions = get_active_sessions()
-    if not active_sessions:
-        return
+    # 24/7: zodra een 100-min cycle eindigt, begint direct de volgende.
+    session_open = get_current_session_open()
+
+    # ========================================================
+    # ECHTE CYCLE-OPEN FAIR VALUE
+    # ========================================================
+    ensure_fair_values(session_open, symbols)
 
     active = len(state.get("managed", {}))
     free_slots = max(0, MAX_ACTIVE_POSITIONS - active)
     if free_slots <= 0:
         return
 
+    session_id = session_open.strftime("%Y%m%d_%H%M")
     candidates = []
 
-    for sess in active_sessions:
-        session_open = sess["open"]
-        session_name = sess["name"]
-
-        # Echte 1m openprijs van DEZE sessie vastleggen.
-        ensure_fair_values(session_open, symbols)
-        session_id = session_open.strftime("%Y%m%d_%H%M")
-
-        for symbol in symbols:
-            if symbol in state.get("managed", {}):
-                continue
-
-            key = f"{symbol}_{session_id}"
-            fv_data = state.get("fair_values", {}).get(key)
-            if not fv_data:
-                continue
-
-            try:
-                snap = strategy_snapshot(
-                    symbol,
-                    session_open,
-                    fv_data["price"],
-                    session_name,
-                )
-                if snap:
-                    candidates.append(snap)
-            except Exception as e:
-                print(
-                    f"Signal error {symbol} [{session_name}]: {e}",
-                    flush=True,
-                )
-
-            time.sleep(0.04)
-
-    # Een symbool kan tijdens overlappende sessies meerdere geldige setups
-    # hebben (bijv. Zuid-Amerika + New York). Open nooit twee keer hetzelfde
-    # symbool in dezelfde scan. De meest recent geopende sessie krijgt voorrang;
-    # daarna het meest recente signaal.
-    best_by_symbol = {}
-    for snap in candidates:
-        symbol = snap["symbol"]
-        rank = (snap.get("session_open_ts", 0), snap.get("ts", 0))
-        current = best_by_symbol.get(symbol)
-        if current is None:
-            best_by_symbol[symbol] = snap
+    for symbol in symbols:
+        if symbol in state.get("managed", {}):
             continue
-        current_rank = (
-            current.get("session_open_ts", 0),
-            current.get("ts", 0),
-        )
-        if rank > current_rank:
-            best_by_symbol[symbol] = snap
 
-    candidates = list(best_by_symbol.values())
-    candidates.sort(
-        key=lambda x: (
-            x.get("ts", 0),
-            x.get("session_open_ts", 0),
-        ),
-        reverse=True,
-    )
+        key = f"{symbol}_{session_id}"
+        fv_data = state.get("fair_values", {}).get(key)
+        if not fv_data:
+            continue
+
+        try:
+            snap = strategy_snapshot(
+                symbol,
+                session_open,
+                fv_data["price"],
+            )
+            if snap:
+                candidates.append(snap)
+        except Exception as e:
+            print(f"Signal error {symbol}: {e}", flush=True)
+
+        time.sleep(0.04)
+
+    # Meest recente bevestigde signalen eerst.
+    candidates.sort(key=lambda x: x["ts"], reverse=True)
 
     opened = 0
     for snap in candidates:
         if opened >= free_slots:
             break
-
-        # Extra bescherming tegen een tweede order voor hetzelfde symbool
-        # wanneer een eerdere kandidaat in deze scan al is geopend.
-        if snap["symbol"] in state.get("managed", {}):
-            continue
-
         try:
             if open_position(snap):
                 opened += 1
         except Exception as e:
-            tg(
-                f"❌ Entry error {snap['symbol']} "
-                f"[{snap.get('session_name', '?')}]: {e}"
-            )
+            tg(f"❌ Entry error {snap['symbol']}: {e}")
 
 def startup():
     load_state()
@@ -995,8 +1031,8 @@ def startup():
         f"🧠 {BOT_NAME} v{VERSION} STARTED\n"
         f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
         f"Fair Pricing Aggressive\n"
-        f"Continuation: {CONTINUATION_MINUTES} min | "
-        f"Sessie: {SESSION_LENGTH_MINUTES} min\n"
+        f"24/7 cycles: {CYCLE_LENGTH_MINUTES} min | "
+        f"Continuation eerste {CONTINUATION_MINUTES} min | daarna reversion\n"
         f"Risk {RISK_PER_TRADE*100:.1f}% | RR {FIXED_RR} | "
         f"ATR stops: {USE_ATR_STOPS}\n"
         f"Displacement >= {DISPLACEMENT_BODY_MULT:.2f}x "
@@ -1004,11 +1040,10 @@ def startup():
         f"BOS({BOS_LOOKBACK})\n"
         f"Max posities: {MAX_ACTIVE_POSITIONS} | "
         f"Leverage: {LEVERAGE}x | Scan: {SCAN_SECONDS}s\n"
-        f"Fair value: echte 1m session-open candle\n"
-        f"Wereldsessies: China 09:30 | London 08:00 | "
-        f"Nederland 09:00 | Zuid-Amerika 10:00 | New York 09:30 (lokale tijd)\n"
-        f"Timezone/DST: automatisch\n"
+        f"Fair value: nieuwe echte 1m cycle-open elke {CYCLE_LENGTH_MINUTES} min\n"
+        f"Nieuwe entries: 24/7 · geen dagelijkse wachttijd\n"
         f"Position management: 24/7\n"
+        f"PnL reporting: BloFin realized PnL + fee + R\n"
         f"Symbolen: {len(symbols)}"
     )
 
