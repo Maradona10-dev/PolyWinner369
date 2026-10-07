@@ -1,23 +1,16 @@
 #!/usr/bin/env python3
 """
-JJ SIMON - FAIR PRICING THEORY BOT v1.2
-BloFin Futures - AGGRESSIVE
+JJ SIMON - FAIR PRICING THEORY BOT v1.4 (Profit Runner Optimaal - Max 2 Posities)
+BloFin Futures - AGGRESSIVE & TREND RUNNER
 ========================================
 
-Aggressieve instellingen behouden:
+Geoptimaliseerde instellingen:
 - Risk 1.8% per trade
-- 1.25R targets
-- 12x isolated
-- Max 4 posities
-- Scan elke 15 sec
-- 2 min re-entry cooldown
-- 12 min continuation / 100 min sessie
-- 1m signalen
-
-Gerichte verbeteringen:
-1) Open posities worden ALTIJD beheerd, ook buiten de entry-sessie.
-2) Fair Value komt van de echte 1m session-open candle, nooit van "last price" bij restart.
-3) Displacement wordt gemeten tegen de mediane body van recente candles + BOS.
+- Maximaal 2 actieve posities tegelijk (voorkomt API-fouten / marge-uitputting)
+- Runner activeert pas op 1.60R (geeft de trade ruimte)
+- Locked winst bij runner: minimaal 0.75R gegarandeerd
+- Ruimere trailing (0.75R) om uitzakken door kleine wicks te voorkomen
+- Max target op 3.00R voor de uitschieters
 """
 
 import os
@@ -41,10 +34,10 @@ except Exception:
     Flask = None
 
 # ============================================================
-# CONFIG - AGGRESSIEVE VERSIE
+# CONFIG - VERBETERDE PROFIT RUNNER VERSIE (MAX 2 POSITIES)
 # ============================================================
 
-VERSION = "1.3-ProfitRunner"
+VERSION = "1.4-ProfitRunnerOptimized-Max2"
 BOT_NAME = "JJ Fair Pricing Profit Runner"
 
 API_KEY = os.getenv("EXCHANGE_API_KEY", "").strip()
@@ -71,40 +64,35 @@ CONTINUATION_MINUTES = int(os.getenv("JJ_CONTINUATION_MINUTES", "12"))
 SESSION_LENGTH_MINUTES = int(os.getenv("JJ_SESSION_LENGTH_MINUTES", "100"))
 
 # Verbeterde displacement:
-# huidige candle-body moet >= 1.25x de mediane body van de vorige 12 candles zijn.
-# 1.25 houdt hem bewust agressief; hoger = selectiever.
 DISPLACEMENT_BODY_MULT = float(os.getenv("JJ_DISPLACEMENT_BODY_MULT", "1.25"))
 DISPLACEMENT_LOOKBACK = int(os.getenv("JJ_DISPLACEMENT_LOOKBACK", "12"))
 BOS_LOOKBACK = int(os.getenv("JJ_BOS_LOOKBACK", "4"))
 
 RISK_PER_TRADE = float(os.getenv("JJ_RISK_PER_TRADE", "0.018"))
-FIXED_RR = float(os.getenv("JJ_FIXED_RR", "1.25"))
+FIXED_RR = float(os.getenv("JJ_FIXED_RR", "2.00"))
 
-# ----- PROFIT RUNNER -----
-# 1.25R is no longer an immediate full close. It arms the runner.
-RUNNER_ACTIVATE_R = float(os.getenv("JJ_RUNNER_ACTIVATE_R", "1.25"))
-RUNNER_TRAIL_R = float(os.getenv("JJ_RUNNER_TRAIL_R", "0.60"))
-RUNNER_LOCK_R = float(os.getenv("JJ_RUNNER_LOCK_R", "0.35"))
-RUNNER_MAX_TARGET_R = float(os.getenv("JJ_RUNNER_MAX_TARGET_R", "2.50"))
-# Fair value is a milestone, not an instant exit. This prevents the tiny
-# near-zero closes visible when entry already sits almost on fair value.
-FAIR_VALUE_MIN_R = float(os.getenv("JJ_FAIR_VALUE_MIN_R", "0.35"))
+# ----- PROFIT RUNNER (Geoptimaliseerd tegen kleine winsten) -----
+RUNNER_ACTIVATE_R = float(os.getenv("JJ_RUNNER_ACTIVATE_R", "1.60"))
+RUNNER_TRAIL_R = float(os.getenv("JJ_RUNNER_TRAIL_R", "0.75"))
+RUNNER_LOCK_R = float(os.getenv("JJ_RUNNER_LOCK_R", "0.75"))
+RUNNER_MAX_TARGET_R = float(os.getenv("JJ_RUNNER_MAX_TARGET_R", "3.00"))
+FAIR_VALUE_MIN_R = float(os.getenv("JJ_FAIR_VALUE_MIN_R", "0.75"))
+
 USE_ATR_STOPS = os.getenv("JJ_USE_ATR_STOPS", "True").lower() == "true"
 ATR_PERIOD = int(os.getenv("JJ_ATR_PERIOD", "14"))
 ATR_SL_MULT = float(os.getenv("JJ_ATR_SL_MULT", "1.1"))
 
 LEVERAGE = int(os.getenv("JJ_LEVERAGE", "12"))
 MARGIN_MODE = os.getenv("JJ_MARGIN_MODE", "isolated").strip().lower()
-MAX_ACTIVE_POSITIONS = int(os.getenv("JJ_MAX_ACTIVE_POSITIONS", "4"))
+MAX_ACTIVE_POSITIONS = int(os.getenv("JJ_MAX_ACTIVE_POSITIONS", "2"))  # Aangepast naar 2
 SCAN_SECONDS = int(os.getenv("JJ_SCAN_SECONDS", "15"))
 REENTRY_COOLDOWN_MIN = int(os.getenv("JJ_REENTRY_COOLDOWN_MIN", "2"))
 
-# Sessie-opens (UTC)
 SESSION_OPENS_UTC = [
     {"hour": 13, "minute": 30},   # New York open
 ]
 
-STATE_FILE = "jj_fair_pricing_profit_runner_v13_state.json"
+STATE_FILE = "jj_fair_pricing_profit_runner_v14_state.json"
 
 DEFAULT_SYMBOLS = [
     "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT",
@@ -292,11 +280,6 @@ def instrument(symbol):
     return x
 
 def candles(symbol, bar, limit=50, confirmed_only=True):
-    """
-    BloFin candles. Voor signalen gebruiken we alleen gesloten candles.
-    Voor de exacte session-open mogen we ook de lopende 1m candle lezen,
-    omdat de OPEN-prijs vanaf het begin van die candle vaststaat.
-    """
     data = public_get(
         "/api/v1/market/candles",
         {"instId": symbol, "bar": bar, "limit": str(limit)},
@@ -325,22 +308,11 @@ def candles(symbol, bar, limit=50, confirmed_only=True):
     return rows
 
 def session_open_price(symbol, session_open):
-    """
-    Haalt de ECHTE open-prijs van de 1m candle waarvan ts exact gelijk is
-    aan de ingestelde sessie-open.
-
-    Belangrijk: bij een Railway restart om bv. 14:05 UTC blijft de fair value
-    dus de 13:30 candle-open en wordt NIET de actuele tickerprijs gebruikt.
-    """
     target_ts = int(session_open.timestamp() * 1000)
-
-    # Sessie duurt 100 min; 180 recente 1m candles geeft ruime marge.
     rows = candles(symbol, "1m", limit=180, confirmed_only=False)
-
     for row in rows:
         if row["ts"] == target_ts:
             return row["open"]
-
     return None
 
 def last_price(symbol):
@@ -422,14 +394,6 @@ def get_phase(session_open):
     return "reversion"
 
 def detect_displacement_and_bos(rows):
-    """
-    Aggressieve maar robuustere displacement:
-    - huidige body >= DISPLACEMENT_BODY_MULT * median body van vorige N candles
-    - candle moet BOS maken over de vorige BOS_LOOKBACK highs/lows
-
-    Dit voorkomt dat een relatief kleine candle al displacement heet alleen
-    omdat de direct voorgaande candle toevallig nóg kleiner was.
-    """
     need = max(DISPLACEMENT_LOOKBACK + 1, BOS_LOOKBACK + 1, 6)
     if len(rows) < need:
         return None
@@ -493,19 +457,11 @@ def strategy_snapshot(symbol, session_open, fair_value):
     minutes_since = (now_utc() - session_open).total_seconds() / 60
 
     valid = False
-
-    # Continuation:
-    # boven fair value + bullish displacement/BOS -> long
-    # onder fair value + bearish displacement/BOS -> short
     if phase == "continuation":
         if signal["direction"] == "long" and signal["close"] > fair_value:
             valid = True
         elif signal["direction"] == "short" and signal["close"] < fair_value:
             valid = True
-
-    # Reversion:
-    # onder fair value + bullish displacement/BOS -> long terug naar fair
-    # boven fair value + bearish displacement/BOS -> short terug naar fair
     else:
         if signal["direction"] == "long" and signal["close"] < fair_value:
             valid = True
@@ -548,7 +504,6 @@ def calculate_size(symbol, entry_price, equity, available, stop_distance):
     risk_amount = equity * RISK_PER_TRADE
     notional = risk_amount / (stop_distance / entry_price)
 
-    # Agressieve bestaande cap behouden.
     max_notional = available * 0.88 * LEVERAGE
     notional = min(notional, max_notional)
 
@@ -581,14 +536,8 @@ def open_position(snapshot):
     ):
         return False
 
-    # Stop distance - agressieve bestaande instellingen behouden.
     if USE_ATR_STOPS:
-        rows = candles(
-            symbol,
-            SIGNAL_BAR,
-            40,
-            confirmed_only=True,
-        )
+        rows = candles(symbol, SIGNAL_BAR, 40, confirmed_only=True)
         trs = []
         for i in range(1, len(rows)):
             tr = max(
@@ -608,13 +557,7 @@ def open_position(snapshot):
     else:
         stop_dist = live * 0.007
 
-    sizing = calculate_size(
-        symbol,
-        live,
-        equity,
-        available,
-        stop_dist,
-    )
+    sizing = calculate_size(symbol, live, equity, available, stop_dist)
     if not sizing:
         return False
 
@@ -628,13 +571,12 @@ def open_position(snapshot):
         side = "sell"
 
     tg(
-        f"🟠 JJ AGGRESSIVE READY\n"
+        f"🟠 JJ OPTIMIZED READY\n"
         f"{symbol} {direction.upper()} · {snapshot['phase'].upper()}\n"
         f"Fair Value: {fmt_price(snapshot['fair_value'])}\n"
         f"Entry ~{fmt_price(live)} | SL {fmt_price(stop)} | "
         f"Runner start {fmt_price(tp)} ({RUNNER_ACTIVATE_R}R) | Max {RUNNER_MAX_TARGET_R}R\n"
-        f"Displacement: {snapshot.get('body_multiple', 0):.2f}x median body\n"
-        f"Minuten open: {snapshot['minutes_since_open']:.1f}"
+        f"Displacement: {snapshot.get('body_multiple', 0):.2f}x median body"
     )
 
     record = {
@@ -661,10 +603,7 @@ def open_position(snapshot):
         with state_lock:
             state["managed"][symbol] = record
         save_state()
-        tg(
-            f"🟢 PAPER OPEN {symbol} {direction.upper()} "
-            f"@ {fmt_price(live)}"
-        )
+        tg(f"🟢 PAPER OPEN {symbol} {direction.upper()} @ {fmt_price(live)}")
         return True
 
     set_leverage(symbol)
@@ -677,9 +616,7 @@ def open_position(snapshot):
         "orderType": "market",
         "size": decimal_str(sizing["contracts"]),
         "reduceOnly": "false",
-        "clientOrderId": (
-            f"jja{int(time.time())}{symbol.split('-')[0]}"
-        )[:32],
+        "clientOrderId": (f"jjax{int(time.time())}{symbol.split('-')[0]}")[:32],
         "slTriggerPrice": decimal_str(stop),
         "slOrderPrice": "-1",
         "slTriggerPriceType": "mark",
@@ -691,22 +628,10 @@ def open_position(snapshot):
         state["managed"][symbol] = record
     save_state()
 
-    tg(
-        f"🟢 LIVE OPEN {symbol} {direction.upper()} "
-        f"@ ~{fmt_price(live)}"
-    )
+    tg(f"🟢 LIVE OPEN {symbol} {direction.upper()} @ ~{fmt_price(live)}")
     return True
 
 def manage_position(symbol):
-    """
-    PROFIT RUNNER:
-    - hard exchange SL blijft de originele 1R noodstop;
-    - fair value sluit NIET meer direct (dit veroorzaakte mini-winsten);
-    - vanaf +1.25R wordt de runner actief;
-    - daarna beschermt de bot minimaal +0.35R;
-    - trailing afstand = 0.60R vanaf beste prijs;
-    - maximale runner target = +2.50R.
-    """
     managed = state.get("managed", {}).get(symbol)
     if not managed:
         return
@@ -723,7 +648,6 @@ def manage_position(symbol):
     if entry <= 0 or risk_dist <= 0:
         return
 
-    # R multiple van de huidige trade.
     if direction == "long":
         r_now = (live - entry) / risk_dist
         hit_stop = live <= stop
@@ -731,7 +655,6 @@ def manage_position(symbol):
         r_now = (entry - live) / risk_dist
         hit_stop = live >= stop
 
-    # Beste prijs sinds entry bijhouden.
     best = fnum(managed.get("best_price"), entry)
     if direction == "long":
         best = max(best, live)
@@ -739,7 +662,6 @@ def manage_position(symbol):
         best = min(best, live)
     managed["best_price"] = best
 
-    # Fair value is voortaan informatie / milestone, geen instant close.
     fair_touched = bool(managed.get("fair_value_touched", False))
     if managed.get("phase") == "reversion" and fair > 0 and not fair_touched:
         touched = (
@@ -748,7 +670,6 @@ def manage_position(symbol):
         )
         if touched:
             managed["fair_value_touched"] = True
-            # Alleen melden als de beweging ten minste enigszins betekenisvol is.
             if r_now >= FAIR_VALUE_MIN_R:
                 tg(
                     f"🎯 FAIR VALUE {symbol} geraakt · {r_now:+.2f}R\n"
@@ -767,11 +688,8 @@ def manage_position(symbol):
 
     reason = None
 
-    # Originele verliesstop blijft altijd leidend.
     if hit_stop:
         reason = "STOP"
-
-    # Runner management pas nadat +1.25R daadwerkelijk is gehaald.
     elif runner_active:
         if direction == "long":
             lock_price = entry + risk_dist * RUNNER_LOCK_R
@@ -830,10 +748,6 @@ def manage_position(symbol):
 # ============================================================
 
 def ensure_fair_values(session_open, symbols):
-    """
-    Leg fair value vast vanaf de echte 1m session-open candle.
-    Geen fallback naar last_price: liever geen entry dan een verkeerde fair value.
-    """
     session_id = session_open.strftime("%Y%m%d_%H%M")
     changed = False
 
@@ -845,11 +759,6 @@ def ensure_fair_values(session_open, symbols):
         try:
             price = session_open_price(symbol, session_open)
             if price is None or price <= 0:
-                print(
-                    f"Fair value nog niet gevonden voor {symbol} "
-                    f"op {session_open.isoformat()}",
-                    flush=True,
-                )
                 continue
 
             state.setdefault("fair_values", {})[key] = {
@@ -858,7 +767,6 @@ def ensure_fair_values(session_open, symbols):
                 "source": "1m_session_open_candle",
             }
             changed = True
-
         except Exception as e:
             print(f"Fair value error {symbol}: {e}", flush=True)
 
@@ -870,24 +778,16 @@ def ensure_fair_values(session_open, symbols):
 def scan_once():
     symbols = valid_symbols()
 
-    # ========================================================
-    # FIX 1: POSITIES ALTIJD BEHEREN
-    # Dit gebeurt vóór de session-window check.
-    # ========================================================
     for symbol in list(state.get("managed", {}).keys()):
         try:
             manage_position(symbol)
         except Exception as e:
             tg(f"⚠️ Manage error {symbol}: {e}")
 
-    # Alleen NIEUWE ENTRIES zijn beperkt tot de JJ sessie.
     session_open = get_current_session_open()
     if not is_in_session_window(session_open):
         return
 
-    # ========================================================
-    # FIX 2: ECHTE SESSION-OPEN FAIR VALUE
-    # ========================================================
     ensure_fair_values(session_open, symbols)
 
     active = len(state.get("managed", {}))
@@ -920,7 +820,6 @@ def scan_once():
 
         time.sleep(0.04)
 
-    # Meest recente bevestigde signalen eerst.
     candidates.sort(key=lambda x: x["ts"], reverse=True)
 
     opened = 0
@@ -930,6 +829,7 @@ def scan_once():
         try:
             if open_position(snap):
                 opened += 1
+            time.sleep(0.5)  # Korte pauze tussen orders om API rate limits tegen te gaan
         except Exception as e:
             tg(f"❌ Entry error {snap['symbol']}: {e}")
 
@@ -941,19 +841,9 @@ def startup():
     tg(
         f"🧠 {BOT_NAME} v{VERSION} STARTED\n"
         f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
-        f"Fair Pricing Aggressive\n"
-        f"Continuation: {CONTINUATION_MINUTES} min | "
-        f"Sessie: {SESSION_LENGTH_MINUTES} min\n"
-        f"Risk {RISK_PER_TRADE*100:.1f}% | Runner vanaf {RUNNER_ACTIVATE_R}R | "
-        f"Max target {RUNNER_MAX_TARGET_R}R | ATR stops: {USE_ATR_STOPS}\n"
-        f"Displacement >= {DISPLACEMENT_BODY_MULT:.2f}x "
-        f"median body ({DISPLACEMENT_LOOKBACK} candles) + "
-        f"BOS({BOS_LOOKBACK})\n"
-        f"Max posities: {MAX_ACTIVE_POSITIONS} | "
-        f"Leverage: {LEVERAGE}x | Scan: {SCAN_SECONDS}s\n"
-        f"Fair value: echte 1m session-open candle\n"
-        f"Position management: 24/7\n"
-        f"Symbolen: {len(symbols)}"
+        f"Runner activate: {RUNNER_ACTIVATE_R}R | Lock: {RUNNER_LOCK_R}R | "
+        f"Trail: {RUNNER_TRAIL_R}R | Max Target: {RUNNER_MAX_TARGET_R}R\n"
+        f"Risk {RISK_PER_TRADE*100:.1f}% | Max posities: {MAX_ACTIVE_POSITIONS}"
     )
 
 def main():
@@ -971,10 +861,7 @@ def main():
                 use_reloader=False,
             )
 
-        threading.Thread(
-            target=run_health,
-            daemon=True,
-        ).start()
+        threading.Thread(target=run_health, daemon=True).start()
 
     startup()
 
