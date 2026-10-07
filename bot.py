@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-JJ SIMON - FAIR PRICING THEORY BOT v1.4 (Profit Runner Optimaal - Max 2 Posities)
+JJ SIMON - FAIR PRICING THEORY BOT v1.4.1 (Minimaal 12 USDT Marge per Trade)
 BloFin Futures - AGGRESSIVE & TREND RUNNER
 ========================================
 
 Geoptimaliseerde instellingen:
-- Risk 1.8% per trade
-- Maximaal 2 actieve posities tegelijk (voorkomt API-fouten / marge-uitputting)
-- Runner activeert pas op 1.60R (geeft de trade ruimte)
+- Minimaal 12 USDT marge per trade (geen centenwerk meer bij winst)
+- Maximaal 2 actieve posities tegelijk
+- Runner activeert pas op 1.60R
 - Locked winst bij runner: minimaal 0.75R gegarandeerd
-- Ruimere trailing (0.75R) om uitzakken door kleine wicks te voorkomen
+- Ruimere trailing (0.75R) om uitzakken te voorkomen
 - Max target op 3.00R voor de uitschieters
 """
 
@@ -34,10 +34,10 @@ except Exception:
     Flask = None
 
 # ============================================================
-# CONFIG - VERBETERDE PROFIT RUNNER VERSIE (MAX 2 POSITIES)
+# CONFIG - MINIMAAL 12 USDT MARGE PER TRADE
 # ============================================================
 
-VERSION = "1.4-ProfitRunnerOptimized-Max2"
+VERSION = "1.4.1-Min12USDT-Margin"
 BOT_NAME = "JJ Fair Pricing Profit Runner"
 
 API_KEY = os.getenv("EXCHANGE_API_KEY", "").strip()
@@ -63,7 +63,6 @@ SIGNAL_BAR = os.getenv("JJ_SIGNAL_BAR", "1m")
 CONTINUATION_MINUTES = int(os.getenv("JJ_CONTINUATION_MINUTES", "12"))
 SESSION_LENGTH_MINUTES = int(os.getenv("JJ_SESSION_LENGTH_MINUTES", "100"))
 
-# Verbeterde displacement:
 DISPLACEMENT_BODY_MULT = float(os.getenv("JJ_DISPLACEMENT_BODY_MULT", "1.25"))
 DISPLACEMENT_LOOKBACK = int(os.getenv("JJ_DISPLACEMENT_LOOKBACK", "12"))
 BOS_LOOKBACK = int(os.getenv("JJ_BOS_LOOKBACK", "4"))
@@ -71,7 +70,10 @@ BOS_LOOKBACK = int(os.getenv("JJ_BOS_LOOKBACK", "4"))
 RISK_PER_TRADE = float(os.getenv("JJ_RISK_PER_TRADE", "0.018"))
 FIXED_RR = float(os.getenv("JJ_FIXED_RR", "2.00"))
 
-# ----- PROFIT RUNNER (Geoptimaliseerd tegen kleine winsten) -----
+# ----- MINIMUM MARGE PER TRADE (Aangepast naar 12 USDT) -----
+MIN_MARGIN_USDT = float(os.getenv("JJ_MIN_MARGIN_USDT", "12.0"))
+
+# ----- PROFIT RUNNER -----
 RUNNER_ACTIVATE_R = float(os.getenv("JJ_RUNNER_ACTIVATE_R", "1.60"))
 RUNNER_TRAIL_R = float(os.getenv("JJ_RUNNER_TRAIL_R", "0.75"))
 RUNNER_LOCK_R = float(os.getenv("JJ_RUNNER_LOCK_R", "0.75"))
@@ -84,7 +86,7 @@ ATR_SL_MULT = float(os.getenv("JJ_ATR_SL_MULT", "1.1"))
 
 LEVERAGE = int(os.getenv("JJ_LEVERAGE", "12"))
 MARGIN_MODE = os.getenv("JJ_MARGIN_MODE", "isolated").strip().lower()
-MAX_ACTIVE_POSITIONS = int(os.getenv("JJ_MAX_ACTIVE_POSITIONS", "2"))  # Aangepast naar 2
+MAX_ACTIVE_POSITIONS = int(os.getenv("JJ_MAX_ACTIVE_POSITIONS", "2"))
 SCAN_SECONDS = int(os.getenv("JJ_SCAN_SECONDS", "15"))
 REENTRY_COOLDOWN_MIN = int(os.getenv("JJ_REENTRY_COOLDOWN_MIN", "2"))
 
@@ -92,7 +94,7 @@ SESSION_OPENS_UTC = [
     {"hour": 13, "minute": 30},   # New York open
 ]
 
-STATE_FILE = "jj_fair_pricing_profit_runner_v14_state.json"
+STATE_FILE = "jj_fair_pricing_profit_runner_v141_state.json"
 
 DEFAULT_SYMBOLS = [
     "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT",
@@ -289,11 +291,9 @@ def candles(symbol, bar, limit=50, confirmed_only=True):
     for c in data:
         if not isinstance(c, list) or len(c) < 6:
             continue
-
         confirm = str(c[-1])
         if confirmed_only and confirm != "1":
             continue
-
         rows.append({
             "ts": int(c[0]),
             "open": fnum(c[1]),
@@ -303,7 +303,6 @@ def candles(symbol, bar, limit=50, confirmed_only=True):
             "volume": fnum(c[5]),
             "confirm": confirm,
         })
-
     rows.sort(key=lambda x: x["ts"])
     return rows
 
@@ -483,7 +482,7 @@ def strategy_snapshot(symbol, session_open, fair_value):
     }
 
 # ============================================================
-# SIZING & ORDERS
+# SIZING & ORDERS (MET MINIMUM 12 USDT MARGE)
 # ============================================================
 
 def calculate_size(symbol, entry_price, equity, available, stop_distance):
@@ -501,8 +500,15 @@ def calculate_size(symbol, entry_price, equity, available, stop_distance):
     ) <= 0:
         return None
 
+    # Standaard risico berekening
     risk_amount = equity * RISK_PER_TRADE
     notional = risk_amount / (stop_distance / entry_price)
+
+    # Controleer of de resulterende marge kleiner is dan de ingestelde minimum marge (12 USDT)
+    current_margin = notional / LEVERAGE
+    if current_margin < MIN_MARGIN_USDT:
+        notional = MIN_MARGIN_USDT * LEVERAGE
+        risk_amount = notional * (stop_distance / entry_price)
 
     max_notional = available * 0.88 * LEVERAGE
     notional = min(notional, max_notional)
@@ -571,11 +577,11 @@ def open_position(snapshot):
         side = "sell"
 
     tg(
-        f"🟠 JJ OPTIMIZED READY\n"
+        f"🟠 JJ MIN12 READY\n"
         f"{symbol} {direction.upper()} · {snapshot['phase'].upper()}\n"
         f"Fair Value: {fmt_price(snapshot['fair_value'])}\n"
         f"Entry ~{fmt_price(live)} | SL {fmt_price(stop)} | "
-        f"Runner start {fmt_price(tp)} ({RUNNER_ACTIVATE_R}R) | Max {RUNNER_MAX_TARGET_R}R\n"
+        f"Marge ~{sizing['notional']/LEVERAGE:.2f} USDT\n"
         f"Displacement: {snapshot.get('body_multiple', 0):.2f}x median body"
     )
 
@@ -616,7 +622,7 @@ def open_position(snapshot):
         "orderType": "market",
         "size": decimal_str(sizing["contracts"]),
         "reduceOnly": "false",
-        "clientOrderId": (f"jjax{int(time.time())}{symbol.split('-')[0]}")[:32],
+        "clientOrderId": (f"jjm12{int(time.time())}{symbol.split('-')[0]}")[:32],
         "slTriggerPrice": decimal_str(stop),
         "slOrderPrice": "-1",
         "slTriggerPriceType": "mark",
@@ -721,7 +727,7 @@ def manage_position(symbol):
     if PAPER_TRADING:
         tg(
             f"{'🟢' if pnl_pct >= 0 else '🔴'} PAPER CLOSE {symbol} · {reason}\n"
-            f"{r_now:+.2f}R · {pnl_pct:+.2f}% · ~{pnl_usdt:+.3f} USDT bruto"
+            f"{r_now:+.2f}R · {pnl_pct:+.2f}% · ~{pnl_usdt:+.3f} USDT"
         )
     else:
         pos = get_position(symbol)
@@ -730,7 +736,7 @@ def manage_position(symbol):
                 "instId": symbol,
                 "marginMode": MARGIN_MODE,
                 "positionSide": "net",
-                "clientOrderId": f"jjax{int(time.time())}"[:32],
+                "clientOrderId": f"jjm12{int(time.time())}"[:32],
             }
             private_post("/api/v1/trade/close-position", body)
             tg(
@@ -829,7 +835,7 @@ def scan_once():
         try:
             if open_position(snap):
                 opened += 1
-            time.sleep(0.5)  # Korte pauze tussen orders om API rate limits tegen te gaan
+            time.sleep(0.5)
         except Exception as e:
             tg(f"❌ Entry error {snap['symbol']}: {e}")
 
@@ -841,9 +847,8 @@ def startup():
     tg(
         f"🧠 {BOT_NAME} v{VERSION} STARTED\n"
         f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
-        f"Runner activate: {RUNNER_ACTIVATE_R}R | Lock: {RUNNER_LOCK_R}R | "
-        f"Trail: {RUNNER_TRAIL_R}R | Max Target: {RUNNER_MAX_TARGET_R}R\n"
-        f"Risk {RISK_PER_TRADE*100:.1f}% | Max posities: {MAX_ACTIVE_POSITIONS}"
+        f"Min Marge per Trade: {MIN_MARGIN_USDT} USDT | Max Posities: {MAX_ACTIVE_POSITIONS}\n"
+        f"Runner activate: {RUNNER_ACTIVATE_R}R | Lock: {RUNNER_LOCK_R}R | Trail: {RUNNER_TRAIL_R}R"
     )
 
 def main():
