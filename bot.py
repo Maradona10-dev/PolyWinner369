@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-JJ SIMON - FAIR PRICING THEORY BOT v1.3 REVERSE
+JJ SIMON - FAIR PRICING THEORY BOT v1.3 MULTI SESSION
 BloFin Futures - AGGRESSIVE
 ========================================
 
@@ -11,14 +11,10 @@ Aggressieve instellingen behouden:
 - Max 4 posities
 - Scan elke 15 sec
 - 2 min re-entry cooldown
-- 12 min continuation / 100 min sessie
+- 12 min continuation / 100 min sessie\n- Asia + London + South America + New York
 - 1m signalen
 
-REVERSE TEST:
-- Exact dezelfde JJ setup/filter, maar de trade-richting wordt omgedraaid.
-- Reverse reversion gebruikt geen Fair Value exit; alleen ATR-SL + 1.25R TP.
-
-Gerichte verbeteringen uit v1.2:
+Gerichte verbeteringen:
 1) Open posities worden ALTIJD beheerd, ook buiten de entry-sessie.
 2) Fair Value komt van de echte 1m session-open candle, nooit van "last price" bij restart.
 3) Displacement wordt gemeten tegen de mediane body van recente candles + BOS.
@@ -34,6 +30,7 @@ import threading
 from uuid import uuid4
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from urllib.parse import urlencode
 from statistics import median
 
@@ -48,8 +45,8 @@ except Exception:
 # CONFIG - AGGRESSIEVE VERSIE
 # ============================================================
 
-VERSION = "1.3-Reverse-Aggressive"
-BOT_NAME = "JJ Fair Pricing REVERSE Aggressive"
+VERSION = "1.3-MultiSession-Aggressive"
+BOT_NAME = "JJ Fair Pricing Aggressive"
 
 API_KEY = os.getenv("EXCHANGE_API_KEY", "").strip()
 API_SECRET = os.getenv("EXCHANGE_SECRET", "").strip()
@@ -93,16 +90,37 @@ MAX_ACTIVE_POSITIONS = int(os.getenv("JJ_MAX_ACTIVE_POSITIONS", "4"))
 SCAN_SECONDS = int(os.getenv("JJ_SCAN_SECONDS", "15"))
 REENTRY_COOLDOWN_MIN = int(os.getenv("JJ_REENTRY_COOLDOWN_MIN", "2"))
 
-# REVERSE MODE: elk geldig JJ-signaal wordt exact tegengesteld uitgevoerd.
-# Origineel LONG -> REVERSE SHORT; origineel SHORT -> REVERSE LONG.
-REVERSE_MODE = os.getenv("JJ_REVERSE_MODE", "True").lower() == "true"
-
-# Sessie-opens (UTC)
-SESSION_OPENS_UTC = [
-    {"hour": 13, "minute": 30},   # New York open
+# Sessie-opens in LOKALE markttijd.
+# ZoneInfo zet deze automatisch correct om naar UTC, inclusief zomer-/wintertijd.
+# Crypto handelt 24/7; deze tijden gebruiken we als Fair Pricing ankers.
+SESSIONS = [
+    {
+        "name": "ASIA",
+        "timezone": "Asia/Tokyo",
+        "hour": 9,
+        "minute": 0,
+    },
+    {
+        "name": "LONDON",
+        "timezone": "Europe/London",
+        "hour": 8,
+        "minute": 0,
+    },
+    {
+        "name": "SOUTH_AMERICA",
+        "timezone": "America/Sao_Paulo",
+        "hour": 10,
+        "minute": 0,
+    },
+    {
+        "name": "NEW_YORK",
+        "timezone": "America/New_York",
+        "hour": 9,
+        "minute": 30,
+    },
 ]
 
-STATE_FILE = "jj_fair_pricing_reverse_aggressive_v13_state.json"
+STATE_FILE = "jj_fair_pricing_multisession_aggressive_v13_state.json"
 
 DEFAULT_SYMBOLS = [
     "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT",
@@ -394,30 +412,61 @@ def set_leverage(symbol):
 # STRATEGY LOGIC
 # ============================================================
 
-def get_current_session_open():
+def get_session_open_utc(session_cfg, now=None):
+    """
+    Bepaal de meest recente lokale sessie-open en converteer die naar UTC.
+    DST wordt automatisch afgehandeld door ZoneInfo.
+    """
+    now = now or now_utc()
+    tz = ZoneInfo(session_cfg["timezone"])
+    local_now = now.astimezone(tz)
+
+    local_open = local_now.replace(
+        hour=session_cfg["hour"],
+        minute=session_cfg["minute"],
+        second=0,
+        microsecond=0,
+    )
+    if local_open > local_now:
+        local_open -= timedelta(days=1)
+
+    return local_open.astimezone(timezone.utc)
+
+
+def get_active_sessions():
+    """
+    Geeft ALLE sessies terug die op dit moment binnen hun 100-min entry-window
+    vallen. Dit is belangrijk omdat South America en New York deels overlappen.
+    """
     now = now_utc()
-    candidates = []
-    for s in SESSION_OPENS_UTC:
-        open_time = now.replace(
-            hour=s["hour"],
-            minute=s["minute"],
-            second=0,
-            microsecond=0,
-        )
-        if open_time > now:
-            open_time -= timedelta(days=1)
-        candidates.append(open_time)
-    return max(candidates)
+    active = []
+
+    for cfg in SESSIONS:
+        session_open = get_session_open_utc(cfg, now)
+        minutes_since = (now - session_open).total_seconds() / 60.0
+
+        if 0 <= minutes_since <= SESSION_LENGTH_MINUTES:
+            active.append({
+                "name": cfg["name"],
+                "timezone": cfg["timezone"],
+                "open": session_open,
+                "minutes_since_open": minutes_since,
+            })
+
+    return active
+
 
 def is_in_session_window(session_open):
     minutes_since = (now_utc() - session_open).total_seconds() / 60
     return 0 <= minutes_since <= SESSION_LENGTH_MINUTES
+
 
 def get_phase(session_open):
     minutes_since = (now_utc() - session_open).total_seconds() / 60
     if minutes_since <= CONTINUATION_MINUTES:
         return "continuation"
     return "reversion"
+
 
 def detect_displacement_and_bos(rows):
     """
@@ -478,7 +527,7 @@ def detect_displacement_and_bos(rows):
         "body_multiple": body_curr / baseline_body if baseline_body > 0 else 0,
     }
 
-def strategy_snapshot(symbol, session_open, fair_value):
+def strategy_snapshot(symbol, session_open, fair_value, session_name):
     rows = candles(symbol, SIGNAL_BAR, limit=50, confirmed_only=True)
     if len(rows) < max(DISPLACEMENT_LOOKBACK + 1, BOS_LOOKBACK + 1, 8):
         return None
@@ -517,6 +566,7 @@ def strategy_snapshot(symbol, session_open, fair_value):
         "symbol": symbol,
         "direction": signal["direction"],
         "phase": phase,
+        "session_name": session_name,
         "fair_value": fair_value,
         "close": signal["close"],
         "minutes_since_open": minutes_since,
@@ -565,15 +615,7 @@ def calculate_size(symbol, entry_price, equity, available, stop_distance):
 
 def open_position(snapshot):
     symbol = snapshot["symbol"]
-    signal_direction = snapshot["direction"]
-
-    # Pure reverse: we keep the exact same JJ setup/filter and trade the
-    # opposite side. This lets us test whether the original signal has
-    # negative expectancy without changing when/where signals occur.
-    if REVERSE_MODE:
-        direction = "short" if signal_direction == "long" else "long"
-    else:
-        direction = signal_direction
+    direction = snapshot["direction"]
 
     equity, available = account()
     live = last_price(symbol)
@@ -634,9 +676,8 @@ def open_position(snapshot):
         side = "sell"
 
     tg(
-        f"🟣 JJ REVERSE AGGRESSIVE READY\n"
-        f"{symbol} {direction.upper()} · {snapshot['phase'].upper()}\n"
-        f"Origineel JJ-signaal: {signal_direction.upper()} -> uitgevoerd: {direction.upper()}\n"
+        f"🟠 JJ AGGRESSIVE READY\n"
+        f"{symbol} {direction.upper()} · {snapshot['session_name']} · {snapshot['phase'].upper()}\n"
         f"Fair Value: {fmt_price(snapshot['fair_value'])}\n"
         f"Entry ~{fmt_price(live)} | SL {fmt_price(stop)} | "
         f"TP {fmt_price(tp)} ({FIXED_RR}R)\n"
@@ -648,11 +689,10 @@ def open_position(snapshot):
         "entry_ts": now_ms(),
         "entry_price": live,
         "direction": direction,
-        "signal_direction": signal_direction,
-        "reverse_mode": REVERSE_MODE,
         "stop": stop,
         "tp": tp,
         "phase": snapshot["phase"],
+        "session_name": snapshot["session_name"],
         "fair_value": snapshot["fair_value"],
         "contracts": sizing["contracts"],
         "risk_usdt": sizing["risk_usdt"],
@@ -730,15 +770,7 @@ def manage_position(symbol):
     )
 
     reached_fair = False
-    # In pure reverse mode is Fair Value geen logisch winstdoel: bij een
-    # omgekeerde reversion-entry ligt Fair Value juist aan de verkeerde kant
-    # van de trade en kan de oude voorwaarde direct waar zijn. Reverse trades
-    # gebruiken daarom de vaste 1.25R TP + ATR stop.
-    if (
-        not managed.get("reverse_mode", REVERSE_MODE)
-        and managed["phase"] == "reversion"
-        and fair > 0
-    ):
+    if managed["phase"] == "reversion" and fair > 0:
         if direction == "long" and live >= fair * 0.997:
             reached_fair = True
         elif direction == "short" and live <= fair * 1.003:
@@ -798,16 +830,22 @@ def manage_position(symbol):
 # MAIN LOOP
 # ============================================================
 
-def ensure_fair_values(session_open, symbols):
+def fair_value_key(symbol, session_name, session_open):
+    return (
+        f"{symbol}_{session_name}_"
+        f"{session_open.strftime('%Y%m%d_%H%M')}"
+    )
+
+
+def ensure_fair_values(session_name, session_open, symbols):
     """
-    Leg fair value vast vanaf de echte 1m session-open candle.
+    Leg per markt-sessie de Fair Value vast vanaf de echte 1m session-open candle.
     Geen fallback naar last_price: liever geen entry dan een verkeerde fair value.
     """
-    session_id = session_open.strftime("%Y%m%d_%H%M")
     changed = False
 
     for symbol in symbols:
-        key = f"{symbol}_{session_id}"
+        key = fair_value_key(symbol, session_name, session_open)
         if key in state.get("fair_values", {}):
             continue
 
@@ -815,7 +853,7 @@ def ensure_fair_values(session_open, symbols):
             price = session_open_price(symbol, session_open)
             if price is None or price <= 0:
                 print(
-                    f"Fair value nog niet gevonden voor {symbol} "
+                    f"Fair value nog niet gevonden voor {symbol} · {session_name} "
                     f"op {session_open.isoformat()}",
                     flush=True,
                 )
@@ -825,82 +863,112 @@ def ensure_fair_values(session_open, symbols):
                 "price": price,
                 "ts": int(session_open.timestamp() * 1000),
                 "source": "1m_session_open_candle",
+                "session": session_name,
             }
             changed = True
 
         except Exception as e:
-            print(f"Fair value error {symbol}: {e}", flush=True)
+            print(
+                f"Fair value error {symbol} · {session_name}: {e}",
+                flush=True,
+            )
 
         time.sleep(0.03)
 
     if changed:
         save_state()
 
+
 def scan_once():
     symbols = valid_symbols()
 
-    # ========================================================
-    # FIX 1: POSITIES ALTIJD BEHEREN
-    # Dit gebeurt vóór de session-window check.
-    # ========================================================
+    # Posities ALTIJD 24/7 beheren, onafhankelijk van entry-sessies.
     for symbol in list(state.get("managed", {}).keys()):
         try:
             manage_position(symbol)
         except Exception as e:
             tg(f"⚠️ Manage error {symbol}: {e}")
 
-    # Alleen NIEUWE ENTRIES zijn beperkt tot de JJ sessie.
-    session_open = get_current_session_open()
-    if not is_in_session_window(session_open):
+    # Er kunnen meerdere sessies tegelijk actief zijn.
+    active_sessions = get_active_sessions()
+    if not active_sessions:
         return
 
-    # ========================================================
-    # FIX 2: ECHTE SESSION-OPEN FAIR VALUE
-    # ========================================================
-    ensure_fair_values(session_open, symbols)
+    # Fair Value per actieve sessie vastleggen.
+    for sess in active_sessions:
+        ensure_fair_values(
+            sess["name"],
+            sess["open"],
+            symbols,
+        )
 
     active = len(state.get("managed", {}))
     free_slots = max(0, MAX_ACTIVE_POSITIONS - active)
     if free_slots <= 0:
         return
 
-    session_id = session_open.strftime("%Y%m%d_%H%M")
     candidates = []
 
-    for symbol in symbols:
-        if symbol in state.get("managed", {}):
-            continue
+    for sess in active_sessions:
+        session_name = sess["name"]
+        session_open = sess["open"]
 
-        key = f"{symbol}_{session_id}"
-        fv_data = state.get("fair_values", {}).get(key)
-        if not fv_data:
-            continue
+        for symbol in symbols:
+            if symbol in state.get("managed", {}):
+                continue
 
-        try:
-            snap = strategy_snapshot(
+            key = fair_value_key(
                 symbol,
+                session_name,
                 session_open,
-                fv_data["price"],
             )
-            if snap:
-                candidates.append(snap)
-        except Exception as e:
-            print(f"Signal error {symbol}: {e}", flush=True)
+            fv_data = state.get("fair_values", {}).get(key)
+            if not fv_data:
+                continue
 
-        time.sleep(0.04)
+            try:
+                snap = strategy_snapshot(
+                    symbol,
+                    session_open,
+                    fv_data["price"],
+                    session_name,
+                )
+                if snap:
+                    candidates.append(snap)
+            except Exception as e:
+                print(
+                    f"Signal error {symbol} · {session_name}: {e}",
+                    flush=True,
+                )
 
-    # Meest recente bevestigde signalen eerst.
-    candidates.sort(key=lambda x: x["ts"], reverse=True)
+            time.sleep(0.04)
+
+    # Nieuwste signalen eerst. Bij dezelfde candle krijgt de sterkste
+    # displacement voorrang.
+    candidates.sort(
+        key=lambda x: (x["ts"], x.get("body_multiple", 0)),
+        reverse=True,
+    )
 
     opened = 0
     for snap in candidates:
         if opened >= free_slots:
             break
+
+        # Bij overlappende sessies kan hetzelfde symbool twee kandidaten hebben.
+        # Nooit twee NET-posities op hetzelfde symbool openen.
+        if snap["symbol"] in state.get("managed", {}):
+            continue
+
         try:
             if open_position(snap):
                 opened += 1
         except Exception as e:
-            tg(f"❌ Entry error {snap['symbol']}: {e}")
+            tg(
+                f"❌ Entry error {snap['symbol']} · "
+                f"{snap['session_name']}: {e}"
+            )
+
 
 def startup():
     load_state()
@@ -910,9 +978,10 @@ def startup():
     tg(
         f"🧠 {BOT_NAME} v{VERSION} STARTED\n"
         f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
-        f"Fair Pricing REVERSE Aggressive\n"
-        f"Reverse mode: {REVERSE_MODE} (JJ LONG -> SHORT / JJ SHORT -> LONG)\n"
-        f"Continuation: {CONTINUATION_MINUTES} min | "
+        f"Fair Pricing Aggressive · MULTI SESSION\n"
+        f"Sessions: ASIA 09:00 Tokyo | LONDON 08:00 London | "
+        f"SOUTH AMERICA 10:00 Sao Paulo | NEW YORK 09:30 NY\n"
+        f"Continuation: {CONTINUATION_MINUTES} min per sessie | "
         f"Sessie: {SESSION_LENGTH_MINUTES} min\n"
         f"Risk {RISK_PER_TRADE*100:.1f}% | RR {FIXED_RR} | "
         f"ATR stops: {USE_ATR_STOPS}\n"
