@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-JJ SIMON - FAIR PRICING THEORY BOT v1.3 MULTI SESSION
+JJ SIMON - FAIR PRICING THEORY BOT v1.2
 BloFin Futures - AGGRESSIVE
 ========================================
 
@@ -11,7 +11,7 @@ Aggressieve instellingen behouden:
 - Max 4 posities
 - Scan elke 15 sec
 - 2 min re-entry cooldown
-- 12 min continuation / 100 min sessie\n- Asia + London + South America + New York
+- 12 min continuation / 100 min sessie
 - 1m signalen
 
 Gerichte verbeteringen:
@@ -30,7 +30,6 @@ import threading
 from uuid import uuid4
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo
 from urllib.parse import urlencode
 from statistics import median
 
@@ -45,8 +44,8 @@ except Exception:
 # CONFIG - AGGRESSIEVE VERSIE
 # ============================================================
 
-VERSION = "1.3-MultiSession-Aggressive"
-BOT_NAME = "JJ Fair Pricing Aggressive"
+VERSION = "1.3-ProfitRunner"
+BOT_NAME = "JJ Fair Pricing Profit Runner"
 
 API_KEY = os.getenv("EXCHANGE_API_KEY", "").strip()
 API_SECRET = os.getenv("EXCHANGE_SECRET", "").strip()
@@ -80,6 +79,16 @@ BOS_LOOKBACK = int(os.getenv("JJ_BOS_LOOKBACK", "4"))
 
 RISK_PER_TRADE = float(os.getenv("JJ_RISK_PER_TRADE", "0.018"))
 FIXED_RR = float(os.getenv("JJ_FIXED_RR", "1.25"))
+
+# ----- PROFIT RUNNER -----
+# 1.25R is no longer an immediate full close. It arms the runner.
+RUNNER_ACTIVATE_R = float(os.getenv("JJ_RUNNER_ACTIVATE_R", "1.25"))
+RUNNER_TRAIL_R = float(os.getenv("JJ_RUNNER_TRAIL_R", "0.60"))
+RUNNER_LOCK_R = float(os.getenv("JJ_RUNNER_LOCK_R", "0.35"))
+RUNNER_MAX_TARGET_R = float(os.getenv("JJ_RUNNER_MAX_TARGET_R", "2.50"))
+# Fair value is a milestone, not an instant exit. This prevents the tiny
+# near-zero closes visible when entry already sits almost on fair value.
+FAIR_VALUE_MIN_R = float(os.getenv("JJ_FAIR_VALUE_MIN_R", "0.35"))
 USE_ATR_STOPS = os.getenv("JJ_USE_ATR_STOPS", "True").lower() == "true"
 ATR_PERIOD = int(os.getenv("JJ_ATR_PERIOD", "14"))
 ATR_SL_MULT = float(os.getenv("JJ_ATR_SL_MULT", "1.1"))
@@ -90,37 +99,12 @@ MAX_ACTIVE_POSITIONS = int(os.getenv("JJ_MAX_ACTIVE_POSITIONS", "4"))
 SCAN_SECONDS = int(os.getenv("JJ_SCAN_SECONDS", "15"))
 REENTRY_COOLDOWN_MIN = int(os.getenv("JJ_REENTRY_COOLDOWN_MIN", "2"))
 
-# Sessie-opens in LOKALE markttijd.
-# ZoneInfo zet deze automatisch correct om naar UTC, inclusief zomer-/wintertijd.
-# Crypto handelt 24/7; deze tijden gebruiken we als Fair Pricing ankers.
-SESSIONS = [
-    {
-        "name": "ASIA",
-        "timezone": "Asia/Tokyo",
-        "hour": 9,
-        "minute": 0,
-    },
-    {
-        "name": "LONDON",
-        "timezone": "Europe/London",
-        "hour": 8,
-        "minute": 0,
-    },
-    {
-        "name": "SOUTH_AMERICA",
-        "timezone": "America/Sao_Paulo",
-        "hour": 10,
-        "minute": 0,
-    },
-    {
-        "name": "NEW_YORK",
-        "timezone": "America/New_York",
-        "hour": 9,
-        "minute": 30,
-    },
+# Sessie-opens (UTC)
+SESSION_OPENS_UTC = [
+    {"hour": 13, "minute": 30},   # New York open
 ]
 
-STATE_FILE = "jj_fair_pricing_multisession_aggressive_v13_state.json"
+STATE_FILE = "jj_fair_pricing_profit_runner_v13_state.json"
 
 DEFAULT_SYMBOLS = [
     "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT",
@@ -412,61 +396,30 @@ def set_leverage(symbol):
 # STRATEGY LOGIC
 # ============================================================
 
-def get_session_open_utc(session_cfg, now=None):
-    """
-    Bepaal de meest recente lokale sessie-open en converteer die naar UTC.
-    DST wordt automatisch afgehandeld door ZoneInfo.
-    """
-    now = now or now_utc()
-    tz = ZoneInfo(session_cfg["timezone"])
-    local_now = now.astimezone(tz)
-
-    local_open = local_now.replace(
-        hour=session_cfg["hour"],
-        minute=session_cfg["minute"],
-        second=0,
-        microsecond=0,
-    )
-    if local_open > local_now:
-        local_open -= timedelta(days=1)
-
-    return local_open.astimezone(timezone.utc)
-
-
-def get_active_sessions():
-    """
-    Geeft ALLE sessies terug die op dit moment binnen hun 100-min entry-window
-    vallen. Dit is belangrijk omdat South America en New York deels overlappen.
-    """
+def get_current_session_open():
     now = now_utc()
-    active = []
-
-    for cfg in SESSIONS:
-        session_open = get_session_open_utc(cfg, now)
-        minutes_since = (now - session_open).total_seconds() / 60.0
-
-        if 0 <= minutes_since <= SESSION_LENGTH_MINUTES:
-            active.append({
-                "name": cfg["name"],
-                "timezone": cfg["timezone"],
-                "open": session_open,
-                "minutes_since_open": minutes_since,
-            })
-
-    return active
-
+    candidates = []
+    for s in SESSION_OPENS_UTC:
+        open_time = now.replace(
+            hour=s["hour"],
+            minute=s["minute"],
+            second=0,
+            microsecond=0,
+        )
+        if open_time > now:
+            open_time -= timedelta(days=1)
+        candidates.append(open_time)
+    return max(candidates)
 
 def is_in_session_window(session_open):
     minutes_since = (now_utc() - session_open).total_seconds() / 60
     return 0 <= minutes_since <= SESSION_LENGTH_MINUTES
-
 
 def get_phase(session_open):
     minutes_since = (now_utc() - session_open).total_seconds() / 60
     if minutes_since <= CONTINUATION_MINUTES:
         return "continuation"
     return "reversion"
-
 
 def detect_displacement_and_bos(rows):
     """
@@ -527,7 +480,7 @@ def detect_displacement_and_bos(rows):
         "body_multiple": body_curr / baseline_body if baseline_body > 0 else 0,
     }
 
-def strategy_snapshot(symbol, session_open, fair_value, session_name):
+def strategy_snapshot(symbol, session_open, fair_value):
     rows = candles(symbol, SIGNAL_BAR, limit=50, confirmed_only=True)
     if len(rows) < max(DISPLACEMENT_LOOKBACK + 1, BOS_LOOKBACK + 1, 8):
         return None
@@ -566,7 +519,6 @@ def strategy_snapshot(symbol, session_open, fair_value, session_name):
         "symbol": symbol,
         "direction": signal["direction"],
         "phase": phase,
-        "session_name": session_name,
         "fair_value": fair_value,
         "close": signal["close"],
         "minutes_since_open": minutes_since,
@@ -677,10 +629,10 @@ def open_position(snapshot):
 
     tg(
         f"🟠 JJ AGGRESSIVE READY\n"
-        f"{symbol} {direction.upper()} · {snapshot['session_name']} · {snapshot['phase'].upper()}\n"
+        f"{symbol} {direction.upper()} · {snapshot['phase'].upper()}\n"
         f"Fair Value: {fmt_price(snapshot['fair_value'])}\n"
         f"Entry ~{fmt_price(live)} | SL {fmt_price(stop)} | "
-        f"TP {fmt_price(tp)} ({FIXED_RR}R)\n"
+        f"Runner start {fmt_price(tp)} ({RUNNER_ACTIVATE_R}R) | Max {RUNNER_MAX_TARGET_R}R\n"
         f"Displacement: {snapshot.get('body_multiple', 0):.2f}x median body\n"
         f"Minuten open: {snapshot['minutes_since_open']:.1f}"
     )
@@ -692,13 +644,16 @@ def open_position(snapshot):
         "stop": stop,
         "tp": tp,
         "phase": snapshot["phase"],
-        "session_name": snapshot["session_name"],
         "fair_value": snapshot["fair_value"],
         "contracts": sizing["contracts"],
         "risk_usdt": sizing["risk_usdt"],
         "notional": sizing["notional"],
         "signal_ts": snapshot["ts"],
         "body_multiple": snapshot.get("body_multiple", 0),
+        "initial_stop_distance": stop_dist,
+        "runner_active": False,
+        "best_price": live,
+        "fair_value_touched": False,
         "paper": PAPER_TRADING,
     }
 
@@ -744,10 +699,13 @@ def open_position(snapshot):
 
 def manage_position(symbol):
     """
-    BELANGRIJK:
-    Deze functie wordt voortaan altijd aangeroepen, óók buiten de 100-min
-    entry-sessie. Daardoor blijven TP / fair-value exits actief.
-    De exchange-side hard SL blijft daarnaast de noodbeveiliging.
+    PROFIT RUNNER:
+    - hard exchange SL blijft de originele 1R noodstop;
+    - fair value sluit NIET meer direct (dit veroorzaakte mini-winsten);
+    - vanaf +1.25R wordt de runner actief;
+    - daarna beschermt de bot minimaal +0.35R;
+    - trailing afstand = 0.60R vanaf beste prijs;
+    - maximale runner target = +2.50R.
     """
     managed = state.get("managed", {}).get(symbol)
     if not managed:
@@ -755,71 +713,112 @@ def manage_position(symbol):
 
     live = last_price(symbol)
     direction = managed["direction"]
-    entry = managed["entry_price"]
-    stop = managed["stop"]
-    tp = managed["tp"]
-    fair = managed.get("fair_value", 0)
+    entry = fnum(managed.get("entry_price"))
+    stop = fnum(managed.get("stop"))
+    fair = fnum(managed.get("fair_value"))
 
-    hit_stop = (
-        (direction == "long" and live <= stop)
-        or (direction == "short" and live >= stop)
-    )
-    hit_tp = (
-        (direction == "long" and live >= tp)
-        or (direction == "short" and live <= tp)
-    )
-
-    reached_fair = False
-    if managed["phase"] == "reversion" and fair > 0:
-        if direction == "long" and live >= fair * 0.997:
-            reached_fair = True
-        elif direction == "short" and live <= fair * 1.003:
-            reached_fair = True
-
-    if not (hit_stop or hit_tp or reached_fair):
+    risk_dist = fnum(managed.get("initial_stop_distance"))
+    if risk_dist <= 0:
+        risk_dist = abs(entry - stop)
+    if entry <= 0 or risk_dist <= 0:
         return
 
-    reason = (
-        "STOP"
-        if hit_stop
-        else ("TP" if hit_tp else "FAIR VALUE")
-    )
+    # R multiple van de huidige trade.
+    if direction == "long":
+        r_now = (live - entry) / risk_dist
+        hit_stop = live <= stop
+    else:
+        r_now = (entry - live) / risk_dist
+        hit_stop = live >= stop
 
-    if PAPER_TRADING:
-        pnl_pct = (
-            ((live - entry) / entry * 100)
-            if direction == "long"
-            else ((entry - live) / entry * 100)
+    # Beste prijs sinds entry bijhouden.
+    best = fnum(managed.get("best_price"), entry)
+    if direction == "long":
+        best = max(best, live)
+    else:
+        best = min(best, live)
+    managed["best_price"] = best
+
+    # Fair value is voortaan informatie / milestone, geen instant close.
+    fair_touched = bool(managed.get("fair_value_touched", False))
+    if managed.get("phase") == "reversion" and fair > 0 and not fair_touched:
+        touched = (
+            (direction == "long" and live >= fair)
+            or (direction == "short" and live <= fair)
         )
+        if touched:
+            managed["fair_value_touched"] = True
+            # Alleen melden als de beweging ten minste enigszins betekenisvol is.
+            if r_now >= FAIR_VALUE_MIN_R:
+                tg(
+                    f"🎯 FAIR VALUE {symbol} geraakt · {r_now:+.2f}R\n"
+                    f"Positie blijft open voor Profit Runner."
+                )
 
-        # Indicatieve bruto PnL op opgeslagen notional.
-        pnl_usdt = (
-            managed.get("notional", 0.0)
-            * (pnl_pct / 100.0)
-        )
-
+    runner_active = bool(managed.get("runner_active", False))
+    if not runner_active and r_now >= RUNNER_ACTIVATE_R:
+        managed["runner_active"] = True
+        runner_active = True
         tg(
-            f"{'🟢' if pnl_pct >= 0 else '🔴'} "
-            f"PAPER CLOSE {symbol} · {reason}\n"
-            f"{pnl_pct:+.2f}% · ~{pnl_usdt:+.3f} USDT bruto"
+            f"🚀 PROFIT RUNNER {symbol} actief · {r_now:+.2f}R\n"
+            f"Lock minimaal +{RUNNER_LOCK_R:.2f}R · "
+            f"trail {RUNNER_TRAIL_R:.2f}R · target {RUNNER_MAX_TARGET_R:.2f}R"
         )
 
-        with state_lock:
-            state["managed"].pop(symbol, None)
-            state["last_exit_ts"][symbol] = now_ms()
+    reason = None
+
+    # Originele verliesstop blijft altijd leidend.
+    if hit_stop:
+        reason = "STOP"
+
+    # Runner management pas nadat +1.25R daadwerkelijk is gehaald.
+    elif runner_active:
+        if direction == "long":
+            lock_price = entry + risk_dist * RUNNER_LOCK_R
+            trail_price = best - risk_dist * RUNNER_TRAIL_R
+            runner_stop = max(lock_price, trail_price)
+            trail_hit = live <= runner_stop
+        else:
+            lock_price = entry - risk_dist * RUNNER_LOCK_R
+            trail_price = best + risk_dist * RUNNER_TRAIL_R
+            runner_stop = min(lock_price, trail_price)
+            trail_hit = live >= runner_stop
+
+        if r_now >= RUNNER_MAX_TARGET_R:
+            reason = "RUNNER TARGET"
+        elif trail_hit:
+            reason = "RUNNER TRAIL"
+
+    if reason is None:
         save_state()
         return
 
-    pos = get_position(symbol)
-    if pos:
-        body = {
-            "instId": symbol,
-            "marginMode": MARGIN_MODE,
-            "positionSide": "net",
-            "clientOrderId": f"jjax{int(time.time())}"[:32],
-        }
-        private_post("/api/v1/trade/close-position", body)
-        tg(f"📤 LIVE CLOSE {symbol} · {reason}")
+    pnl_pct = (
+        ((live - entry) / entry * 100)
+        if direction == "long"
+        else ((entry - live) / entry * 100)
+    )
+    pnl_usdt = managed.get("notional", 0.0) * (pnl_pct / 100.0)
+
+    if PAPER_TRADING:
+        tg(
+            f"{'🟢' if pnl_pct >= 0 else '🔴'} PAPER CLOSE {symbol} · {reason}\n"
+            f"{r_now:+.2f}R · {pnl_pct:+.2f}% · ~{pnl_usdt:+.3f} USDT bruto"
+        )
+    else:
+        pos = get_position(symbol)
+        if pos:
+            body = {
+                "instId": symbol,
+                "marginMode": MARGIN_MODE,
+                "positionSide": "net",
+                "clientOrderId": f"jjax{int(time.time())}"[:32],
+            }
+            private_post("/api/v1/trade/close-position", body)
+            tg(
+                f"📤 LIVE CLOSE {symbol} · {reason}\n"
+                f"{r_now:+.2f}R · prijs ~{fmt_price(live)}"
+            )
 
     with state_lock:
         state["managed"].pop(symbol, None)
@@ -830,22 +829,16 @@ def manage_position(symbol):
 # MAIN LOOP
 # ============================================================
 
-def fair_value_key(symbol, session_name, session_open):
-    return (
-        f"{symbol}_{session_name}_"
-        f"{session_open.strftime('%Y%m%d_%H%M')}"
-    )
-
-
-def ensure_fair_values(session_name, session_open, symbols):
+def ensure_fair_values(session_open, symbols):
     """
-    Leg per markt-sessie de Fair Value vast vanaf de echte 1m session-open candle.
+    Leg fair value vast vanaf de echte 1m session-open candle.
     Geen fallback naar last_price: liever geen entry dan een verkeerde fair value.
     """
+    session_id = session_open.strftime("%Y%m%d_%H%M")
     changed = False
 
     for symbol in symbols:
-        key = fair_value_key(symbol, session_name, session_open)
+        key = f"{symbol}_{session_id}"
         if key in state.get("fair_values", {}):
             continue
 
@@ -853,7 +846,7 @@ def ensure_fair_values(session_name, session_open, symbols):
             price = session_open_price(symbol, session_open)
             if price is None or price <= 0:
                 print(
-                    f"Fair value nog niet gevonden voor {symbol} · {session_name} "
+                    f"Fair value nog niet gevonden voor {symbol} "
                     f"op {session_open.isoformat()}",
                     flush=True,
                 )
@@ -863,112 +856,82 @@ def ensure_fair_values(session_name, session_open, symbols):
                 "price": price,
                 "ts": int(session_open.timestamp() * 1000),
                 "source": "1m_session_open_candle",
-                "session": session_name,
             }
             changed = True
 
         except Exception as e:
-            print(
-                f"Fair value error {symbol} · {session_name}: {e}",
-                flush=True,
-            )
+            print(f"Fair value error {symbol}: {e}", flush=True)
 
         time.sleep(0.03)
 
     if changed:
         save_state()
 
-
 def scan_once():
     symbols = valid_symbols()
 
-    # Posities ALTIJD 24/7 beheren, onafhankelijk van entry-sessies.
+    # ========================================================
+    # FIX 1: POSITIES ALTIJD BEHEREN
+    # Dit gebeurt vóór de session-window check.
+    # ========================================================
     for symbol in list(state.get("managed", {}).keys()):
         try:
             manage_position(symbol)
         except Exception as e:
             tg(f"⚠️ Manage error {symbol}: {e}")
 
-    # Er kunnen meerdere sessies tegelijk actief zijn.
-    active_sessions = get_active_sessions()
-    if not active_sessions:
+    # Alleen NIEUWE ENTRIES zijn beperkt tot de JJ sessie.
+    session_open = get_current_session_open()
+    if not is_in_session_window(session_open):
         return
 
-    # Fair Value per actieve sessie vastleggen.
-    for sess in active_sessions:
-        ensure_fair_values(
-            sess["name"],
-            sess["open"],
-            symbols,
-        )
+    # ========================================================
+    # FIX 2: ECHTE SESSION-OPEN FAIR VALUE
+    # ========================================================
+    ensure_fair_values(session_open, symbols)
 
     active = len(state.get("managed", {}))
     free_slots = max(0, MAX_ACTIVE_POSITIONS - active)
     if free_slots <= 0:
         return
 
+    session_id = session_open.strftime("%Y%m%d_%H%M")
     candidates = []
 
-    for sess in active_sessions:
-        session_name = sess["name"]
-        session_open = sess["open"]
+    for symbol in symbols:
+        if symbol in state.get("managed", {}):
+            continue
 
-        for symbol in symbols:
-            if symbol in state.get("managed", {}):
-                continue
+        key = f"{symbol}_{session_id}"
+        fv_data = state.get("fair_values", {}).get(key)
+        if not fv_data:
+            continue
 
-            key = fair_value_key(
+        try:
+            snap = strategy_snapshot(
                 symbol,
-                session_name,
                 session_open,
+                fv_data["price"],
             )
-            fv_data = state.get("fair_values", {}).get(key)
-            if not fv_data:
-                continue
+            if snap:
+                candidates.append(snap)
+        except Exception as e:
+            print(f"Signal error {symbol}: {e}", flush=True)
 
-            try:
-                snap = strategy_snapshot(
-                    symbol,
-                    session_open,
-                    fv_data["price"],
-                    session_name,
-                )
-                if snap:
-                    candidates.append(snap)
-            except Exception as e:
-                print(
-                    f"Signal error {symbol} · {session_name}: {e}",
-                    flush=True,
-                )
+        time.sleep(0.04)
 
-            time.sleep(0.04)
-
-    # Nieuwste signalen eerst. Bij dezelfde candle krijgt de sterkste
-    # displacement voorrang.
-    candidates.sort(
-        key=lambda x: (x["ts"], x.get("body_multiple", 0)),
-        reverse=True,
-    )
+    # Meest recente bevestigde signalen eerst.
+    candidates.sort(key=lambda x: x["ts"], reverse=True)
 
     opened = 0
     for snap in candidates:
         if opened >= free_slots:
             break
-
-        # Bij overlappende sessies kan hetzelfde symbool twee kandidaten hebben.
-        # Nooit twee NET-posities op hetzelfde symbool openen.
-        if snap["symbol"] in state.get("managed", {}):
-            continue
-
         try:
             if open_position(snap):
                 opened += 1
         except Exception as e:
-            tg(
-                f"❌ Entry error {snap['symbol']} · "
-                f"{snap['session_name']}: {e}"
-            )
-
+            tg(f"❌ Entry error {snap['symbol']}: {e}")
 
 def startup():
     load_state()
@@ -978,13 +941,11 @@ def startup():
     tg(
         f"🧠 {BOT_NAME} v{VERSION} STARTED\n"
         f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
-        f"Fair Pricing Aggressive · MULTI SESSION\n"
-        f"Sessions: ASIA 09:00 Tokyo | LONDON 08:00 London | "
-        f"SOUTH AMERICA 10:00 Sao Paulo | NEW YORK 09:30 NY\n"
-        f"Continuation: {CONTINUATION_MINUTES} min per sessie | "
+        f"Fair Pricing Aggressive\n"
+        f"Continuation: {CONTINUATION_MINUTES} min | "
         f"Sessie: {SESSION_LENGTH_MINUTES} min\n"
-        f"Risk {RISK_PER_TRADE*100:.1f}% | RR {FIXED_RR} | "
-        f"ATR stops: {USE_ATR_STOPS}\n"
+        f"Risk {RISK_PER_TRADE*100:.1f}% | Runner vanaf {RUNNER_ACTIVATE_R}R | "
+        f"Max target {RUNNER_MAX_TARGET_R}R | ATR stops: {USE_ATR_STOPS}\n"
         f"Displacement >= {DISPLACEMENT_BODY_MULT:.2f}x "
         f"median body ({DISPLACEMENT_LOOKBACK} candles) + "
         f"BOS({BOS_LOOKBACK})\n"
