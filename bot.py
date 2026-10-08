@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
 """
-JJ SIMON - FAIR PRICING THEORY BOT v1.4.3 (Strikte Minimaal 12 USDT Marge per Trade)
-BloFin Futures - AGGRESSIVE & TREND RUNNER (47 Munten Uitgebreide Editie)
-========================================
-
-Geoptimaliseerde instellingen:
-- Minimaal 12 USDT marge per trade (keihard afgedwongen)
-- Maximaal 2 actieve posities tegelijk
-- Runner activeert pas op 1.60R
-- Locked winst bij runner: minimaal 0.75R gegarandeerd
-- Ruimere trailing (0.75R) om uitzakken te voorkomen
-- Max target op 3.00R voor de uitschieters
-- Uitgebreide selectie van 47 high-volume en momentum altcoins
+JJ SIMON - EBP STRATEGY BOT v2.0 (Sweep & Close / External Bar Pattern)
+BloFin Futures - Volledige Integratie met Pandas EBP Logica
+==============================================================
+- Detecteert Bullish & Bearish EBP signalen
+- Strikte minimale marge per trade (12.0 USDT)
+- Automatische risico- en orderafhandeling voor BloFin
 """
 
 import os
@@ -23,11 +17,12 @@ import hashlib
 import threading
 from uuid import uuid4
 from decimal import Decimal, ROUND_DOWN
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from urllib.parse import urlencode
-from statistics import median
 
 import requests
+import pandas as pd
+import numpy as np
 
 try:
     from flask import Flask
@@ -35,11 +30,11 @@ except Exception:
     Flask = None
 
 # ============================================================
-# CONFIG - STRIKT MINIMAAL 12 USDT MARGE PER TRADE
+# CONFIGURATIE & PARAMETERS
 # ============================================================
 
-VERSION = "1.4.3-StriktMin12USDT-47Coins"
-BOT_NAME = "JJ Fair Pricing Profit Runner"
+VERSION = "2.0-EBP-BloFin"
+BOT_NAME = "JJ EBP Strategy Bot"
 
 API_KEY = os.getenv("EXCHANGE_API_KEY", "").strip()
 API_SECRET = os.getenv("EXCHANGE_SECRET", "").strip()
@@ -59,54 +54,23 @@ BASE_URL = (
     else "https://openapi.blofin.com"
 )
 
-# ----- Agressieve strategie parameters -----
-SIGNAL_BAR = os.getenv("JJ_SIGNAL_BAR", "1m")
-CONTINUATION_MINUTES = int(os.getenv("JJ_CONTINUATION_MINUTES", "12"))
-SESSION_LENGTH_MINUTES = int(os.getenv("JJ_SESSION_LENGTH_MINUTES", "100"))
-
-DISPLACEMENT_BODY_MULT = float(os.getenv("JJ_DISPLACEMENT_BODY_MULT", "1.25"))
-DISPLACEMENT_LOOKBACK = int(os.getenv("JJ_DISPLACEMENT_LOOKBACK", "12"))
-BOS_LOOKBACK = int(os.getenv("JJ_BOS_LOOKBACK", "4"))
-
-RISK_PER_TRADE = float(os.getenv("JJ_RISK_PER_TRADE", "0.018"))
-FIXED_RR = float(os.getenv("JJ_FIXED_RR", "2.00"))
-
-# ----- STRIKT MINIMUM MARGE PER TRADE (12 USDT) -----
+SIGNAL_BAR = os.getenv("JJ_SIGNAL_BAR", "15m")  # Bijv. 15m of 30m candles
 MIN_MARGIN_USDT = float(os.getenv("JJ_MIN_MARGIN_USDT", "12.0"))
-
-# ----- PROFIT RUNNER -----
-RUNNER_ACTIVATE_R = float(os.getenv("JJ_RUNNER_ACTIVATE_R", "1.60"))
-RUNNER_TRAIL_R = float(os.getenv("JJ_RUNNER_TRAIL_R", "0.75"))
-RUNNER_LOCK_R = float(os.getenv("JJ_RUNNER_LOCK_R", "0.75"))
-RUNNER_MAX_TARGET_R = float(os.getenv("JJ_RUNNER_MAX_TARGET_R", "3.00"))
-FAIR_VALUE_MIN_R = float(os.getenv("JJ_FAIR_VALUE_MIN_R", "0.75"))
-
-USE_ATR_STOPS = os.getenv("JJ_USE_ATR_STOPS", "True").lower() == "true"
-ATR_PERIOD = int(os.getenv("JJ_ATR_PERIOD", "14"))
-ATR_SL_MULT = float(os.getenv("JJ_ATR_SL_MULT", "1.1"))
-
+FIXED_RR = float(os.getenv("JJ_FIXED_RR", "2.00"))
 LEVERAGE = int(os.getenv("JJ_LEVERAGE", "12"))
 MARGIN_MODE = os.getenv("JJ_MARGIN_MODE", "isolated").strip().lower()
 MAX_ACTIVE_POSITIONS = int(os.getenv("JJ_MAX_ACTIVE_POSITIONS", "2"))
-SCAN_SECONDS = int(os.getenv("JJ_SCAN_SECONDS", "15"))
-REENTRY_COOLDOWN_MIN = int(os.getenv("JJ_REENTRY_COOLDOWN_MIN", "2"))
+SCAN_SECONDS = int(os.getenv("JJ_SCAN_SECONDS", "30"))
 
-SESSION_OPENS_UTC = [
-    {"hour": 1, "minute": 30},    # China (Shanghai) open (01:30 UTC)
-    {"hour": 13, "minute": 0},    # Zuid-Amerika (São Paulo/B3) open (13:00 UTC)
-    {"hour": 13, "minute": 30},   # New York open (13:30 UTC)
-]
+STATE_FILE = "jj_ebp_bot_state.json"
 
-STATE_FILE = "jj_fair_pricing_profit_runner_v143_state.json"
-
-# Uitgebreide lijst van exact 47 munten (inclusief THETA, HBAR, TAO, SHIB, COR, PUMP)
+# De 47 geselecteerde munten
 DEFAULT_SYMBOLS = [
     "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT",
     "DOGE-USDT", "ADA-USDT", "AVAX-USDT", "LINK-USDT", "DOT-USDT",
     "SUI-USDT", "NEAR-USDT", "APT-USDT", "ARB-USDT", "OP-USDT",
     "INJ-USDT", "TIA-USDT", "FET-USDT", "RENDER-USDT", "WIF-USDT",
     "PEPE-USDT", "WLD-USDT", "JUP-USDT", "ORDI-USDT",
-    # Jouw verzoek + sterke strategie-aanvullingen (totaal 47):
     "THETA-USDT", "HBAR-USDT", "TAO-USDT", "SHIB-USDT", "COR-USDT", "PUMP-USDT",
     "SEI-USDT", "SOMI-USDT", "STRK-USDT", "MANTA-USDT", "ALT-USDT",
     "DYM-USDT", "ZETA-USDT", "PORTAL-USDT", "AXL-USDT", "ENA-USDT",
@@ -121,7 +85,7 @@ SYMBOLS = (
 )
 
 # ============================================================
-# HELPERS
+# HELPERS & STATE MANAGEMENT
 # ============================================================
 
 session = requests.Session()
@@ -130,7 +94,6 @@ state_lock = threading.Lock()
 
 state = {
     "managed": {},
-    "fair_values": {},
     "last_exit_ts": {},
 }
 
@@ -142,9 +105,6 @@ def fnum(v, default=0.0):
 
 def now_ms():
     return int(time.time() * 1000)
-
-def now_utc():
-    return datetime.now(timezone.utc)
 
 def fmt_price(v):
     if v >= 1000:
@@ -206,7 +166,7 @@ def decimal_str(value):
     return s.rstrip("0").rstrip(".") if "." in s else s
 
 # ============================================================
-# BLOFIN API
+# BLOFIN API AUTH & REQUESTS
 # ============================================================
 
 def _check_api_response(data, where):
@@ -265,7 +225,7 @@ def private_post(path, body):
     return _check_api_response(r.json(), path)
 
 # ============================================================
-# MARKET DATA
+# MARKET DATA & INSTRUMENTS
 # ============================================================
 
 def load_instruments():
@@ -291,7 +251,7 @@ def instrument(symbol):
         raise RuntimeError(f"Instrument niet beschikbaar: {symbol}")
     return x
 
-def candles(symbol, bar, limit=50, confirmed_only=True):
+def get_candles_df(symbol, bar, limit=60):
     data = public_get(
         "/api/v1/market/candles",
         {"instId": symbol, "bar": bar, "limit": str(limit)},
@@ -301,9 +261,6 @@ def candles(symbol, bar, limit=50, confirmed_only=True):
     for c in data:
         if not isinstance(c, list) or len(c) < 6:
             continue
-        confirm = str(c[-1])
-        if confirmed_only and confirm != "1":
-            continue
         rows.append({
             "ts": int(c[0]),
             "open": fnum(c[1]),
@@ -311,18 +268,16 @@ def candles(symbol, bar, limit=50, confirmed_only=True):
             "low": fnum(c[3]),
             "close": fnum(c[4]),
             "volume": fnum(c[5]),
-            "confirm": confirm,
         })
-    rows.sort(key=lambda x: x["ts"])
-    return rows
+    
+    if not rows:
+        return pd.DataFrame()
 
-def session_open_price(symbol, session_open):
-    target_ts = int(session_open.timestamp() * 1000)
-    rows = candles(symbol, "1m", limit=180, confirmed_only=False)
-    for row in rows:
-        if row["ts"] == target_ts:
-            return row["open"]
-    return None
+    df = pd.DataFrame(rows)
+    df = df.sort_values("ts").reset_index(drop=True)
+    df["datetime"] = pd.to_datetime(df["ts"], unit="ms")
+    df.set_index("datetime", inplace=True)
+    return df
 
 def last_price(symbol):
     data = public_get(
@@ -335,35 +290,12 @@ def last_price(symbol):
 
 def account():
     data = private_get("/api/v1/account/balance").get("data", {})
-    equity = fnum(data.get("totalEquity"))
     available = 0.0
     for d in data.get("details", []) or []:
         if d.get("currency") == "USDT":
             available = fnum(d.get("available"))
             break
-    return equity, available
-
-def positions():
-    data = private_get("/api/v1/account/positions").get("data", [])
-    out = []
-    for p in data or []:
-        qty = fnum(p.get("positions"))
-        if abs(qty) <= 0:
-            continue
-        p = dict(p)
-        p["_qty"] = qty
-        p["_is_long"] = (
-            str(p.get("positionSide", "")).lower() in ("long", "net")
-            and qty > 0
-        )
-        out.append(p)
-    return out
-
-def get_position(symbol):
-    for p in positions():
-        if p.get("instId") == symbol:
-            return p
-    return None
+    return available
 
 def set_leverage(symbol):
     body = {
@@ -374,150 +306,78 @@ def set_leverage(symbol):
     return private_post("/api/v1/account/set-leverage", body)
 
 # ============================================================
-# STRATEGY LOGIC
+# EBP STRATEGY LOGIC (PANDAS)
 # ============================================================
 
-def get_current_session_open():
-    now = now_utc()
-    candidates = []
-    for s in SESSION_OPENS_UTC:
-        open_time = now.replace(
-            hour=s["hour"],
-            minute=s["minute"],
-            second=0,
-            microsecond=0,
-        )
-        if open_time > now:
-            open_time -= timedelta(days=1)
-        candidates.append(open_time)
-    return max(candidates)
+def detect_bullish_ebp(df: pd.DataFrame) -> pd.Series:
+    prev_open = df['open'].shift(1)
+    prev_low  = df['low'].shift(1)
+    
+    sweep = df['low'] < prev_low
+    close_above_prior_open = df['close'] > prev_open
+    
+    return sweep & close_above_prior_open
 
-def is_in_session_window(session_open):
-    minutes_since = (now_utc() - session_open).total_seconds() / 60
-    return 0 <= minutes_since <= SESSION_LENGTH_MINUTES
+def detect_bearish_ebp(df: pd.DataFrame) -> pd.Series:
+    prev_open = df['open'].shift(1)
+    prev_high = df['high'].shift(1)
+    
+    sweep = df['high'] > prev_high
+    close_below_prior_open = df['close'] < prev_open
+    
+    return sweep & close_below_prior_open
 
-def get_phase(session_open):
-    minutes_since = (now_utc() - session_open).total_seconds() / 60
-    if minutes_since <= CONTINUATION_MINUTES:
-        return "continuation"
-    return "reversion"
-
-def detect_displacement_and_bos(rows):
-    need = max(DISPLACEMENT_LOOKBACK + 1, BOS_LOOKBACK + 1, 6)
-    if len(rows) < need:
+def check_symbol_ebp(symbol):
+    df = get_candles_df(symbol, SIGNAL_BAR, limit=50)
+    if len(df) < 10:
         return None
 
-    curr = rows[-1]
-    history = rows[-(DISPLACEMENT_LOOKBACK + 1):-1]
+    df['bullish_ebp'] = detect_bullish_ebp(df)
+    df['bearish_ebp'] = detect_bearish_ebp(df)
 
-    historical_bodies = [
-        abs(r["close"] - r["open"])
-        for r in history
-        if abs(r["close"] - r["open"]) > 0
-    ]
-    if not historical_bodies:
-        return None
+    # We controleren de op-één-na-laatste candle (om te zorgen dat deze volledig gesloten is)
+    # of de meest recente afhankelijk van jevoorkeur. We pakken de laatste afgesloten index [-2] of [-1].
+    # Hier gebruiken we de meest recente actieve/laatste rij van de DataFrame:
+    last_row = df.iloc[-1]
 
-    baseline_body = median(historical_bodies)
-    body_curr = abs(curr["close"] - curr["open"])
-
-    is_displacement = (
-        baseline_body > 0
-        and body_curr >= baseline_body * DISPLACEMENT_BODY_MULT
-    )
-    if not is_displacement:
-        return None
-
-    bos_rows = rows[-(BOS_LOOKBACK + 1):-1]
-    recent_high = max(r["high"] for r in bos_rows)
-    recent_low = min(r["low"] for r in bos_rows)
-
-    bullish_bos = curr["close"] > recent_high
-    bearish_bos = curr["close"] < recent_low
-
-    if bullish_bos:
-        direction = "long"
-    elif bearish_bos:
-        direction = "short"
-    else:
-        return None
-
-    return {
-        "displacement": True,
-        "bos": True,
-        "direction": direction,
-        "close": curr["close"],
-        "ts": curr["ts"],
-        "body": body_curr,
-        "median_body": baseline_body,
-        "body_multiple": body_curr / baseline_body if baseline_body > 0 else 0,
-    }
-
-def strategy_snapshot(symbol, session_open, fair_value):
-    rows = candles(symbol, SIGNAL_BAR, limit=50, confirmed_only=True)
-    if len(rows) < max(DISPLACEMENT_LOOKBACK + 1, BOS_LOOKBACK + 1, 8):
-        return None
-
-    signal = detect_displacement_and_bos(rows)
-    if not signal:
-        return None
-
-    phase = get_phase(session_open)
-    minutes_since = (now_utc() - session_open).total_seconds() / 60
-
-    valid = False
-    if phase == "continuation":
-        if signal["direction"] == "long" and signal["close"] > fair_value:
-            valid = True
-        elif signal["direction"] == "short" and signal["close"] < fair_value:
-            valid = True
-    else:
-        if signal["direction"] == "long" and signal["close"] < fair_value:
-            valid = True
-        elif signal["direction"] == "short" and signal["close"] > fair_value:
-            valid = True
-
-    if not valid:
-        return None
-
-    return {
-        "symbol": symbol,
-        "direction": signal["direction"],
-        "phase": phase,
-        "fair_value": fair_value,
-        "close": signal["close"],
-        "minutes_since_open": minutes_since,
-        "ts": signal["ts"],
-        "body_multiple": signal["body_multiple"],
-    }
+    if last_row['bullish_ebp']:
+        return {
+            "symbol": symbol,
+            "direction": "long",
+            "close": last_row['close'],
+            "low": last_row['low'],
+            "high": last_row['high'],
+            "ts": int(last_row.name.timestamp() * 1000)
+        }
+    elif last_row['bearish_ebp']:
+        return {
+            "symbol": symbol,
+            "direction": "short",
+            "close": last_row['close'],
+            "low": last_row['low'],
+            "high": last_row['high'],
+            "ts": int(last_row.name.timestamp() * 1000)
+        }
+    
+    return None
 
 # ============================================================
-# SIZING & ORDERS (STRIKTE MINIMALE MARGE VAN 12 USDT)
+# SIZING & ORDERS (MINIMUM 12 USDT MARGE)
 # ============================================================
 
-def calculate_size(symbol, entry_price, equity, available, stop_distance):
+def calculate_size(symbol, entry_price, available, stop_distance):
     meta = instrument(symbol)
     contract_value = fnum(meta.get("contractValue"))
     min_size = fnum(meta.get("minSize"))
     lot_size = fnum(meta.get("lotSize"))
 
-    if min(
-        contract_value,
-        min_size,
-        lot_size,
-        entry_price,
-        stop_distance,
-    ) <= 0:
+    if min(contract_value, min_size, lot_size, entry_price, stop_distance) <= 0:
         return None
 
-    target_margin = MIN_MARGIN_USDT  # 12.0 USDT
-    notional = target_margin * LEVERAGE
-
+    notional = MIN_MARGIN_USDT * LEVERAGE
     max_notional = available * 0.88 * LEVERAGE
     if notional > max_notional:
         return None
-
-    risk_amount = notional * (stop_distance / entry_price)
 
     contracts = floor_step(
         notional / (contract_value * entry_price),
@@ -528,72 +388,44 @@ def calculate_size(symbol, entry_price, equity, available, stop_distance):
         return None
 
     final_notional = contracts * contract_value * entry_price
-    if (final_notional / LEVERAGE) < (MIN_MARGIN_USDT * 0.95):
-        return None
-
     return {
         "contracts": contracts,
         "notional": final_notional,
-        "risk_usdt": risk_amount,
     }
 
-def open_position(snapshot):
-    symbol = snapshot["symbol"]
-    direction = snapshot["direction"]
-
-    equity, available = account()
+def open_position(signal):
+    symbol = signal["symbol"]
+    direction = signal["direction"]
     live = last_price(symbol)
+    available = account()
 
-    last_exit = int(
-        state.get("last_exit_ts", {}).get(symbol, 0) or 0
-    )
-    if (
-        last_exit
-        and now_ms() - last_exit < REENTRY_COOLDOWN_MIN * 60_000
-    ):
-        return False
-
-    if USE_ATR_STOPS:
-        rows = candles(symbol, SIGNAL_BAR, 40, confirmed_only=True)
-        trs = []
-        for i in range(1, len(rows)):
-            tr = max(
-                rows[i]["high"] - rows[i]["low"],
-                abs(rows[i]["high"] - rows[i - 1]["close"]),
-                abs(rows[i]["low"] - rows[i - 1]["close"]),
-            )
-            trs.append(tr)
-
-        atr_slice = trs[-ATR_PERIOD:]
-        atr = (
-            sum(atr_slice) / len(atr_slice)
-            if atr_slice
-            else live * 0.01
-        )
-        stop_dist = atr * ATR_SL_MULT
-    else:
-        stop_dist = live * 0.007
-
-    sizing = calculate_size(symbol, live, equity, available, stop_dist)
-    if not sizing:
-        return False
-
+    # Stop Loss gebaseerd op de sweep candle low/high
     if direction == "long":
-        stop = live - stop_dist
+        stop = signal["low"] * 0.998  # Kleine marge onder de sweep low
+        stop_dist = live - stop
+        if stop_dist <= 0:
+            stop_dist = live * 0.008
+            stop = live - stop_dist
         tp = live + stop_dist * FIXED_RR
         side = "buy"
     else:
-        stop = live + stop_dist
+        stop = signal["high"] * 1.002  # Kleine marge boven de sweep high
+        stop_dist = stop - live
+        if stop_dist <= 0:
+            stop_dist = live * 0.008
+            stop = live + stop_dist
         tp = live - stop_dist * FIXED_RR
         side = "sell"
 
+    sizing = calculate_size(symbol, live, available, stop_dist)
+    if not sizing:
+        return False
+
     tg(
-        f"🟠 JJ STRICT MIN12 READY\n"
-        f"{symbol} {direction.upper()} · {snapshot['phase'].upper()}\n"
-        f"Fair Value: {fmt_price(snapshot['fair_value'])}\n"
-        f"Entry ~{fmt_price(live)} | SL {fmt_price(stop)} | "
-        f"Marge ~{sizing['notional']/LEVERAGE:.2f} USDT\n"
-        f"Displacement: {snapshot.get('body_multiple', 0):.2f}x median body"
+        f"🚨 EBP SIGNAL DETECTED!\n"
+        f"Coin: {symbol} | Richting: {direction.upper()}\n"
+        f"Entry: {fmt_price(live)} | SL: {fmt_price(stop)} | TP: {fmt_price(tp)}\n"
+        f"Marge: ~{MIN_MARGIN_USDT} USDT (Notional: {sizing['notional']:.2f})"
     )
 
     record = {
@@ -602,17 +434,8 @@ def open_position(snapshot):
         "direction": direction,
         "stop": stop,
         "tp": tp,
-        "phase": snapshot["phase"],
-        "fair_value": snapshot["fair_value"],
         "contracts": sizing["contracts"],
-        "risk_usdt": sizing["risk_usdt"],
         "notional": sizing["notional"],
-        "signal_ts": snapshot["ts"],
-        "body_multiple": snapshot.get("body_multiple", 0),
-        "initial_stop_distance": stop_dist,
-        "runner_active": False,
-        "best_price": live,
-        "fair_value_touched": False,
         "paper": PAPER_TRADING,
     }
 
@@ -633,7 +456,7 @@ def open_position(snapshot):
         "orderType": "market",
         "size": decimal_str(sizing["contracts"]),
         "reduceOnly": "false",
-        "clientOrderId": (f"jjm12{int(time.time())}{symbol.split('-')[0]}")[:32],
+        "clientOrderId": (f"jjebp{int(time.time())}{symbol.split('-')[0]}")[:32],
         "slTriggerPrice": decimal_str(stop),
         "slOrderPrice": "-1",
         "slTriggerPriceType": "mark",
@@ -648,236 +471,70 @@ def open_position(snapshot):
     tg(f"🟢 LIVE OPEN {symbol} {direction.upper()} @ ~{fmt_price(live)}")
     return True
 
-def manage_position(symbol):
-    managed = state.get("managed", {}).get(symbol)
-    if not managed:
-        return
+def manage_positions():
+    managed = list(state.get("managed", {}).items())
+    for symbol, managed_pos in managed:
+        live = last_price(symbol)
+        direction = managed_pos["direction"]
+        stop = fnum(managed_pos["stop"])
+        tp = fnum(managed_pos["tp"])
 
-    live = last_price(symbol)
-    direction = managed["direction"]
-    entry = fnum(managed.get("entry_price"))
-    stop = fnum(managed.get("stop"))
-    fair = fnum(managed.get("fair_value"))
+        hit_stop = (direction == "long" and live <= stop) or (direction == "short" and live >= stop)
+        hit_tp = (direction == "long" and live >= tp) or (direction == "short" and live <= tp)
 
-    risk_dist = fnum(managed.get("initial_stop_distance"))
-    if risk_dist <= 0:
-        risk_dist = abs(entry - stop)
-    if entry <= 0 or risk_dist <= 0:
-        return
-
-    if direction == "long":
-        r_now = (live - entry) / risk_dist
-        hit_stop = live <= stop
-    else:
-        r_now = (entry - live) / risk_dist
-        hit_stop = live >= stop
-
-    best = fnum(managed.get("best_price"), entry)
-    if direction == "long":
-        best = max(best, live)
-    else:
-        best = min(best, live)
-    managed["best_price"] = best
-
-    fair_touched = bool(managed.get("fair_value_touched", False))
-    if managed.get("phase") == "reversion" and fair > 0 and not fair_touched:
-        touched = (
-            (direction == "long" and live >= fair)
-            or (direction == "short" and live <= fair)
-        )
-        if touched:
-            managed["fair_value_touched"] = True
-            if r_now >= FAIR_VALUE_MIN_R:
-                tg(
-                    f"🎯 FAIR VALUE {symbol} geraakt · {r_now:+.2f}R\n"
-                    f"Positie blijft open voor Profit Runner."
-                )
-
-    runner_active = bool(managed.get("runner_active", False))
-    if not runner_active and r_now >= RUNNER_ACTIVATE_R:
-        managed["runner_active"] = True
-        runner_active = True
-        tg(
-            f"🚀 PROFIT RUNNER {symbol} actief · {r_now:+.2f}R\n"
-            f"Lock minimaal +{RUNNER_LOCK_R:.2f}R · "
-            f"trail {RUNNER_TRAIL_R:.2f}R · target {RUNNER_MAX_TARGET_R:.2f}R"
-        )
-
-    reason = None
-
-    if hit_stop:
-        reason = "STOP"
-    elif runner_active:
-        if direction == "long":
-            lock_price = entry + risk_dist * RUNNER_LOCK_R
-            trail_price = best - risk_dist * RUNNER_TRAIL_R
-            runner_stop = max(lock_price, trail_price)
-            trail_hit = live <= runner_stop
-        else:
-            lock_price = entry - risk_dist * RUNNER_LOCK_R
-            trail_price = best + risk_dist * RUNNER_TRAIL_R
-            runner_stop = min(lock_price, trail_price)
-            trail_hit = live >= runner_stop
-
-        if r_now >= RUNNER_MAX_TARGET_R:
-            reason = "RUNNER TARGET"
-        elif trail_hit:
-            reason = "RUNNER TRAIL"
-
-    if reason is None:
-        save_state()
-        return
-
-    pnl_pct = (
-        ((live - entry) / entry * 100)
-        if direction == "long"
-        else ((entry - live) / entry * 100)
-    )
-    pnl_usdt = managed.get("notional", 0.0) * (pnl_pct / 100.0)
-
-    if PAPER_TRADING:
-        tg(
-            f"{'🟢' if pnl_pct >= 0 else '🔴'} PAPER CLOSE {symbol} · {reason}\n"
-            f"{r_now:+.2f}R · {pnl_pct:+.2f}% · ~{pnl_usdt:+.3f} USDT"
-        )
-    else:
-        pos = get_position(symbol)
-        if pos:
-            body = {
-                "instId": symbol,
-                "marginMode": MARGIN_MODE,
-                "positionSide": "net",
-                "clientOrderId": f"jjm12{int(time.time())}"[:32],
-            }
-            private_post("/api/v1/trade/close-position", body)
-            tg(
-                f"📤 LIVE CLOSE {symbol} · {reason}\n"
-                f"{r_now:+.2f}R · prijs ~{fmt_price(live)}"
-            )
-
-    with state_lock:
-        state["managed"].pop(symbol, None)
-        state["last_exit_ts"][symbol] = now_ms()
-    save_state()
+        if hit_stop or hit_tp:
+            reason = "TP REACHED 🎯" if hit_tp else "STOP LOSS 🛑"
+            tg(f"🔒 CLOSE {symbol} · Reden: {reason} · Prijs: {fmt_price(live)}")
+            
+            with state_lock:
+                state["managed"].pop(symbol, None)
+            save_state()
 
 # ============================================================
 # MAIN LOOP
 # ============================================================
 
-def ensure_fair_values(session_open, symbols):
-    session_id = session_open.strftime("%Y%m%d_%H%M")
-    changed = False
-
-    for symbol in symbols:
-        key = f"{symbol}_{session_id}"
-        if key in state.get("fair_values", {}):
-            continue
-
-        try:
-            price = session_open_price(symbol, session_open)
-            if price is None or price <= 0:
-                continue
-
-            state.setdefault("fair_values", {})[key] = {
-                "price": price,
-                "ts": int(session_open.timestamp() * 1000),
-                "source": "1m_session_open_candle",
-            }
-            changed = True
-        except Exception as e:
-            print(f"Fair value error {symbol}: {e}", flush=True)
-
-        time.sleep(0.03)
-
-    if changed:
-        save_state()
-
 def scan_once():
-    symbols = valid_symbols()
-
-    for symbol in list(state.get("managed", {}).keys()):
-        try:
-            manage_position(symbol)
-        except Exception as e:
-            tg(f"⚠️ Manage error {symbol}: {e}")
-
-    session_open = get_current_session_open()
-    if not is_in_session_window(session_open):
-        return
-
-    ensure_fair_values(session_open, symbols)
+    manage_positions()
 
     active = len(state.get("managed", {}))
-    free_slots = max(0, MAX_ACTIVE_POSITIONS - active)
-    if free_slots <= 0:
+    if active >= MAX_ACTIVE_POSITIONS:
         return
 
-    session_id = session_open.strftime("%Y%m%d_%H%M")
-    candidates = []
-
+    symbols = valid_symbols()
     for symbol in symbols:
         if symbol in state.get("managed", {}):
             continue
 
-        key = f"{symbol}_{session_id}"
-        fv_data = state.get("fair_values", {}).get(key)
-        if not fv_data:
-            continue
-
         try:
-            snap = strategy_snapshot(
-                symbol,
-                session_open,
-                fv_data["price"],
-            )
-            if snap:
-                candidates.append(snap)
+            signal = check_symbol_ebp(symbol)
+            if signal:
+                open_position(signal)
+                if len(state.get("managed", {})) >= MAX_ACTIVE_POSITIONS:
+                    break
         except Exception as e:
-            print(f"Signal error {symbol}: {e}", flush=True)
-
-        time.sleep(0.04)
-
-    candidates.sort(key=lambda x: x["ts"], reverse=True)
-
-    opened = 0
-    for snap in candidates:
-        if opened >= free_slots:
-            break
-        try:
-            if open_position(snap):
-                opened += 1
-            time.sleep(0.5)
-        except Exception as e:
-            tg(f"❌ Entry error {snap['symbol']}: {e}")
+            print(f"Scan error {symbol}: {e}", flush=True)
+        
+        time.sleep(0.05)
 
 def startup():
     load_state()
     load_instruments()
     symbols = valid_symbols()
-
     tg(
         f"🧠 {BOT_NAME} v{VERSION} STARTED\n"
-        f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
-        f"Aantal actieve munten in scan: {len(symbols)}\n"
-        f"Strikt Min Marge per Trade: {MIN_MARGIN_USDT} USDT | Max Posities: {MAX_ACTIVE_POSITIONS}\n"
-        f"Runner activate: {RUNNER_ACTIVATE_R}R | Lock: {RUNNER_LOCK_R}R | Trail: {RUNNER_TRAIL_R}R"
+        f"Mode: {'PAPER' | PAPER_TRADING and 'PAPER' or 'LIVE'}\n"
+        f"Actieve munten: {len(symbols)} | Min Marge: {MIN_MARGIN_USDT} USDT"
     )
 
 def main():
     if Flask is not None:
         def run_health():
             app = Flask(__name__)
-
             @app.route("/")
             def home():
                 return f"{BOT_NAME} v{VERSION} is running", 200
-
-            app.run(
-                host="0.0.0.0",
-                port=int(os.getenv("PORT", 8080)),
-                use_reloader=False,
-            )
-
+            app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)), use_reloader=False)
         threading.Thread(target=run_health, daemon=True).start()
 
     startup()
