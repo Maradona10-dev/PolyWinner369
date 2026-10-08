@@ -461,4 +461,428 @@ def strategy_snapshot(symbol, session_open, fair_value):
     if phase == "continuation":
         if signal["direction"] == "long" and signal["close"] > fair_value:
             valid = True
-        elif signal["direction"] == "short
+        elif signal["direction"] == "short" and signal["close"] < fair_value:
+            valid = True
+    else:
+        if signal["direction"] == "long" and signal["close"] < fair_value:
+            valid = True
+        elif signal["direction"] == "short" and signal["close"] > fair_value:
+            valid = True
+
+    if not valid:
+        return None
+
+    return {
+        "symbol": symbol,
+        "direction": signal["direction"],
+        "phase": phase,
+        "fair_value": fair_value,
+        "close": signal["close"],
+        "minutes_since_open": minutes_since,
+        "ts": signal["ts"],
+        "body_multiple": signal["body_multiple"],
+    }
+
+# ============================================================
+# SIZING & ORDERS (STRIKTE MINIMALE MARGE VAN 12 USDT)
+# ============================================================
+
+def calculate_size(symbol, entry_price, equity, available, stop_distance):
+    meta = instrument(symbol)
+    contract_value = fnum(meta.get("contractValue"))
+    min_size = fnum(meta.get("minSize"))
+    lot_size = fnum(meta.get("lotSize"))
+
+    if min(
+        contract_value,
+        min_size,
+        lot_size,
+        entry_price,
+        stop_distance,
+    ) <= 0:
+        return None
+
+    target_margin = MIN_MARGIN_USDT  # 12.0 USDT
+    notional = target_margin * LEVERAGE
+
+    max_notional = available * 0.88 * LEVERAGE
+    if notional > max_notional:
+        return None
+
+    risk_amount = notional * (stop_distance / entry_price)
+
+    contracts = floor_step(
+        notional / (contract_value * entry_price),
+        lot_size,
+    )
+    
+    if contracts < min_size:
+        return None
+
+    final_notional = contracts * contract_value * entry_price
+    if (final_notional / LEVERAGE) < (MIN_MARGIN_USDT * 0.95):
+        return None
+
+    return {
+        "contracts": contracts,
+        "notional": final_notional,
+        "risk_usdt": risk_amount,
+    }
+
+def open_position(snapshot):
+    symbol = snapshot["symbol"]
+    direction = snapshot["direction"]
+
+    equity, available = account()
+    live = last_price(symbol)
+
+    last_exit = int(
+        state.get("last_exit_ts", {}).get(symbol, 0) or 0
+    )
+    if (
+        last_exit
+        and now_ms() - last_exit < REENTRY_COOLDOWN_MIN * 60_000
+    ):
+        return False
+
+    if USE_ATR_STOPS:
+        rows = candles(symbol, SIGNAL_BAR, 40, confirmed_only=True)
+        trs = []
+        for i in range(1, len(rows)):
+            tr = max(
+                rows[i]["high"] - rows[i]["low"],
+                abs(rows[i]["high"] - rows[i - 1]["close"]),
+                abs(rows[i]["low"] - rows[i - 1]["close"]),
+            )
+            trs.append(tr)
+
+        atr_slice = trs[-ATR_PERIOD:]
+        atr = (
+            sum(atr_slice) / len(atr_slice)
+            if atr_slice
+            else live * 0.01
+        )
+        stop_dist = atr * ATR_SL_MULT
+    else:
+        stop_dist = live * 0.007
+
+    sizing = calculate_size(symbol, live, equity, available, stop_dist)
+    if not sizing:
+        return False
+
+    if direction == "long":
+        stop = live - stop_dist
+        tp = live + stop_dist * FIXED_RR
+        side = "buy"
+    else:
+        stop = live + stop_dist
+        tp = live - stop_dist * FIXED_RR
+        side = "sell"
+
+    tg(
+        f"🟠 JJ STRICT MIN12 READY\n"
+        f"{symbol} {direction.upper()} · {snapshot['phase'].upper()}\n"
+        f"Fair Value: {fmt_price(snapshot['fair_value'])}\n"
+        f"Entry ~{fmt_price(live)} | SL {fmt_price(stop)} | "
+        f"Marge ~{sizing['notional']/LEVERAGE:.2f} USDT\n"
+        f"Displacement: {snapshot.get('body_multiple', 0):.2f}x median body"
+    )
+
+    record = {
+        "entry_ts": now_ms(),
+        "entry_price": live,
+        "direction": direction,
+        "stop": stop,
+        "tp": tp,
+        "phase": snapshot["phase"],
+        "fair_value": snapshot["fair_value"],
+        "contracts": sizing["contracts"],
+        "risk_usdt": sizing["risk_usdt"],
+        "notional": sizing["notional"],
+        "signal_ts": snapshot["ts"],
+        "body_multiple": snapshot.get("body_multiple", 0),
+        "initial_stop_distance": stop_dist,
+        "runner_active": False,
+        "best_price": live,
+        "fair_value_touched": False,
+        "paper": PAPER_TRADING,
+    }
+
+    if PAPER_TRADING:
+        with state_lock:
+            state["managed"][symbol] = record
+        save_state()
+        tg(f"🟢 PAPER OPEN {symbol} {direction.upper()} @ {fmt_price(live)}")
+        return True
+
+    set_leverage(symbol)
+
+    body = {
+        "instId": symbol,
+        "marginMode": MARGIN_MODE,
+        "positionSide": "net",
+        "side": side,
+        "orderType": "market",
+        "size": decimal_str(sizing["contracts"]),
+        "reduceOnly": "false",
+        "clientOrderId": (f"jjm12{int(time.time())}{symbol.split('-')[0]}")[:32],
+        "slTriggerPrice": decimal_str(stop),
+        "slOrderPrice": "-1",
+        "slTriggerPriceType": "mark",
+    }
+
+    private_post("/api/v1/trade/order", body)
+
+    with state_lock:
+        state["managed"][symbol] = record
+    save_state()
+
+    tg(f"🟢 LIVE OPEN {symbol} {direction.upper()} @ ~{fmt_price(live)}")
+    return True
+
+def manage_position(symbol):
+    managed = state.get("managed", {}).get(symbol)
+    if not managed:
+        return
+
+    live = last_price(symbol)
+    direction = managed["direction"]
+    entry = fnum(managed.get("entry_price"))
+    stop = fnum(managed.get("stop"))
+    fair = fnum(managed.get("fair_value"))
+
+    risk_dist = fnum(managed.get("initial_stop_distance"))
+    if risk_dist <= 0:
+        risk_dist = abs(entry - stop)
+    if entry <= 0 or risk_dist <= 0:
+        return
+
+    if direction == "long":
+        r_now = (live - entry) / risk_dist
+        hit_stop = live <= stop
+    else:
+        r_now = (entry - live) / risk_dist
+        hit_stop = live >= stop
+
+    best = fnum(managed.get("best_price"), entry)
+    if direction == "long":
+        best = max(best, live)
+    else:
+        best = min(best, live)
+    managed["best_price"] = best
+
+    fair_touched = bool(managed.get("fair_value_touched", False))
+    if managed.get("phase") == "reversion" and fair > 0 and not fair_touched:
+        touched = (
+            (direction == "long" and live >= fair)
+            or (direction == "short" and live <= fair)
+        )
+        if touched:
+            managed["fair_value_touched"] = True
+            if r_now >= FAIR_VALUE_MIN_R:
+                tg(
+                    f"🎯 FAIR VALUE {symbol} geraakt · {r_now:+.2f}R\n"
+                    f"Positie blijft open voor Profit Runner."
+                )
+
+    runner_active = bool(managed.get("runner_active", False))
+    if not runner_active and r_now >= RUNNER_ACTIVATE_R:
+        managed["runner_active"] = True
+        runner_active = True
+        tg(
+            f"🚀 PROFIT RUNNER {symbol} actief · {r_now:+.2f}R\n"
+            f"Lock minimaal +{RUNNER_LOCK_R:.2f}R · "
+            f"trail {RUNNER_TRAIL_R:.2f}R · target {RUNNER_MAX_TARGET_R:.2f}R"
+        )
+
+    reason = None
+
+    if hit_stop:
+        reason = "STOP"
+    elif runner_active:
+        if direction == "long":
+            lock_price = entry + risk_dist * RUNNER_LOCK_R
+            trail_price = best - risk_dist * RUNNER_TRAIL_R
+            runner_stop = max(lock_price, trail_price)
+            trail_hit = live <= runner_stop
+        else:
+            lock_price = entry - risk_dist * RUNNER_LOCK_R
+            trail_price = best + risk_dist * RUNNER_TRAIL_R
+            runner_stop = min(lock_price, trail_price)
+            trail_hit = live >= runner_stop
+
+        if r_now >= RUNNER_MAX_TARGET_R:
+            reason = "RUNNER TARGET"
+        elif trail_hit:
+            reason = "RUNNER TRAIL"
+
+    if reason is None:
+        save_state()
+        return
+
+    pnl_pct = (
+        ((live - entry) / entry * 100)
+        if direction == "long"
+        else ((entry - live) / entry * 100)
+    )
+    pnl_usdt = managed.get("notional", 0.0) * (pnl_pct / 100.0)
+
+    if PAPER_TRADING:
+        tg(
+            f"{'🟢' if pnl_pct >= 0 else '🔴'} PAPER CLOSE {symbol} · {reason}\n"
+            f"{r_now:+.2f}R · {pnl_pct:+.2f}% · ~{pnl_usdt:+.3f} USDT"
+        )
+    else:
+        pos = get_position(symbol)
+        if pos:
+            body = {
+                "instId": symbol,
+                "marginMode": MARGIN_MODE,
+                "positionSide": "net",
+                "clientOrderId": f"jjm12{int(time.time())}"[:32],
+            }
+            private_post("/api/v1/trade/close-position", body)
+            tg(
+                f"📤 LIVE CLOSE {symbol} · {reason}\n"
+                f"{r_now:+.2f}R · prijs ~{fmt_price(live)}"
+            )
+
+    with state_lock:
+        state["managed"].pop(symbol, None)
+        state["last_exit_ts"][symbol] = now_ms()
+    save_state()
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
+def ensure_fair_values(session_open, symbols):
+    session_id = session_open.strftime("%Y%m%d_%H%M")
+    changed = False
+
+    for symbol in symbols:
+        key = f"{symbol}_{session_id}"
+        if key in state.get("fair_values", {}):
+            continue
+
+        try:
+            price = session_open_price(symbol, session_open)
+            if price is None or price <= 0:
+                continue
+
+            state.setdefault("fair_values", {})[key] = {
+                "price": price,
+                "ts": int(session_open.timestamp() * 1000),
+                "source": "1m_session_open_candle",
+            }
+            changed = True
+        except Exception as e:
+            print(f"Fair value error {symbol}: {e}", flush=True)
+
+        time.sleep(0.03)
+
+    if changed:
+        save_state()
+
+def scan_once():
+    symbols = valid_symbols()
+
+    for symbol in list(state.get("managed", {}).keys()):
+        try:
+            manage_position(symbol)
+        except Exception as e:
+            tg(f"⚠️ Manage error {symbol}: {e}")
+
+    session_open = get_current_session_open()
+    if not is_in_session_window(session_open):
+        return
+
+    ensure_fair_values(session_open, symbols)
+
+    active = len(state.get("managed", {}))
+    free_slots = max(0, MAX_ACTIVE_POSITIONS - active)
+    if free_slots <= 0:
+        return
+
+    session_id = session_open.strftime("%Y%m%d_%H%M")
+    candidates = []
+
+    for symbol in symbols:
+        if symbol in state.get("managed", {}):
+            continue
+
+        key = f"{symbol}_{session_id}"
+        fv_data = state.get("fair_values", {}).get(key)
+        if not fv_data:
+            continue
+
+        try:
+            snap = strategy_snapshot(
+                symbol,
+                session_open,
+                fv_data["price"],
+            )
+            if snap:
+                candidates.append(snap)
+        except Exception as e:
+            print(f"Signal error {symbol}: {e}", flush=True)
+
+        time.sleep(0.04)
+
+    candidates.sort(key=lambda x: x["ts"], reverse=True)
+
+    opened = 0
+    for snap in candidates:
+        if opened >= free_slots:
+            break
+        try:
+            if open_position(snap):
+                opened += 1
+            time.sleep(0.5)
+        except Exception as e:
+            tg(f"❌ Entry error {snap['symbol']}: {e}")
+
+def startup():
+    load_state()
+    load_instruments()
+    symbols = valid_symbols()
+
+    tg(
+        f"🧠 {BOT_NAME} v{VERSION} STARTED\n"
+        f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
+        f"Strikt Min Marge per Trade: {MIN_MARGIN_USDT} USDT | Max Posities: {MAX_ACTIVE_POSITIONS}\n"
+        f"Runner activate: {RUNNER_ACTIVATE_R}R | Lock: {RUNNER_LOCK_R}R | Trail: {RUNNER_TRAIL_R}R"
+    )
+
+def main():
+    if Flask is not None:
+        def run_health():
+            app = Flask(__name__)
+
+            @app.route("/")
+            def home():
+                return f"{BOT_NAME} v{VERSION} is running", 200
+
+            app.run(
+                host="0.0.0.0",
+                port=int(os.getenv("PORT", 8080)),
+                use_reloader=False,
+            )
+
+        threading.Thread(target=run_health, daemon=True).start()
+
+    startup()
+
+    while True:
+        try:
+            scan_once()
+        except KeyboardInterrupt:
+            tg(f"🛑 {BOT_NAME} gestopt")
+            break
+        except Exception as e:
+            tg(f"⚠️ Loop error: {e}")
+
+        time.sleep(SCAN_SECONDS)
+
+if __name__ == "__main__":
+    main()
