@@ -335,9 +335,6 @@ def check_symbol_ebp(symbol):
     df['bullish_ebp'] = detect_bullish_ebp(df)
     df['bearish_ebp'] = detect_bearish_ebp(df)
 
-    # We controleren de op-één-na-laatste candle (om te zorgen dat deze volledig gesloten is)
-    # of de meest recente afhankelijk van jevoorkeur. We pakken de laatste afgesloten index [-2] of [-1].
-    # Hier gebruiken we de meest recente actieve/laatste rij van de DataFrame:
     last_row = df.iloc[-1]
 
     if last_row['bullish_ebp']:
@@ -399,9 +396,8 @@ def open_position(signal):
     live = last_price(symbol)
     available = account()
 
-    # Stop Loss gebaseerd op de sweep candle low/high
     if direction == "long":
-        stop = signal["low"] * 0.998  # Kleine marge onder de sweep low
+        stop = signal["low"] * 0.998
         stop_dist = live - stop
         if stop_dist <= 0:
             stop_dist = live * 0.008
@@ -409,7 +405,7 @@ def open_position(signal):
         tp = live + stop_dist * FIXED_RR
         side = "buy"
     else:
-        stop = signal["high"] * 1.002  # Kleine marge boven de sweep high
+        stop = signal["high"] * 1.002
         stop_dist = stop - live
         if stop_dist <= 0:
             stop_dist = live * 0.008
@@ -521,9 +517,13 @@ def startup():
     load_state()
     load_instruments()
     symbols = valid_symbols()
+    
+    # HIER WAS DE FOUT OPGELOST (gebruik van nette if/else in plaats van de '|' operator op booleans)
+    mode_str = "PAPER" if PAPER_TRADING else "LIVE"
+    
     tg(
         f"🧠 {BOT_NAME} v{VERSION} STARTED\n"
-        f"Mode: {'PAPER' | PAPER_TRADING and 'PAPER' or 'LIVE'}\n"
+        f"Mode: {mode_str}\n"
         f"Actieve munten: {len(symbols)} | Min Marge: {MIN_MARGIN_USDT} USDT"
     )
 
