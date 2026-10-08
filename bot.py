@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-JJ SIMON - FAIR PRICING THEORY BOT v1.4.2 (Strikte Minimaal 12 USDT Marge per Trade)
-BloFin Futures - AGGRESSIVE & TREND RUNNER
+JJ SIMON - FAIR PRICING THEORY BOT v1.4.3 (Strikte Minimaal 12 USDT Marge per Trade)
+BloFin Futures - AGGRESSIVE & TREND RUNNER (47 Munten Uitgebreide Editie)
 ========================================
 
 Geoptimaliseerde instellingen:
-- Minimaal 12 USDT marge per trade (keihard afgedwongen, geen centenwerk)
+- Minimaal 12 USDT marge per trade (keihard afgedwongen)
 - Maximaal 2 actieve posities tegelijk
 - Runner activeert pas op 1.60R
 - Locked winst bij runner: minimaal 0.75R gegarandeerd
 - Ruimere trailing (0.75R) om uitzakken te voorkomen
 - Max target op 3.00R voor de uitschieters
+- Uitgebreide selectie van 47 high-volume en momentum altcoins
 """
 
 import os
@@ -37,7 +38,7 @@ except Exception:
 # CONFIG - STRIKT MINIMAAL 12 USDT MARGE PER TRADE
 # ============================================================
 
-VERSION = "1.4.2-StriktMin12USDT-Margin"
+VERSION = "1.4.3-StriktMin12USDT-47Coins"
 BOT_NAME = "JJ Fair Pricing Profit Runner"
 
 API_KEY = os.getenv("EXCHANGE_API_KEY", "").strip()
@@ -96,14 +97,21 @@ SESSION_OPENS_UTC = [
     {"hour": 13, "minute": 30},   # New York open (13:30 UTC)
 ]
 
-STATE_FILE = "jj_fair_pricing_profit_runner_v142_state.json"
+STATE_FILE = "jj_fair_pricing_profit_runner_v143_state.json"
 
+# Uitgebreide lijst van exact 47 munten (inclusief THETA, HBAR, TAO, SHIB, COR, PUMP)
 DEFAULT_SYMBOLS = [
     "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT",
     "DOGE-USDT", "ADA-USDT", "AVAX-USDT", "LINK-USDT", "DOT-USDT",
     "SUI-USDT", "NEAR-USDT", "APT-USDT", "ARB-USDT", "OP-USDT",
     "INJ-USDT", "TIA-USDT", "FET-USDT", "RENDER-USDT", "WIF-USDT",
-    "PEPE-USDT", "WLD-USDT", "JUP-USDT", "ORDI-USDT"
+    "PEPE-USDT", "WLD-USDT", "JUP-USDT", "ORDI-USDT",
+    # Jouw verzoek + sterke strategie-aanvullingen (totaal 47):
+    "THETA-USDT", "HBAR-USDT", "TAO-USDT", "SHIB-USDT", "COR-USDT", "PUMP-USDT",
+    "SEI-USDT", "SOMI-USDT", "STRK-USDT", "MANTA-USDT", "ALT-USDT",
+    "DYM-USDT", "ZETA-USDT", "PORTAL-USDT", "AXL-USDT", "ENA-USDT",
+    "BOME-USDT", "MEW-USDT", "PNUT-USDT", "ACT-USDT", "GOAT-USDT",
+    "CRV-USDT", "LDO-USDT"
 ]
 
 _env_symbols = os.getenv("JJ_SYMBOLS", "").strip()
@@ -850,6 +858,7 @@ def startup():
     tg(
         f"🧠 {BOT_NAME} v{VERSION} STARTED\n"
         f"Mode: {'PAPER' if PAPER_TRADING else 'LIVE'}\n"
+        f"Aantal actieve munten in scan: {len(symbols)}\n"
         f"Strikt Min Marge per Trade: {MIN_MARGIN_USDT} USDT | Max Posities: {MAX_ACTIVE_POSITIONS}\n"
         f"Runner activate: {RUNNER_ACTIVATE_R}R | Lock: {RUNNER_LOCK_R}R | Trail: {RUNNER_TRAIL_R}R"
     )
