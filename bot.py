@@ -1,9 +1,9 @@
-#!/usr/bin/env python3
+#!/usr/init/env python3
 """
-JJ SIMON - EBP STRATEGY BOT v2.0 (Sweep & Close / External Bar Pattern)
+JJ SIMON - EBP STRATEGY BOT v2.1 (60 Munten Editie)
 BloFin Futures - Volledige Integratie met Pandas EBP Logica
 ==============================================================
-- Detecteert Bullish & Bearish EBP signalen
+- Detecteert Bullish & Bearish EBP signalen op 60 munten
 - Strikte minimale marge per trade (12.0 USDT)
 - Automatische risico- en orderafhandeling voor BloFin
 """
@@ -33,7 +33,7 @@ except Exception:
 # CONFIGURATIE & PARAMETERS
 # ============================================================
 
-VERSION = "2.0-EBP-BloFin"
+VERSION = "2.1-EBP-60Coins"
 BOT_NAME = "JJ EBP Strategy Bot"
 
 API_KEY = os.getenv("EXCHANGE_API_KEY", "").strip()
@@ -54,7 +54,7 @@ BASE_URL = (
     else "https://openapi.blofin.com"
 )
 
-SIGNAL_BAR = os.getenv("JJ_SIGNAL_BAR", "15m")  # Bijv. 15m of 30m candles
+SIGNAL_BAR = os.getenv("JJ_SIGNAL_BAR", "15m")  # 15 minuten candles
 MIN_MARGIN_USDT = float(os.getenv("JJ_MIN_MARGIN_USDT", "12.0"))
 FIXED_RR = float(os.getenv("JJ_FIXED_RR", "2.00"))
 LEVERAGE = int(os.getenv("JJ_LEVERAGE", "12"))
@@ -64,18 +64,23 @@ SCAN_SECONDS = int(os.getenv("JJ_SCAN_SECONDS", "30"))
 
 STATE_FILE = "jj_ebp_bot_state.json"
 
-# De 47 geselecteerde munten
+# Uitgebreide lijst van exact 60 sterke munten
 DEFAULT_SYMBOLS = [
+    # Majors & Layer 1s (1-15)
     "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT",
-    "DOGE-USDT", "ADA-USDT", "AVAX-USDT", "LINK-USDT", "DOT-USDT",
-    "SUI-USDT", "NEAR-USDT", "APT-USDT", "ARB-USDT", "OP-USDT",
-    "INJ-USDT", "TIA-USDT", "FET-USDT", "RENDER-USDT", "WIF-USDT",
-    "PEPE-USDT", "WLD-USDT", "JUP-USDT", "ORDI-USDT",
-    "THETA-USDT", "HBAR-USDT", "TAO-USDT", "SHIB-USDT", "COR-USDT", "PUMP-USDT",
-    "SEI-USDT", "SOMI-USDT", "STRK-USDT", "MANTA-USDT", "ALT-USDT",
-    "DYM-USDT", "ZETA-USDT", "PORTAL-USDT", "AXL-USDT", "ENA-USDT",
-    "BOME-USDT", "MEW-USDT", "PNUT-USDT", "ACT-USDT", "GOAT-USDT",
-    "CRV-USDT", "LDO-USDT"
+    "ADA-USDT", "AVAX-USDT", "DOT-USDT", "NEAR-USDT", "SUI-USDT",
+    "APT-USDT", "SEI-USDT", "FTM-USDT", "HBAR-USDT", "THETA-USDT",
+    # Populaire Altcoins & DeFi (16-35)
+    "LINK-USDT", "ARB-USDT", "OP-USDT", "INJ-USDT", "TIA-USDT",
+    "FET-USDT", "RENDER-USDT", "TAO-USDT", "STRK-USDT", "MANTA-USDT",
+    "ALT-USDT", "DYM-USDT", "ZETA-USDT", "PORTAL-USDT", "AXL-USDT",
+    "ENA-USDT", "CRV-USDT", "LDO-USDT", "JUP-USDT", "ORDI-USDT",
+    # Memes & High Volume (36-60)
+    "DOGE-USDT", "SHIB-USDT", "PEPE-USDT", "WIF-USDT", "WLD-USDT",
+    "COR-USDT", "PUMP-USDT", "BOME-USDT", "MEW-USDT", "PNUT-USDT",
+    "ACT-USDT", "GOAT-USDT", "NEIRO-USDT", "POPCAT-USDT", "FLOKI-USDT",
+    "BONK-USDT", "CHZ-USDT", "RUNE-USDT", "ATOM-USDT", "ALGO-USDT",
+    "SAND-USDT", "MANA-USDT", "AXS-USDT", "GALA-USDT", "GMT-USDT"
 ]
 
 _env_symbols = os.getenv("JJ_SYMBOLS", "").strip()
@@ -511,14 +516,13 @@ def scan_once():
         except Exception as e:
             print(f"Scan error {symbol}: {e}", flush=True)
         
-        time.sleep(0.05)
+        time.sleep(0.04)
 
 def startup():
     load_state()
     load_instruments()
     symbols = valid_symbols()
     
-    # HIER WAS DE FOUT OPGELOST (gebruik van nette if/else in plaats van de '|' operator op booleans)
     mode_str = "PAPER" if PAPER_TRADING else "LIVE"
     
     tg(
