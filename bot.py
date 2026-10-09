@@ -1,558 +1,513 @@
-#!/usr/init/env python3
-"""
-JJ SIMON - EBP STRATEGY BOT v2.1 (60 Munten Editie)
-BloFin Futures - Volledige Integratie met Pandas EBP Logica
-==============================================================
-- Detecteert Bullish & Bearish EBP signalen op 60 munten
-- Strikte minimale marge per trade (12.0 USDT)
-- Automatische risico- en orderafhandeling voor BloFin
-"""
+#!/usr/bin/env python3
+"""JJ EBP BloFin v2.2 — execution hardening, not a proven profitable strategy.
+Install: pip install requests pandas flask
+Default PAPER_TRADING=True: no private API calls, simulated balance 250 USDT.
+For exchange demo: PAPER_TRADING=False, BLOFIN_DEMO=True, demo API credentials.
+LIVE requires net_mode, isolated margin and a dedicated account/subaccount.
+Do not run alongside v2.1 or another bot on the same instruments.
+State v2.1 is intentionally not imported; reconcile old positions on BloFin first.
+Keep the state file on persistent storage; run only one process per account.
 
+Defaults: 15m closed EBP candles, >=12 USDT estimated margin, 12x, 2R,
+2 total positions, <=3 USDT estimated stop loss including fee/slippage allowance.
+Minimum margin is an estimate before fill, not a guarantee of actual margin.
+Paper exits use sampled mark prices, not an intrabar backtest; funding excluded.
+No promise of hourly trades or improved win rate. Test in exchange demo first.
+"""
 import os
 import time
 import json
+import math
 import hmac
 import base64
 import hashlib
 import threading
+import logging
+from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
 from uuid import uuid4
-from decimal import Decimal, ROUND_DOWN
-from datetime import datetime, timezone
 from urllib.parse import urlencode
-
+from collections import Counter
 import requests
 import pandas as pd
-import numpy as np
 
-try:
-    from flask import Flask
-except Exception:
-    Flask = None
-
-# ============================================================
-# CONFIGURATIE & PARAMETERS
-# ============================================================
-
-VERSION = "2.1-EBP-60Coins"
-BOT_NAME = "JJ EBP Strategy Bot"
-
-API_KEY = os.getenv("EXCHANGE_API_KEY", "").strip()
-API_SECRET = os.getenv("EXCHANGE_SECRET", "").strip()
-API_PASSPHRASE = os.getenv("EXCHANGE_PASSWORD", "").strip()
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-if TELEGRAM_BOT_TOKEN.startswith("bot"):
-    TELEGRAM_BOT_TOKEN = TELEGRAM_BOT_TOKEN[3:]
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-PAPER_TRADING = os.getenv("PAPER_TRADING", "True").lower() == "true"
-BLOFIN_DEMO = os.getenv("BLOFIN_DEMO", "False").lower() == "true"
-
-BASE_URL = (
-    "https://demo-trading-openapi.blofin.com"
-    if BLOFIN_DEMO
-    else "https://openapi.blofin.com"
-)
-
-SIGNAL_BAR = os.getenv("JJ_SIGNAL_BAR", "15m")  # 15 minuten candles
-MIN_MARGIN_USDT = float(os.getenv("JJ_MIN_MARGIN_USDT", "12.0"))
-FIXED_RR = float(os.getenv("JJ_FIXED_RR", "2.00"))
-LEVERAGE = int(os.getenv("JJ_LEVERAGE", "12"))
-MARGIN_MODE = os.getenv("JJ_MARGIN_MODE", "isolated").strip().lower()
-MAX_ACTIVE_POSITIONS = int(os.getenv("JJ_MAX_ACTIVE_POSITIONS", "2"))
-SCAN_SECONDS = int(os.getenv("JJ_SCAN_SECONDS", "30"))
-
-STATE_FILE = "jj_ebp_bot_state.json"
-
-# Uitgebreide lijst van exact 60 sterke munten
-DEFAULT_SYMBOLS = [
-    # Majors & Layer 1s (1-15)
-    "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT",
-    "ADA-USDT", "AVAX-USDT", "DOT-USDT", "NEAR-USDT", "SUI-USDT",
-    "APT-USDT", "SEI-USDT", "FTM-USDT", "HBAR-USDT", "THETA-USDT",
-    # Populaire Altcoins & DeFi (16-35)
-    "LINK-USDT", "ARB-USDT", "OP-USDT", "INJ-USDT", "TIA-USDT",
-    "FET-USDT", "RENDER-USDT", "TAO-USDT", "STRK-USDT", "MANTA-USDT",
-    "ALT-USDT", "DYM-USDT", "ZETA-USDT", "PORTAL-USDT", "AXL-USDT",
-    "ENA-USDT", "CRV-USDT", "LDO-USDT", "JUP-USDT", "ORDI-USDT",
-    # Memes & High Volume (36-60)
-    "DOGE-USDT", "SHIB-USDT", "PEPE-USDT", "WIF-USDT", "WLD-USDT",
-    "COR-USDT", "PUMP-USDT", "BOME-USDT", "MEW-USDT", "PNUT-USDT",
-    "ACT-USDT", "GOAT-USDT", "NEIRO-USDT", "POPCAT-USDT", "FLOKI-USDT",
-    "BONK-USDT", "CHZ-USDT", "RUNE-USDT", "ATOM-USDT", "ALGO-USDT",
-    "SAND-USDT", "MANA-USDT", "AXS-USDT", "GALA-USDT", "GMT-USDT"
-]
-
-_env_symbols = os.getenv("JJ_SYMBOLS", "").strip()
-SYMBOLS = (
-    [x.strip().upper() for x in _env_symbols.split(",") if x.strip()]
-    if _env_symbols else DEFAULT_SYMBOLS
-)
-
-# ============================================================
-# HELPERS & STATE MANAGEMENT
-# ============================================================
-
+VERSION = '2.2'
+def envf(name, default):
+    value = float(os.getenv(name, str(default)))
+    if not math.isfinite(value):
+        raise ValueError(name + ': invalid number')
+    return value
+PAPER_TRADING = os.getenv('PAPER_TRADING', 'True').lower() == 'true'
+BLOFIN_DEMO = os.getenv('BLOFIN_DEMO', 'False').lower() == 'true'
+BASE_URL = 'https://demo-trading-openapi.blofin.com' if BLOFIN_DEMO else 'https://openapi.blofin.com'
+API_KEY = os.getenv('EXCHANGE_API_KEY', '').strip()
+API_SECRET = os.getenv('EXCHANGE_SECRET', '').strip()
+API_PASSWORD = os.getenv('EXCHANGE_PASSWORD', '').strip()
+TG_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip().removeprefix('bot')
+TG_CHAT = os.getenv('TELEGRAM_CHAT_ID', '').strip()
+BAR = os.getenv('JJ_SIGNAL_BAR', '15m')
+BAR_MS = {'1m':60000,'3m':180000,'5m':300000,'15m':900000,'30m':1800000,'1H':3600000}
+MARGIN = envf('JJ_MIN_MARGIN_USDT', 12)
+LEV = int(os.getenv('JJ_LEVERAGE', '12'))
+RR = envf('JJ_FIXED_RR', 2)
+MAX_POS = int(os.getenv('JJ_MAX_ACTIVE_POSITIONS', '2'))
+SCAN_SECONDS = envf('JJ_SCAN_SECONDS', 30)
+RISK_CAP = envf('JJ_MAX_LOSS_USDT', 3)
+FEE = envf('JJ_TAKER_FEE_RATE', .0006)  # each side; adjust to your actual tier
+SLIPPAGE = envf('JJ_SLIPPAGE_ALLOWANCE', .001)
+MAX_SPREAD = envf('JJ_MAX_SPREAD_PCT', .002)
+MAX_CHASE_R = envf('JJ_MAX_ENTRY_DRIFT_R', .35)
+MAX_STOP_PCT = envf('JJ_MAX_STOP_PCT', .04)
+MIN_STOP_PCT = envf('JJ_MIN_STOP_PCT', .002)
+COOLDOWN = envf('JJ_COOLDOWN_SECONDS', 900)
+MAX_AGE = envf('JJ_MAX_SIGNAL_AGE_SECONDS', 120)
+PAPER_BALANCE = envf('JJ_PAPER_BALANCE_USDT', 250)
+STATE_FILE = os.getenv('JJ_STATE_FILE', f'jj_ebp_v22_{"paper" if PAPER_TRADING else "demo" if BLOFIN_DEMO else "live"}.json')
+DEFAULT_SYMBOLS = '''BTC ETH SOL BNB XRP ADA AVAX DOT NEAR SUI APT SEI FTM HBAR THETA LINK ARB OP INJ TIA FET RENDER TAO STRK MANTA ALT DYM ZETA PORTAL AXL ENA CRV LDO JUP ORDI DOGE SHIB PEPE WIF WLD COR PUMP BOME MEW PNUT ACT GOAT NEIRO POPCAT FLOKI BONK CHZ RUNE ATOM ALGO SAND MANA AXS GALA GMT'''.split()
+SYMBOLS = list(dict.fromkeys(x.strip().upper() for x in os.getenv('JJ_SYMBOLS', ','.join(x+'-USDT' for x in DEFAULT_SYMBOLS)).split(',') if x.strip()))
 session = requests.Session()
-instrument_cache = {}
-state_lock = threading.Lock()
+meta = {}
+state = {'mode': 'paper' if PAPER_TRADING else 'demo' if BLOFIN_DEMO else 'live',
+         'managed': {}, 'seen': {}, 'last_exit': {}, 'paper_realized': 0.0}
+health = {'last_cycle': 0, 'error': ''}
+log = logging.getLogger('ebp')
 
-state = {
-    "managed": {},
-    "last_exit_ts": {},
-}
+def notify(message):
+    log.info(message)
+    if TG_TOKEN and TG_CHAT:
+        try:
+            response = requests.post(f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage',
+                json={'chat_id':TG_CHAT,'text':message,'disable_web_page_preview':True}, timeout=8)
+            if response.status_code != 200:
+                log.warning('Telegram rejected message: HTTP %s', response.status_code)
+        except requests.RequestException:
+            log.warning('Telegram unavailable')  # never log token-containing URL
 
-def fnum(v, default=0.0):
-    try:
-        return float(v)
-    except Exception:
-        return default
-
-def now_ms():
-    return int(time.time() * 1000)
-
-def fmt_price(v):
-    if v >= 1000:
-        return f"{v:.2f}"
-    if v >= 1:
-        return f"{v:.5f}".rstrip("0").rstrip(".")
-    return f"{v:.8f}".rstrip("0").rstrip(".")
-
-def tg(message):
-    print(message, flush=True)
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-                "disable_web_page_preview": True,
-            },
-            timeout=10,
-        )
-    except Exception as e:
-        print(f"Telegram error: {e}", flush=True)
-
-def load_state():
-    global state
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            saved = json.load(f)
-        if isinstance(saved, dict):
-            state.update(saved)
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        print(f"State load error: {e}", flush=True)
-
-def save_state():
-    try:
-        with state_lock:
-            tmp = STATE_FILE + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(state, f, indent=2)
-            os.replace(tmp, STATE_FILE)
-    except Exception as e:
-        print(f"State save error: {e}", flush=True)
-
-def floor_step(value, step):
-    if step <= 0:
-        return value
-    d_value = Decimal(str(value))
-    d_step = Decimal(str(step))
-    units = (d_value / d_step).to_integral_value(rounding=ROUND_DOWN)
-    return float(units * d_step)
-
-def decimal_str(value):
-    d = Decimal(str(value))
-    s = format(d, "f")
-    return s.rstrip("0").rstrip(".") if "." in s else s
-
-# ============================================================
-# BLOFIN API AUTH & REQUESTS
-# ============================================================
-
-def _check_api_response(data, where):
-    if not isinstance(data, dict):
-        raise RuntimeError(f"{where}: invalid response")
-    if str(data.get("code", "")) != "0":
-        raise RuntimeError(f"{where}: {data.get('code')} {data.get('msg')}")
-    return data
-
-def public_get(path, params=None):
-    params = params or {}
-    r = session.get(BASE_URL + path, params=params, timeout=15)
-    r.raise_for_status()
-    return _check_api_response(r.json(), path)
-
-def _signed_headers(method, request_path, body_str=""):
-    if not API_KEY or not API_SECRET or not API_PASSPHRASE:
-        raise RuntimeError("BloFin API credentials ontbreken")
-    timestamp = str(now_ms())
-    nonce = str(uuid4())
-    prehash = f"{request_path}{method.upper()}{timestamp}{nonce}{body_str}"
-    hex_sig = hmac.new(
-        API_SECRET.encode(),
-        prehash.encode(),
-        hashlib.sha256,
-    ).hexdigest().encode()
-    signature = base64.b64encode(hex_sig).decode()
-    return {
-        "ACCESS-KEY": API_KEY,
-        "ACCESS-SIGN": signature,
-        "ACCESS-TIMESTAMP": timestamp,
-        "ACCESS-NONCE": nonce,
-        "ACCESS-PASSPHRASE": API_PASSPHRASE,
-        "Content-Type": "application/json",
-    }
-
-def private_get(path, params=None):
-    params = params or {}
-    query = urlencode(params)
-    request_path = path + (f"?{query}" if query else "")
-    headers = _signed_headers("GET", request_path, "")
-    r = session.get(BASE_URL + request_path, headers=headers, timeout=15)
-    r.raise_for_status()
-    return _check_api_response(r.json(), path)
-
-def private_post(path, body):
-    body_str = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
-    headers = _signed_headers("POST", path, body_str)
-    r = session.post(
-        BASE_URL + path,
-        headers=headers,
-        data=body_str.encode(),
-        timeout=15,
-    )
-    r.raise_for_status()
-    return _check_api_response(r.json(), path)
-
-# ============================================================
-# MARKET DATA & INSTRUMENTS
-# ============================================================
-
-def load_instruments():
-    global instrument_cache
-    data = public_get("/api/v1/market/instruments").get("data", [])
-    instrument_cache = {
-        x.get("instId"): x
-        for x in data
-        if isinstance(x, dict) and x.get("instId")
-    }
-    return instrument_cache
-
-def valid_symbols():
-    if not instrument_cache:
-        load_instruments()
-    return [s for s in SYMBOLS if s in instrument_cache]
-
-def instrument(symbol):
-    if symbol not in instrument_cache:
-        load_instruments()
-    x = instrument_cache.get(symbol)
-    if not x:
-        raise RuntimeError(f"Instrument niet beschikbaar: {symbol}")
+def num(value):
+    x = float(value)
+    if not math.isfinite(x):
+        raise ValueError('Non-finite API value')
     return x
 
-def get_candles_df(symbol, bar, limit=60):
-    data = public_get(
-        "/api/v1/market/candles",
-        {"instId": symbol, "bar": bar, "limit": str(limit)},
-    ).get("data", [])
+def amount(value):
+    s = format(Decimal(str(value)), 'f')
+    return s.rstrip('0').rstrip('.') if '.' in s else s
 
+def step(value, quantum, up=False):
+    d, q = Decimal(str(value)), Decimal(str(quantum))
+    if q <= 0:
+        raise ValueError('Invalid tick/lot size')
+    return float((d/q).to_integral_value(rounding=ROUND_CEILING if up else ROUND_FLOOR)*q)
+
+def save():
+    # A failed durable write must propagate and stop trading.
+    temp = STATE_FILE + '.tmp'
+    with open(temp, 'w', encoding='utf8') as f:
+        json.dump(state, f, indent=2, allow_nan=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp, STATE_FILE)
+
+def load():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, encoding='utf8') as f:
+            saved = json.load(f)
+        if saved.get('mode') != state['mode']:
+            raise RuntimeError('State mode mismatch')
+        for key in ('managed','seen','last_exit'):
+            if not isinstance(saved.get(key), dict):
+                raise RuntimeError('Invalid state: '+key)
+        state.update(saved)
+
+def api(method, path, params=None, body=None, private=False):
+    query = urlencode(params or {})
+    request_path = path + ('?'+query if query else '')
+    body_text = json.dumps(body, separators=(',', ':')) if body is not None else ''
+    # GET retries only. Never blindly retry POST after an ambiguous timeout.
+    for attempt in range(3 if method == 'GET' else 1):
+        headers = {'Content-Type':'application/json'}
+        if private:
+            if PAPER_TRADING:
+                raise RuntimeError('Private API forbidden in paper mode')
+            stamp, nonce = str(int(time.time()*1000)), uuid4().hex
+            digest = hmac.new(API_SECRET.encode(),
+                (request_path+method+stamp+nonce+body_text).encode(), hashlib.sha256).hexdigest()
+            headers.update({'ACCESS-KEY':API_KEY,'ACCESS-PASSPHRASE':API_PASSWORD,
+                'ACCESS-TIMESTAMP':stamp,'ACCESS-NONCE':nonce,
+                'ACCESS-SIGN':base64.b64encode(digest.encode()).decode()})
+        try:
+            response = session.request(method, BASE_URL+request_path, headers=headers,
+                data=body_text.encode() if body is not None else None, timeout=(5,10))
+            response.raise_for_status()
+            result = response.json()
+            if not isinstance(result, dict) or str(result.get('code')) != '0':
+                raise RuntimeError(f'{path}: {result.get("code")} {result.get("msg")}')
+            data = result.get('data')
+            for item in data if isinstance(data, list) else [data]:
+                if isinstance(item, dict) and 'code' in item and str(item['code']) != '0':
+                    raise RuntimeError(f'{path}: nested {item["code"]} {item.get("msg")}')
+            return data
+        except (requests.RequestException, ValueError):
+            if attempt == (2 if method == 'GET' else 0):
+                raise RuntimeError(f'{path}: network/response failure; POST outcome may be unknown') from None
+            time.sleep(.5*(attempt+1))
+
+def get(path, params=None, private=False):
+    return api('GET', path, params=params, private=private)
+def post(path, body):
+    return api('POST', path, body=body, private=True)
+def one(data):
+    if isinstance(data, list):
+        if len(data) != 1:
+            raise RuntimeError('Expected exactly one API result')
+        return data[0]
+    if not isinstance(data, dict):
+        raise RuntimeError('Expected API object')
+    return data
+
+def candles(symbol):
     rows = []
-    for c in data:
-        if not isinstance(c, list) or len(c) < 6:
+    for c in get('/api/v1/market/candles', {'instId':symbol,'bar':BAR,'limit':'80'}):
+        if not isinstance(c, list) or len(c) < 9 or str(c[8]) != '1':
             continue
-        rows.append({
-            "ts": int(c[0]),
-            "open": fnum(c[1]),
-            "high": fnum(c[2]),
-            "low": fnum(c[3]),
-            "close": fnum(c[4]),
-            "volume": fnum(c[5]),
-        })
-    
-    if not rows:
-        return pd.DataFrame()
+        rows.append([int(c[0]), *[num(v) for v in c[1:6]]])
+    df = pd.DataFrame(rows, columns=['ts','open','high','low','close','volume'])
+    return df.drop_duplicates('ts').sort_values('ts').reset_index(drop=True)
 
-    df = pd.DataFrame(rows)
-    df = df.sort_values("ts").reset_index(drop=True)
-    df["datetime"] = pd.to_datetime(df["ts"], unit="ms")
-    df.set_index("datetime", inplace=True)
-    return df
+def detect_bullish_ebp(df):
+    return (df.low < df.low.shift()) & (df.close > df.open.shift())
+def detect_bearish_ebp(df):
+    return (df.high > df.high.shift()) & (df.close < df.open.shift())
 
-def last_price(symbol):
-    data = public_get(
-        "/api/v1/market/tickers",
-        {"instId": symbol},
-    ).get("data", [])
-    if not data:
-        raise RuntimeError(f"Geen ticker voor {symbol}")
-    return fnum(data[0].get("last"))
+def signal(symbol):
+    df = candles(symbol)
+    if len(df) < 20:
+        return None, 'few_candles'
+    row = df.iloc[-1]
+    stamp = int(row.ts)
+    if int(state['seen'].get(symbol, 0)) >= stamp:
+        return None, 'already_seen'
+    age = time.time() - (stamp+BAR_MS[BAR])/1000
+    if age < 0 or age > MAX_AGE:
+        return None, 'stale'
+    bull, bear = bool(detect_bullish_ebp(df).iloc[-1]), bool(detect_bearish_ebp(df).iloc[-1])
+    if bull == bear:
+        return None, 'ambiguous' if bull else 'no_ebp'
+    return {'symbol':symbol,'direction':'long' if bull else 'short','ts':stamp,
+            'close':float(row.close),'low':float(row.low),'high':float(row.high)}, 'signal'
 
-def account():
-    data = private_get("/api/v1/account/balance").get("data", {})
-    available = 0.0
-    for d in data.get("details", []) or []:
-        if d.get("currency") == "USDT":
-            available = fnum(d.get("available"))
-            break
-    return available
+def positions():
+    data = get('/api/v1/account/positions', private=True)
+    if not isinstance(data, list):
+        raise RuntimeError('Invalid positions response')
+    return {p['instId']:p for p in data if num(p['positions']) != 0}
 
-def set_leverage(symbol):
-    body = {
-        "instId": symbol,
-        "leverage": str(LEVERAGE),
-        "marginMode": MARGIN_MODE,
-    }
-    return private_post("/api/v1/account/set-leverage", body)
-
-# ============================================================
-# EBP STRATEGY LOGIC (PANDAS)
-# ============================================================
-
-def detect_bullish_ebp(df: pd.DataFrame) -> pd.Series:
-    prev_open = df['open'].shift(1)
-    prev_low  = df['low'].shift(1)
-    
-    sweep = df['low'] < prev_low
-    close_above_prior_open = df['close'] > prev_open
-    
-    return sweep & close_above_prior_open
-
-def detect_bearish_ebp(df: pd.DataFrame) -> pd.Series:
-    prev_open = df['open'].shift(1)
-    prev_high = df['high'].shift(1)
-    
-    sweep = df['high'] > prev_high
-    close_below_prior_open = df['close'] < prev_open
-    
-    return sweep & close_below_prior_open
-
-def check_symbol_ebp(symbol):
-    df = get_candles_df(symbol, SIGNAL_BAR, limit=50)
-    if len(df) < 10:
-        return None
-
-    df['bullish_ebp'] = detect_bullish_ebp(df)
-    df['bearish_ebp'] = detect_bearish_ebp(df)
-
-    last_row = df.iloc[-1]
-
-    if last_row['bullish_ebp']:
-        return {
-            "symbol": symbol,
-            "direction": "long",
-            "close": last_row['close'],
-            "low": last_row['low'],
-            "high": last_row['high'],
-            "ts": int(last_row.name.timestamp() * 1000)
-        }
-    elif last_row['bearish_ebp']:
-        return {
-            "symbol": symbol,
-            "direction": "short",
-            "close": last_row['close'],
-            "low": last_row['low'],
-            "high": last_row['high'],
-            "ts": int(last_row.name.timestamp() * 1000)
-        }
-    
-    return None
-
-# ============================================================
-# SIZING & ORDERS (MINIMUM 12 USDT MARGE)
-# ============================================================
-
-def calculate_size(symbol, entry_price, available, stop_distance):
-    meta = instrument(symbol)
-    contract_value = fnum(meta.get("contractValue"))
-    min_size = fnum(meta.get("minSize"))
-    lot_size = fnum(meta.get("lotSize"))
-
-    if min(contract_value, min_size, lot_size, entry_price, stop_distance) <= 0:
-        return None
-
-    notional = MIN_MARGIN_USDT * LEVERAGE
-    max_notional = available * 0.88 * LEVERAGE
-    if notional > max_notional:
-        return None
-
-    contracts = floor_step(
-        notional / (contract_value * entry_price),
-        lot_size,
-    )
-    
-    if contracts < min_size:
-        return None
-
-    final_notional = contracts * contract_value * entry_price
-    return {
-        "contracts": contracts,
-        "notional": final_notional,
-    }
-
-def open_position(signal):
-    symbol = signal["symbol"]
-    direction = signal["direction"]
-    live = last_price(symbol)
-    available = account()
-
-    if direction == "long":
-        stop = signal["low"] * 0.998
-        stop_dist = live - stop
-        if stop_dist <= 0:
-            stop_dist = live * 0.008
-            stop = live - stop_dist
-        tp = live + stop_dist * FIXED_RR
-        side = "buy"
-    else:
-        stop = signal["high"] * 1.002
-        stop_dist = stop - live
-        if stop_dist <= 0:
-            stop_dist = live * 0.008
-            stop = live + stop_dist
-        tp = live - stop_dist * FIXED_RR
-        side = "sell"
-
-    sizing = calculate_size(symbol, live, available, stop_dist)
-    if not sizing:
-        return False
-
-    tg(
-        f"🚨 EBP SIGNAL DETECTED!\n"
-        f"Coin: {symbol} | Richting: {direction.upper()}\n"
-        f"Entry: {fmt_price(live)} | SL: {fmt_price(stop)} | TP: {fmt_price(tp)}\n"
-        f"Marge: ~{MIN_MARGIN_USDT} USDT (Notional: {sizing['notional']:.2f})"
-    )
-
-    record = {
-        "entry_ts": now_ms(),
-        "entry_price": live,
-        "direction": direction,
-        "stop": stop,
-        "tp": tp,
-        "contracts": sizing["contracts"],
-        "notional": sizing["notional"],
-        "paper": PAPER_TRADING,
-    }
-
+def balance():
     if PAPER_TRADING:
-        with state_lock:
-            state["managed"][symbol] = record
-        save_state()
-        tg(f"🟢 PAPER OPEN {symbol} {direction.upper()} @ {fmt_price(live)}")
-        return True
+        return PAPER_BALANCE + state['paper_realized'] - sum(p['notional']/LEV for p in state['managed'].values())
+    data = one(get('/api/v1/account/balance', private=True))
+    for item in data.get('details', []):
+        if item.get('currency') == 'USDT':
+            return num(item['available'])
+    raise RuntimeError('USDT available balance missing')
 
-    set_leverage(symbol)
+def mark(symbol):
+    return num(one(get('/api/v1/market/mark-price', {'instId':symbol}))['markPrice'])
 
-    body = {
-        "instId": symbol,
-        "marginMode": MARGIN_MODE,
-        "positionSide": "net",
-        "side": side,
-        "orderType": "market",
-        "size": decimal_str(sizing["contracts"]),
-        "reduceOnly": "false",
-        "clientOrderId": (f"jjebp{int(time.time())}{symbol.split('-')[0]}")[:32],
-        "slTriggerPrice": decimal_str(stop),
-        "slOrderPrice": "-1",
-        "slTriggerPriceType": "mark",
-    }
+def plan(sig, entry, available):
+    m = meta[sig['symbol']]
+    tick, cv, lot = num(m['tickSize']), num(m['contractValue']), num(m['lotSize'])
+    long = sig['direction'] == 'long'
+    stop = step(sig['low']*.998 if long else sig['high']*1.002, tick, up=not long)
+    distance = entry-stop if long else stop-entry
+    if distance <= 0 or not MIN_STOP_PCT <= distance/entry <= MAX_STOP_PCT:
+        return None, 'invalid_stop'
+    if abs(entry-sig['close']) > MAX_CHASE_R*distance:
+        return None, 'entry_drift'
+    tp = step(entry + distance*RR if long else entry-distance*RR, tick, up=long)
+    if tp <= 0 or cv <= 0:
+        return None, 'invalid_contract'
+    size = step(max(MARGIN*LEV/(cv*entry), num(m['minSize'])), lot, up=True)
+    notional = size*cv*entry
+    risk = size*cv*distance + notional*(2*FEE+SLIPPAGE)
+    if risk > RISK_CAP:
+        return None, 'risk_cap'
+    if notional/LEV + notional*(2*FEE+SLIPPAGE) > available*.88:
+        return None, 'balance'
+    if size > num(m['maxMarketSize']):
+        return None, 'max_size'
+    return {'direction':sig['direction'],'entry_price':entry,'stop':stop,'tp':tp,
+            'contracts':size,'notional':notional,'risk_estimate':risk,'signal_ts':sig['ts'],
+            'entry_ts':time.time(),'status':'open'}, 'ok'
 
-    private_post("/api/v1/trade/order", body)
+def close_live(symbol, p, reason):
+    # Retain record until exchange position is confirmed zero. No blind retries.
+    current = positions().get(symbol)
+    if not current:
+        return
+    size = num(current['positions'])
+    expected_long = p['direction'] == 'long'
+    if (size > 0) != expected_long or current['marginMode'] != 'isolated':
+        raise RuntimeError('Position changed externally: manual reconciliation needed')
+    p['status'] = 'closing'
+    p['close_reason'] = reason
+    p['close_client_id'] = 'jjclose'+uuid4().hex[:24]
+    save()
+    post('/api/v1/trade/order', {'instId':symbol,'marginMode':'isolated','positionSide':'net',
+        'side':'sell' if size > 0 else 'buy','orderType':'market','size':amount(abs(size)),
+        'reduceOnly':'true','clientOrderId':p['close_client_id']})
+    notify(f'CLOSE aangevraagd {symbol}: {reason}; wacht op exchangebevestiging')
 
-    with state_lock:
-        state["managed"][symbol] = record
-    save_state()
+def protected(symbol, p):
+    orders = get('/api/v1/trade/orders-tpsl-pending', {'instId':symbol}, private=True)
+    for o in orders:
+        if o.get('positionSide') != 'net' or o.get('marginMode') != 'isolated':
+            continue
+        if o.get('side') != ('sell' if p['direction']=='long' else 'buy'):
+            continue
+        if o.get('slTriggerPriceType') != 'mark' or o.get('tpTriggerPriceType') != 'mark':
+            continue
+        if o.get('slOrderPrice') != '-1' or o.get('tpOrderPrice') != '-1':
+            continue
+        qty = num(o['size'])
+        if qty != -1 and qty < p['contracts']:
+            continue
+        tick = num(meta[symbol]['tickSize'])
+        if abs(num(o['slTriggerPrice'])-p['stop']) < tick/2 and abs(num(o['tpTriggerPrice'])-p['tp']) < tick/2:
+            return True
+    return False
 
-    tg(f"🟢 LIVE OPEN {symbol} {direction.upper()} @ ~{fmt_price(live)}")
+def reconcile_pending(symbol, p):
+    detail = one(get('/api/v1/trade/order-detail',
+        {'instId':symbol,'clientOrderId':p['client_id']}, private=True))
+    if detail.get('state') not in ('filled','canceled'):
+        raise RuntimeError('Entry order unresolved; new entries blocked')
+    filled = num(detail['filledSize'])
+    if filled <= 0:
+        del state['managed'][symbol]
+        save()
+        notify(f'Geen fill {symbol}; order afgesloten')
+        return False
+    p.update(contracts=filled, entry_price=num(detail['averagePrice']), status='open')
+    p['notional'] = filled*num(meta[symbol]['contractValue'])*p['entry_price']
+    save()
+    notify(f'OPEN bevestigd {symbol} {p["direction"]} @ {p["entry_price"]:.8g}; {filled:g} contracten')
     return True
 
-def manage_positions():
-    managed = list(state.get("managed", {}).items())
-    for symbol, managed_pos in managed:
-        live = last_price(symbol)
-        direction = managed_pos["direction"]
-        stop = fnum(managed_pos["stop"])
-        tp = fnum(managed_pos["tp"])
-
-        hit_stop = (direction == "long" and live <= stop) or (direction == "short" and live >= stop)
-        hit_tp = (direction == "long" and live >= tp) or (direction == "short" and live <= tp)
-
-        if hit_stop or hit_tp:
-            reason = "TP REACHED 🎯" if hit_tp else "STOP LOSS 🛑"
-            tg(f"🔒 CLOSE {symbol} · Reden: {reason} · Prijs: {fmt_price(live)}")
-            
-            with state_lock:
-                state["managed"].pop(symbol, None)
-            save_state()
-
-# ============================================================
-# MAIN LOOP
-# ============================================================
-
-def scan_once():
-    manage_positions()
-
-    active = len(state.get("managed", {}))
-    if active >= MAX_ACTIVE_POSITIONS:
-        return
-
-    symbols = valid_symbols()
-    for symbol in symbols:
-        if symbol in state.get("managed", {}):
-            continue
-
+def manage():
+    live_positions = {} if PAPER_TRADING else positions()
+    ok = True
+    for symbol, p in list(state['managed'].items()):
         try:
-            signal = check_symbol_ebp(symbol)
-            if signal:
-                open_position(signal)
-                if len(state.get("managed", {})) >= MAX_ACTIVE_POSITIONS:
-                    break
-        except Exception as e:
-            print(f"Scan error {symbol}: {e}", flush=True)
-        
-        time.sleep(0.04)
+            if not PAPER_TRADING and p['status'] == 'pending':
+                if not reconcile_pending(symbol, p):
+                    continue
+                live_positions = positions()
+            if not PAPER_TRADING and symbol not in live_positions:
+                p['zero_checks'] = p.get('zero_checks',0)+1
+                if p['zero_checks'] < 2:
+                    ok = False
+                    continue
+                del state['managed'][symbol]
+                state['last_exit'][symbol] = time.time()
+                save()
+                notify(f'Positie {symbol} bij BloFin gesloten; nulpositie bevestigd (reden/PnL niet afgeleid)')
+                continue
+            p['zero_checks'] = 0
+            if not PAPER_TRADING:
+                current = live_positions[symbol]
+                q = num(current['positions'])
+                if (q > 0) != (p['direction']=='long') or abs(q) != p['contracts'] or current['marginMode'] != 'isolated':
+                    raise RuntimeError('Position differs from bot state; new entries blocked')
+                if p['status'] == 'closing':
+                    detail = one(get('/api/v1/trade/order-detail',
+                        {'instId':symbol,'clientOrderId':p['close_client_id']}, private=True))
+                    if detail.get('state') in ('filled','canceled'):
+                        # A terminal partial close may leave a residual position.
+                        p['contracts'] = abs(q)
+                        close_live(symbol, p, 'remaining position after close')
+                    ok = False
+                    continue
+            price = mark(symbol)
+            long = p['direction']=='long'
+            hit_sl = price <= p['stop'] if long else price >= p['stop']
+            hit_tp = price >= p['tp'] if long else price <= p['tp']
+            if PAPER_TRADING and (hit_sl or hit_tp):
+                pnl = (price-p['entry_price'])*(1 if long else -1)*p['contracts']*num(meta[symbol]['contractValue'])
+                pnl -= p['contracts']*num(meta[symbol]['contractValue'])*(price+p['entry_price'])*FEE
+                pnl -= p['notional']*SLIPPAGE
+                state['paper_realized'] += pnl
+                del state['managed'][symbol]
+                state['last_exit'][symbol] = time.time()
+                save()
+                notify(f'PAPER CLOSE {symbol}: {"SL" if hit_sl else "TP"}; geschat netto {pnl:+.2f} USDT')
+            elif not PAPER_TRADING:
+                # Verify actual exchange TP/SL, not merely accepted entry fields.
+                actual_distance = p['entry_price']-p['stop'] if long else p['stop']-p['entry_price']
+                actual_risk = p['contracts']*num(meta[symbol]['contractValue'])*max(actual_distance, 0) + p['notional']*(2*FEE+SLIPPAGE)
+                has_protection = protected(symbol, p)
+                invalid_fill = actual_distance <= 0 or actual_risk > RISK_CAP
+                if hit_sl or hit_tp or not has_protection or invalid_fill:
+                    close_live(symbol, p, 'SL/TP reached' if hit_sl or hit_tp else 'fill risk invalid' if invalid_fill else 'exchange TP/SL missing')
+                    ok = False
+        except OSError:
+            raise
+        except Exception as exc:
+            ok = False
+            log.error('Management %s: %s', symbol, exc)
+    health['last_cycle'] = time.time()
+    return ok, live_positions
+
+def open_signal(sig):
+    symbol = sig['symbol']
+    ticker = one(get('/api/v1/market/tickers', {'instId':symbol}))
+    ask, bid = num(ticker['askPrice']), num(ticker['bidPrice'])
+    if bid <= 0 or ask < bid or (ask-bid)/((ask+bid)/2) > MAX_SPREAD:
+        return 'spread'
+    entry = ask if sig['direction']=='long' else bid
+    p, reason = plan(sig, entry, balance())
+    if not p:
+        return reason
+    current_mark = mark(symbol)
+    inside = p['stop'] < current_mark < p['tp'] if sig['direction']=='long' else p['tp'] < current_mark < p['stop']
+    if not inside:
+        return 'mark_outside_levels'
+    if not PAPER_TRADING:
+        if symbol in positions():
+            return 'existing_exchange_position'
+        post('/api/v1/account/set-leverage',
+            {'instId':symbol,'leverage':str(LEV),'marginMode':'isolated'})
+        p['status'] = 'pending'
+        p['client_id'] = 'jjebp'+uuid4().hex[:27]
+    # Persist intent BEFORE sending order. Unknown POST result is reconciled by ID.
+    state['managed'][symbol] = p
+    state['seen'][symbol] = sig['ts']
+    save()
+    if PAPER_TRADING:
+        notify(f'PAPER OPEN {symbol} {p["direction"]}: entry {entry:.8g}, SL {p["stop"]:.8g}, TP {p["tp"]:.8g}, risico ~{p["risk_estimate"]:.2f} USDT')
+    else:
+        post('/api/v1/trade/order', {'instId':symbol,'marginMode':'isolated','positionSide':'net',
+            'side':'buy' if p['direction']=='long' else 'sell','orderType':'market',
+            'size':amount(p['contracts']),'reduceOnly':'false','clientOrderId':p['client_id'],
+            'slTriggerPrice':amount(p['stop']),'slOrderPrice':'-1','slTriggerPriceType':'mark',
+            'tpTriggerPrice':amount(p['tp']),'tpOrderPrice':'-1','tpTriggerPriceType':'mark'})
+        time.sleep(1)
+        manage()
+    return 'opened_or_pending'
 
 def startup():
-    load_state()
-    load_instruments()
-    symbols = valid_symbols()
-    
-    mode_str = "PAPER" if PAPER_TRADING else "LIVE"
-    
-    tg(
-        f"🧠 {BOT_NAME} v{VERSION} STARTED\n"
-        f"Mode: {mode_str}\n"
-        f"Actieve munten: {len(symbols)} | Min Marge: {MIN_MARGIN_USDT} USDT"
-    )
+    if BAR not in BAR_MS or min(MARGIN,LEV,RR,MAX_POS,SCAN_SECONDS,RISK_CAP,MAX_AGE) <= 0:
+        raise ValueError('Invalid configuration')
+    if min(FEE,SLIPPAGE,COOLDOWN,MIN_STOP_PCT) < 0 or MAX_STOP_PCT <= MIN_STOP_PCT:
+        raise ValueError('Invalid risk configuration')
+    if os.getenv('JJ_MARGIN_MODE', 'isolated').lower() != 'isolated':
+        raise ValueError('This version supports isolated only')
+    load()
+    instruments = get('/api/v1/market/instruments')
+    meta.update({m['instId']:m for m in instruments if m.get('state')=='live'
+        and m.get('contractType')=='linear' and m.get('settleCurrency')=='USDT'})
+    missing = [s for s in SYMBOLS if s not in meta or num(meta[s]['maxLeverage']) < LEV]
+    allowed = [s for s in SYMBOLS if s not in missing]
+    if any(s not in meta for s in state['managed']):
+        raise RuntimeError('Managed instrument unavailable: reconcile manually')
+    if not allowed:
+        raise RuntimeError('No supported instruments')
+    if not PAPER_TRADING:
+        if not all((API_KEY,API_SECRET,API_PASSWORD)):
+            raise RuntimeError('API credentials missing')
+        mode = one(get('/api/v1/account/position-mode', private=True))
+        if mode['positionMode'] != 'net_mode':
+            raise RuntimeError('Requires net_mode; account mode is not changed automatically')
+        external = positions()
+        unknown = set(external)-set(state['managed'])
+        if unknown:
+            raise RuntimeError('Unmanaged existing positions; reconcile before start: '+','.join(sorted(unknown)))
+        orders = get('/api/v1/trade/orders-pending', private=True)
+        if any(o.get('clientOrderId') not in {p.get('client_id') for p in state['managed'].values()} for o in orders):
+            raise RuntimeError('Unmanaged pending orders; reconcile before start')
+    notify(f'JJ EBP v{VERSION} gestart: {state["mode"]}, {len(allowed)} munten, {BAR}, marge >=~{MARGIN:g}, {LEV}x, {RR:g}R, risicolimiet ~{RISK_CAP:g} USDT')
+    if missing:
+        notify('Overgeslagen (niet beschikbaar / leverage): '+', '.join(missing))
+    return allowed
+
+def serve_health():
+    try:
+        from flask import Flask
+    except ImportError:
+        return
+    app = Flask(__name__)
+    @app.route('/')
+    def home():
+        fresh = time.time()-health['last_cycle'] < 120
+        return {'bot':'JJ EBP','version':VERSION,'mode':state['mode'],
+                'recent_cycle':fresh,'error':health['error']}, 200 if fresh and not health['error'] else 503
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT','8080')), use_reloader=False)
 
 def main():
-    if Flask is not None:
-        def run_health():
-            app = Flask(__name__)
-            @app.route("/")
-            def home():
-                return f"{BOT_NAME} v{VERSION} is running", 200
-            app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)), use_reloader=False)
-        threading.Thread(target=run_health, daemon=True).start()
-
-    startup()
-
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    # Linux process lock prevents accidental duplicate runs using the same state.
+    import fcntl
+    lock = open(STATE_FILE+'.lock', 'a')
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    symbols = startup()
+    threading.Thread(target=serve_health, daemon=True).start()
+    next_scan, last_report, last_alert = 0, 0, 0
+    cursor = 0
+    counts = Counter()
     while True:
         try:
-            scan_once()
+            good, external = manage()
+            health['error'] = '' if good else 'position reconciliation blocked'
+            if good and time.time() >= next_scan:
+                # Rotate list to avoid favouring BTC/ETH every scan.
+                ordered = symbols[cursor:]+symbols[:cursor]
+                cursor = (cursor+1)%len(symbols)
+                last_manage = time.monotonic()
+                for symbol in ordered:
+                    if time.monotonic()-last_manage >= 5:
+                        good, external = manage()
+                        last_manage = time.monotonic()
+                        if not good:
+                            break
+                    if len(set(state['managed'])|set(external)) >= MAX_POS:
+                        break
+                    if symbol in state['managed'] or symbol in external:
+                        continue
+                    if time.time()-state['last_exit'].get(symbol,0) < COOLDOWN:
+                        counts['cooldown'] += 1
+                        continue
+                    try:
+                        sig, reason = signal(symbol)
+                        if sig:
+                            reason = open_signal(sig)
+                            if any(p['status'] in ('pending','closing') for p in state['managed'].values()):
+                                break
+                        counts[reason] += 1
+                    except OSError:
+                        raise
+                    except Exception as exc:
+                        log.error('Scan %s: %s', symbol, exc)
+                        counts['errors'] += 1
+                        if any(p['status'] in ('pending','closing') for p in state['managed'].values()):
+                            break
+                    time.sleep(.10)
+                next_scan = time.time()+SCAN_SECONDS
+            if time.time()-last_report >= 1800:
+                notify(f'Status: {len(state["managed"])} beheerde posities; scanresultaten {dict(counts)}')
+                counts.clear()
+                last_report = time.time()
         except KeyboardInterrupt:
-            tg(f"🛑 {BOT_NAME} gestopt")
+            notify('Bot gestopt; live exchange TP/SL blijft staan. Paperposities blijven in state.')
             break
-        except Exception as e:
-            tg(f"⚠️ Loop error: {e}")
+        except OSError:
+            # Persistence failure must stop the process, not restart order submission.
+            raise
+        except Exception as exc:
+            health['error'] = 'API/reconciliation error'
+            log.error('Loop: %s', exc)
+            if time.time()-last_alert >= 300:
+                notify('API/reconciliatieprobleem: nieuwe entries geblokkeerd; bekijk log en BloFin.')
+                last_alert = time.time()
+        time.sleep(5)
 
-        time.sleep(SCAN_SECONDS)
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
