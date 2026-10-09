@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""JJ EBP BloFin v2.2 — execution hardening, not a proven profitable strategy.
+"""JJ EBP BloFin v2.2.1 — clear closure reports; execution hardening, not a proven profitable strategy.
+Reports use confirmed positions-history, separate fees and funding bills.
+Unmatched history is queued durably, retried every minute, and never guessed.
+Reasons use confirmed closing order categories/IDs, not the sign of PnL.
+No exact-once Telegram guarantee after a crash; a duplicate can occur.
+Keep existing JJ_MIN_MARGIN_USDT value and persistent jj_ebp_v22 state file.
+This file is based on v2.2: no cash TP/trailing changes.
+Liquidity filters apply only to new entries, never to ongoing management.
+Defaults are conservative trial settings, not demonstrated optimal thresholds:
+JJ_MIN_24H_VOLUME_USDT=1000000, JJ_MAX_SPREAD_PCT=0.001,
+JJ_DEPTH_BAND_PCT=0.002, JJ_MIN_DEPTH_MULT=10,
+JJ_MAX_BOOK_IMPACT_PCT=0.001. Missing/stale data means no entry.
+Volume covers last 96 completed 15m bars (rolling completed 24 hours).
+Order book snapshots cannot guarantee future exit liquidity or fill price.
 Install: pip install requests pandas flask
 Default PAPER_TRADING=True: no private API calls, simulated balance 250 USDT.
 For exchange demo: PAPER_TRADING=False, BLOFIN_DEMO=True, demo API credentials.
@@ -30,7 +43,7 @@ from collections import Counter
 import requests
 import pandas as pd
 
-VERSION = '2.2'
+VERSION = '2.2.2-Liquidity'
 def envf(name, default):
     value = float(os.getenv(name, str(default)))
     if not math.isfinite(value):
@@ -46,7 +59,7 @@ TG_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip().removeprefix('bot')
 TG_CHAT = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 BAR = os.getenv('JJ_SIGNAL_BAR', '15m')
 BAR_MS = {'1m':60000,'3m':180000,'5m':300000,'15m':900000,'30m':1800000,'1H':3600000}
-MARGIN = envf('JJ_MIN_MARGIN_USDT', 8 )
+MARGIN = envf('JJ_MIN_MARGIN_USDT', 12)
 LEV = int(os.getenv('JJ_LEVERAGE', '12'))
 RR = envf('JJ_FIXED_RR', 2)
 MAX_POS = int(os.getenv('JJ_MAX_ACTIVE_POSITIONS', '2'))
@@ -54,7 +67,13 @@ SCAN_SECONDS = envf('JJ_SCAN_SECONDS', 30)
 RISK_CAP = envf('JJ_MAX_LOSS_USDT', 3)
 FEE = envf('JJ_TAKER_FEE_RATE', .0006)  # each side; adjust to your actual tier
 SLIPPAGE = envf('JJ_SLIPPAGE_ALLOWANCE', .001)
-MAX_SPREAD = envf('JJ_MAX_SPREAD_PCT', .002)
+MAX_SPREAD = envf('JJ_MAX_SPREAD_PCT', .001)  # 0.10%; applies only to entries
+MIN_VOLUME = envf('JJ_MIN_24H_VOLUME_USDT', 1000000)
+DEPTH_BAND = envf('JJ_DEPTH_BAND_PCT', .002)  # 0.20% around executable top price
+DEPTH_MULT = envf('JJ_MIN_DEPTH_MULT', 10)  # each side >= 10x position notional
+MAX_IMPACT = envf('JJ_MAX_BOOK_IMPACT_PCT', .001)  # 0.10% VWAP vs best price
+liquidity_cache = {}
+
 MAX_CHASE_R = envf('JJ_MAX_ENTRY_DRIFT_R', .35)
 MAX_STOP_PCT = envf('JJ_MAX_STOP_PCT', .04)
 MIN_STOP_PCT = envf('JJ_MIN_STOP_PCT', .002)
@@ -67,7 +86,7 @@ SYMBOLS = list(dict.fromkeys(x.strip().upper() for x in os.getenv('JJ_SYMBOLS', 
 session = requests.Session()
 meta = {}
 state = {'mode': 'paper' if PAPER_TRADING else 'demo' if BLOFIN_DEMO else 'live',
-         'managed': {}, 'seen': {}, 'last_exit': {}, 'paper_realized': 0.0}
+         'managed': {}, 'seen': {}, 'last_exit': {}, 'paper_realized': 0.0, 'reports': {}}
 health = {'last_cycle': 0, 'error': ''}
 log = logging.getLogger('ebp')
 
@@ -79,8 +98,12 @@ def notify(message):
                 json={'chat_id':TG_CHAT,'text':message,'disable_web_page_preview':True}, timeout=8)
             if response.status_code != 200:
                 log.warning('Telegram rejected message: HTTP %s', response.status_code)
+                return False
+            return True
         except requests.RequestException:
             log.warning('Telegram unavailable')  # never log token-containing URL
+            return False
+    return True
 
 def num(value):
     x = float(value)
@@ -287,6 +310,8 @@ def reconcile_pending(symbol, p):
         save()
         notify(f'Geen fill {symbol}; order afgesloten')
         return False
+    if detail.get('positionId'):
+        p['position_id'] = str(detail['positionId'])
     p.update(contracts=filled, entry_price=num(detail['averagePrice']), status='open')
     p['notional'] = filled*num(meta[symbol]['contractValue'])*p['entry_price']
     save()
@@ -307,14 +332,19 @@ def manage():
                 if p['zero_checks'] < 2:
                     ok = False
                     continue
+                key = uuid4().hex
+                state.setdefault('reports', {})[key] = {'symbol':symbol, 'position':dict(p),
+                    'observed_closed':time.time(), 'next_attempt':0, 'waiting_sent':False}
                 del state['managed'][symbol]
                 state['last_exit'][symbol] = time.time()
                 save()
-                notify(f'Positie {symbol} bij BloFin gesloten; nulpositie bevestigd (reden/PnL niet afgeleid)')
                 continue
             p['zero_checks'] = 0
             if not PAPER_TRADING:
                 current = live_positions[symbol]
+                if current.get('positionId') and not p.get('position_id'):
+                    p['position_id'] = str(current['positionId'])
+                    save()
                 q = num(current['positions'])
                 if (q > 0) != (p['direction']=='long') or abs(q) != p['contracts'] or current['marginMode'] != 'isolated':
                     raise RuntimeError('Position differs from bot state; new entries blocked')
@@ -357,6 +387,218 @@ def manage():
     health['last_cycle'] = time.time()
     return ok, live_positions
 
+def matched_history(symbol, p, closed_at):
+    """Reject ambiguous matches; never report another trade's result."""
+    rows = get('/api/v1/account/positions-history',
+        {'instId':symbol,'begin':str(int((p['entry_ts']-120)*1000)),
+         'end':str(int((closed_at+120)*1000)), 'limit':'100'}, private=True)
+    if not isinstance(rows, list) or len(rows) >= 100:
+        return None
+    found = []
+    seen = set()
+    for h in rows:
+        if h.get('instId') != symbol or h.get('marginMode') != 'isolated':
+            continue
+        if h.get('side') != ('buy' if p['direction']=='long' else 'sell'):
+            continue
+        opened, closed = num(h['createTime'])/1000, num(h['updateTime'])/1000
+        if abs(opened-p['entry_ts']) > 120 or not p['entry_ts'] <= closed <= closed_at+120:
+            continue
+        if p.get('position_id') and str(h.get('positionId')) != p['position_id']:
+            continue
+        if abs(num(h['openAveragePrice'])-p['entry_price']) > num(meta[symbol]['tickSize'])*2:
+            continue
+        hid = h.get('historyId')
+        if not hid or hid in seen:
+            continue
+        seen.add(hid)
+        found.append(h)
+    if not found:
+        return None
+    if len({h.get('positionId') for h in found}) != 1:
+        return None
+    quantity = sum(num(h['closePositions']) for h in found)
+    if abs(quantity-p['contracts']) > num(meta[symbol]['lotSize'])/100:
+        return None
+    return found
+
+def confirmed_reason(symbol, p, rows):
+    if any(num(h.get('liquidationPositions',0)) > 0 for h in rows):
+        return 'Liquidatie gemeld door BloFin'
+    orders = get('/api/v1/trade/orders-history', {'instId':symbol,'limit':'100'}, private=True)
+    categories = set()
+    close_ids = set()
+    for o in orders:
+        if o.get('instId') != symbol or o.get('side') != ('sell' if p['direction']=='long' else 'buy'):
+            continue
+        if o.get('state') not in ('filled','canceled') or num(o.get('filledSize',0)) <= 0:
+            continue
+        stamp = num(o['updateTime'])
+        if not min(num(h['updateTime']) for h in rows)-120000 <= stamp <= max(num(h['updateTime']) for h in rows)+120000:
+            continue
+        if p.get('position_id') and o.get('positionId') and str(o['positionId']) != p['position_id']:
+            continue
+        category = o.get('orderCategory')
+        if category in ('tp','sl','adl','full_liquidation','partial_liquidation'):
+            categories.add(category)
+        if o.get('clientOrderId') == p.get('close_client_id') and p.get('close_client_id'):
+            close_ids.add(o['clientOrderId'])
+    if len(categories)==1:
+        return {'tp':'Take-profit uitgevoerd', 'sl':'Stop-loss uitgevoerd',
+            'adl':'Automatische deleveraging', 'full_liquidation':'Liquidatie',
+            'partial_liquidation':'Gedeeltelijke liquidatie'}[next(iter(categories))]
+    if close_ids:
+        reason = p.get('close_reason','')
+        if reason == 'exchange TP/SL missing':
+            return 'Veiligheidssluiting: TP/SL ontbrak'
+        if reason == 'fill risk invalid':
+            return 'Veiligheidssluiting: risico na uitvoering te hoog'
+        return 'Door de bot gesloten (sluitorder bevestigd)'
+    return 'Sluiting bevestigd; oorzaak niet bevestigd'
+
+def format_report(symbol, p, rows, funding, reason):
+    qty = sum(num(h['closePositions']) for h in rows)
+    exit_price = sum(num(h['closePositions'])*num(h['closeAveragePrice']) for h in rows)/qty
+    pnl = sum(num(h['realizedPnl']) for h in rows)
+    fees = sum(num(h['fee']) for h in rows)
+    opened = min(num(h['createTime']) for h in rows)
+    closed = max(num(h['updateTime']) for h in rows)
+    # Positions-history documents realizedPnl and trading fee separately.
+    net = pnl-fees+funding if funding is not None else None
+    prefix = '✅' if (net if net is not None else pnl-fees) >= 0 else '🔴'
+    result = (f'Resultaat na kosten/funding: {net:+.2f} USDT' if net is not None
+              else f'Resultaat na handelskosten: {pnl-fees:+.2f} USDT (funding nog onbekend)')
+    return (f'{prefix} {symbol} {p["direction"].upper()} gesloten\n'
+        f'{result}\n'
+        f'Handels-PnL: {pnl:+.2f} USDT | Kosten: {fees:.4f} USDT\n'
+        f'Funding: {funding:+.4f} USDT\n' if funding is not None else
+        f'{prefix} {symbol} {p["direction"].upper()} gesloten\n{result}\n'
+        f'Handels-PnL: {pnl:+.2f} USDT | Kosten: {fees:.4f} USDT\n') + (
+        f'Instap: {num(rows[0]["openAveragePrice"]):.8g} → Uitstap: {exit_price:.8g}\n'
+        f'Duur: {(closed-opened)/60000:.0f} minuten\nReden: {reason}')
+
+def process_reports():
+    if PAPER_TRADING:
+        return
+    # Reporting is read-only and runs after risk management; max one per loop.
+    for key, report in list(state.setdefault('reports',{}).items()):
+        if time.time() < report['next_attempt']:
+            continue
+        symbol, p = report['symbol'], report['position']
+        report['next_attempt'] = time.time()+60
+        save()
+        try:
+            rows = matched_history(symbol,p,report['observed_closed'])
+            if rows is None:
+                if not report['waiting_sent']:
+                    report['waiting_sent'] = notify(f'🔒 {symbol} gesloten bij BloFin. Het definitieve resultaat is nog niet beschikbaar; volgt zodra de afrekening bevestigd is.')
+                    save()
+                return
+            funding = None
+            try:
+                begin = min(int(h['createTime']) for h in rows)
+                end = max(int(h['updateTime']) for h in rows)
+                if end-begin <= 7*86400000:
+                    bills = get('/api/v1/account/funding-fees', {'instId':symbol,
+                        'begin':str(begin),'end':str(end),'limit':'1000'}, private=True)
+                    if isinstance(bills,list) and len(bills)<1000:
+                        funding = sum(num(f['fundingFee']) for f in bills
+                            if f.get('instId')==symbol and f.get('marginMode')=='isolated'
+                            and begin <= num(f['fundingTime']) <= end)
+            except Exception:
+                pass
+            try:
+                reason = confirmed_reason(symbol,p,rows)
+            except Exception:
+                reason = 'Sluiting bevestigd; oorzaak niet bevestigd'
+            if notify(format_report(symbol,p,rows,funding,reason)):
+                del state['reports'][key]
+                save()
+        except OSError:
+            raise
+        except Exception as exc:
+            log.warning('Afrekening %s nog niet beschikbaar: %s',symbol,exc)
+            if not report['waiting_sent']:
+                report['waiting_sent'] = notify(f'🔒 {symbol} gesloten. Afrekening tijdelijk niet beschikbaar; de bot probeert het opnieuw.')
+                save()
+        return
+
+
+def trailing_volume(symbol):
+    """Exact quote volume of last 96 consecutive completed 15m candles.
+    No approximate base-volume * last-price conversion. Cached for one minute.
+    """
+    cached = liquidity_cache.get(symbol)
+    if cached and time.time()-cached['checked'] < 60:
+        return cached['volume']
+    data = get('/api/v1/market/candles', {'instId':symbol,'bar':'15m','limit':'100'})
+    rows = {}
+    for c in data:
+        if isinstance(c,list) and len(c)>=9 and str(c[8])=='1':
+            ts, vol = int(c[0]), num(c[7])  # documented quote-currency volume
+            if vol < 0:
+                raise RuntimeError('Negative quote volume')
+            rows[ts] = vol
+    stamps = sorted(rows)[-96:]
+    if len(stamps)!=96 or any(y-x!=900000 for x,y in zip(stamps,stamps[1:])):
+        raise RuntimeError('Incomplete 24h liquidity data')
+    age = time.time()*1000-(stamps[-1]+900000)
+    if not -5000 <= age <= 1020000:
+        raise RuntimeError('Stale volume data')
+    total = sum(rows[t] for t in stamps)
+    liquidity_cache[symbol] = {'volume':total,'checked':time.time()}
+    return total
+
+def book_side(levels, contracts, cv, buy, entry_notional):
+    if not isinstance(levels,list) or not levels:
+        return False
+    parsed = [(num(x[0]),num(x[1])) for x in levels if isinstance(x,list) and len(x)>=2]
+    if not parsed or any(price<=0 or qty<0 for price,qty in parsed):
+        return False
+    parsed.sort(key=lambda x:x[0], reverse=not buy)
+    best = parsed[0][0]
+    band = [(price,qty) for price,qty in parsed
+        if abs(price/best-1)<=DEPTH_BAND]
+    if sum(price*qty*cv for price,qty in band) < entry_notional*DEPTH_MULT:
+        return False
+    remaining, cost = contracts, 0.0
+    for price,qty in band:
+        take = min(remaining,qty)
+        cost += price*take
+        remaining -= take
+        if remaining <= contracts*1e-10:
+            break
+    if remaining > contracts*1e-10:
+        return False
+    vwap = cost/contracts
+    impact = vwap/best-1 if buy else 1-vwap/best
+    return impact <= MAX_IMPACT
+
+def liquidity_check(symbol, p):
+    try:
+        if trailing_volume(symbol) < MIN_VOLUME:
+            return 'liquidity_volume'
+        book = one(get('/api/v1/market/books', {'instId':symbol,'size':'100'}))
+        if abs(time.time()*1000-num(book['ts'])) > 10000:
+            return 'liquidity_stale'
+        cv = num(meta[symbol]['contractValue'])
+        # Both opening and eventual closing sides must have sufficient depth.
+        if not book_side(book['asks'],p['contracts'],cv,True,p['notional']):
+            return 'liquidity_depth'
+        if not book_side(book['bids'],p['contracts'],cv,False,p['notional']):
+            return 'liquidity_depth'
+        ask = min(num(x[0]) for x in book['asks'])
+        bid = max(num(x[0]) for x in book['bids'])
+        if bid<=0 or ask<bid or (ask-bid)/((ask+bid)/2)>MAX_SPREAD:
+            return 'liquidity_spread'
+        return 'ok'
+    except OSError:
+        raise
+    except Exception as exc:
+        log.warning('Liquiditeitsdata %s niet bruikbaar: %s',symbol,exc)
+        return 'liquidity_data'
+
+
 def open_signal(sig):
     symbol = sig['symbol']
     ticker = one(get('/api/v1/market/tickers', {'instId':symbol}))
@@ -367,10 +609,23 @@ def open_signal(sig):
     p, reason = plan(sig, entry, balance())
     if not p:
         return reason
+    liquidity = liquidity_check(symbol, p)
+    if liquidity != 'ok':
+        return liquidity
     current_mark = mark(symbol)
     inside = p['stop'] < current_mark < p['tp'] if sig['direction']=='long' else p['tp'] < current_mark < p['stop']
     if not inside:
         return 'mark_outside_levels'
+    fresh = one(get('/api/v1/market/tickers', {'instId':symbol}))
+    fresh_ask, fresh_bid = num(fresh['askPrice']), num(fresh['bidPrice'])
+    if abs(time.time()*1000-num(fresh['ts'])) > 10000:
+        return 'liquidity_stale'
+    if fresh_bid <= 0 or fresh_ask < fresh_bid or (fresh_ask-fresh_bid)/((fresh_ask+fresh_bid)/2)>MAX_SPREAD:
+        return 'liquidity_spread'
+    fresh_entry = fresh_ask if p['direction']=='long' else fresh_bid
+    if abs(fresh_entry/entry-1)>MAX_IMPACT:
+        return 'liquidity_price_moved'
+    # Keep original sizing/levels only when price stayed inside the allowed tolerance.
     if not PAPER_TRADING:
         if symbol in positions():
             return 'existing_exchange_position'
@@ -395,6 +650,8 @@ def open_signal(sig):
     return 'opened_or_pending'
 
 def startup():
+    if MIN_VOLUME<=0 or DEPTH_MULT<1 or not 0<DEPTH_BAND<1 or not 0<MAX_IMPACT<1 or not 0<MAX_SPREAD<1:
+        raise ValueError('Invalid liquidity configuration')
     if BAR not in BAR_MS or min(MARGIN,LEV,RR,MAX_POS,SCAN_SECONDS,RISK_CAP,MAX_AGE) <= 0:
         raise ValueError('Invalid configuration')
     if min(FEE,SLIPPAGE,COOLDOWN,MIN_STOP_PCT) < 0 or MAX_STOP_PCT <= MIN_STOP_PCT:
@@ -402,6 +659,7 @@ def startup():
     if os.getenv('JJ_MARGIN_MODE', 'isolated').lower() != 'isolated':
         raise ValueError('This version supports isolated only')
     load()
+    state.setdefault('reports', {})
     instruments = get('/api/v1/market/instruments')
     meta.update({m['instId']:m for m in instruments if m.get('state')=='live'
         and m.get('contractType')=='linear' and m.get('settleCurrency')=='USDT'})
@@ -425,6 +683,7 @@ def startup():
         if any(o.get('clientOrderId') not in {p.get('client_id') for p in state['managed'].values()} for o in orders):
             raise RuntimeError('Unmanaged pending orders; reconcile before start')
     notify(f'JJ EBP v{VERSION} gestart: {state["mode"]}, {len(allowed)} munten, {BAR}, marge >=~{MARGIN:g}, {LEV}x, {RR:g}R, risicolimiet ~{RISK_CAP:g} USDT')
+    notify(f'Liquiditeitsfilter: 24u volume >= {MIN_VOLUME:,.0f} USDT; spread <= {MAX_SPREAD*100:.2f}%; diepte beide zijden >= {DEPTH_MULT:g}x positie binnen {DEPTH_BAND*100:.2f}%')
     if missing:
         notify('Overgeslagen (niet beschikbaar / leverage): '+', '.join(missing))
     return allowed
@@ -456,6 +715,7 @@ def main():
     while True:
         try:
             good, external = manage()
+            process_reports()
             health['error'] = '' if good else 'position reconciliation blocked'
             if good and time.time() >= next_scan:
                 # Rotate list to avoid favouring BTC/ETH every scan.
