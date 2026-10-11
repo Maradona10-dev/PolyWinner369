@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
-"""JJ EBP BloFin v2.2.1 — clear closure reports; execution hardening, not a proven profitable strategy.
+"""JJ EBP BloFin v2.2.4 — confirmed reports and sampled trade telemetry; execution hardening, not a proven profitable strategy.
 Reports use confirmed positions-history, separate fees and funding bills.
+History queries use positionId when known; matching failures are explained.
+Sampled mark-price extremes are estimates, not exact intrabar highs/lows.
+Existing positions start measurement at upgrade; old extremes cannot be recovered.
+Completed report records remain in the persistent state journal.
+Deployment: replace bot.py; retain all existing strategy/environment settings.
+Railway live: mount a persistent volume at /data and use
+JJ_STATE_FILE=/data/jj_ebp_v22_live.json (keep the existing persistent file).
+If deployment previously lost state, JJ_RECOVER_SYMBOLS must explicitly list
+the actual open instruments, comma separated. Recovery only accepts existing
+full-position market TP/SL using mark price, isolated net mode and matching leverage.
+Recovery does not place an entry order. Remove this whitelist after recovery.
+Reporting cannot reconstruct old peak/trough PnL from closure history.
 Unmatched history is queued durably, retried every minute, and never guessed.
 Reasons use confirmed closing order categories/IDs, not the sign of PnL.
 No exact-once Telegram guarantee after a crash; a duplicate can occur.
@@ -43,7 +55,7 @@ from collections import Counter
 import requests
 import pandas as pd
 
-VERSION = '2.2.2-Liquidity'
+VERSION = '2.2.4-Telemetry'
 def envf(name, default):
     value = float(os.getenv(name, str(default)))
     if not math.isfinite(value):
@@ -59,7 +71,7 @@ TG_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip().removeprefix('bot')
 TG_CHAT = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 BAR = os.getenv('JJ_SIGNAL_BAR', '15m')
 BAR_MS = {'1m':60000,'3m':180000,'5m':300000,'15m':900000,'30m':1800000,'1H':3600000}
-MARGIN = envf('JJ_MIN_MARGIN_USDT', 8 )
+MARGIN = envf('JJ_MIN_MARGIN_USDT', 12)
 LEV = int(os.getenv('JJ_LEVERAGE', '12'))
 RR = envf('JJ_FIXED_RR', 2)
 MAX_POS = int(os.getenv('JJ_MAX_ACTIVE_POSITIONS', '2'))
@@ -73,6 +85,7 @@ DEPTH_BAND = envf('JJ_DEPTH_BAND_PCT', .002)  # 0.20% around executable top pric
 DEPTH_MULT = envf('JJ_MIN_DEPTH_MULT', 10)  # each side >= 10x position notional
 MAX_IMPACT = envf('JJ_MAX_BOOK_IMPACT_PCT', .001)  # 0.10% VWAP vs best price
 liquidity_cache = {}
+balance_diagnostic = {}
 
 MAX_CHASE_R = envf('JJ_MAX_ENTRY_DRIFT_R', .35)
 MAX_STOP_PCT = envf('JJ_MAX_STOP_PCT', .04)
@@ -80,7 +93,21 @@ MIN_STOP_PCT = envf('JJ_MIN_STOP_PCT', .002)
 COOLDOWN = envf('JJ_COOLDOWN_SECONDS', 900)
 MAX_AGE = envf('JJ_MAX_SIGNAL_AGE_SECONDS', 120)
 PAPER_BALANCE = envf('JJ_PAPER_BALANCE_USDT', 250)
-STATE_FILE = os.getenv('JJ_STATE_FILE', f'jj_ebp_v22_{"paper" if PAPER_TRADING else "demo" if BLOFIN_DEMO else "live"}.json')
+VOLUME_PATH = os.getenv('RAILWAY_VOLUME_MOUNT_PATH', '').strip()
+STATE_NAME = f'jj_ebp_v22_{"paper" if PAPER_TRADING else "demo" if BLOFIN_DEMO else "live"}.json'
+STATE_FILE = os.getenv('JJ_STATE_FILE', os.path.join(VOLUME_PATH, STATE_NAME) if VOLUME_PATH else STATE_NAME)
+RECOVER_SYMBOLS = {x.strip().upper() for x in os.getenv('JJ_RECOVER_SYMBOLS', '').split(',') if x.strip()}
+
+def prepare_state_directory():
+    if os.getenv('RAILWAY_ENVIRONMENT_ID') and not PAPER_TRADING:
+        if not VOLUME_PATH or not os.path.isdir(VOLUME_PATH):
+            raise RuntimeError('Attach a Railway volume before live startup')
+        root = os.path.realpath(VOLUME_PATH)
+        target = os.path.realpath(STATE_FILE)
+        if os.path.commonpath([root, target]) != root:
+            raise RuntimeError('JJ_STATE_FILE must be inside the Railway volume')
+    os.makedirs(os.path.dirname(os.path.abspath(STATE_FILE)), exist_ok=True)
+
 DEFAULT_SYMBOLS = '''BTC ETH SOL BNB XRP ADA AVAX DOT NEAR SUI APT SEI FTM HBAR THETA LINK ARB OP INJ TIA FET RENDER TAO STRK MANTA ALT DYM ZETA PORTAL AXL ENA CRV LDO JUP ORDI DOGE SHIB PEPE WIF WLD COR PUMP BOME MEW PNUT ACT GOAT NEIRO POPCAT FLOKI BONK CHZ RUNE ATOM ALGO SAND MANA AXS GALA GMT'''.split()
 SYMBOLS = list(dict.fromkeys(x.strip().upper() for x in os.getenv('JJ_SYMBOLS', ','.join(x+'-USDT' for x in DEFAULT_SYMBOLS)).split(',') if x.strip()))
 session = requests.Session()
@@ -254,8 +281,13 @@ def plan(sig, entry, available):
     risk = size*cv*distance + notional*(2*FEE+SLIPPAGE)
     if risk > RISK_CAP:
         return None, 'risk_cap'
-    if notional/LEV + notional*(2*FEE+SLIPPAGE) > available*.88:
+    needed = notional/LEV + notional*(2*FEE+SLIPPAGE)
+    balance_diagnostic.update(symbol=sig['symbol'], available=available, required=needed/.88,
+                              ts=time.time())
+    if needed > available*.88:
+        balance_diagnostic['blocked'] = True
         return None, 'balance'
+    balance_diagnostic['blocked'] = False
     if size > num(m['maxMarketSize']):
         return None, 'max_size'
     return {'direction':sig['direction'],'entry_price':entry,'stop':stop,'tp':tp,
@@ -313,10 +345,48 @@ def reconcile_pending(symbol, p):
     if detail.get('positionId'):
         p['position_id'] = str(detail['positionId'])
     p.update(contracts=filled, entry_price=num(detail['averagePrice']), status='open')
+    p['original_contracts'] = filled
     p['notional'] = filled*num(meta[symbol]['contractValue'])*p['entry_price']
     save()
-    notify(f'OPEN bevestigd {symbol} {p["direction"]} @ {p["entry_price"]:.8g}; {filled:g} contracten')
+    notify(f'🟢 OPEN {symbol} {p["direction"].upper()} @ {p["entry_price"]:.8g}\n'
+           f'{filled:g} contracten | TP {p["tp"]:.8g} | SL {p["stop"]:.8g}\n'
+           f'Nominale positie: {p["notional"]:.2f} USDT | marge indicatief: {p["notional"]/LEV:.2f} USDT')
     return True
+
+def sample_trade(symbol, p, price):
+    """Measure existing mark samples; no additional exchange order or exit rule."""
+    stamp = time.time()
+    direction = 1 if p['direction']=='long' else -1
+    units = p['contracts']*num(meta[symbol]['contractValue'])
+    gross = direction*(price-p['entry_price'])*units
+    approx_net = gross - units*(p['entry_price']+price)*FEE
+    m = p.setdefault('metrics', {})
+    first = not m
+    if first:
+        m.update(started=stamp, samples=0, peak_gross=gross, trough_gross=gross,
+                 peak_after_estimated_fees=approx_net, peak_ts=stamp, trough_ts=stamp)
+    p.setdefault('original_stop', p['stop'])
+    p.setdefault('original_tp', p['tp'])
+    p.setdefault('original_contracts', p['contracts'])
+    if gross > m['peak_gross']:
+        m.update(peak_gross=gross, peak_ts=stamp)
+    if gross < m['trough_gross']:
+        m.update(trough_gross=gross, trough_ts=stamp)
+    m['peak_after_estimated_fees'] = max(m['peak_after_estimated_fees'], approx_net)
+    m.update(samples=m['samples']+1, last_ts=stamp, last_mark=price,
+             last_gross=gross, last_after_estimated_fees=approx_net)
+    # Extremes are durable at every sample, including just before exit handling.
+    save()
+
+def metric_text(p):
+    m = p.get('metrics')
+    if not m:
+        return 'Winstverloop: niet gemeten (positie voor deze update gesloten)'
+    return (f"Beste/slechtste gemeten bruto-PnL: {m['peak_gross']:+.2f} / "
+            f"{m['trough_gross']:+.2f} USDT\n"
+            f"Beste na geschatte handelskosten: {m['peak_after_estimated_fees']:+.2f} USDT "
+            f"(zonder funding; {m['samples']} koersmetingen)\n"
+            "Gemeten vanaf deze botversie; pieken tussen metingen kunnen ontbreken")
 
 def manage():
     live_positions = {} if PAPER_TRADING else positions()
@@ -345,6 +415,9 @@ def manage():
                 if current.get('positionId') and not p.get('position_id'):
                     p['position_id'] = str(current['positionId'])
                     save()
+                if current.get('createTime') and not p.get('exchange_entry_ts'):
+                    p['exchange_entry_ts'] = num(current['createTime'])/1000
+                    save()
                 q = num(current['positions'])
                 if (q > 0) != (p['direction']=='long') or abs(q) != p['contracts'] or current['marginMode'] != 'isolated':
                     raise RuntimeError('Position differs from bot state; new entries blocked')
@@ -358,6 +431,7 @@ def manage():
                     ok = False
                     continue
             price = mark(symbol)
+            sample_trade(symbol, p, price)
             long = p['direction']=='long'
             hit_sl = price <= p['stop'] if long else price >= p['stop']
             hit_tp = price >= p['tp'] if long else price <= p['tp']
@@ -377,7 +451,7 @@ def manage():
                 has_protection = protected(symbol, p)
                 invalid_fill = actual_distance <= 0 or actual_risk > RISK_CAP
                 if hit_sl or hit_tp or not has_protection or invalid_fill:
-                    close_live(symbol, p, 'SL/TP reached' if hit_sl or hit_tp else 'fill risk invalid' if invalid_fill else 'exchange TP/SL missing')
+                    close_live(symbol, p, 'bot SL reached' if hit_sl else 'bot TP reached' if hit_tp else 'fill risk invalid' if invalid_fill else 'exchange TP/SL missing')
                     ok = False
         except OSError:
             raise
@@ -387,40 +461,73 @@ def manage():
     health['last_cycle'] = time.time()
     return ok, live_positions
 
+class ReportPending(RuntimeError):
+    pass
+
 def matched_history(symbol, p, closed_at):
-    """Reject ambiguous matches; never report another trade's result."""
-    rows = get('/api/v1/account/positions-history',
-        {'instId':symbol,'begin':str(int((p['entry_ts']-120)*1000)),
-         'end':str(int((closed_at+120)*1000)), 'limit':'100'}, private=True)
-    if not isinstance(rows, list) or len(rows) >= 100:
-        return None
-    found = []
-    seen = set()
+    """Position ID + close window, price and quantity; never guess a trade."""
+    params = {'instId':symbol, 'limit':'100'}
+    pid = str(p.get('position_id') or '')
+    if pid:
+        # Avoid relying on a server timestamp filter's creation/update semantics.
+        params['positionId'] = pid
+    pages, rows, cursors = 0, [], set()
+    while pages < 5:
+        batch = get('/api/v1/account/positions-history', params, private=True)
+        if not isinstance(batch, list):
+            raise ReportPending('Ongeldig antwoord op positiehistorie')
+        rows.extend(batch)
+        pages += 1
+        if len(batch) < 100:
+            break
+        cursor = str(batch[-1].get('historyId') or '')
+        if not cursor or cursor in cursors:
+            raise ReportPending('Historie kon niet volledig worden gepagineerd')
+        cursors.add(cursor)
+        params['after'] = cursor
+    else:
+        raise ReportPending('Te veel historie; controleer positie-ID')
+    expected_start = p.get('exchange_entry_ts', p['entry_ts'])
+    found, seen, rejects = [], set(), Counter()
     for h in rows:
         if h.get('instId') != symbol or h.get('marginMode') != 'isolated':
             continue
         if h.get('side') != ('buy' if p['direction']=='long' else 'sell'):
+            rejects['richting'] += 1
             continue
         opened, closed = num(h['createTime'])/1000, num(h['updateTime'])/1000
-        if abs(opened-p['entry_ts']) > 120 or not p['entry_ts'] <= closed <= closed_at+120:
+        # A position ID is stronger evidence than local order submission time.
+        # Close time, entry price and total quantity must still all match.
+        if pid and str(h.get('positionId') or '') != pid:
+            rejects['positie-ID'] += 1
             continue
-        if p.get('position_id') and str(h.get('positionId')) != p['position_id']:
+        if not pid and abs(opened-expected_start) > 120:
+            rejects['openingstijd'] += 1
+            continue
+        if not p['entry_ts']-120 <= closed <= closed_at+120:
+            rejects['sluitingstijd'] += 1
             continue
         if abs(num(h['openAveragePrice'])-p['entry_price']) > num(meta[symbol]['tickSize'])*2:
+            rejects['instapprijs'] += 1
             continue
-        hid = h.get('historyId')
-        if not hid or hid in seen:
+        hid = str(h.get('historyId') or '')
+        if not hid:
+            rejects['historie-ID'] += 1
+            continue
+        if hid in seen:
             continue
         seen.add(hid)
         found.append(h)
     if not found:
-        return None
-    if len({h.get('positionId') for h in found}) != 1:
-        return None
-    quantity = sum(num(h['closePositions']) for h in found)
-    if abs(quantity-p['contracts']) > num(meta[symbol]['lotSize'])/100:
-        return None
-    return found
+        detail = ', '.join(f'{k}: {v}' for k,v in rejects.items())
+        raise ReportPending('Geen passende afrekening'+(' ('+detail+')' if detail else '; historie nog leeg'))
+    if len({str(h.get('positionId') or '') for h in found}) != 1:
+        raise ReportPending('Meerdere posities passen; afrekening niet gekoppeld')
+    quantity = sum(abs(num(h['closePositions'])) for h in found)
+    expected = p.get('original_contracts', p['contracts'])
+    if abs(quantity-expected) > num(meta[symbol]['lotSize'])/100:
+        raise ReportPending(f'Gesloten aantal past niet: historie {quantity:g}, verwacht {expected:g}')
+    return sorted(found, key=lambda h: num(h['updateTime']))
 
 def confirmed_reason(symbol, p, rows):
     if any(num(h.get('liquidationPositions',0)) > 0 for h in rows):
@@ -453,76 +560,113 @@ def confirmed_reason(symbol, p, rows):
             return 'Veiligheidssluiting: TP/SL ontbrak'
         if reason == 'fill risk invalid':
             return 'Veiligheidssluiting: risico na uitvoering te hoog'
+        if reason == 'bot TP reached':
+            return 'Door de bot gesloten: TP-niveau bereikt (sluitorder bevestigd)'
+        if reason == 'bot SL reached':
+            return 'Door de bot gesloten: SL-niveau bereikt (sluitorder bevestigd)'
         return 'Door de bot gesloten (sluitorder bevestigd)'
     return 'Sluiting bevestigd; oorzaak niet bevestigd'
 
-def format_report(symbol, p, rows, funding, reason):
-    qty = sum(num(h['closePositions']) for h in rows)
-    exit_price = sum(num(h['closePositions'])*num(h['closeAveragePrice']) for h in rows)/qty
-    pnl = sum(num(h['realizedPnl']) for h in rows)
+def report_values(rows, funding):
+    quantity = sum(abs(num(h['closePositions'])) for h in rows)
+    if quantity <= 0:
+        raise ReportPending('Historie bevat geen gesloten hoeveelheid')
+    gross = sum(num(h['realizedPnl']) for h in rows)
     fees = sum(num(h['fee']) for h in rows)
-    opened = min(num(h['createTime']) for h in rows)
+    return dict(gross=gross, fees=fees, funding=funding,
+        net=gross-fees+funding if funding is not None else None,
+        after_fees=gross-fees,
+        exit_price=sum(abs(num(h['closePositions']))*num(h['closeAveragePrice']) for h in rows)/quantity)
+
+def format_report(symbol, p, rows, funding, reason):
+    v = report_values(rows, funding)
+    opened = p.get('exchange_entry_ts', p['entry_ts'])*1000
     closed = max(num(h['updateTime']) for h in rows)
-    # Positions-history documents realizedPnl and trading fee separately.
-    net = pnl-fees+funding if funding is not None else None
-    prefix = '✅' if (net if net is not None else pnl-fees) >= 0 else '🔴'
-    result = (f'Resultaat na kosten/funding: {net:+.2f} USDT' if net is not None
-              else f'Resultaat na handelskosten: {pnl-fees:+.2f} USDT (funding nog onbekend)')
-    return (f'{prefix} {symbol} {p["direction"].upper()} gesloten\n'
-        f'{result}\n'
-        f'Handels-PnL: {pnl:+.2f} USDT | Kosten: {fees:.4f} USDT\n'
-        f'Funding: {funding:+.4f} USDT\n' if funding is not None else
-        f'{prefix} {symbol} {p["direction"].upper()} gesloten\n{result}\n'
-        f'Handels-PnL: {pnl:+.2f} USDT | Kosten: {fees:.4f} USDT\n') + (
-        f'Instap: {num(rows[0]["openAveragePrice"]):.8g} → Uitstap: {exit_price:.8g}\n'
-        f'Duur: {(closed-opened)/60000:.0f} minuten\nReden: {reason}')
+    value = v['net'] if v['net'] is not None else v['after_fees']
+    text = [f'{"✅" if value >= 0 else "🔴"} {symbol} {p["direction"].upper()} gesloten']
+    if v['net'] is not None:
+        text.append(f'Netto na handelskosten/funding: {v["net"]:+.2f} USDT')
+    else:
+        text.append(f'Na handelskosten: {v["after_fees"]:+.2f} USDT; funding nog onbekend')
+    text.append(f'Bruto: {v["gross"]:+.2f} | Handelskosten: {v["fees"]:.4f} USDT')
+    if funding is not None:
+        text.append(f'Funding: {funding:+.4f} USDT')
+    text.extend([f'Instap {p["entry_price"]:.8g} → Uitstap {v["exit_price"]:.8g}',
+        f'Duur: {max(0, (closed-opened)/60000):.0f} minuten',
+        f'Reden: {reason}', metric_text(p)])
+    return '\n'.join(text)
+
+def funding_for(symbol, p, rows):
+    begin = int(p.get('exchange_entry_ts', p['entry_ts'])*1000)
+    end = max(int(h['updateTime']) for h in rows)
+    if not 0 <= end-begin <= 7*86400000 or time.time()*1000-begin > 7*86400000:
+        return None
+    bills = get('/api/v1/account/funding-fees', {'instId':symbol,
+                'begin':str(begin),'end':str(end),'limit':'1000'}, private=True)
+    if not isinstance(bills,list) or len(bills)>=1000:
+        return None
+    return sum(num(f['fundingFee']) for f in bills
+        if f.get('instId')==symbol and f.get('marginMode')=='isolated'
+        and begin <= num(f['fundingTime']) <= end)
+
+def archive_report(key, symbol, p, rows, funding, reason):
+    v = report_values(rows, funding)
+    record = dict(symbol=symbol, direction=p['direction'], entry_price=p['entry_price'],
+        entry_ts=p.get('exchange_entry_ts',p['entry_ts']),
+        closed_ts=max(num(h['updateTime']) for h in rows)/1000,
+        reason=reason, history_ids=[str(h['historyId']) for h in rows],
+        metrics=dict(p.get('metrics',{})), original_stop=p.get('original_stop',p['stop']),
+        original_tp=p.get('original_tp',p['tp']), **v)
+    journal = state.setdefault('journal',{})
+    journal[key] = record
+    while len(journal)>1000:
+        del journal[next(iter(journal))]
 
 def process_reports():
     if PAPER_TRADING:
         return
-    # Reporting is read-only and runs after risk management; max one per loop.
-    for key, report in list(state.setdefault('reports',{}).items()):
-        if time.time() < report['next_attempt']:
-            continue
+    # Old unmatched reports must not starve newer trades.
+    due = sorted(state.setdefault('reports',{}).items(),
+                 key=lambda item: item[1].get('next_attempt',0))
+    for key, report in due:
+        if time.time() < report.get('next_attempt',0):
+            break
         symbol, p = report['symbol'], report['position']
         report['next_attempt'] = time.time()+60
+        report['attempts'] = report.get('attempts',0)+1
         save()
         try:
             rows = matched_history(symbol,p,report['observed_closed'])
-            if rows is None:
-                if not report['waiting_sent']:
-                    report['waiting_sent'] = notify(f'🔒 {symbol} gesloten bij BloFin. Het definitieve resultaat is nog niet beschikbaar; volgt zodra de afrekening bevestigd is.')
-                    save()
-                return
+            if rows is None:  # compatibility with earlier matchers/test adapters
+                raise ReportPending('Historie nog niet gekoppeld')
             funding = None
             try:
-                begin = min(int(h['createTime']) for h in rows)
-                end = max(int(h['updateTime']) for h in rows)
-                if end-begin <= 7*86400000:
-                    bills = get('/api/v1/account/funding-fees', {'instId':symbol,
-                        'begin':str(begin),'end':str(end),'limit':'1000'}, private=True)
-                    if isinstance(bills,list) and len(bills)<1000:
-                        funding = sum(num(f['fundingFee']) for f in bills
-                            if f.get('instId')==symbol and f.get('marginMode')=='isolated'
-                            and begin <= num(f['fundingTime']) <= end)
+                funding = funding_for(symbol,p,rows)
             except Exception:
                 pass
             try:
                 reason = confirmed_reason(symbol,p,rows)
             except Exception:
                 reason = 'Sluiting bevestigd; oorzaak niet bevestigd'
+            # Save evidence BEFORE notification; a Telegram error does not lose data.
+            archive_report(key,symbol,p,rows,funding,reason)
+            save()
             if notify(format_report(symbol,p,rows,funding,reason)):
                 del state['reports'][key]
                 save()
         except OSError:
             raise
         except Exception as exc:
-            log.warning('Afrekening %s nog niet beschikbaar: %s',symbol,exc)
-            if not report['waiting_sent']:
-                report['waiting_sent'] = notify(f'🔒 {symbol} gesloten. Afrekening tijdelijk niet beschikbaar; de bot probeert het opnieuw.')
-                save()
+            detail = str(exc) if isinstance(exc,ReportPending) else 'API/datafout; bekijk Railway-log'
+            report['last_problem'] = detail
+            log.warning('Afrekening %s: %s',symbol,exc)
+            if time.time()-report.get('last_notice',0) >= 1800:
+                delay = max(0,int((time.time()-report['observed_closed'])/60))
+                if notify(f'🔒 {symbol} gesloten; resultaat nog niet bevestigd ({delay} min).\n'
+                          f'{detail}. De bot probeert opnieuw; dit is geen winst/verliesmelding.'):
+                    report['last_notice'] = time.time()
+            save()
         return
-
 
 def trailing_volume(symbol):
     """Exact quote volume of last 96 consecutive completed 15m candles.
@@ -649,6 +793,53 @@ def open_signal(sig):
         manage()
     return 'opened_or_pending'
 
+def recover_existing(external):
+    """Explicit, read-only exchange recovery; never creates or cancels orders."""
+    unknown = set(external) - set(state['managed'])
+    if unknown - RECOVER_SYMBOLS:
+        raise RuntimeError('Unmanaged existing positions; set JJ_RECOVER_SYMBOLS only after review: '
+                           + ','.join(sorted(unknown - RECOVER_SYMBOLS)))
+    staged = {}
+    for symbol in sorted(unknown):
+        current = external[symbol]
+        if symbol not in meta:
+            raise RuntimeError('Recovery instrument unavailable: '+symbol)
+        if current.get('positionSide') != 'net' or current.get('marginMode') != 'isolated':
+            raise RuntimeError('Recovery requires isolated net position: '+symbol)
+        if num(current.get('leverage')) != LEV:
+            raise RuntimeError('Recovery leverage differs from configuration: '+symbol)
+        q, entry = num(current['positions']), num(current['averagePrice'])
+        cv = num(meta[symbol]['contractValue'])
+        created = num(current.get('createTime'))/1000
+        if q == 0 or min(entry, cv, created) <= 0 or created > time.time()+60:
+            raise RuntimeError('Incomplete recovery position data: '+symbol)
+        direction = 'long' if q > 0 else 'short'
+        candidates = []
+        for o in get('/api/v1/trade/orders-tpsl-pending', {'instId':symbol}, private=True):
+            if o.get('instId') != symbol or o.get('positionSide') != 'net' or o.get('marginMode') != 'isolated':
+                continue
+            if o.get('side') != ('sell' if q > 0 else 'buy'):
+                continue
+            if o.get('slTriggerPriceType') != 'mark' or o.get('tpTriggerPriceType') != 'mark':
+                continue
+            if o.get('slOrderPrice') != '-1' or o.get('tpOrderPrice') != '-1':
+                continue
+            size = num(o.get('size'))
+            if size != -1 and size < abs(q):
+                continue
+            stop, tp = num(o.get('slTriggerPrice')), num(o.get('tpTriggerPrice'))
+            if not (0 < stop < entry < tp if q > 0 else 0 < tp < entry < stop):
+                continue
+            candidates.append((stop, tp))
+        if len(candidates) != 1:
+            raise RuntimeError('Recovery needs exactly one matching full-position mark-price market TP/SL: '+symbol)
+        stop, tp = candidates[0]
+        staged[symbol] = dict(entry_ts=created, entry_price=entry, direction=direction,
+            stop=stop, tp=tp, contracts=abs(q), notional=abs(q)*cv*entry,
+            risk_estimate=abs(q)*cv*abs(entry-stop), status='open',
+            position_id=str(current.get('positionId') or ''), recovered=True)
+    return staged
+
 def startup():
     if MIN_VOLUME<=0 or DEPTH_MULT<1 or not 0<DEPTH_BAND<1 or not 0<MAX_IMPACT<1 or not 0<MAX_SPREAD<1:
         raise ValueError('Invalid liquidity configuration')
@@ -660,6 +851,7 @@ def startup():
         raise ValueError('This version supports isolated only')
     load()
     state.setdefault('reports', {})
+    state.setdefault('journal', {})
     instruments = get('/api/v1/market/instruments')
     meta.update({m['instId']:m for m in instruments if m.get('state')=='live'
         and m.get('contractType')=='linear' and m.get('settleCurrency')=='USDT'})
@@ -676,17 +868,60 @@ def startup():
         if mode['positionMode'] != 'net_mode':
             raise RuntimeError('Requires net_mode; account mode is not changed automatically')
         external = positions()
-        unknown = set(external)-set(state['managed'])
-        if unknown:
-            raise RuntimeError('Unmanaged existing positions; reconcile before start: '+','.join(sorted(unknown)))
+        recovered = recover_existing(external)
         orders = get('/api/v1/trade/orders-pending', private=True)
         if any(o.get('clientOrderId') not in {p.get('client_id') for p in state['managed'].values()} for o in orders):
             raise RuntimeError('Unmanaged pending orders; reconcile before start')
+        if recovered:
+            state['managed'].update(recovered)
+            save()
+            for symbol, p in recovered.items():
+                notify(f"♻️ {symbol} {p['direction'].upper()} hersteld; "
+                       f"entry {p['entry_price']:g}; TP {p['tp']:g}; SL {p['stop']:g}. "
+                       "Bestaande BloFin TP/SL overgenomen; geen nieuwe entry geplaatst.")
     notify(f'JJ EBP v{VERSION} gestart: {state["mode"]}, {len(allowed)} munten, {BAR}, marge >=~{MARGIN:g}, {LEV}x, {RR:g}R, risicolimiet ~{RISK_CAP:g} USDT')
     notify(f'Liquiditeitsfilter: 24u volume >= {MIN_VOLUME:,.0f} USDT; spread <= {MAX_SPREAD*100:.2f}%; diepte beide zijden >= {DEPTH_MULT:g}x positie binnen {DEPTH_BAND*100:.2f}%')
     if missing:
         notify('Overgeslagen (niet beschikbaar / leverage): '+', '.join(missing))
     return allowed
+
+SCAN_LABELS = {'stale':'buiten instapvenster', 'no_ebp':'geen EBP',
+    'balance':'onvoldoende vrij saldo', 'spread':'spread te groot',
+    'entry_drift':'prijs te ver van signaal', 'risk_cap':'risicolimiet',
+    'invalid_stop':'stopafstand ongeldig', 'cooldown':'wachttijd na sluiting',
+    'opened_or_pending':'entry geplaatst/in afwachting', 'liquidity_volume':'24u volume te laag',
+    'liquidity_depth':'orderboek onvoldoende', 'liquidity_spread':'spread te groot (boek)',
+    'liquidity_stale':'liquiditeitsdata te oud', 'liquidity_data':'liquiditeitsdata ontbreekt',
+    'already_seen':'signaal al verwerkt', 'errors':'scanfout'}
+
+def status_report(counts):
+    text = [f'📊 Status: {len(state["managed"])} beheerde posities']
+    try:
+        available = balance()
+        text.append(f'Vrij beschikbaar: {available:.2f} USDT | ingestelde marge: {MARGIN:g} USDT')
+    except Exception:
+        text.append('Vrij saldo: tijdelijk niet beschikbaar')
+    if balance_diagnostic.get('blocked'):
+        age = int((time.time()-balance_diagnostic['ts'])/60)
+        text.append(f'Laatste saldo-afwijzing ({age} min geleden): {balance_diagnostic["symbol"]}; '
+                    f'nodig incl. kosten/buffer {balance_diagnostic["required"]:.2f} USDT; '
+                    f'toen vrij {balance_diagnostic["available"]:.2f} USDT')
+    for symbol,p in state['managed'].items():
+        m = p.get('metrics',{})
+        detail = f'{symbol} {p["direction"].upper()} | TP {p["tp"]:.8g} | SL {p["stop"]:.8g}'
+        if m:
+            detail += (f' | laatst gemeten bruto {m["last_gross"]:+.2f} USDT'
+                       f' ({int(time.time()-m["last_ts"])} sec geleden)'
+                       f' | beste {m["peak_gross"]:+.2f}')
+        text.append(detail)
+    if counts:
+        text.append('Controles afgelopen periode (kunnen hetzelfde signaal herhalen):')
+        text.extend(f'• {SCAN_LABELS.get(k,k)}: {v}' for k,v in counts.items())
+    pending = state.get('reports',{})
+    if pending:
+        oldest = max(int((time.time()-r['observed_closed'])/60) for r in pending.values())
+        text.append(f'Afrekening wacht: {len(pending)} trade(s); oudste {oldest} min')
+    return '\n'.join(text)
 
 def serve_health():
     try:
@@ -705,6 +940,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     # Linux process lock prevents accidental duplicate runs using the same state.
     import fcntl
+    prepare_state_directory()
     lock = open(STATE_FILE+'.lock', 'a')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     symbols = startup()
@@ -752,7 +988,7 @@ def main():
                     time.sleep(.10)
                 next_scan = time.time()+SCAN_SECONDS
             if time.time()-last_report >= 1800:
-                notify(f'Status: {len(state["managed"])} beheerde posities; scanresultaten {dict(counts)}')
+                notify(status_report(counts))
                 counts.clear()
                 last_report = time.time()
         except KeyboardInterrupt:
