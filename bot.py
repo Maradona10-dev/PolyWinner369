@@ -87,7 +87,7 @@ RISK_PCT = envf('CRT_RISK_PER_TRADE', .01)
 NOTIONAL_PCT = envf('CRT_MAX_POSITION_PCT', .95)
 DAY_LOSS = envf('CRT_MAX_DAILY_LOSS', .03)
 WEEK_LOSS = envf('CRT_MAX_WEEKLY_LOSS', .07)
-DAY_TRADES = int(os.getenv('CRT_MAX_TRADES_PER_DAY', '4'))
+DAY_TRADES = int(os.getenv('CRT_MAX_TRADES_PER_DAY', '12'))
 LOSS_STREAK = int(os.getenv('CRT_MAX_CONSECUTIVE_LOSSES', '4'))
 risk_snapshot = {'equity':0.0, 'updated':0.0}
 
