@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""JJ EBP BloFin v2.2.5 — confirmed reports and sampled trade telemetry; execution hardening, not a proven profitable strategy.
+"""JJ EBP BloFin v2.2.6 — confirmed reports and sampled trade telemetry; execution hardening, not a proven profitable strategy.
 Reports use confirmed positions-history, separate fees and funding bills.
 History queries use positionId when known; matching failures are explained.
 Sampled mark-price extremes are estimates, not exact intrabar highs/lows.
@@ -49,6 +49,7 @@ import base64
 import hashlib
 import threading
 import logging
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
 from uuid import uuid4
 from urllib.parse import urlencode
@@ -56,7 +57,7 @@ from collections import Counter
 import requests
 import pandas as pd
 
-VERSION = '2.2.5-NoVolume'
+VERSION = '2.2.6-ReportFix-SignalInfo'
 def envf(name, default):
     value = float(os.getenv(name, str(default)))
     if not math.isfinite(value):
@@ -72,7 +73,7 @@ TG_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip().removeprefix('bot')
 TG_CHAT = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 BAR = os.getenv('JJ_SIGNAL_BAR', '15m')
 BAR_MS = {'1m':60000,'3m':180000,'5m':300000,'15m':900000,'30m':1800000,'1H':3600000}
-MARGIN = envf('JJ_MIN_MARGIN_USDT', 8)
+MARGIN = envf('JJ_MIN_MARGIN_USDT', 12)
 LEV = int(os.getenv('JJ_LEVERAGE', '12'))
 RR = envf('JJ_FIXED_RR', 2)
 MAX_POS = int(os.getenv('JJ_MAX_ACTIVE_POSITIONS', '2'))
@@ -249,8 +250,11 @@ def signal(symbol):
     bull, bear = bool(detect_bullish_ebp(df).iloc[-1]), bool(detect_bearish_ebp(df).iloc[-1])
     if bull == bear:
         return None, 'ambiguous' if bull else 'no_ebp'
+    previous = df.iloc[-2]
     return {'symbol':symbol,'direction':'long' if bull else 'short','ts':stamp,
-            'close':float(row.close),'low':float(row.low),'high':float(row.high)}, 'signal'
+            'open':float(row.open),'close':float(row.close),'low':float(row.low),'high':float(row.high),
+            'previous_open':float(previous.open),'previous_high':float(previous.high),
+            'previous_low':float(previous.low)}, 'signal'
 
 def positions():
     data = get('/api/v1/account/positions', private=True)
@@ -299,7 +303,9 @@ def plan(sig, entry, available):
         return None, 'max_size'
     return {'direction':sig['direction'],'entry_price':entry,'stop':stop,'tp':tp,
             'contracts':size,'notional':notional,'risk_estimate':risk,'signal_ts':sig['ts'],
-            'entry_ts':time.time(),'status':'open'}, 'ok'
+            'entry_ts':time.time(),'status':'open',
+            'signal_evidence':{k:sig[k] for k in ('ts','open','high','low','close',
+                'previous_open','previous_high','previous_low') if k in sig}}, 'ok'
 
 def close_live(symbol, p, reason):
     # Retain record until exchange position is confirmed zero. No blind retries.
@@ -338,6 +344,27 @@ def protected(symbol, p):
             return True
     return False
 
+def signal_explanation(p):
+    evidence = p.get('signal_evidence') or {}
+    required = ('ts','open','high','low','close','previous_open','previous_high','previous_low')
+    if not all(k in evidence for k in required):
+        return '\nEBP-details: niet opgeslagen bij deze oudere positie.'
+    start = datetime.fromtimestamp(evidence['ts']/1000, timezone.utc)
+    end = datetime.fromtimestamp((evidence['ts']+BAR_MS[BAR])/1000, timezone.utc)
+    long = p['direction'] == 'long'
+    extreme = evidence['low'] if long else evidence['high']
+    previous_extreme = evidence['previous_low'] if long else evidence['previous_high']
+    swept = extreme < previous_extreme if long else extreme > previous_extreme
+    closed = evidence['close'] > evidence['previous_open'] if long else evidence['close'] < evidence['previous_open']
+    return (f'\n🔎 {"Bullish" if long else "Bearish"} EBP | afgesloten {BAR}-candle\n'
+            f'Candle: {start:%d-%m %H:%M}–{end:%H:%M} UTC\n'
+            f'O {evidence["open"]:.8g} | H {evidence["high"]:.8g} | '
+            f'L {evidence["low"]:.8g} | C {evidence["close"]:.8g}\n'
+            f'{"✅" if swept else "❌"} Sweep: {"low" if long else "high"} {extreme:.8g} '
+            f'{"<" if long else ">"} vorige {"low" if long else "high"} {previous_extreme:.8g}\n'
+            f'{"✅" if closed else "❌"} Slot {evidence["close"]:.8g} '
+            f'{">" if long else "<"} vorige open {evidence["previous_open"]:.8g}')
+
 def reconcile_pending(symbol, p):
     detail = one(get('/api/v1/trade/order-detail',
         {'instId':symbol,'clientOrderId':p['client_id']}, private=True))
@@ -357,7 +384,7 @@ def reconcile_pending(symbol, p):
     save()
     notify(f'🟢 OPEN {symbol} {p["direction"].upper()} @ {p["entry_price"]:.8g}\n'
            f'{filled:g} contracten | TP {p["tp"]:.8g} | SL {p["stop"]:.8g}\n'
-           f'Nominale positie: {p["notional"]:.2f} USDT | marge indicatief: {p["notional"]/LEV:.2f} USDT')
+           f'Nominale positie: {p["notional"]:.2f} USDT | marge indicatief: {p["notional"]/LEV:.2f} USDT' + signal_explanation(p))
     return True
 
 def sample_trade(symbol, p, price):
@@ -499,9 +526,6 @@ def matched_history(symbol, p, closed_at):
     for h in rows:
         if h.get('instId') != symbol or h.get('marginMode') != 'isolated':
             continue
-        if h.get('side') != ('buy' if p['direction']=='long' else 'sell'):
-            rejects['richting'] += 1
-            continue
         opened, closed = num(h['createTime'])/1000, num(h['updateTime'])/1000
         # A position ID is stronger evidence than local order submission time.
         # Close time, entry price and total quantity must still all match.
@@ -516,6 +540,33 @@ def matched_history(symbol, p, closed_at):
             continue
         if abs(num(h['openAveragePrice'])-p['entry_price']) > num(meta[symbol]['tickSize'])*2:
             rejects['instapprijs'] += 1
+            continue
+        # History side may describe a closing order rather than the position.
+        # Never use buy/sell alone to decide whether this is our trade.
+        position_side = str(h.get('positionSide') or '').lower()
+        if position_side in ('long', 'short') and position_side != p['direction']:
+            rejects['positierichting'] += 1
+            continue
+        try:
+            entry = float(h['openAveragePrice'])
+            exit_price = float(h['closeAveragePrice'])
+            qty = abs(float(h['closePositions']))
+            realized = float(h['realizedPnl'])
+            contract_value = float(meta[symbol]['contractValue'])
+            values = (entry, exit_price, qty, realized, contract_value)
+            if not all(math.isfinite(v) for v in values) or min(entry, exit_price, qty, contract_value) <= 0:
+                raise ValueError('invalid history numbers')
+        except (KeyError, TypeError, ValueError):
+            rejects['onvolledige afrekening'] += 1
+            continue
+        expected_pnl = (exit_price-entry)*qty*contract_value*(1 if p['direction']=='long' else -1)
+        # Allow rounded monetary values; costs/funding are reported separately.
+        pnl_tolerance = max(0.01, abs(expected_pnl)*0.0001)
+        if abs(realized-expected_pnl) > pnl_tolerance:
+            rejects['PnL past niet bij positierichting'] += 1
+            continue
+        if not pid and position_side not in ('long', 'short') and abs(expected_pnl) <= pnl_tolerance:
+            rejects['richting onvoldoende bevestigd zonder positie-ID'] += 1
             continue
         hid = str(h.get('historyId') or '')
         if not hid:
@@ -789,7 +840,7 @@ def open_signal(sig):
     state['seen'][symbol] = sig['ts']
     save()
     if PAPER_TRADING:
-        notify(f'PAPER OPEN {symbol} {p["direction"]}: entry {entry:.8g}, SL {p["stop"]:.8g}, TP {p["tp"]:.8g}, risico ~{p["risk_estimate"]:.2f} USDT')
+        notify(f'PAPER OPEN {symbol} {p["direction"]}: entry {entry:.8g}, SL {p["stop"]:.8g}, TP {p["tp"]:.8g}, risico ~{p["risk_estimate"]:.2f} USDT' + signal_explanation(p))
     else:
         post('/api/v1/trade/order', {'instId':symbol,'marginMode':'isolated','positionSide':'net',
             'side':'buy' if p['direction']=='long' else 'sell','orderType':'market',
