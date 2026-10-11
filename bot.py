@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""JJ EBP BloFin v2.2.4 — confirmed reports and sampled trade telemetry; execution hardening, not a proven profitable strategy.
+"""JJ EBP BloFin v2.2.5 — confirmed reports and sampled trade telemetry; execution hardening, not a proven profitable strategy.
 Reports use confirmed positions-history, separate fees and funding bills.
 History queries use positionId when known; matching failures are explained.
 Sampled mark-price extremes are estimates, not exact intrabar highs/lows.
 Existing positions start measurement at upgrade; old extremes cannot be recovered.
 Completed report records remain in the persistent state journal.
 Deployment: replace bot.py; retain all existing strategy/environment settings.
-Railway live: mount a persistent volume at /data and use
-JJ_STATE_FILE=/data/jj_ebp_v22_live.json (keep the existing persistent file).
+A persistent volume is optional. Without one, state is stored locally and may
+be lost at redeployment. Existing unknown positions still block new entries.
+If a volume exists, use JJ_STATE_FILE within its actual mount path.
 If deployment previously lost state, JJ_RECOVER_SYMBOLS must explicitly list
 the actual open instruments, comma separated. Recovery only accepts existing
 full-position market TP/SL using mark price, isolated net mode and matching leverage.
@@ -55,7 +56,7 @@ from collections import Counter
 import requests
 import pandas as pd
 
-VERSION = '2.2.4-Telemetry'
+VERSION = '2.2.5-NoVolume'
 def envf(name, default):
     value = float(os.getenv(name, str(default)))
     if not math.isfinite(value):
@@ -99,14 +100,20 @@ STATE_FILE = os.getenv('JJ_STATE_FILE', os.path.join(VOLUME_PATH, STATE_NAME) if
 RECOVER_SYMBOLS = {x.strip().upper() for x in os.getenv('JJ_RECOVER_SYMBOLS', '').split(',') if x.strip()}
 
 def prepare_state_directory():
-    if os.getenv('RAILWAY_ENVIRONMENT_ID') and not PAPER_TRADING:
-        if not VOLUME_PATH or not os.path.isdir(VOLUME_PATH):
-            raise RuntimeError('Attach a Railway volume before live startup')
-        root = os.path.realpath(VOLUME_PATH)
-        target = os.path.realpath(STATE_FILE)
-        if os.path.commonpath([root, target]) != root:
-            raise RuntimeError('JJ_STATE_FILE must be inside the Railway volume')
+    # A missing Railway volume is allowed. A normal /data directory is not
+    # persistent storage; never claim persistence from directory existence alone.
     os.makedirs(os.path.dirname(os.path.abspath(STATE_FILE)), exist_ok=True)
+
+def state_storage_notice():
+    if not os.getenv('RAILWAY_ENVIRONMENT_ID'):
+        return ''
+    if VOLUME_PATH and os.path.isdir(VOLUME_PATH):
+        root, target = os.path.realpath(VOLUME_PATH), os.path.realpath(STATE_FILE)
+        if os.path.commonpath([root,target]) == root:
+            return 'Statusbestand staat op het gekoppelde Railway-volume.'
+    return ('⚠️ Zonder vaste opslag: positiegegevens, afrekeningen en winstmetingen '
+            'kunnen bij een deployment verdwijnen. Onbekende open posities worden '
+            'niet automatisch overgenomen; gebruik zo nodig JJ_RECOVER_SYMBOLS.')
 
 DEFAULT_SYMBOLS = '''BTC ETH SOL BNB XRP ADA AVAX DOT NEAR SUI APT SEI FTM HBAR THETA LINK ARB OP INJ TIA FET RENDER TAO STRK MANTA ALT DYM ZETA PORTAL AXL ENA CRV LDO JUP ORDI DOGE SHIB PEPE WIF WLD COR PUMP BOME MEW PNUT ACT GOAT NEIRO POPCAT FLOKI BONK CHZ RUNE ATOM ALGO SAND MANA AXS GALA GMT'''.split()
 SYMBOLS = list(dict.fromkeys(x.strip().upper() for x in os.getenv('JJ_SYMBOLS', ','.join(x+'-USDT' for x in DEFAULT_SYMBOLS)).split(',') if x.strip()))
@@ -849,6 +856,9 @@ def startup():
         raise ValueError('Invalid risk configuration')
     if os.getenv('JJ_MARGIN_MODE', 'isolated').lower() != 'isolated':
         raise ValueError('This version supports isolated only')
+    storage_notice = state_storage_notice()
+    if storage_notice:
+        notify(storage_notice)
     load()
     state.setdefault('reports', {})
     state.setdefault('journal', {})
