@@ -1,44 +1,34 @@
 #!/usr/bin/env python3
-"""JJ EBP BloFin v2.2.6 — confirmed reports and sampled trade telemetry; execution hardening, not a proven profitable strategy.
-Reports use confirmed positions-history, separate fees and funding bills.
-History queries use positionId when known; matching failures are explained.
-Sampled mark-price extremes are estimates, not exact intrabar highs/lows.
-Existing positions start measurement at upgrade; old extremes cannot be recovered.
-Completed report records remain in the persistent state journal.
-Deployment: replace bot.py; retain all existing strategy/environment settings.
-A persistent volume is optional. Without one, state is stored locally and may
-be lost at redeployment. Existing unknown positions still block new entries.
-If a volume exists, use JJ_STATE_FILE within its actual mount path.
-If deployment previously lost state, JJ_RECOVER_SYMBOLS must explicitly list
-the actual open instruments, comma separated. Recovery only accepts existing
-full-position market TP/SL using mark price, isolated net mode and matching leverage.
-Recovery does not place an entry order. Remove this whitelist after recovery.
-Reporting cannot reconstruct old peak/trough PnL from closure history.
-Unmatched history is queued durably, retried every minute, and never guessed.
-Reasons use confirmed closing order categories/IDs, not the sign of PnL.
-No exact-once Telegram guarantee after a crash; a duplicate can occur.
-Keep existing JJ_MIN_MARGIN_USDT value and persistent jj_ebp_v22 state file.
-This file is based on v2.2: no cash TP/trailing changes.
-Liquidity filters apply only to new entries, never to ongoing management.
-Defaults are conservative trial settings, not demonstrated optimal thresholds:
-JJ_MIN_24H_VOLUME_USDT=1000000, JJ_MAX_SPREAD_PCT=0.001,
-JJ_DEPTH_BAND_PCT=0.002, JJ_MIN_DEPTH_MULT=10,
-JJ_MAX_BOOK_IMPACT_PCT=0.001. Missing/stale data means no entry.
-Volume covers last 96 completed 15m bars (rolling completed 24 hours).
-Order book snapshots cannot guarantee future exit liquidity or fill price.
-Install: pip install requests pandas flask
-Default PAPER_TRADING=True: no private API calls, simulated balance 250 USDT.
-For exchange demo: PAPER_TRADING=False, BLOFIN_DEMO=True, demo API credentials.
-LIVE requires net_mode, isolated margin and a dedicated account/subaccount.
-Do not run alongside v2.1 or another bot on the same instruments.
-State v2.1 is intentionally not imported; reconcile old positions on BloFin first.
-Keep the state file on persistent storage; run only one process per account.
-
-Defaults: 15m closed EBP candles, >=12 USDT estimated margin, 12x, 2R,
-2 total positions, <=3 USDT estimated stop loss including fee/slippage allowance.
-Minimum margin is an estimate before fill, not a guarantee of actual margin.
-Paper exits use sampled mark prices, not an intrabar backtest; funding excluded.
-No promise of hourly trades or improved win rate. Test in exchange demo first.
+"""CRT BloFin + Telegram v1.0 — automatic futures trading, paper by default.
+Standalone new strategy; do not run alongside the EBP bot on the same account.
+Closed 15m reference candle >=1.5 ATR; sweep/reclaim within 5 bars; closed 4H bias.
+Engulfing/rejection/ADX optional and disabled by default. No separate second retest.
+Entry occurs AFTER exchange confirms the signal candle, at the current bid/ask,
+not at a guaranteed next-bar opening. Excessive delay/drift skips the trade.
+Risk target 1% equity including estimated trading costs/stop slippage; gaps,
+funding and actual fills can exceed this estimate. Contract sizes round DOWN.
+Default notional cap 95% equity (not 95% margin); leverage is independently 12.
+No fixed minimum margin. Exchange minSize above risk budget means no entry.
+Daily/weekly gates use futures account equity, sampled; UTC periods; dedicated
+USDT subaccount assumed (deposits/transfers change equity and these gates).
+Four attempted entries/day; four confirmed net losses permanently block entries.
+Weekly loss permanently blocks entries; day gate resets next UTC day.
+Management/protection continues while entries are blocked. Missing account data,
+unknown positions, unresolved closure accounting/funding block new entries.
+Counters/state are LOCAL unless JJ_STATE_FILE points inside a mounted volume.
+Without persistence deployment loses counters/reports; never deploy over open
+positions without reconciliation. Old EBP state is NOT imported automatically.
+Initial/recovered positions retain actual exchange TP/SL; realized RR may differ
+from planned 1.8R due to fills/tick size/fees. No unverified RR guarantee.
+Live TP/SL are market mark triggers; protection is checked after fill. Unknown
+POST results reconcile by persisted client ID, not automatic resubmission.
+Telegram uses EXCHANGE_API_KEY, EXCHANGE_SECRET, EXCHANGE_PASSWORD,
+TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID from environment. No credentials in code.
+PAPER_TRADING=True default: public data only, sampled exits, no funding model.
+For exchange demo set PAPER_TRADING=False and BLOFIN_DEMO=True with demo keys.
+For real live set PAPER_TRADING=False and BLOFIN_DEMO=False with real keys.
+Install requests pandas flask. Python >=3.10, Linux/Railway process lock.
+This file is a LIVE/PAPER LOOP, not the historical backtest. No profit claim.
 """
 import os
 import time
@@ -57,7 +47,7 @@ from collections import Counter
 import requests
 import pandas as pd
 
-VERSION = '2.2.6-ReportFix-SignalInfo'
+VERSION = '1.0-CRT-BloFin'
 def envf(name, default):
     value = float(os.getenv(name, str(default)))
     if not math.isfinite(value):
@@ -72,31 +62,46 @@ API_PASSWORD = os.getenv('EXCHANGE_PASSWORD', '').strip()
 TG_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip().removeprefix('bot')
 TG_CHAT = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 BAR = os.getenv('JJ_SIGNAL_BAR', '15m')
-BAR_MS = {'1m':60000,'3m':180000,'5m':300000,'15m':900000,'30m':1800000,'1H':3600000}
-MARGIN = envf('JJ_MIN_MARGIN_USDT', 7)
+BAR_MS = {'1m':60000,'3m':180000,'5m':300000,'15m':900000,'30m':1800000,'1H':3600000,'4H':14400000}
+MARGIN = 1.0  # legacy validation only; no fixed margin in CRT sizing
 LEV = int(os.getenv('JJ_LEVERAGE', '12'))
-RR = envf('JJ_FIXED_RR', 2)
-MAX_POS = int(os.getenv('JJ_MAX_ACTIVE_POSITIONS', '2'))
+RR = envf('CRT_RR', 1.8)
+MAX_POS = int(os.getenv('CRT_MAX_POSITIONS', '1'))
 SCAN_SECONDS = envf('JJ_SCAN_SECONDS', 30)
-RISK_CAP = envf('JJ_MAX_LOSS_USDT', 3)
-FEE = envf('JJ_TAKER_FEE_RATE', .0006)  # each side; adjust to your actual tier
-SLIPPAGE = envf('JJ_SLIPPAGE_ALLOWANCE', .001)
+RISK_CAP = envf('CRT_MAX_LOSS_USDT', 1e12)  # optional absolute cap; percent risk normally binds
+FEE = envf('JJ_TAKER_FEE_RATE', .0004)  # each side; adjust to your actual tier
+SLIPPAGE = envf('JJ_SLIPPAGE_ALLOWANCE', .0002)
 MAX_SPREAD = envf('JJ_MAX_SPREAD_PCT', .001)  # 0.10%; applies only to entries
 MIN_VOLUME = envf('JJ_MIN_24H_VOLUME_USDT', 1000000)
 DEPTH_BAND = envf('JJ_DEPTH_BAND_PCT', .002)  # 0.20% around executable top price
 DEPTH_MULT = envf('JJ_MIN_DEPTH_MULT', 10)  # each side >= 10x position notional
 MAX_IMPACT = envf('JJ_MAX_BOOK_IMPACT_PCT', .001)  # 0.10% VWAP vs best price
+
+CRT_MULT = envf('CRT_RANGE_MULTIPLIER', 1.5)
+CRT_WINDOW = int(os.getenv('CRT_RETEST_BARS', '5'))
+CRT_ENGULF = os.getenv('CRT_REQUIRE_ENGULF', 'False').lower() == 'true'
+CRT_REJECTION = os.getenv('CRT_A_PLUS_ONLY', 'False').lower() == 'true'
+CRT_ADX = os.getenv('CRT_USE_ADX', 'False').lower() == 'true'
+CRT_ADX_MIN = envf('CRT_ADX_THRESHOLD', 20)
+RISK_PCT = envf('CRT_RISK_PER_TRADE', .01)
+NOTIONAL_PCT = envf('CRT_MAX_POSITION_PCT', .95)
+DAY_LOSS = envf('CRT_MAX_DAILY_LOSS', .03)
+WEEK_LOSS = envf('CRT_MAX_WEEKLY_LOSS', .07)
+DAY_TRADES = int(os.getenv('CRT_MAX_TRADES_PER_DAY', '4'))
+LOSS_STREAK = int(os.getenv('CRT_MAX_CONSECUTIVE_LOSSES', '4'))
+risk_snapshot = {'equity':0.0, 'updated':0.0}
+
 liquidity_cache = {}
 balance_diagnostic = {}
 
 MAX_CHASE_R = envf('JJ_MAX_ENTRY_DRIFT_R', .35)
 MAX_STOP_PCT = envf('JJ_MAX_STOP_PCT', .04)
-MIN_STOP_PCT = envf('JJ_MIN_STOP_PCT', .002)
+MIN_STOP_PCT = envf('CRT_MIN_STOP_PCT', .0001)
 COOLDOWN = envf('JJ_COOLDOWN_SECONDS', 900)
 MAX_AGE = envf('JJ_MAX_SIGNAL_AGE_SECONDS', 120)
-PAPER_BALANCE = envf('JJ_PAPER_BALANCE_USDT', 250)
+PAPER_BALANCE = envf('JJ_PAPER_BALANCE_USDT', 10000)
 VOLUME_PATH = os.getenv('RAILWAY_VOLUME_MOUNT_PATH', '').strip()
-STATE_NAME = f'jj_ebp_v22_{"paper" if PAPER_TRADING else "demo" if BLOFIN_DEMO else "live"}.json'
+STATE_NAME = f'crt_blofin_v1_{"paper" if PAPER_TRADING else "demo" if BLOFIN_DEMO else "live"}.json'
 STATE_FILE = os.getenv('JJ_STATE_FILE', os.path.join(VOLUME_PATH, STATE_NAME) if VOLUME_PATH else STATE_NAME)
 RECOVER_SYMBOLS = {x.strip().upper() for x in os.getenv('JJ_RECOVER_SYMBOLS', '').split(',') if x.strip()}
 
@@ -117,13 +122,13 @@ def state_storage_notice():
             'niet automatisch overgenomen; gebruik zo nodig JJ_RECOVER_SYMBOLS.')
 
 DEFAULT_SYMBOLS = '''BTC ETH SOL BNB XRP ADA AVAX DOT NEAR SUI APT SEI FTM HBAR THETA LINK ARB OP INJ TIA FET RENDER TAO STRK MANTA ALT DYM ZETA PORTAL AXL ENA CRV LDO JUP ORDI DOGE SHIB PEPE WIF WLD COR PUMP BOME MEW PNUT ACT GOAT NEIRO POPCAT FLOKI BONK CHZ RUNE ATOM ALGO SAND MANA AXS GALA GMT'''.split()
-SYMBOLS = list(dict.fromkeys(x.strip().upper() for x in os.getenv('JJ_SYMBOLS', ','.join(x+'-USDT' for x in DEFAULT_SYMBOLS)).split(',') if x.strip()))
+SYMBOLS = list(dict.fromkeys(x.strip().upper() for x in os.getenv('CRT_SYMBOLS', 'BTC-USDT').split(',') if x.strip()))
 session = requests.Session()
 meta = {}
-state = {'mode': 'paper' if PAPER_TRADING else 'demo' if BLOFIN_DEMO else 'live',
+state = {'strategy':'CRT-v1', 'mode': 'paper' if PAPER_TRADING else 'demo' if BLOFIN_DEMO else 'live',
          'managed': {}, 'seen': {}, 'last_exit': {}, 'paper_realized': 0.0, 'reports': {}}
 health = {'last_cycle': 0, 'error': ''}
-log = logging.getLogger('ebp')
+log = logging.getLogger('crt')
 
 def notify(message):
     log.info(message)
@@ -169,6 +174,8 @@ def load():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, encoding='utf8') as f:
             saved = json.load(f)
+        if saved.get('strategy')!='CRT-v1':
+            raise RuntimeError('Wrong strategy state: choose a new JJ_STATE_FILE for CRT')
         if saved.get('mode') != state['mode']:
             raise RuntimeError('State mode mismatch')
         for key in ('managed','seen','last_exit'):
@@ -222,39 +229,116 @@ def one(data):
         raise RuntimeError('Expected API object')
     return data
 
-def candles(symbol):
+def candles(symbol, bar=None, limit=120):
+    bar = bar or BAR
     rows = []
-    for c in get('/api/v1/market/candles', {'instId':symbol,'bar':BAR,'limit':'80'}):
-        if not isinstance(c, list) or len(c) < 9 or str(c[8]) != '1':
+    for c in get('/api/v1/market/candles', {'instId':symbol,'bar':bar,'limit':str(limit)}):
+        if not isinstance(c,list) or len(c)<9 or str(c[8])!='1':
             continue
-        rows.append([int(c[0]), *[num(v) for v in c[1:6]]])
+        values = [num(v) for v in c[1:6]]
+        if min(values[:4])<=0 or values[1]<max(values[0],values[3]) or values[2]>min(values[0],values[3]):
+            raise ValueError('Invalid candle')
+        rows.append([int(c[0]),*values])
     df = pd.DataFrame(rows, columns=['ts','open','high','low','close','volume'])
-    return df.drop_duplicates('ts').sort_values('ts').reset_index(drop=True)
+    df = df.drop_duplicates('ts').sort_values('ts').reset_index(drop=True)
+    duration = BAR_MS[bar]
+    if len(df)>1 and not (df.ts.diff().iloc[1:]==duration).all():
+        raise ValueError('Candle gap: entries blocked')
+    if len(df) and df.ts.iloc[-1]+duration > time.time()*1000:
+        raise ValueError('Future candle: entries blocked')
+    return df
 
 def detect_bullish_ebp(df):
     return (df.low < df.low.shift()) & (df.close > df.open.shift())
 def detect_bearish_ebp(df):
     return (df.high > df.high.shift()) & (df.close < df.open.shift())
 
+def rma(series, length=14):
+    result = pd.Series(float('nan'),index=series.index,dtype=float)
+    valid = series.dropna()
+    if len(valid)<length:
+        return result
+    first = valid.index[length-1]
+    result.loc[first] = valid.iloc[:length].mean()
+    value = result.loc[first]
+    for index in valid.index[length:]:
+        value = (value*(length-1)+float(series.loc[index]))/length
+        result.loc[index] = value
+    return result
+
+def crt_indicators(df):
+    df = df.copy()
+    previous = df.close.shift()
+    tr = pd.concat([df.high-df.low,(df.high-previous).abs(),(df.low-previous).abs()],axis=1).max(axis=1)
+    tr.iloc[0] = float('nan')
+    df['atr'] = rma(tr)
+    if CRT_ADX:
+        up,down = df.high.diff(),-df.low.diff()
+        plus = up.where((up>down)&(up>0),0.0)
+        minus = down.where((down>up)&(down>0),0.0)
+        plus.iloc[0]=minus.iloc[0]=float('nan')
+        pdm,mdm = rma(plus),rma(minus)
+        denominator = (pdm+mdm).replace(0,float('nan'))
+        df['adx'] = rma(100*(pdm-mdm).abs()/denominator)
+    return df
+
 def signal(symbol):
-    df = candles(symbol)
-    if len(df) < 20:
-        return None, 'few_candles'
+    df = candles(symbol, BAR, 120)
+    if len(df)<40:
+        return None,'few_candles'
     row = df.iloc[-1]
     stamp = int(row.ts)
-    if int(state['seen'].get(symbol, 0)) >= stamp:
-        return None, 'already_seen'
-    age = time.time() - (stamp+BAR_MS[BAR])/1000
-    if age < 0 or age > MAX_AGE:
-        return None, 'stale'
-    bull, bear = bool(detect_bullish_ebp(df).iloc[-1]), bool(detect_bearish_ebp(df).iloc[-1])
-    if bull == bear:
-        return None, 'ambiguous' if bull else 'no_ebp'
-    previous = df.iloc[-2]
-    return {'symbol':symbol,'direction':'long' if bull else 'short','ts':stamp,
-            'open':float(row.open),'close':float(row.close),'low':float(row.low),'high':float(row.high),
-            'previous_open':float(previous.open),'previous_high':float(previous.high),
-            'previous_low':float(previous.low)}, 'signal'
+    if int(state['seen'].get(symbol,0)) >= stamp:
+        return None,'already_seen'
+    closed_at = stamp+BAR_MS[BAR]
+    age = time.time()-closed_at/1000
+    if not 0<=age<=MAX_AGE:
+        return None,'stale'
+    df = crt_indicators(df)
+    anchor = None
+    for i in range(14,len(df)):
+        r = df.iloc[i]
+        if not math.isfinite(float(r.atr)) or r.high-r.low <= float(r.atr)*CRT_MULT or r.close==r.open:
+            continue
+        bull = r.close>r.open
+        prev = df.iloc[i-1]
+        engulf = r.close>prev.high and r.open<=prev.low if bull else r.close<prev.low and r.open>=prev.high
+        if not CRT_ENGULF or engulf:
+            anchor = i
+    if anchor is None or not 1<=len(df)-1-anchor<=CRT_WINDOW:
+        return None,'no_crt'
+    ref, row = df.iloc[anchor],df.iloc[-1]
+    ref_ts = int(ref.ts)
+    if int(state.setdefault('crt_used',{}).get(symbol,0))>=ref_ts:
+        return None,'crt_used'
+    long = ref.close>ref.open
+    sweep = row.low<ref.low and row.close>ref.low if long else row.high>ref.high and row.close<ref.high
+    if not sweep or (row.close>row.open)!=long or row.close==row.open:
+        return None,'no_sweep'
+    body = abs(row.close-row.open)
+    wick = min(row.open,row.close)-row.low if long else row.high-max(row.open,row.close)
+    if CRT_REJECTION and wick<=body*1.5:
+        return None,'rejection'
+    if CRT_ADX and (not math.isfinite(float(row.adx)) or row.adx<CRT_ADX_MIN):
+        return None,'adx'
+    htf = candles(symbol,'4H',60)
+    known = htf[htf.ts+BAR_MS['4H']<=closed_at]
+    if known.empty:
+        return None,'htf_missing'
+    hr = known.iloc[-1]
+    if closed_at-(int(hr.ts)+BAR_MS['4H'])>=BAR_MS['4H']:
+        return None,'htf_stale'
+    bias = 1 if hr.close>hr.open else -1 if hr.close<hr.open else 0
+    if bias!=(1 if long else -1):
+        return None,'htf_direction'
+    atr = float(row.atr)
+    stop = float(row.low)-atr*.05 if long else float(row.high)+atr*.05
+    return dict(symbol=symbol,direction='long' if long else 'short',ts=stamp,
+        close=float(row.close),low=float(row.low),high=float(row.high),planned_sl=stop,
+        crt_ts=ref_ts,evidence=dict(signal_ts=stamp,open=float(row.open),high=float(row.high),
+        low=float(row.low),close=float(row.close),crt_ts=ref_ts,crt_high=float(ref.high),
+        crt_low=float(ref.low),atr=atr,htf_ts=int(hr.ts),htf_open=float(hr.open),
+        htf_close=float(hr.close),bias=bias)), 'signal' 
 
 def positions():
     data = get('/api/v1/account/positions', private=True)
@@ -275,37 +359,38 @@ def mark(symbol):
     return num(one(get('/api/v1/market/mark-price', {'instId':symbol}))['markPrice'])
 
 def plan(sig, entry, available):
+    equity = risk_snapshot['equity']
+    if equity<=0 or time.time()-risk_snapshot['updated']>30:
+        return None,'equity_stale'
     m = meta[sig['symbol']]
-    tick, cv, lot = num(m['tickSize']), num(m['contractValue']), num(m['lotSize'])
-    long = sig['direction'] == 'long'
-    stop = step(sig['low']*.998 if long else sig['high']*1.002, tick, up=not long)
+    tick,cv,lot = num(m['tickSize']),num(m['contractValue']),num(m['lotSize'])
+    long = sig['direction']=='long'
+    stop = step(sig['planned_sl'],tick,up=not long)
     distance = entry-stop if long else stop-entry
-    if distance <= 0 or not MIN_STOP_PCT <= distance/entry <= MAX_STOP_PCT:
-        return None, 'invalid_stop'
-    if abs(entry-sig['close']) > MAX_CHASE_R*distance:
-        return None, 'entry_drift'
-    tp = step(entry + distance*RR if long else entry-distance*RR, tick, up=long)
-    if tp <= 0 or cv <= 0:
-        return None, 'invalid_contract'
-    size = step(max(MARGIN*LEV/(cv*entry), num(m['minSize'])), lot, up=True)
+    if stop<=0 or distance<=0 or not MIN_STOP_PCT<=distance/entry<=MAX_STOP_PCT:
+        return None,'invalid_stop'
+    if abs(entry-sig['close'])>MAX_CHASE_R*distance:
+        return None,'entry_drift'
+    tp = step(entry+distance*RR if long else entry-distance*RR,tick,up=long)
+    if tp<=0 or cv<=0:
+        return None,'invalid_contract'
+    budget = min(equity*RISK_PCT,RISK_CAP)
+    per_contract = cv*(distance+entry*(2*FEE+SLIPPAGE))
+    size = step(min(budget/per_contract,equity*NOTIONAL_PCT/(cv*entry),
+        available*.88/(cv*entry*(1/LEV+2*FEE+SLIPPAGE)),num(m['maxMarketSize'])),lot)
+    if size<num(m['minSize']):
+        return None,'below_min_size'
     notional = size*cv*entry
-    risk = size*cv*distance + notional*(2*FEE+SLIPPAGE)
-    if risk > RISK_CAP:
-        return None, 'risk_cap'
-    needed = notional/LEV + notional*(2*FEE+SLIPPAGE)
-    balance_diagnostic.update(symbol=sig['symbol'], available=available, required=needed/.88,
-                              ts=time.time())
-    if needed > available*.88:
-        balance_diagnostic['blocked'] = True
-        return None, 'balance'
-    balance_diagnostic['blocked'] = False
-    if size > num(m['maxMarketSize']):
-        return None, 'max_size'
-    return {'direction':sig['direction'],'entry_price':entry,'stop':stop,'tp':tp,
-            'contracts':size,'notional':notional,'risk_estimate':risk,'signal_ts':sig['ts'],
-            'entry_ts':time.time(),'status':'open',
-            'signal_evidence':{k:sig[k] for k in ('ts','open','high','low','close',
-                'previous_open','previous_high','previous_low') if k in sig}}, 'ok'
+    risk = size*per_contract
+    needed = notional/LEV+notional*(2*FEE+SLIPPAGE)
+    balance_diagnostic.update(symbol=sig['symbol'],available=available,required=needed/.88,
+        ts=time.time(),blocked=needed>available*.88)
+    if needed>available*.88:
+        return None,'balance'
+    return dict(direction=sig['direction'],entry_price=entry,stop=stop,tp=tp,
+        contracts=size,notional=notional,risk_estimate=risk,risk_budget=budget,
+        signal_ts=sig['ts'],crt_ts=sig['crt_ts'],entry_ts=time.time(),status='open',
+        signal_evidence=dict(sig['evidence'])), 'ok' 
 
 def close_live(symbol, p, reason):
     # Retain record until exchange position is confirmed zero. No blind retries.
@@ -345,25 +430,19 @@ def protected(symbol, p):
     return False
 
 def signal_explanation(p):
-    evidence = p.get('signal_evidence') or {}
-    required = ('ts','open','high','low','close','previous_open','previous_high','previous_low')
-    if not all(k in evidence for k in required):
-        return '\nEBP-details: niet opgeslagen bij deze oudere positie.'
-    start = datetime.fromtimestamp(evidence['ts']/1000, timezone.utc)
-    end = datetime.fromtimestamp((evidence['ts']+BAR_MS[BAR])/1000, timezone.utc)
-    long = p['direction'] == 'long'
-    extreme = evidence['low'] if long else evidence['high']
-    previous_extreme = evidence['previous_low'] if long else evidence['previous_high']
-    swept = extreme < previous_extreme if long else extreme > previous_extreme
-    closed = evidence['close'] > evidence['previous_open'] if long else evidence['close'] < evidence['previous_open']
-    return (f'\n🔎 {"Bullish" if long else "Bearish"} EBP | afgesloten {BAR}-candle\n'
-            f'Candle: {start:%d-%m %H:%M}–{end:%H:%M} UTC\n'
-            f'O {evidence["open"]:.8g} | H {evidence["high"]:.8g} | '
-            f'L {evidence["low"]:.8g} | C {evidence["close"]:.8g}\n'
-            f'{"✅" if swept else "❌"} Sweep: {"low" if long else "high"} {extreme:.8g} '
-            f'{"<" if long else ">"} vorige {"low" if long else "high"} {previous_extreme:.8g}\n'
-            f'{"✅" if closed else "❌"} Slot {evidence["close"]:.8g} '
-            f'{">" if long else "<"} vorige open {evidence["previous_open"]:.8g}')
+    e = p.get('signal_evidence') or {}
+    if 'crt_ts' not in e:
+        return '\nCRT-details niet beschikbaar voor herstelde positie.'
+    start = datetime.fromtimestamp(e['signal_ts']/1000,timezone.utc)
+    long = p['direction']=='long'
+    return (f'\n🔎 CRT {BAR} | signaal {start:%d-%m %H:%M} UTC (candlebegin)\n'
+        f'Referentie H {e["crt_high"]:.8g} / L {e["crt_low"]:.8g} | ATR {e["atr"]:.8g}\n'
+        f'✅ Sweep {"low" if long else "high"} {e["low"] if long else e["high"]:.8g}; '
+        f'slot terug {e["close"]:.8g}\n'
+        f'✅ Afgesloten 4H-bias {"LONG" if e["bias"]==1 else "SHORT"}: '
+        f'open {e["htf_open"]:.8g} → slot {e["htf_close"]:.8g}\n'
+        f'Geschat stoprisico incl. handelskosten {p["risk_estimate"]:.2f} USDT '
+        f'| budget {p["risk_budget"]:.2f} USDT')
 
 def reconcile_pending(symbol, p):
     detail = one(get('/api/v1/trade/order-detail',
@@ -474,6 +553,7 @@ def manage():
                 pnl -= p['contracts']*num(meta[symbol]['contractValue'])*(price+p['entry_price'])*FEE
                 pnl -= p['notional']*SLIPPAGE
                 state['paper_realized'] += pnl
+                record_risk_result(uuid4().hex,pnl)
                 del state['managed'][symbol]
                 state['last_exit'][symbol] = time.time()
                 save()
@@ -483,7 +563,7 @@ def manage():
                 actual_distance = p['entry_price']-p['stop'] if long else p['stop']-p['entry_price']
                 actual_risk = p['contracts']*num(meta[symbol]['contractValue'])*max(actual_distance, 0) + p['notional']*(2*FEE+SLIPPAGE)
                 has_protection = protected(symbol, p)
-                invalid_fill = actual_distance <= 0 or actual_risk > RISK_CAP
+                invalid_fill = actual_distance <= 0 or actual_risk > min(RISK_CAP,p.get('risk_budget',RISK_CAP))*1.02
                 if hit_sl or hit_tp or not has_protection or invalid_fill:
                     close_live(symbol, p, 'bot SL reached' if hit_sl else 'bot TP reached' if hit_tp else 'fill risk invalid' if invalid_fill else 'exchange TP/SL missing')
                     ok = False
@@ -677,6 +757,8 @@ def archive_report(key, symbol, p, rows, funding, reason):
         original_tp=p.get('original_tp',p['tp']), **v)
     journal = state.setdefault('journal',{})
     journal[key] = record
+    if v.get('net') is not None:
+        record_risk_result(key,v['net'])
     while len(journal)>1000:
         del journal[next(iter(journal))]
 
@@ -702,6 +784,8 @@ def process_reports():
                 funding = funding_for(symbol,p,rows)
             except Exception:
                 pass
+            if funding is None:
+                raise ReportPending('Funding nog niet verifieerbaar; entryblokkade blijft actief')
             try:
                 reason = confirmed_reason(symbol,p,rows)
             except Exception:
@@ -801,8 +885,69 @@ def liquidity_check(symbol, p):
         return 'liquidity_data'
 
 
+def account_equity():
+    if PAPER_TRADING:
+        value = PAPER_BALANCE+state['paper_realized']
+        for symbol,p in state['managed'].items():
+            value += p.get('metrics',{}).get('last_after_estimated_fees',0.0)
+        return value
+    data = one(get('/api/v1/account/balance',private=True))
+    value = num(data['totalEquity'])
+    if value<=0:
+        raise RuntimeError('Futures equity unavailable/nonpositive')
+    return value
+
+def record_risk_result(key, net):
+    guard = state.setdefault('risk_guard',{})
+    done = guard.setdefault('processed',[])
+    if key in done:
+        return
+    guard['losses'] = guard.get('losses',0)+1 if net<0 else 0
+    done.append(key)
+    if guard['losses']>=LOSS_STREAK:
+        guard['permanent'] = f'{LOSS_STREAK} bevestigde nettoverliezen op rij'
+
+def risk_gate():
+    # This gate NEVER skips manage()/exchange protection.
+    equity = account_equity()
+    risk_snapshot.update(equity=equity,updated=time.time())
+    now = datetime.now(timezone.utc)
+    day = now.date().isoformat()
+    year,week,_ = now.isocalendar()
+    week_key = f'{year}-{week}'
+    guard = state.setdefault('risk_guard',{})
+    before = json.dumps(guard,sort_keys=True)
+    if guard.get('day')!=day:
+        guard.update(day=day,day_start=equity,trades_today=0,daily_stop=False)
+    if guard.get('week')!=week_key:
+        guard.update(week=week_key,week_start=equity)
+    if equity<=0:
+        guard['permanent']='Equity niet positief'
+    if equity<=guard['day_start']*(1-DAY_LOSS):
+        guard['daily_stop']=True
+    if equity<=guard['week_start']*(1-WEEK_LOSS):
+        guard['permanent']='Weekverlieslimiet (permanente entryblokkade)'
+    unresolved = bool(state.get('reports'))
+    journal = state.get('journal',{})
+    unknown_funding = any(v.get('funding') is None for v in journal.values())
+    reason = (guard.get('permanent') or ('dagverlieslimiet' if guard.get('daily_stop') else '')
+        or ('dagelijkse entrylimiet' if guard.get('trades_today',0)>=DAY_TRADES else '')
+        or ('afrekening/funding nog niet bevestigd' if unresolved or unknown_funding else ''))
+    previous = guard.get('blocked','')
+    guard['blocked']=reason
+    if json.dumps(guard,sort_keys=True)!=before:
+        save()
+    if reason and reason!=previous:
+        notify('⏸ Nieuwe entries geblokkeerd: '+reason+'. Positiebeheer en BloFin TP/SL blijven actief.')
+    return reason
+
 def open_signal(sig):
     symbol = sig['symbol']
+    if symbol in state['managed']:
+        return 'existing_managed_position'
+    blocked = risk_gate()
+    if blocked:
+        return blocked
     ticker = one(get('/api/v1/market/tickers', {'instId':symbol}))
     ask, bid = num(ticker['askPrice']), num(ticker['bidPrice'])
     if bid <= 0 or ask < bid or (ask-bid)/((ask+bid)/2) > MAX_SPREAD:
@@ -834,8 +979,10 @@ def open_signal(sig):
         post('/api/v1/account/set-leverage',
             {'instId':symbol,'leverage':str(LEV),'marginMode':'isolated'})
         p['status'] = 'pending'
-        p['client_id'] = 'jjebp'+uuid4().hex[:27]
+        p['client_id'] = 'crtbot'+uuid4().hex[:27]
     # Persist intent BEFORE sending order. Unknown POST result is reconciled by ID.
+    state['risk_guard']['trades_today'] += 1
+    state.setdefault('crt_used',{})[symbol] = sig['crt_ts']
     state['managed'][symbol] = p
     state['seen'][symbol] = sig['ts']
     save()
@@ -901,6 +1048,8 @@ def recover_existing(external):
 def startup():
     if MIN_VOLUME<=0 or DEPTH_MULT<1 or not 0<DEPTH_BAND<1 or not 0<MAX_IMPACT<1 or not 0<MAX_SPREAD<1:
         raise ValueError('Invalid liquidity configuration')
+    if BAR!='15m' or not 0<RISK_PCT<=.1 or not 0<NOTIONAL_PCT<=1 or not 0<DAY_LOSS<1 or not 0<WEEK_LOSS<1 or min(DAY_TRADES,LOSS_STREAK,CRT_WINDOW,CRT_MULT)<1:
+        raise ValueError('Invalid CRT/risk configuration')
     if BAR not in BAR_MS or min(MARGIN,LEV,RR,MAX_POS,SCAN_SECONDS,RISK_CAP,MAX_AGE) <= 0:
         raise ValueError('Invalid configuration')
     if min(FEE,SLIPPAGE,COOLDOWN,MIN_STOP_PCT) < 0 or MAX_STOP_PCT <= MIN_STOP_PCT:
@@ -940,13 +1089,14 @@ def startup():
                 notify(f"♻️ {symbol} {p['direction'].upper()} hersteld; "
                        f"entry {p['entry_price']:g}; TP {p['tp']:g}; SL {p['stop']:g}. "
                        "Bestaande BloFin TP/SL overgenomen; geen nieuwe entry geplaatst.")
-    notify(f'JJ EBP v{VERSION} gestart: {state["mode"]}, {len(allowed)} munten, {BAR}, marge >=~{MARGIN:g}, {LEV}x, {RR:g}R, risicolimiet ~{RISK_CAP:g} USDT')
+    notify(f'CRT BloFin v{VERSION} gestart: {state["mode"]}, {len(allowed)} munten, {BAR} + 4H, {LEV}x, {RR:g}R. Risicodoel {RISK_PCT*100:g}% equity; positiewaarde maximaal {NOTIONAL_PCT*100:g}% equity. Geen vaste minimummarge.')
     notify(f'Liquiditeitsfilter: 24u volume >= {MIN_VOLUME:,.0f} USDT; spread <= {MAX_SPREAD*100:.2f}%; diepte beide zijden >= {DEPTH_MULT:g}x positie binnen {DEPTH_BAND*100:.2f}%')
     if missing:
         notify('Overgeslagen (niet beschikbaar / leverage): '+', '.join(missing))
+    risk_gate()
     return allowed
 
-SCAN_LABELS = {'stale':'buiten instapvenster', 'no_ebp':'geen EBP',
+SCAN_LABELS = {'stale':'buiten instapvenster', 'no_crt':'geen recente CRT', 'no_sweep':'geen sweep/reclaim', 'crt_used':'CRT al gebruikt', 'htf_direction':'4H-bias niet passend', 'below_min_size':'minimumcontract boven risicobudget',
     'balance':'onvoldoende vrij saldo', 'spread':'spread te groot',
     'entry_drift':'prijs te ver van signaal', 'risk_cap':'risicolimiet',
     'invalid_stop':'stopafstand ongeldig', 'cooldown':'wachttijd na sluiting',
@@ -959,9 +1109,13 @@ def status_report(counts):
     text = [f'📊 Status: {len(state["managed"])} beheerde posities']
     try:
         available = balance()
-        text.append(f'Vrij beschikbaar: {available:.2f} USDT | ingestelde marge: {MARGIN:g} USDT')
+        text.append(f'Vrij beschikbaar: {available:.2f} USDT | risicodoel: {RISK_PCT*100:g}% equity')
     except Exception:
         text.append('Vrij saldo: tijdelijk niet beschikbaar')
+    guard = state.get('risk_guard',{})
+    text.append(f'Entries vandaag (UTC): {guard.get("trades_today",0)}/{DAY_TRADES} | verliesreeks {guard.get("losses",0)}/{LOSS_STREAK}')
+    if guard.get('blocked'):
+        text.append('Nieuwe entries geblokkeerd: '+guard['blocked'])
     if balance_diagnostic.get('blocked'):
         age = int((time.time()-balance_diagnostic['ts'])/60)
         text.append(f'Laatste saldo-afwijzing ({age} min geleden): {balance_diagnostic["symbol"]}; '
@@ -993,7 +1147,7 @@ def serve_health():
     @app.route('/')
     def home():
         fresh = time.time()-health['last_cycle'] < 120
-        return {'bot':'JJ EBP','version':VERSION,'mode':state['mode'],
+        return {'bot':'CRT BloFin','version':VERSION,'mode':state['mode'],
                 'recent_cycle':fresh,'error':health['error']}, 200 if fresh and not health['error'] else 503
     app.run(host='0.0.0.0', port=int(os.getenv('PORT','8080')), use_reloader=False)
 
@@ -1013,8 +1167,9 @@ def main():
         try:
             good, external = manage()
             process_reports()
+            entry_block = risk_gate()
             health['error'] = '' if good else 'position reconciliation blocked'
-            if good and time.time() >= next_scan:
+            if good and not entry_block and time.time() >= next_scan:
                 # Rotate list to avoid favouring BTC/ETH every scan.
                 ordered = symbols[cursor:]+symbols[:cursor]
                 cursor = (cursor+1)%len(symbols)
