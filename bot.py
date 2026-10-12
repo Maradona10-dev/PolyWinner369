@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CRT BloFin + Telegram v1.0 — automatic futures trading, paper by default.
+"""CRT BloFin + Telegram v1.1 — Python-configured PAPER trading.
 Standalone new strategy; do not run alongside the EBP bot on the same account.
 Closed 15m reference candle >=1.5 ATR; sweep/reclaim within 5 bars; closed 4H bias.
 Engulfing/rejection/ADX optional and disabled by default. No separate second retest.
@@ -11,7 +11,7 @@ Default notional cap 95% equity (not 95% margin); leverage is independently 12.
 No fixed minimum margin. Exchange minSize above risk budget means no entry.
 Daily/weekly gates use futures account equity, sampled; UTC periods; dedicated
 USDT subaccount assumed (deposits/transfers change equity and these gates).
-Four attempted entries/day; four confirmed net losses permanently block entries.
+Twelve attempted entries/day; four confirmed net losses permanently block entries.
 Weekly loss permanently blocks entries; day gate resets next UTC day.
 Management/protection continues while entries are blocked. Missing account data,
 unknown positions, unresolved closure accounting/funding block new entries.
@@ -24,9 +24,10 @@ Live TP/SL are market mark triggers; protection is checked after fill. Unknown
 POST results reconcile by persisted client ID, not automatic resubmission.
 Telegram uses EXCHANGE_API_KEY, EXCHANGE_SECRET, EXCHANGE_PASSWORD,
 TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID from environment. No credentials in code.
-PAPER_TRADING=True default: public data only, sampled exits, no funding model.
-For exchange demo set PAPER_TRADING=False and BLOFIN_DEMO=True with demo keys.
-For real live set PAPER_TRADING=False and BLOFIN_DEMO=False with real keys.
+PAPER_TRADING is fixed True in Python: no real orders, regardless of Railway.
+Python settings: 10,000 simulated USDT; BTC, ETH, SOL, BNB, XRP and ZEC;
+12 entry attempts/day. These settings ignore the equivalent Railway variables.
+Paper uses public data only, sampled exits, no funding model.
 Install requests pandas flask. Python >=3.10, Linux/Railway process lock.
 This file is a LIVE/PAPER LOOP, not the historical backtest. No profit claim.
 """
@@ -47,14 +48,15 @@ from collections import Counter
 import requests
 import pandas as pd
 
-VERSION = '1.0-CRT-BloFin'
+VERSION = '1.1-CRT-BloFin-Paper'
 def envf(name, default):
     value = float(os.getenv(name, str(default)))
     if not math.isfinite(value):
         raise ValueError(name + ': invalid number')
     return value
-PAPER_TRADING = os.getenv('PAPER_TRADING', 'True').lower() == 'true'
-BLOFIN_DEMO = os.getenv('BLOFIN_DEMO', 'False').lower() == 'true'
+# Change the requested settings HERE, not in Railway.
+PAPER_TRADING = True
+BLOFIN_DEMO = False
 BASE_URL = 'https://demo-trading-openapi.blofin.com' if BLOFIN_DEMO else 'https://openapi.blofin.com'
 API_KEY = os.getenv('EXCHANGE_API_KEY', '').strip()
 API_SECRET = os.getenv('EXCHANGE_SECRET', '').strip()
@@ -87,7 +89,7 @@ RISK_PCT = envf('CRT_RISK_PER_TRADE', .01)
 NOTIONAL_PCT = envf('CRT_MAX_POSITION_PCT', .95)
 DAY_LOSS = envf('CRT_MAX_DAILY_LOSS', .03)
 WEEK_LOSS = envf('CRT_MAX_WEEKLY_LOSS', .07)
-DAY_TRADES = int(os.getenv('CRT_MAX_TRADES_PER_DAY', '12'))
+DAY_TRADES = 12
 LOSS_STREAK = int(os.getenv('CRT_MAX_CONSECUTIVE_LOSSES', '4'))
 risk_snapshot = {'equity':0.0, 'updated':0.0}
 
@@ -99,10 +101,11 @@ MAX_STOP_PCT = envf('JJ_MAX_STOP_PCT', .04)
 MIN_STOP_PCT = envf('CRT_MIN_STOP_PCT', .0001)
 COOLDOWN = envf('JJ_COOLDOWN_SECONDS', 900)
 MAX_AGE = envf('JJ_MAX_SIGNAL_AGE_SECONDS', 120)
-PAPER_BALANCE = envf('JJ_PAPER_BALANCE_USDT', 10000)
+PAPER_BALANCE = 10000.0
 VOLUME_PATH = os.getenv('RAILWAY_VOLUME_MOUNT_PATH', '').strip()
-STATE_NAME = f'crt_blofin_v1_{"paper" if PAPER_TRADING else "demo" if BLOFIN_DEMO else "live"}.json'
-STATE_FILE = os.getenv('JJ_STATE_FILE', os.path.join(VOLUME_PATH, STATE_NAME) if VOLUME_PATH else STATE_NAME)
+STATE_NAME = 'crt_blofin_v1_paper_six_symbols.json'
+# Separate paper state; an old Railway JJ_STATE_FILE cannot select live state.
+STATE_FILE = os.path.join(VOLUME_PATH, STATE_NAME) if VOLUME_PATH else STATE_NAME
 RECOVER_SYMBOLS = {x.strip().upper() for x in os.getenv('JJ_RECOVER_SYMBOLS', '').split(',') if x.strip()}
 
 def prepare_state_directory():
@@ -122,7 +125,7 @@ def state_storage_notice():
             'niet automatisch overgenomen; gebruik zo nodig JJ_RECOVER_SYMBOLS.')
 
 DEFAULT_SYMBOLS = '''BTC ETH SOL BNB XRP ADA AVAX DOT NEAR SUI APT SEI FTM HBAR THETA LINK ARB OP INJ TIA FET RENDER TAO STRK MANTA ALT DYM ZETA PORTAL AXL ENA CRV LDO JUP ORDI DOGE SHIB PEPE WIF WLD COR PUMP BOME MEW PNUT ACT GOAT NEIRO POPCAT FLOKI BONK CHZ RUNE ATOM ALGO SAND MANA AXS GALA GMT'''.split()
-SYMBOLS = list(dict.fromkeys(x.strip().upper() for x in os.getenv('CRT_SYMBOLS', 'BTC-USDT').split(',') if x.strip()))
+SYMBOLS = ['BTC-USDT', 'ETH-USDT', 'SOL-USDT', 'BNB-USDT', 'XRP-USDT', 'ZEC-USDT']
 session = requests.Session()
 meta = {}
 state = {'strategy':'CRT-v1', 'mode': 'paper' if PAPER_TRADING else 'demo' if BLOFIN_DEMO else 'live',
