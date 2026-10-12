@@ -7,7 +7,10 @@ All trading settings below are Python constants; Railway cannot enable live.
 Uses exchange-confirmed closed 15m candles and closed 4H EMA20/EMA50 trend.
 A: body engulfing. B: wick rejection confirmed within two closed candles.
 If both qualify, A wins; never two entries on one signal. Stop beyond the
-three-candle pullback extreme, or earlier rejection extreme, plus 0.15 ATR.
+four-candle pullback extreme, plus 0.15 ATR. EMA-zone widened by 0.25 ATR.
+4H slope compares EMA20 with one closed candle ago; rejection wick >=1.5 body.
+Valid setups persist for up to 300 seconds; only spread/drift blocks are retried.
+Evaluated candles and executed entries are tracked separately, across restarts.
 Targets 1.8 price R, not guaranteed net R. Maximum holding time is sampled
 at each management cycle; API outages can delay simulated exits.
 Risk sizing includes modeled stop slippage and both fees; gaps can exceed it.
@@ -30,9 +33,17 @@ import requests
 import pandas as pd
 
 # ====================== SETTINGS: CHANGE IN PYTHON ======================
-VERSION = '1.0-Trend-Pullback-Paper'
+VERSION = '1.2-Trend-Pullback-Paper-20'
 PAPER_TRADING = True  # fixed paper-only program; no real order functionality
-SYMBOLS = ['BTC-USDT','ETH-USDT','SOL-USDT','BNB-USDT','XRP-USDT','ZEC-USDT']
+# Candidate universe for paper testing, not a measured ranking of profitability
+# or signal frequency. Startup checks BloFin availability; entries retain the
+# same quote-volume, spread, trend, confirmation and risk requirements.
+SYMBOLS = [
+    'BTC-USDT', 'ETH-USDT', 'SOL-USDT', 'BNB-USDT', 'XRP-USDT',
+    'ZEC-USDT', 'DOGE-USDT', 'ADA-USDT', 'AVAX-USDT', 'LINK-USDT',
+    'SUI-USDT', 'NEAR-USDT', 'APT-USDT', 'ARB-USDT', 'OP-USDT',
+    'INJ-USDT', 'TAO-USDT', 'SEI-USDT', 'LTC-USDT', 'BCH-USDT',
+]
 INITIAL_CAPITAL = 10000.0
 RISK_PER_TRADE = 0.005
 MAX_POSITION_PCT = 0.95  # notional/equity, not margin/equity
@@ -44,16 +55,19 @@ MAX_WEEKLY_LOSS = 0.07
 MAX_CONSECUTIVE_LOSSES = 4
 RR = 1.8
 STOP_ATR_BUFFER = 0.15
-MAX_ENTRY_DRIFT_ATR = 0.25
+MAX_ENTRY_DRIFT_ATR = 0.35
 MAX_HOLD_SECONDS = 4*3600
-MAX_SIGNAL_AGE = 120
+MAX_SIGNAL_AGE = 300
+PULLBACK_LOOKBACK = 4
+ZONE_BUFFER_ATR = 0.25
+REJECTION_WICK_RATIO = 1.5
 MIN_STOP_PCT = 0.0001
 MAX_STOP_PCT = 0.04
 FEE = 0.0004  # modeled fee per side, not verified account fee tier
 SLIPPAGE = 0.0002
 MAX_SPREAD = 0.001
 MIN_24H_VOLUME = 1000000.0  # USDT quote volume from 96 completed 15m candles
-COOLDOWN_SECONDS = 900
+COOLDOWN_SECONDS = 600
 SCAN_SECONDS = 20
 REPORT_SECONDS = 1800
 MANAGE_SECONDS = 5
@@ -67,9 +81,10 @@ SESSION = requests.Session()
 META = {}
 HTF_CACHE = {}
 DIAGNOSTICS = {}
+OUTCOMES = {}  # one latest outcome per (symbol, candle) in a reporting period
 HEALTH = {'cycle':0,'error':''}
 STATE = {'strategy':'trend-pullback-paper-v1','capital':INITIAL_CAPITAL,'positions':{},
-         'seen':{},'used_rejections':{},'last_exit':{},'trades':[], 'route_stats':{},'guard':{}}
+         'seen':{},'executed':{},'pending':{},'used_rejections':{},'last_exit':{},'trades':[], 'route_stats':{},'guard':{}}
 LOG = logging.getLogger('pullback')
 
 
@@ -190,38 +205,40 @@ def htf_trend(symbol,decision_ms):
         HTF_CACHE.pop(symbol,None)
         return 0,None,'htf_stale'
     htf = indicators(known)
-    last, earlier = htf.iloc[-1],htf.iloc[-4]
+    last, earlier = htf.iloc[-1],htf.iloc[-2]
     bias = 1 if last.ema20>last.ema50 and last.ema20>earlier.ema20 else -1 if last.ema20<last.ema50 and last.ema20<earlier.ema20 else 0
-    return bias,{'ts':int(last.ts),'ema20':float(last.ema20),'ema50':float(last.ema50),'ema20_before':float(earlier.ema20)},'ok'
+    reason = 'ok' if bias else 'htf_order_equal' if last.ema20==last.ema50 else 'htf_slope_long' if last.ema20>last.ema50 else 'htf_slope_short'
+    return bias,{'ts':int(last.ts),'ema20':float(last.ema20),'ema50':float(last.ema50),'ema20_before':float(earlier.ema20)},reason
 
 
 def touches_zone(row):
     bottom,top = min(row.ema20,row.ema50),max(row.ema20,row.ema50)
-    return row.low<=top and row.high>=bottom
+    buffer = ZONE_BUFFER_ATR*float(row.atr)
+    return math.isfinite(buffer) and row.low<=top+buffer and row.high>=bottom-buffer
 
 
 def pattern(df,direction):
     """Pure closed-candle rules, suitable for offline tests. A has precedence."""
     i = len(df)-1
     row,prev = df.iloc[i],df.iloc[i-1]
-    recent = df.iloc[i-2:i+1]
+    recent = df.iloc[i-PULLBACK_LOOKBACK+1:i+1]
     if not any(touches_zone(r) for _,r in recent.iterrows()):
         return None,'no_pullback'
     favorable = direction*(row.close-row.open)>0
     engulf = (prev.close<prev.open and row.open<=prev.close and row.close>=prev.open) if direction==1 else (prev.close>prev.open and row.open>=prev.close and row.close<=prev.open)
-    if favorable and engulf and abs(row.close-row.open)>abs(prev.close-prev.open):
-        return {'route':'engulfing','anchor':int(prev.ts),'start':i-2},'ok'
+    if favorable and engulf:
+        return {'route':'engulfing','anchor':int(prev.ts),'start':i-PULLBACK_LOOKBACK+1},'ok'
     for j in (i-1,i-2):
         rejection = df.iloc[j]
         body = abs(rejection.close-rejection.open)
         wick = min(rejection.close,rejection.open)-rejection.low if direction==1 else rejection.high-max(rejection.close,rejection.open)
-        if body<=0 or wick<2*body or not touches_zone(rejection):
+        if body<=0 or wick<REJECTION_WICK_RATIO*body or not touches_zone(rejection):
             continue
         threshold = rejection.high if direction==1 else rejection.low
         broke = direction*(row.close-threshold)>0
         already_broke = any(direction*(r.close-threshold)>0 for _,r in df.iloc[j+1:i].iterrows())
         if favorable and broke and not already_broke:
-            return {'route':'rejection','anchor':int(rejection.ts),'start':min(i-2,j)},'ok'
+            return {'route':'rejection','anchor':int(rejection.ts),'start':i-PULLBACK_LOOKBACK+1},'ok'
     return None,'no_confirmation'
 
 
@@ -230,12 +247,23 @@ def signal(symbol):
     if len(raw)<100:
         return None,'few_candles',None
     stamp = int(raw.ts.iloc[-1])
-    if STATE['seen'].get(symbol,-1)>=stamp:
-        return None,'same_candle',stamp
     decision = stamp+DURATION['15m']
     age = time.time()-decision/1000
     if age<0 or age>MAX_SIGNAL_AGE:
+        if symbol in STATE['pending']:
+            del STATE['pending'][symbol];save()
+        if STATE['seen'].get(symbol,-1)>=stamp:
+            return None,'same_candle',stamp
         return None,'stale',stamp
+    if STATE['executed'].get(symbol,-1)>=stamp:
+        return None,'same_candle',stamp
+    pending = STATE['pending'].get(symbol)
+    if pending and pending['ts']==stamp:
+        return dict(pending),'signal_retry',stamp
+    if pending:
+        del STATE['pending'][symbol];save()
+    if STATE['seen'].get(symbol,-1)>=stamp:
+        return None,'same_candle',stamp
     df = indicators(raw)
     atr = float(df.atr.iloc[-1])
     if not math.isfinite(atr) or atr<=0:
@@ -254,8 +282,8 @@ def signal(symbol):
     stop = extreme-direction*STOP_ATR_BUFFER*atr
     return {'symbol':symbol,'direction':direction,'route':setup['route'],'anchor':setup['anchor'],
             'ts':stamp,'close':float(row.close),'atr':atr,'stop':stop,'htf':htf,
-            'zone_low':float(min(row.ema20,row.ema50)),
-            'zone_high':float(max(row.ema20,row.ema50)),
+            'zone_low':float(min(row.ema20,row.ema50)-ZONE_BUFFER_ATR*atr),
+            'zone_high':float(max(row.ema20,row.ema50)+ZONE_BUFFER_ATR*atr),
             'quote_volume':float(raw.quote_volume.iloc[-96:].sum())},'signal',stamp
 
 
@@ -341,6 +369,11 @@ def plan(sig,bid,ask):
 
 
 def open_paper(sig):
+    if STATE['executed'].get(sig['symbol'],-1)>=sig['ts']:
+        return 'already_executed'
+    age = time.time()-(sig['ts']+DURATION['15m'])/1000
+    if not 0<=age<=MAX_SIGNAL_AGE:
+        return 'signal_expired'
     if risk_gate() or STATE['positions']:
         return 'entry_blocked'
     if sig['quote_volume']<MIN_24H_VOLUME:
@@ -355,6 +388,8 @@ def open_paper(sig):
     p['last_mark']=current
     STATE['capital']-=p['entry_fee']
     STATE['positions'][sig['symbol']]=p
+    STATE['executed'][sig['symbol']]=sig['ts']
+    STATE['pending'].pop(sig['symbol'],None)
     STATE['guard']['attempts']+=1
     if sig['route']=='rejection':STATE['used_rejections'][sig['symbol']]=sig['anchor']
     save()
@@ -405,6 +440,10 @@ def manage():
 
 
 LABELS = {'no_trend':'4H geen duidelijke trend','no_pullback':'15m geen pullback in EMA-zone',
+          'htf_order_equal':'4H EMA20 en EMA50 gelijk; geen richting',
+          'htf_slope_long':'4H EMA20 boven EMA50, maar EMA20 stijgt niet',
+          'htf_slope_short':'4H EMA20 onder EMA50, maar EMA20 daalt niet',
+          'signal_expired':'geldig signaal verlopen (5 minuten)',
           'no_confirmation':'15m nog geen bevestiging','stale':'candle te oud voor entry',
           'htf_missing':'te weinig afgesloten 4H-data','htf_stale':'4H-data te oud',
           'minimum_contract':'minimumcontract boven risicobudget','entry_drift':'prijs te ver van bevestiging',
@@ -449,6 +488,7 @@ def startup():
     if set(STATE['positions'])-set(META):raise RuntimeError('Saved paper position instrument unavailable')
     risk_gate()
     notify(f'🧪 {VERSION} gestart: PAPER\n{", ".join(META)}\n4H EMA20/50 + helling | 15m pullback + engulfing OF rejection-bevestiging\n'
+           f'4-candle pullback | zonebuffer 0.25 ATR | wick 1.5× | signaal 5 min | drift 0.35 ATR\n'
            f'Startsaldo {INITIAL_CAPITAL:.2f} | risicodoel {RISK_PER_TRADE*100:g}% | maximaal {MAX_TRADES_PER_DAY} entries/dag\n'
            f'1 positie | 1.8R | tijdslimiet 4 uur | geen echte orders')
     if skipped:notify('Niet beschikbaar, overgeslagen: '+', '.join(skipped))
@@ -490,12 +530,19 @@ def main():
                     try:
                         sig,reason,stamp = signal(symbol)
                         if reason=='same_candle':continue
-                        if sig:reason=open_paper(sig)
+                        if sig:
+                            # Save setup before attempting entry; preserve only retryable setups.
+                            STATE['pending'][symbol]=dict(sig)
+                            save()
+                            reason=open_paper(sig)
+                            if reason not in ('spread','entry_drift'):
+                                STATE['pending'].pop(symbol,None)
                         if stamp is not None:
                             STATE['seen'][symbol]=stamp
                             DIAGNOSTICS[symbol]={'ts':stamp,'reason':reason}
+                            OUTCOMES[(symbol,stamp)]=reason
                             save()
-                        counts[reason]+=1
+                        else:counts[reason]+=1
                     except OSError:raise
                     except Exception as exc:
                         LOG.error('Scan %s: %s',symbol,exc)
@@ -503,7 +550,8 @@ def main():
                     time.sleep(.1)
                 next_scan=time.time()+SCAN_SECONDS
             if time.time()-last_report>=REPORT_SECONDS:
-                notify(status(counts));counts.clear();last_report=time.time()
+                reported = counts + Counter(OUTCOMES.values())
+                notify(status(reported));counts.clear();OUTCOMES.clear();last_report=time.time()
             HEALTH.update(cycle=time.time(),error='')
         except KeyboardInterrupt:
             notify('Paper-bot gestopt; status opgeslagen.');break
