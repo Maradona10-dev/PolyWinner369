@@ -51,7 +51,7 @@ import requests
 import pandas as pd
 
 # ====================== SETTINGS: CHANGE IN PYTHON ======================
-VERSION = '1.4-Trend-Pullback-Paper-Paired'
+VERSION = '1.4.1-Trend-Pullback-Paper-QuoteFix'
 PAPER_TRADING = True  # fixed paper-only program; no real order functionality
 # Candidate universe for paper testing, not a measured ranking of profitability
 # or signal frequency. Startup checks BloFin availability; entries retain the
@@ -103,6 +103,8 @@ HTF_CACHE = {}
 DIAGNOSTICS = {}
 OUTCOMES = {}  # one latest outcome per (symbol, candle) in a reporting period
 HEALTH = {'cycle':0,'error':''}
+QUOTE_DIAGNOSTICS = {}
+QUOTE_WARNED = {}
 LAST_BACKUP = 0.0
 STATE = {'strategy':'trend-pullback-paper-v1','capital':INITIAL_CAPITAL,'positions':{},
          'seen':{},'executed':{},'pending':{},'used_rejections':{},'last_exit':{},'trades':[], 'route_stats':{},'guard':{},
@@ -347,19 +349,49 @@ def signal(symbol):
             'quote_volume':float(raw.quote_volume.iloc[-96:].sum())},'signal',stamp
 
 
-def ticker(symbol):
-    data = one(get('/api/v1/market/tickers',{'instId':symbol}))
-    bid,ask = number(data['bidPrice']),number(data['askPrice'])
-    if bid<=0 or ask<bid or abs(time.time()*1000-number(data['ts']))>15000:
-        raise ValueError('Invalid/stale ticker')
+def checked_quote(symbol,bid,ask,stamp,source):
+    bid,ask,stamp=number(bid),number(ask),number(stamp)
+    age=time.time()*1000-stamp
+    if bid<=0 or ask<=0 or ask<bid:
+        raise ValueError(f'{symbol} {source}: invalid bid/ask ({bid:g}/{ask:g})')
+    if age>15000 or age< -5000:
+        raise ValueError(f'{symbol} {source}: quote age {age/1000:.1f}s outside fresh window')
+    QUOTE_DIAGNOSTICS[symbol]={'source':source,'age_seconds':age/1000,'updated':time.time()}
     return bid,ask
+
+
+def ticker(symbol):
+    """Retain strict freshness; try an independent fresh book if ticker fails."""
+    expected=(ValueError,RuntimeError,KeyError,IndexError,TypeError)
+    try:
+        data=one(get('/api/v1/market/tickers',{'instId':symbol}))
+        return checked_quote(symbol,data['bidPrice'],data['askPrice'],data['ts'],'ticker')
+    except expected as exc:
+        ticker_reason=f'{type(exc).__name__}: {exc}'
+    try:
+        book=one(get('/api/v1/market/books',{'instId':symbol,'size':'5'}))
+        if not book.get('bids') or not book.get('asks'):
+            raise ValueError('empty order book')
+        if number(book['bids'][0][1])<=0 or number(book['asks'][0][1])<=0:
+            raise ValueError('best book level has no size')
+        quote=checked_quote(symbol,book['bids'][0][0],book['asks'][0][0],book['ts'],'orderbook')
+        QUOTE_DIAGNOSTICS[symbol]['fallback_reason']=ticker_reason
+        if time.time()-QUOTE_WARNED.get(symbol,0)>=60:
+            LOG.warning('Quote fallback %s: %s; fresh orderbook used',symbol,ticker_reason)
+            QUOTE_WARNED[symbol]=time.time()
+        return quote
+    except expected as exc:
+        book_reason=f'{type(exc).__name__}: {exc}'
+        QUOTE_DIAGNOSTICS[symbol]={'source':'unavailable','updated':time.time(),
+                                   'ticker_reason':ticker_reason,'book_reason':book_reason}
+        raise ValueError(f'{symbol}: no fresh quote; ticker [{ticker_reason}]; orderbook [{book_reason}]') from None
 
 
 def mark(symbol):
     data = one(get('/api/v1/market/mark-price',{'instId':symbol}))
     price = number(data['markPrice'])
     if price<=0 or ('ts' in data and abs(time.time()*1000-number(data['ts']))>15000):
-        raise ValueError('Invalid/stale mark')
+        raise ValueError(f'{symbol}: invalid/stale mark price')
     return price
 
 
@@ -448,6 +480,7 @@ def plan(sig,bid,ask):
                 entry_fee=units*fill*FEE,risk=units*loss,risk_budget=budget,
                 rank_score=score,rank_parts=parts,cost_risk=cost_risk,
                 policy_version=VERSION,
+                entry_quote_source=QUOTE_DIAGNOSTICS.get(sig['symbol'],{}).get('source','unknown'),
                 opened=time.time(),last_mark=executable),'ok'
 
 
@@ -618,6 +651,8 @@ def close_paper(symbol,p,bid,ask,reason):
               'rank_score':p.get('rank_score'),'rank_parts':p.get('rank_parts'),
               'selection_id':p.get('selection_id'),
               'policy_version':p.get('policy_version','before-analysis-update')}
+    record['entry_quote_source']=p.get('entry_quote_source','before-quote-fix')
+    record['exit_quote_diagnostics']=dict(QUOTE_DIAGNOSTICS.get(symbol,{}))
     model_stop = p['stop']*(1-d*SLIPPAGE)
     record['exit_diagnostics']={'bid':bid,'ask':ask,'model_stop_fill':model_stop,
         'exit_spread_pct':(ask-bid)/((ask+bid)/2),
@@ -769,6 +804,8 @@ def status(counts):
     lines.append(f'Volledig gesloten testparen {paired["count"]}: basis {paired["baseline_net"]:+.2f}, shadow {paired["shadow_net"]:+.2f}, verschil {paired["shadow_net"]-paired["baseline_net"]:+.2f} USDT')
     lines.append(f'Shadow beter in {paired["shadow_better"]} paren; {len(STATE["shadows"])} varianten nog open. Alleen basis beïnvloedt saldo/risicolimieten.')
     lines.append('Opslag: '+('volume-pad ingesteld; controleer Railway-koppeling' if VOLUME_PATH else 'lokaal/tijdelijk; deployment kan resultaten wissen'))
+    recent_books=[symbol for symbol,info in QUOTE_DIAGNOSTICS.items() if info['source']=='orderbook' and time.time()-info['updated']<300]
+    if recent_books:lines.append('Verse orderboekquotes als ticker-alternatief: '+', '.join(recent_books))
     recognized=STATE['recognitions']
     lines.append(f'Herkenningen sinds analyse-update: engulfing {recognized["engulfing"]}, rejection {recognized["rejection"]}, beide {recognized["overlap"]}. Niet allemaal uitgevoerd.')
     for symbol,p in STATE['positions'].items():
@@ -850,10 +887,10 @@ def main():
             notify('Paper-bot gestopt; status opgeslagen.');break
         except OSError:raise
         except Exception as exc:
-            LOG.error('Management cycle: %s',exc)
-            HEALTH['error']='market data/management unavailable'
+            LOG.exception('Management cycle: %s',exc)
+            HEALTH['error']=f'{type(exc).__name__}: {str(exc)[:180]}'
             if time.time()-last_alert>300:
-                notify('Marktdata/positiecontrole tijdelijk niet beschikbaar; nieuwe entries gepauzeerd.')
+                notify('Marktdata/positiecontrole tijdelijk niet beschikbaar; nieuwe entries gepauzeerd.\n'+HEALTH['error'])
                 last_alert=time.time()
         time.sleep(MANAGE_SECONDS)
 
