@@ -21,6 +21,18 @@ not a probability. All currently eligible candidates are compared before entry.
 Sampled net excursions and exit diagnostics are stored; old trades are not
 retrospectively reconstructed. Metrics based on mark exclude actual exit spread.
 Measurements start at entry for new positions, at upgrade for existing positions.
+v1.4: confirmation AND current modeled fill must stay within 0.75 ATR of the
+buffered zone. This is an experimental filter, not a proven optimal threshold.
+Each NEW baseline entry starts a paired shadow with identical entry/size/fees.
+At +1R quoted modeled NET profit the shadow moves its stop to modeled fee- and
+slippage-covering bid/ask price. Baseline retains its original 1.8R/SL/time exits.
+Both use the same snapshots while paired; gaps can still cause BE losses.
+Shadow outcomes do not affect balance, daily caps or loss streaks. Comparison
+includes only pairs with BOTH exits closed, and is not a portfolio backtest.
+Prior entries are never given retroactive shadows. Active shadow exits persist.
+State uses an atomic file and a periodic .bak checkpoint. BOTH disappear on
+redeploy without a real Railway volume mounted at the configured path. Merely
+creating /data or setting an environment variable does not provision a volume.
 UTC daily/weekly boundaries; weekly and loss-streak stops require manual review.
 State is separate from CRT. Without a Railway volume, redeploy may reset it.
 """
@@ -30,6 +42,8 @@ import math
 import time
 import logging
 import threading
+import shutil
+from uuid import uuid4
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
 from collections import Counter
@@ -37,7 +51,7 @@ import requests
 import pandas as pd
 
 # ====================== SETTINGS: CHANGE IN PYTHON ======================
-VERSION = '1.3-Trend-Pullback-Paper-Analysis'
+VERSION = '1.4-Trend-Pullback-Paper-Paired'
 PAPER_TRADING = True  # fixed paper-only program; no real order functionality
 # Candidate universe for paper testing, not a measured ranking of profitability
 # or signal frequency. Startup checks BloFin availability; entries retain the
@@ -64,6 +78,8 @@ MAX_HOLD_SECONDS = 4*3600
 MAX_SIGNAL_AGE = 300
 PULLBACK_LOOKBACK = 4
 ZONE_BUFFER_ATR = 0.25
+MAX_ZONE_DISTANCE_ATR = 0.75
+SHADOW_BE_TRIGGER_R = 1.0  # quoted modeled net profit / original modeled risk
 REJECTION_WICK_RATIO = 1.5
 MIN_STOP_PCT = 0.0001
 MAX_STOP_PCT = 0.04
@@ -87,9 +103,11 @@ HTF_CACHE = {}
 DIAGNOSTICS = {}
 OUTCOMES = {}  # one latest outcome per (symbol, candle) in a reporting period
 HEALTH = {'cycle':0,'error':''}
+LAST_BACKUP = 0.0
 STATE = {'strategy':'trend-pullback-paper-v1','capital':INITIAL_CAPITAL,'positions':{},
          'seen':{},'executed':{},'pending':{},'used_rejections':{},'last_exit':{},'trades':[], 'route_stats':{},'guard':{},
-         'recognitions':{'engulfing':0,'rejection':0,'overlap':0},'selections':[]}
+         'recognitions':{'engulfing':0,'rejection':0,'overlap':0},'selections':[],
+         'shadows':{},'pairs':{},'paired_stats':{'count':0,'baseline_net':0.0,'shadow_net':0.0,'shadow_better':0}}
 LOG = logging.getLogger('pullback')
 
 
@@ -140,18 +158,33 @@ def one(data):
 
 
 def save():
+    global LAST_BACKUP
     temporary = STATE_FILE+'.tmp'
     with open(temporary,'w') as handle:
         json.dump(STATE,handle,allow_nan=False)
         handle.flush()
         os.fsync(handle.fileno())
+    # Periodic previous-state checkpoint; both files are ephemeral without a volume.
+    if os.path.exists(STATE_FILE) and time.time()-LAST_BACKUP>=60:
+        backup_tmp=STATE_FILE+'.bak.tmp'
+        with open(STATE_FILE,'rb') as src,open(backup_tmp,'wb') as dest:
+            shutil.copyfileobj(src,dest);dest.flush();os.fsync(dest.fileno())
+        os.replace(backup_tmp,STATE_FILE+'.bak')
+        LAST_BACKUP=time.time()
     os.replace(temporary,STATE_FILE)
+    directory=os.open(os.path.dirname(os.path.abspath(STATE_FILE)),os.O_RDONLY)
+    try:os.fsync(directory)
+    finally:os.close(directory)
 
 
 def load():
+    if not os.path.exists(STATE_FILE) and os.path.exists(STATE_FILE+'.bak'):
+        raise RuntimeError('Statusbestand ontbreekt maar backup bestaat; herstel gecontroleerd in plaats van stil resetten.')
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as handle:
-            saved = json.load(handle)
+        try:
+            with open(STATE_FILE) as handle:saved=json.load(handle)
+        except (ValueError,OSError) as exc:
+            raise RuntimeError('Statusbestand onleesbaar; controleer '+STATE_FILE+'.bak. Geen automatische reset.') from exc
         if saved.get('strategy')!=STATE['strategy']:
             raise RuntimeError('Wrong strategy state')
         if not isinstance(saved.get('positions'),dict) or not math.isfinite(float(saved.get('capital',float('nan')))):
@@ -297,6 +330,8 @@ def signal(symbol):
     zone_low = float(min(row.ema20,row.ema50)-ZONE_BUFFER_ATR*atr)
     zone_high = float(max(row.ema20,row.ema50)+ZONE_BUFFER_ATR*atr)
     distance_atr = max(zone_low-float(row.close),float(row.close)-zone_high,0)/atr
+    if distance_atr>MAX_ZONE_DISTANCE_ATR:
+        return None,'zone_too_far',stamp
     touched = [int(r.ts) for _,r in pullback.iterrows() if touches_zone(r)]
     span = float(row.high-row.low)
     close_strength = (float(row.close-row.low) if direction==1 else float(row.high-row.close))/span if span>0 else 0
@@ -378,11 +413,16 @@ def rank_setup(sig,fill,stop,bid,ask):
 
 
 def plan(sig,bid,ask):
+    if sig.get('zone_distance_atr',0)>MAX_ZONE_DISTANCE_ATR:
+        return None,'zone_too_far'
     if (ask-bid)/((ask+bid)/2)>MAX_SPREAD:
         return None,'spread'
     d = sig['direction']
     executable = ask if d==1 else bid
     fill = executable*(1+d*SLIPPAGE)
+    if 'zone_low' in sig and 'zone_high' in sig:
+        fill_zone_distance=max(sig['zone_low']-fill,fill-sig['zone_high'],0)/sig['atr']
+        if fill_zone_distance>MAX_ZONE_DISTANCE_ATR:return None,'zone_too_far'
     if abs(fill-sig['close'])>MAX_ENTRY_DRIFT_ATR*sig['atr']:
         return None,'entry_drift'
     meta = META[sig['symbol']]
@@ -432,9 +472,11 @@ def open_paper(sig):
         return 'signal_expired'
     p['last_mark']=current
     p['opened']=time.time()
+    p['pair_id']=uuid4().hex
     sample_position(p,current)
     STATE['capital']-=p['entry_fee']
     STATE['positions'][sig['symbol']]=p
+    create_shadow(p)
     STATE['executed'][sig['symbol']]=sig['ts']
     STATE['pending'].pop(sig['symbol'],None)
     STATE['guard']['attempts']+=1
@@ -452,6 +494,77 @@ def open_paper(sig):
            f'15m-pullback + gesloten bevestiging | risico geschat {p["risk"]:.2f}/{p["risk_budget"]:.2f} USDT\n'
            f'Positiewaarde {p["units"]*p["entry"]:.2f} USDT | tijdslimiet 4 uur')
     return 'opened'
+
+
+def create_shadow(p):
+    pair_id=p['pair_id']
+    shadow={k:p[k] for k in ('symbol','direction','entry','units','entry_fee','stop','target','risk','opened','pair_id')}
+    shadow.update(armed=False,original_stop=p['stop'],policy_version=VERSION)
+    STATE['shadows'][pair_id]=shadow
+    STATE['pairs'][pair_id]={'symbol':p['symbol'],'opened':p['opened'],'baseline':None,'shadow':None,
+                             'policy_version':VERSION,'finalized':False}
+
+
+def finish_pair(pair_id):
+    pair=STATE['pairs'].get(pair_id)
+    if not pair or pair['finalized'] or pair['baseline'] is None or pair['shadow'] is None:return
+    stats=STATE['paired_stats'];base=pair['baseline']['net'];variant=pair['shadow']['net']
+    stats['count']+=1;stats['baseline_net']+=base;stats['shadow_net']+=variant
+    stats['shadow_better']+=int(variant>base)
+    pair['finalized']=True;pair['delta']=variant-base;save()
+    notify(f'🔬 PAAR VERGELEKEN {pair["symbol"]}\nBasis 1.8R: {base:+.2f} | shadow +1R→kostendekkend: {variant:+.2f} USDT\n'
+           f'Verschil {variant-base:+.2f} USDT. Zelfde entry/grootte, geen extra orders of saldo-impact.')
+
+
+def be_stop(shadow):
+    d=shadow['direction'];entry=shadow['entry']
+    exit_zero=entry*(1+d*FEE)/(1-d*FEE)
+    reference_zero=exit_zero/(1-d*SLIPPAGE)
+    # BE is triggered on executable bid (long)/ask (short), not on mark.
+    return rounded(reference_zero,META[shadow['symbol']]['tick'],up=d==1)
+
+
+def shadow_net(shadow,bid,ask):
+    d=shadow['direction'];exit_price=(bid if d==1 else ask)*(1-d*SLIPPAGE)
+    net=shadow['units']*(exit_price-shadow['entry'])*d-shadow['entry_fee']-shadow['units']*exit_price*FEE
+    return exit_price,net
+
+
+def close_shadow(pair_id,shadow,bid,ask,reason):
+    exit_price,net=shadow_net(shadow,bid,ask)
+    result={'net':net,'reason':reason,'closed':time.time(),'exit':exit_price,'armed':shadow['armed'],
+            'stop':shadow['stop'],'trigger':shadow.get('exit_trigger')}
+    STATE['pairs'][pair_id]['shadow']=result
+    del STATE['shadows'][pair_id];save();finish_pair(pair_id)
+
+
+def manage_shadows(observations=None):
+    observations=observations or {}
+    for pair_id,s in list(STATE['shadows'].items()):
+        symbol=s['symbol']
+        if s.get('exit_trigger'):
+            if symbol in observations:_,bid,ask=observations[symbol]
+            else:bid,ask=ticker(symbol)
+            close_shadow(pair_id,s,bid,ask,s['exit_trigger']['reason']);continue
+        if symbol in observations:price,bid,ask=observations[symbol]
+        else:
+            price=mark(symbol)
+            d=s['direction']
+            early='SL' if not s['armed'] and d*(price-s['stop'])<=0 else 'TP' if d*(price-s['target'])>=0 else 'TIME' if time.time()-s['opened']>=MAX_HOLD_SECONDS else None
+            if early:
+                s['exit_trigger']={'mark':price,'reason':early,'time':time.time()};save()
+            bid,ask=ticker(symbol)
+            if early:
+                close_shadow(pair_id,s,bid,ask,early);continue
+        d=s['direction'];executable=bid if d==1 else ask
+        stop_reference=executable if s['armed'] else price
+        reason='BE' if s['armed'] and d*(stop_reference-s['stop'])<=0 else 'SL' if not s['armed'] and d*(price-s['stop'])<=0 else 'TP' if d*(price-s['target'])>=0 else 'TIME' if time.time()-s['opened']>=MAX_HOLD_SECONDS else None
+        if reason:
+            s['exit_trigger']={'mark':price,'executable':executable,'reason':reason,'time':time.time()};save()
+            close_shadow(pair_id,s,bid,ask,reason);continue
+        _,net=shadow_net(s,bid,ask)
+        if not s['armed'] and net>=s['risk']*SHADOW_BE_TRIGGER_R:
+            s['stop']=be_stop(s);s['armed']=True;s['armed_at']=time.time();save()
 
 
 def sample_position(p,price):
@@ -512,6 +625,9 @@ def close_paper(symbol,p,bid,ask,reason):
         'exit_r':net/p['risk'] if p['risk']>0 else None,
         'trigger_to_fill_seconds':max(0,time.time()-p['exit_trigger']['time']) if p.get('exit_trigger') else None}
     record['observation']=loss_observation(p,net,reason)
+    record['pair_id']=p.get('pair_id')
+    if p.get('pair_id') in STATE['pairs']:
+        STATE['pairs'][p['pair_id']]['baseline']={'net':net,'reason':reason,'closed':time.time()}
     STATE['trades'].append(record)
     STATE['trades']=STATE['trades'][-2000:]
     stats = STATE['route_stats'].setdefault(p['route'],{'trades':0,'wins':0,'net':0.0,'gross_wins':0.0,'gross_losses':0.0})
@@ -523,6 +639,7 @@ def close_paper(symbol,p,bid,ask,reason):
     del STATE['positions'][symbol]
     STATE['last_exit'][symbol]=time.time()
     save();risk_gate()
+    if p.get('pair_id'):finish_pair(p['pair_id'])
     m = p.get('metrics')
     details = (f'Beste/slechtste gemeten netto {m["peak_net"]:+.2f}/{m["trough_net"]:+.2f} USDT '
                f'({m["peak_r"]:+.2f}R/{m["trough_r"]:+.2f}R)\nMeetdekking: {"vanaf update" if m.get("partial_history") else "vanaf entry"}; grootste meetpauze {m["max_gap_seconds"]:.1f}s\n') if m and p['risk']>0 else 'Historische koersmetingen ontbreken.\n'
@@ -535,6 +652,7 @@ def close_paper(symbol,p,bid,ask,reason):
 
 
 def manage():
+    observations={}
     for symbol,p in list(STATE['positions'].items()):
         if p.get('exit_trigger'):
             bid,ask=ticker(symbol)
@@ -548,10 +666,13 @@ def manage():
         if reason and not p.get('exit_trigger'):
             p['exit_trigger']={'reason':reason,'mark':price,'time':time.time()}
             save()  # retain trigger across a failed ticker request/restart
+        # Same mark and quote snapshot is shared with the paired shadow.
+        bid,ask=ticker(symbol)
+        observations[symbol]=(price,bid,ask)
         if p.get('exit_trigger'):
-            bid,ask = ticker(symbol)
             close_paper(symbol,p,bid,ask,p['exit_trigger']['reason'])
         else:save()
+    manage_shadows(observations)
     # Entry guards never interrupt management of existing paper positions.
 
 
@@ -621,6 +742,7 @@ def historical_loss_summary():
 
 
 LABELS = {'no_trend':'4H geen duidelijke trend','no_pullback':'15m geen pullback in EMA-zone',
+          'zone_too_far':'bevestiging/entry verder dan 0.75 ATR van pullbackzone',
           'eligible_not_selected':'geldige kandidaat; andere setup geselecteerd/wacht',
           'htf_order_equal':'4H EMA20 en EMA50 gelijk; geen richting',
           'htf_slope_long':'4H EMA20 boven EMA50, maar EMA20 stijgt niet',
@@ -643,6 +765,10 @@ def status(counts):
         s = STATE['route_stats'].get(route,{'trades':0,'wins':0,'net':0})
         rate = 100*s['wins']/s['trades'] if s['trades'] else 0
         lines.append(f'{route}: {s["trades"]} gesloten | winst {rate:.1f}% | netto {s["net"]:+.2f} USDT')
+    paired=STATE['paired_stats']
+    lines.append(f'Volledig gesloten testparen {paired["count"]}: basis {paired["baseline_net"]:+.2f}, shadow {paired["shadow_net"]:+.2f}, verschil {paired["shadow_net"]-paired["baseline_net"]:+.2f} USDT')
+    lines.append(f'Shadow beter in {paired["shadow_better"]} paren; {len(STATE["shadows"])} varianten nog open. Alleen basis beïnvloedt saldo/risicolimieten.')
+    lines.append('Opslag: '+('volume-pad ingesteld; controleer Railway-koppeling' if VOLUME_PATH else 'lokaal/tijdelijk; deployment kan resultaten wissen'))
     recognized=STATE['recognitions']
     lines.append(f'Herkenningen sinds analyse-update: engulfing {recognized["engulfing"]}, rejection {recognized["rejection"]}, beide {recognized["overlap"]}. Niet allemaal uitgevoerd.')
     for symbol,p in STATE['positions'].items():
@@ -673,12 +799,15 @@ def startup():
         META[symbol]=values
     if not META:raise RuntimeError('No supported symbols')
     if set(STATE['positions'])-set(META):raise RuntimeError('Saved paper position instrument unavailable')
+    if any(s['symbol'] not in META for s in STATE['shadows'].values()):
+        raise RuntimeError('Saved shadow instrument unavailable; do not discard paired history.')
     risk_gate()
     notify(f'🧪 {VERSION} gestart: PAPER\n{", ".join(META)}\n4H EMA20/50 + helling | 15m pullback + engulfing OF rejection-bevestiging\n'
            f'4-candle pullback | zonebuffer 0.25 ATR | wick 1.5× | signaal 5 min | drift 0.35 ATR\n'
            f'Startsaldo {INITIAL_CAPITAL:.2f} | risicodoel {RISK_PER_TRADE*100:g}% | maximaal {MAX_TRADES_PER_DAY} entries/dag\n'
            f'1 positie | 1.8R | tijdslimiet 4 uur | geen echte orders')
     notify('Alle geldige kandidaten worden vergeleken op een vaste selectiescore; geen bewezen winstkans. Nieuwe trades meten koersverloop en stop-uitvoering; beide patronen worden geteld.')
+    notify('Afstandsgrens 0.75 ATR actief. Basis blijft 1.8R; shadow test +1 nettoR→kostendekkende bid/ask-stop. Alleen volledig gesloten paren worden vergeleken; gaps kunnen ook bij BE verlies geven.')
     summary=historical_loss_summary()
     if summary:notify(summary)
     if skipped:notify('Niet beschikbaar, overgeslagen: '+', '.join(skipped))
