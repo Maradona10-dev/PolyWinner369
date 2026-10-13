@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""Trend + pullback + confirmation: BloFin public futures data, PAPER ONLY.
+"""Two-route daytrading: BloFin public futures data, PAPER ONLY.
+Version 2.0 adds closed-15m consolidation breakouts alongside pullback patterns.
+Two DISTINCT instruments maximum; no averaging down. Each NEW entry targets
+0.25% equity risk, joint planned stop risk <=0.5%. Joint MARK notional <=95%
+equity and modeled available margin cap apply to both positions together.
+Legacy positions keep original sizes/stops; may consume all new risk budget.
+Breakout range=previous 8 bars, width<=2 previous ATR; confirmation volume above
+the previous 20-bar mean; close AND fill <=0.50 ATR beyond the breakout level.
+Stops behind the opposite range end plus 0.15 ATR. No EMA-zone gate for breakout.
+Observer scans remain read-only when entry slots/gates block new positions.
+Clock/status shows actual entry, expiry and last market sample. All parameters
+are experimental; extra signal opportunities are not guaranteed profitable.
 Python >=3.10. Install: requests pandas flask. Start: python bot.py
 Telegram secrets remain TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in Railway.
 No BloFin credentials are needed; this program has no exchange order endpoint.
@@ -45,13 +56,14 @@ import threading
 import shutil
 from uuid import uuid4
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
 from collections import Counter
 import requests
 import pandas as pd
 
 # ====================== SETTINGS: CHANGE IN PYTHON ======================
-VERSION = '1.4.1-Trend-Pullback-Paper-QuoteFix'
+VERSION = '2.0-TwoRoute-BloFin-Paper'
 PAPER_TRADING = True  # fixed paper-only program; no real order functionality
 # Candidate universe for paper testing, not a measured ranking of profitability
 # or signal frequency. Startup checks BloFin availability; entries retain the
@@ -63,10 +75,11 @@ SYMBOLS = [
     'INJ-USDT', 'TAO-USDT', 'SEI-USDT', 'LTC-USDT', 'BCH-USDT',
 ]
 INITIAL_CAPITAL = 10000.0
-RISK_PER_TRADE = 0.005
+RISK_PER_TRADE = 0.0025
+MAX_TOTAL_RISK_PCT = 0.005
 MAX_POSITION_PCT = 0.95  # notional/equity, not margin/equity
 LEVERAGE = 12
-MAX_POSITIONS = 1
+MAX_POSITIONS = 2
 MAX_TRADES_PER_DAY = 12
 MAX_DAILY_LOSS = 0.03
 MAX_WEEKLY_LOSS = 0.07
@@ -81,6 +94,10 @@ ZONE_BUFFER_ATR = 0.25
 MAX_ZONE_DISTANCE_ATR = 0.75
 SHADOW_BE_TRIGGER_R = 1.0  # quoted modeled net profit / original modeled risk
 REJECTION_WICK_RATIO = 1.5
+BREAKOUT_BARS = 8
+BREAKOUT_MAX_RANGE_ATR = 2.0
+BREAKOUT_VOLUME_BARS = 20
+MAX_BREAKOUT_DISTANCE_ATR = 0.50
 MIN_STOP_PCT = 0.0001
 MAX_STOP_PCT = 0.04
 FEE = 0.0004  # modeled fee per side, not verified account fee tier
@@ -108,7 +125,8 @@ QUOTE_WARNED = {}
 LAST_BACKUP = 0.0
 STATE = {'strategy':'trend-pullback-paper-v1','capital':INITIAL_CAPITAL,'positions':{},
          'seen':{},'executed':{},'pending':{},'used_rejections':{},'last_exit':{},'trades':[], 'route_stats':{},'guard':{},
-         'recognitions':{'engulfing':0,'rejection':0,'overlap':0},'selections':[],
+         'recognitions':{'engulfing':0,'rejection':0,'overlap':0,'breakout':0},'selections':[],
+         'observer_seen':{},
          'shadows':{},'pairs':{},'paired_stats':{'count':0,'baseline_net':0.0,'shadow_net':0.0,'shadow_better':0}}
 LOG = logging.getLogger('pullback')
 
@@ -125,9 +143,13 @@ def notify(message):
     if not TG_TOKEN or not TG_CHAT:
         return False
     try:
-        response = requests.post('https://api.telegram.org/bot'+TG_TOKEN+'/sendMessage',
-            json={'chat_id':TG_CHAT,'text':message[:4000]},timeout=(5,10))
-        return response.status_code==200 and response.json().get('ok') is True
+        for offset in range(0,len(message),3800):
+            chunk=message[offset:offset+3800]
+            response = requests.post('https://api.telegram.org/bot'+TG_TOKEN+'/sendMessage',
+                json={'chat_id':TG_CHAT,'text':chunk},timeout=(5,10))
+            if response.status_code!=200 or response.json().get('ok') is not True:
+                return False
+        return True
     except (requests.RequestException,ValueError):
         LOG.warning('Telegram delivery failed; details retained in log/state')
         return False
@@ -192,6 +214,7 @@ def load():
         if not isinstance(saved.get('positions'),dict) or not math.isfinite(float(saved.get('capital',float('nan')))):
             raise RuntimeError('Invalid saved paper state')
         STATE.update(saved)
+        STATE['recognitions'].setdefault('breakout',0)
 
 
 def candles(symbol,bar='15m',limit=120):
@@ -288,65 +311,87 @@ def pattern(df,direction):
     return None,'no_confirmation'
 
 
-def signal(symbol):
-    raw = candles(symbol)
-    if len(raw)<100:
-        return None,'few_candles',None
-    stamp = int(raw.ts.iloc[-1])
-    decision = stamp+DURATION['15m']
-    age = time.time()-decision/1000
+def breakout_pattern(df,direction):
+    """Use the PREVIOUS eight candles, ATR and volume; current close confirms."""
+    if len(df)<BREAKOUT_VOLUME_BARS+1:return None,'few_candles'
+    row=df.iloc[-1];prior=df.iloc[-BREAKOUT_BARS-1:-1]
+    atr=float(df.atr.iloc[-2])
+    high,low=float(prior.high.max()),float(prior.low.min())
+    if not math.isfinite(atr) or atr<=0 or high-low>BREAKOUT_MAX_RANGE_ATR*atr:
+        return None,'range_not_compact'
+    level=high if direction==1 else low
+    if direction*(float(row.close)-level)<=0 or direction*(float(row.close)-float(row.open))<=0:
+        return None,'no_breakout'
+    average=float(df.volume.iloc[-BREAKOUT_VOLUME_BARS-1:-1].mean())
+    if average<=0 or float(row.volume)<=average:return None,'breakout_volume'
+    distance=direction*(float(row.close)-level)/float(row.atr)
+    if distance>MAX_BREAKOUT_DISTANCE_ATR:return None,'breakout_chase'
+    return {'route':'breakout','routes':['breakout'],'engine':'breakout','anchor':int(prior.ts.iloc[0]),
+            'rejection_anchor':None,'range_low':low,'range_high':high,'entry_level':level,
+            'volume_ratio':float(row.volume)/average,'level_distance_atr':distance},'ok'
+
+
+def signal(symbol,observe=False):
+    raw=candles(symbol)
+    if len(raw)<100:return None,'few_candles',None
+    stamp=int(raw.ts.iloc[-1]);decision=stamp+DURATION['15m']
+    if observe and STATE['observer_seen'].get(symbol,-1)>=stamp:return None,'same_candle',stamp
+    age=time.time()-decision/1000
     if age<0 or age>MAX_SIGNAL_AGE:
-        if symbol in STATE['pending']:
-            del STATE['pending'][symbol];save()
-        if STATE['seen'].get(symbol,-1)>=stamp:
-            return None,'same_candle',stamp
+        if not observe:
+            if symbol in STATE['pending']:del STATE['pending'][symbol];save()
+            if STATE['seen'].get(symbol,-1)>=stamp:return None,'same_candle',stamp
         return None,'stale',stamp
-    if STATE['executed'].get(symbol,-1)>=stamp:
-        return None,'same_candle',stamp
-    pending = STATE['pending'].get(symbol)
-    if pending and pending['ts']==stamp:
-        return dict(pending),'signal_retry',stamp
-    if pending:
-        del STATE['pending'][symbol];save()
-    if STATE['seen'].get(symbol,-1)>=stamp:
-        return None,'same_candle',stamp
-    df = indicators(raw)
-    atr = float(df.atr.iloc[-1])
-    if not math.isfinite(atr) or atr<=0:
-        return None,'atr_invalid',stamp
-    direction,htf,reason = htf_trend(symbol,decision)
-    if direction==0:
-        return None,reason if reason!='ok' else 'no_trend',stamp
-    setup,reason = pattern(df,direction)
-    if not setup:
-        return None,reason,stamp
-    if setup['route']=='rejection' and STATE['used_rejections'].get(symbol,-1)>=setup['anchor']:
-        return None,'used_rejection',stamp
-    row = df.iloc[-1]
-    pullback = df.iloc[setup['start']:]
-    routes = list(setup['routes'])
-    if 'rejection' in routes and STATE['used_rejections'].get(symbol,-1)>=setup['rejection_anchor']:
-        routes.remove('rejection')
-    for route in routes:STATE['recognitions'][route]+=1
-    if len(routes)==2:STATE['recognitions']['overlap']+=1
-    zone_low = float(min(row.ema20,row.ema50)-ZONE_BUFFER_ATR*atr)
-    zone_high = float(max(row.ema20,row.ema50)+ZONE_BUFFER_ATR*atr)
-    distance_atr = max(zone_low-float(row.close),float(row.close)-zone_high,0)/atr
-    if distance_atr>MAX_ZONE_DISTANCE_ATR:
-        return None,'zone_too_far',stamp
-    touched = [int(r.ts) for _,r in pullback.iterrows() if touches_zone(r)]
-    span = float(row.high-row.low)
-    close_strength = (float(row.close-row.low) if direction==1 else float(row.high-row.close))/span if span>0 else 0
-    extreme = float(pullback.low.min() if direction==1 else pullback.high.max())
-    stop = extreme-direction*STOP_ATR_BUFFER*atr
-    return {'symbol':symbol,'direction':direction,'route':setup['route'],'routes':routes,
-            'rejection_anchor':setup['rejection_anchor'],'anchor':setup['anchor'],
-            'ts':stamp,'close':float(row.close),'atr':atr,'stop':stop,'htf':htf,
-            'zone_low':zone_low,'zone_high':zone_high,'zone_distance_atr':distance_atr,
-            'body_atr':float(abs(row.close-row.open))/atr,'close_strength':close_strength,
-            'last_zone_touch_ts':max(touched) if touched else None,
+    if not observe:
+        if STATE['executed'].get(symbol,-1)>=stamp:return None,'same_candle',stamp
+        pending=STATE['pending'].get(symbol)
+        if pending and pending['ts']==stamp:return dict(pending),'signal_retry',stamp
+        if pending:del STATE['pending'][symbol];save()
+        if STATE['seen'].get(symbol,-1)>=stamp:return None,'same_candle',stamp
+    df=indicators(raw);row=df.iloc[-1];atr=float(row.atr)
+    if not math.isfinite(atr) or atr<=0:return None,'atr_invalid',stamp
+    direction,htf,reason=htf_trend(symbol,decision)
+    if direction==0:return None,reason if reason!='ok' else 'no_trend',stamp
+    setup,pull_reason=pattern(df,direction)
+    breakout,break_reason=breakout_pattern(df,direction)
+    common={'symbol':symbol,'direction':direction,'ts':stamp,'close':float(row.close),'atr':atr,
+            'htf':htf,'body_atr':float(abs(row.close-row.open))/atr,
+            'close_strength':(float(row.close-row.low) if direction==1 else float(row.high-row.close))/float(row.high-row.low) if row.high>row.low else 0,
             'signal_ohlc':{k:float(row[k]) for k in ('open','high','low','close')},
-            'quote_volume':float(raw.quote_volume.iloc[-96:].sum())},'signal',stamp
+            'quote_volume':float(raw.quote_volume.iloc[-96:].sum())}
+    candidates=[]
+    if setup:
+        routes=list(setup['routes'])
+        if not observe and 'rejection' in routes and STATE['used_rejections'].get(symbol,-1)>=setup['rejection_anchor']:
+            routes.remove('rejection')
+        if routes:
+            pullback=df.iloc[setup['start']:]
+            zone_low=float(min(row.ema20,row.ema50)-ZONE_BUFFER_ATR*atr)
+            zone_high=float(max(row.ema20,row.ema50)+ZONE_BUFFER_ATR*atr)
+            distance=max(zone_low-float(row.close),float(row.close)-zone_high,0)/atr
+            if distance<=MAX_ZONE_DISTANCE_ATR:
+                extreme=float(pullback.low.min() if direction==1 else pullback.high.max())
+                touched=[int(r.ts) for _,r in pullback.iterrows() if touches_zone(r)]
+                candidates.append(dict(common,engine='pullback',route=routes[0],routes=routes,
+                    rejection_anchor=setup['rejection_anchor'],anchor=setup['anchor'],
+                    stop=extreme-direction*STOP_ATR_BUFFER*atr,zone_low=zone_low,zone_high=zone_high,
+                    zone_distance_atr=distance,last_zone_touch_ts=max(touched) if touched else None))
+            else:pull_reason='zone_too_far'
+        else:pull_reason='used_rejection'
+    if breakout:
+        candidates.append(dict(common,**breakout,stop=(breakout['range_low'] if direction==1 else breakout['range_high'])-direction*STOP_ATR_BUFFER*atr,
+            zone_low=breakout['range_low'],zone_high=breakout['range_high'],zone_distance_atr=breakout['level_distance_atr'],last_zone_touch_ts=None))
+    if not candidates:
+        return None,pull_reason if pull_reason!='no_pullback' else break_reason,stamp
+    if not observe:
+        recognized={r for s in candidates for r in s['routes']}
+        for route in recognized:STATE['recognitions'][route]+=1
+        if 'engulfing' in recognized and 'rejection' in recognized:STATE['recognitions']['overlap']+=1
+    # One setup per symbol/candle; provisional score uses close, actual quotes are
+    # scored again by plan(). Quote costs/portfolio constraints are checked later.
+    chosen=max(candidates,key=lambda s:rank_setup(s,s['close'],s['stop'],s['close'],s['close'])[0])
+    chosen['engines_available']=sorted({s['engine'] for s in candidates})
+    return chosen,'signal',stamp
 
 
 def checked_quote(symbol,bid,ask,stamp,source):
@@ -444,15 +489,20 @@ def rank_setup(sig,fill,stop,bid,ask):
     return round(score,2),parts,cost_risk
 
 
-def plan(sig,bid,ask):
-    if sig.get('zone_distance_atr',0)>MAX_ZONE_DISTANCE_ATR:
+def plan(sig,bid,ask,mark_price=None):
+    breakout=sig.get('engine')=='breakout'
+    if not breakout and sig.get('zone_distance_atr',0)>MAX_ZONE_DISTANCE_ATR:
         return None,'zone_too_far'
     if (ask-bid)/((ask+bid)/2)>MAX_SPREAD:
         return None,'spread'
     d = sig['direction']
     executable = ask if d==1 else bid
     fill = executable*(1+d*SLIPPAGE)
-    if 'zone_low' in sig and 'zone_high' in sig:
+    if breakout:
+        beyond=d*(fill-sig['entry_level'])/sig['atr']
+        if beyond<0:return None,'breakout_reclaimed'
+        if beyond>MAX_BREAKOUT_DISTANCE_ATR:return None,'breakout_chase'
+    elif 'zone_low' in sig and 'zone_high' in sig:
         fill_zone_distance=max(sig['zone_low']-fill,fill-sig['zone_high'],0)/sig['atr']
         if fill_zone_distance>MAX_ZONE_DISTANCE_ATR:return None,'zone_too_far'
     if abs(fill-sig['close'])>MAX_ENTRY_DRIFT_ATR*sig['atr']:
@@ -468,9 +518,25 @@ def plan(sig,bid,ask):
     stop_fill = stop*(1-d*SLIPPAGE)
     loss = d*(fill-stop_fill)+FEE*(fill+stop_fill)
     value = equity()
-    budget = value*RISK_PER_TRADE
-    max_units = min(budget/loss,value*MAX_POSITION_PCT/fill,
-                    max(0,STATE['capital'])*.88/(fill*(1/LEVERAGE+FEE)))
+    risk_used,notional_used,margin_used=portfolio_usage()
+    budget = min(value*RISK_PER_TRADE,max(0,value*MAX_TOTAL_RISK_PCT-risk_used))
+    notional_left=max(0,value*MAX_POSITION_PCT-notional_used)
+    margin_left=max(0,STATE['capital']-margin_used)*.88
+    if budget<=0:return None,'portfolio_risk'
+    if notional_left<=0:return None,'portfolio_notional'
+    if margin_left<=0:return None,'portfolio_margin'
+    # Caps use estimated equity AFTER entry fees and entry spread/slippage.
+    # open_paper repeats this plan with the fresh mark before committing state.
+    entry_mark=executable if mark_price is None else number(mark_price)
+    equity_cost=fill*FEE+d*(fill-entry_mark)
+    denominators=(loss+RISK_PER_TRADE*equity_cost,
+                  loss+MAX_TOTAL_RISK_PCT*equity_cost,
+                  entry_mark+MAX_POSITION_PCT*equity_cost)
+    if min(denominators)<=0:return None,'target_invalid'
+    max_units = min(value*RISK_PER_TRADE/denominators[0],
+                    max(0,value*MAX_TOTAL_RISK_PCT-risk_used)/denominators[1],
+                    notional_left/denominators[2],
+                    margin_left/(fill*(1/LEVERAGE+FEE)))
     contracts = rounded(min(max_units/meta['cv'],meta['maximum']),meta['lot'])
     if contracts<meta['minimum'] or contracts<=0:
         return None,'minimum_contract'
@@ -490,7 +556,7 @@ def open_paper(sig):
     age = time.time()-(sig['ts']+DURATION['15m'])/1000
     if not 0<=age<=MAX_SIGNAL_AGE:
         return 'signal_expired'
-    if risk_gate() or STATE['positions']:
+    if risk_gate() or len(STATE['positions'])>=MAX_POSITIONS or sig['symbol'] in STATE['positions']:
         return 'entry_blocked'
     if sig['quote_volume']<MIN_24H_VOLUME:
         return 'low_volume'
@@ -499,6 +565,8 @@ def open_paper(sig):
     if not p:return reason
     # Current mark must not already invalidate the planned stop or target.
     current = mark(sig['symbol'])
+    p,reason=plan(sig,bid,ask,current)
+    if not p:return reason
     if not p['direction']*(current-p['stop'])>0 or not p['direction']*(p['target']-current)>0:
         return 'mark_outside'
     if time.time()-(sig['ts']+DURATION['15m'])/1000>MAX_SIGNAL_AGE:
@@ -522,11 +590,19 @@ def open_paper(sig):
     notify(f'🧪 PAPER OPEN {sig["symbol"]} {label}\nRoute: {p["route"]} | 4H EMA20 {p["htf"]["ema20"]:.6g}, EMA50 {p["htf"]["ema50"]:.6g}\n'
            f'Herkenningen: {", ".join(p.get("routes",[p["route"]]))} | selectiescore {p["rank_score"]:.1f}/100 (geen winstkans)\n'
            f'Afstand bevestiging/zone {p.get("zone_distance_atr",0):.2f} ATR | geschatte kosten/stopafstand {p["cost_risk"]*100:.1f}%\n'
-           f'15m EMA-zone {p["zone_low"]:.8g}–{p["zone_high"]:.8g} | bevestigingsclose {p["close"]:.8g}\n'
+           f'Methode: {p.get("engine","pullback")} | zone/range {p["zone_low"]:.8g}–{p["zone_high"]:.8g} | bevestigingsclose {p["close"]:.8g}\n'
            f'Entry {p["entry"]:.8g} | SL {p["stop"]:.8g} | TP {p["target"]:.8g}\n'
-           f'15m-pullback + gesloten bevestiging | risico geschat {p["risk"]:.2f}/{p["risk_budget"]:.2f} USDT\n'
+           f'Gesloten 15m-bevestiging | risico geschat {p["risk"]:.2f}/{p["risk_budget"]:.2f} USDT\n'
            f'Positiewaarde {p["units"]*p["entry"]:.2f} USDT | tijdslimiet 4 uur')
     return 'opened'
+
+
+def portfolio_usage():
+    positions=STATE['positions'].values()
+    risk=sum(max(0,float(p['risk'])) for p in positions)
+    notional=sum(p['units']*p.get('last_mark',p['entry']) for p in STATE['positions'].values())
+    margin=sum(p['units']*p['entry']/LEVERAGE for p in STATE['positions'].values())
+    return risk,notional,margin
 
 
 def create_shadow(p):
@@ -571,33 +647,43 @@ def close_shadow(pair_id,shadow,bid,ask,reason):
     del STATE['shadows'][pair_id];save();finish_pair(pair_id)
 
 
+def manage_one_shadow(pair_id,s,observations):
+    symbol=s['symbol']
+    if s.get('exit_trigger'):
+        if symbol in observations:_,bid,ask=observations[symbol]
+        else:bid,ask=ticker(symbol)
+        close_shadow(pair_id,s,bid,ask,s['exit_trigger']['reason']);return
+    if symbol in observations:price,bid,ask=observations[symbol]
+    else:
+        price=mark(symbol)
+        d=s['direction']
+        early='SL' if not s['armed'] and d*(price-s['stop'])<=0 else 'TP' if d*(price-s['target'])>=0 else 'TIME' if time.time()-s['opened']>=MAX_HOLD_SECONDS else None
+        if early:
+            s['exit_trigger']={'mark':price,'reason':early,'time':time.time()};save()
+        bid,ask=ticker(symbol)
+        if early:
+            close_shadow(pair_id,s,bid,ask,early);return
+    d=s['direction'];executable=bid if d==1 else ask
+    stop_reference=executable if s['armed'] else price
+    reason='BE' if s['armed'] and d*(stop_reference-s['stop'])<=0 else 'SL' if not s['armed'] and d*(price-s['stop'])<=0 else 'TP' if d*(price-s['target'])>=0 else 'TIME' if time.time()-s['opened']>=MAX_HOLD_SECONDS else None
+    if reason:
+        s['exit_trigger']={'mark':price,'executable':executable,'reason':reason,'time':time.time()};save()
+        close_shadow(pair_id,s,bid,ask,reason);return
+    _,net=shadow_net(s,bid,ask)
+    if not s['armed'] and net>=s['risk']*SHADOW_BE_TRIGGER_R:
+        s['stop']=be_stop(s);s['armed']=True;s['armed_at']=time.time();save()
+
+
+
 def manage_shadows(observations=None):
     observations=observations or {}
+    errors=[]
     for pair_id,s in list(STATE['shadows'].items()):
-        symbol=s['symbol']
-        if s.get('exit_trigger'):
-            if symbol in observations:_,bid,ask=observations[symbol]
-            else:bid,ask=ticker(symbol)
-            close_shadow(pair_id,s,bid,ask,s['exit_trigger']['reason']);continue
-        if symbol in observations:price,bid,ask=observations[symbol]
-        else:
-            price=mark(symbol)
-            d=s['direction']
-            early='SL' if not s['armed'] and d*(price-s['stop'])<=0 else 'TP' if d*(price-s['target'])>=0 else 'TIME' if time.time()-s['opened']>=MAX_HOLD_SECONDS else None
-            if early:
-                s['exit_trigger']={'mark':price,'reason':early,'time':time.time()};save()
-            bid,ask=ticker(symbol)
-            if early:
-                close_shadow(pair_id,s,bid,ask,early);continue
-        d=s['direction'];executable=bid if d==1 else ask
-        stop_reference=executable if s['armed'] else price
-        reason='BE' if s['armed'] and d*(stop_reference-s['stop'])<=0 else 'SL' if not s['armed'] and d*(price-s['stop'])<=0 else 'TP' if d*(price-s['target'])>=0 else 'TIME' if time.time()-s['opened']>=MAX_HOLD_SECONDS else None
-        if reason:
-            s['exit_trigger']={'mark':price,'executable':executable,'reason':reason,'time':time.time()};save()
-            close_shadow(pair_id,s,bid,ask,reason);continue
-        _,net=shadow_net(s,bid,ask)
-        if not s['armed'] and net>=s['risk']*SHADOW_BE_TRIGGER_R:
-            s['stop']=be_stop(s);s['armed']=True;s['armed_at']=time.time();save()
+        try:manage_one_shadow(pair_id,s,observations)
+        except OSError:raise
+        except Exception as exc:
+            errors.append(f"{s['symbol']} shadow: {exc}")
+    if errors:raise RuntimeError(' | '.join(errors))
 
 
 def sample_position(p,price):
@@ -614,7 +700,7 @@ def sample_position(p,price):
         p['metrics']=m
     gap = max(0,now-m.get('last_sample',now))
     m.update(samples=m['samples']+1,last_sample=now,last_gap_seconds=gap,
-             max_gap_seconds=max(m['max_gap_seconds'],gap),last_mark=price,
+             max_gap_seconds=max(m['max_gap_seconds'],gap),last_mark=price,last_net=net,
              peak_gross=max(m['peak_gross'],gross),trough_gross=min(m['trough_gross'],gross),
              peak_net=max(m['peak_net'],net),trough_net=min(m['trough_net'],net))
     risk = p.get('risk',0)
@@ -648,7 +734,7 @@ def close_paper(symbol,p,bid,ask,reason):
               'routes':p.get('routes',[p['route']]),'metrics':p.get('metrics'),
               'trigger':p.get('exit_trigger'),'signal_evidence':{k:p.get(k) for k in
                 ('ts','anchor','zone_distance_atr','body_atr','close_strength','signal_ohlc','htf','zone_low','zone_high','last_zone_touch_ts')},
-              'rank_score':p.get('rank_score'),'rank_parts':p.get('rank_parts'),
+              'engine':p.get('engine','pullback'),'rank_score':p.get('rank_score'),'rank_parts':p.get('rank_parts'),
               'selection_id':p.get('selection_id'),
               'policy_version':p.get('policy_version','before-analysis-update')}
     record['entry_quote_source']=p.get('entry_quote_source','before-quote-fix')
@@ -686,29 +772,37 @@ def close_paper(symbol,p,bid,ask,reason):
            +details+execution+record['observation']+'\nGemeten pieken kunnen bewegingen missen; inclusief fees/slippage, zonder funding.')
 
 
-def manage():
-    observations={}
-    for symbol,p in list(STATE['positions'].items()):
-        if p.get('exit_trigger'):
-            bid,ask=ticker(symbol)
-            close_paper(symbol,p,bid,ask,p['exit_trigger']['reason'])
-            continue
-        price = mark(symbol)
-        p['last_mark']=price
-        sample_position(p,price)
-        d = p['direction']
-        reason = 'SL' if d*(price-p['stop'])<=0 else 'TP' if d*(price-p['target'])>=0 else 'TIME' if time.time()-p['opened']>=MAX_HOLD_SECONDS else None
-        if reason and not p.get('exit_trigger'):
-            p['exit_trigger']={'reason':reason,'mark':price,'time':time.time()}
-            save()  # retain trigger across a failed ticker request/restart
-        # Same mark and quote snapshot is shared with the paired shadow.
+def manage_one_position(symbol,p,observations):
+    if p.get('exit_trigger'):
         bid,ask=ticker(symbol)
-        observations[symbol]=(price,bid,ask)
-        if p.get('exit_trigger'):
-            close_paper(symbol,p,bid,ask,p['exit_trigger']['reason'])
-        else:save()
-    manage_shadows(observations)
-    # Entry guards never interrupt management of existing paper positions.
+        close_paper(symbol,p,bid,ask,p['exit_trigger']['reason'])
+        return
+    price = mark(symbol)
+    p['last_mark']=price
+    sample_position(p,price)
+    d = p['direction']
+    reason = 'SL' if d*(price-p['stop'])<=0 else 'TP' if d*(price-p['target'])>=0 else 'TIME' if time.time()-p['opened']>=MAX_HOLD_SECONDS else None
+    if reason and not p.get('exit_trigger'):
+        p['exit_trigger']={'reason':reason,'mark':price,'time':time.time()}
+        save()  # retain trigger across a failed ticker request/restart
+    # Same mark and quote snapshot is shared with the paired shadow.
+    bid,ask=ticker(symbol)
+    observations[symbol]=(price,bid,ask)
+    if p.get('exit_trigger'):
+        close_paper(symbol,p,bid,ask,p['exit_trigger']['reason'])
+    else:save()
+
+def manage():
+    observations={};errors=[]
+    for symbol,p in list(STATE['positions'].items()):
+        try:manage_one_position(symbol,p,observations)
+        except OSError:raise
+        except Exception as exc:errors.append(f'{symbol} baseline: {exc}')
+    try:manage_shadows(observations)
+    except OSError:raise
+    except Exception as exc:errors.append(str(exc))
+    # Continue all existing exits before blocking new entries on any data error.
+    if errors:raise RuntimeError(' | '.join(errors))
 
 
 def scan_entries(symbols,counts):
@@ -718,7 +812,8 @@ def scan_entries(symbols,counts):
     for symbol in symbols:
         if time.monotonic()-last_manage>=MANAGE_SECONDS:
             manage();last_manage=time.monotonic()
-        if risk_gate() or STATE['positions']:return
+        if risk_gate() or len(STATE['positions'])>=MAX_POSITIONS:return
+        if symbol in STATE['positions']:continue
         if time.time()-STATE['last_exit'].get(symbol,0)<COOLDOWN_SECONDS:continue
         try:
             sig,reason,stamp = signal(symbol)
@@ -746,22 +841,50 @@ def scan_entries(symbols,counts):
     audit={'id':str(time.time_ns()),'time':time.time(),'policy_version':VERSION,
            'ranked':[{'symbol':s['symbol'],'signal_ts':s['ts'],'score':score,
                       'routes':s.get('routes',[s['route']]),'zone_distance_atr':s.get('zone_distance_atr')}
-                     for score,s in ranked], 'chosen':None}
+                     for score,s in ranked], 'chosen':[]}
     STATE['selections'].append(audit);STATE['selections']=STATE['selections'][-500:];save()
     for _,sig in ranked:
-        if STATE['positions'] or risk_gate():break
+        if len(STATE['positions'])>=MAX_POSITIONS or risk_gate():break
+        if sig['symbol'] in STATE['positions']:continue
         sig=dict(sig,selection_id=audit['id']);symbol,stamp=sig['symbol'],sig['ts']
         try:
             reason=open_paper(sig)
             DIAGNOSTICS[symbol]={'ts':stamp,'reason':reason};OUTCOMES[(symbol,stamp)]=reason
             if reason not in ('spread','entry_drift'):STATE['pending'].pop(symbol,None)
-            if reason=='opened':audit['chosen']=symbol
+            if reason=='opened':audit['chosen'].append(symbol)
             save()
         except OSError:raise
         except Exception as exc:
             LOG.error('Entry quote/plan %s: %s',symbol,exc);counts['API/data error']+=1
-            if symbol in STATE['positions']:audit['chosen']=symbol;save()
-        if STATE['positions']:break
+            if symbol in STATE['positions'] and symbol not in audit['chosen']:audit['chosen'].append(symbol);save()
+        if len(STATE['positions'])>=MAX_POSITIONS:break
+
+
+def observe_signals(symbols,counts):
+    """Current market observations while entries are blocked; never opens trades."""
+    last_manage=time.monotonic()
+    for symbol in symbols:
+        if time.monotonic()-last_manage>=MANAGE_SECONDS:
+            manage();last_manage=time.monotonic()
+        try:
+            sig,reason,stamp=signal(symbol,observe=True)
+            if reason=='same_candle':continue
+            if sig:reason='observed_'+sig.get('engine','pullback')
+            if stamp is not None:
+                STATE['observer_seen'][symbol]=stamp
+                DIAGNOSTICS[symbol]={'ts':stamp,'reason':reason}
+                OUTCOMES[(symbol,stamp)]=reason;save()
+            else:counts[reason]+=1
+        except OSError:raise
+        except Exception as exc:
+            LOG.error('Observation %s: %s',symbol,exc);counts['API/data error']+=1
+        time.sleep(.1)
+
+
+def local_time(stamp):
+    date=datetime.fromtimestamp(stamp,timezone.utc)
+    try:return date.astimezone(ZoneInfo('Europe/Amsterdam')).strftime('%d-%m %H:%M:%S %Z')
+    except ZoneInfoNotFoundError:return date.strftime('%d-%m %H:%M:%S UTC')
 
 
 def historical_loss_summary():
@@ -777,6 +900,16 @@ def historical_loss_summary():
 
 
 LABELS = {'no_trend':'4H geen duidelijke trend','no_pullback':'15m geen pullback in EMA-zone',
+          'no_breakout':'geen bevestigde consolidatie-breakout',
+          'range_not_compact':'range breder dan 2 ATR',
+          'breakout_volume':'breakoutvolume niet boven 20-candle gemiddelde',
+          'breakout_chase':'prijs verder dan 0.50 ATR voorbij breakoutniveau',
+          'breakout_reclaimed':'koers terug binnen breakoutrange',
+          'portfolio_risk':'gezamenlijk risicobudget bezet',
+          'portfolio_notional':'gezamenlijke positiewaardelimiet bezet',
+          'portfolio_margin':'gezamenlijke margeruimte bezet',
+          'observed_pullback':'pullbacksignaal gezien; geen entry tijdens blokkade',
+          'observed_breakout':'breakoutsignaal gezien; geen entry tijdens blokkade',
           'zone_too_far':'bevestiging/entry verder dan 0.75 ATR van pullbackzone',
           'eligible_not_selected':'geldige kandidaat; andere setup geselecteerd/wacht',
           'htf_order_equal':'4H EMA20 en EMA50 gelijk; geen richting',
@@ -796,7 +929,13 @@ def status(counts):
              f'Equity {equity():.2f} USDT | gerealiseerd saldo {STATE["capital"]:.2f}',
              f'Posities {len(STATE["positions"])}/{MAX_POSITIONS} | entries UTC {STATE["guard"].get("attempts",0)}/{MAX_TRADES_PER_DAY}']
     if gate:lines.append('Nieuwe entries geblokkeerd: '+gate)
-    for route in ('engulfing','rejection'):
+    elif len(STATE['positions'])>=MAX_POSITIONS:lines.append('Nieuwe entries geblokkeerd: beide positieplaatsen bezet. Observeren gaat door.')
+    else:lines.append(f'Vrije positieplaatsen: {MAX_POSITIONS-len(STATE["positions"])}; scanner actief.')
+    risk_used,notional_used,margin_used=portfolio_usage()
+    lines.append(f'Gepland stoprisico {risk_used:.2f}/{equity()*MAX_TOTAL_RISK_PCT:.2f} USDT | positiewaarde {notional_used:.2f}/{equity()*MAX_POSITION_PCT:.2f} | marge gereserveerd {margin_used:.2f}')
+    pullback=[STATE['route_stats'].get(route,{'trades':0,'net':0}) for route in ('engulfing','rejection')]
+    lines.append(f'Pullback totaal: {sum(s["trades"] for s in pullback)} gesloten | netto {sum(s["net"] for s in pullback):+.2f} USDT')
+    for route in ('engulfing','rejection','breakout'):
         s = STATE['route_stats'].get(route,{'trades':0,'wins':0,'net':0})
         rate = 100*s['wins']/s['trades'] if s['trades'] else 0
         lines.append(f'{route}: {s["trades"]} gesloten | winst {rate:.1f}% | netto {s["net"]:+.2f} USDT')
@@ -807,14 +946,18 @@ def status(counts):
     recent_books=[symbol for symbol,info in QUOTE_DIAGNOSTICS.items() if info['source']=='orderbook' and time.time()-info['updated']<300]
     if recent_books:lines.append('Verse orderboekquotes als ticker-alternatief: '+', '.join(recent_books))
     recognized=STATE['recognitions']
-    lines.append(f'Herkenningen sinds analyse-update: engulfing {recognized["engulfing"]}, rejection {recognized["rejection"]}, beide {recognized["overlap"]}. Niet allemaal uitgevoerd.')
+    lines.append(f'Herkenningen: engulfing {recognized["engulfing"]}, rejection {recognized["rejection"]}, beide {recognized["overlap"]}, breakout {recognized["breakout"]}. Niet allemaal uitgevoerd.')
     for symbol,p in STATE['positions'].items():
         m=p.get('metrics')
-        if m:lines.append(f'{symbol}: beste/slechtste gemeten netto {m["peak_net"]:+.2f}/{m["trough_net"]:+.2f} USDT')
+        elapsed=max(0,time.time()-p['opened']);remaining=max(0,MAX_HOLD_SECONDS-elapsed)
+        lines.append(f'{symbol} {"LONG" if p["direction"]==1 else "SHORT"} | entry {local_time(p["opened"])} | loopt {elapsed/60:.0f} min | resterend {remaining/60:.0f} min | deadline {local_time(p["opened"]+MAX_HOLD_SECONDS)}')
+        if m:lines.append(f'Laatste meting {max(0,time.time()-m["last_sample"]):.1f}s geleden | netto nu {m.get("last_net",0):+.2f} | beste/slechtste {m["peak_net"]:+.2f}/{m["trough_net"]:+.2f} USDT')
+        if p.get('exit_trigger'):lines.append('Uitgang vastgesteld; wacht op verse uitvoeringsquote.')
     if counts:
         lines.append('Een uitkomst per munt/afgesloten candle; geen herhaalde scans:')
         lines.extend(f'• {LABELS.get(k,k)}: {v}' for k,v in counts.items())
     for symbol,info in DIAGNOSTICS.items():
+        if time.time()-(info['ts']+DURATION['15m'])/1000>1800:continue
         stamp = datetime.fromtimestamp((info['ts']+DURATION['15m'])/1000,timezone.utc).strftime('%H:%M UTC')
         lines.append(f'{symbol} [{stamp}]: {LABELS.get(info["reason"],info["reason"])}')
     lines.append('Paper schat fills/kosten; geen echte orders en geen funding.')
@@ -839,12 +982,12 @@ def startup():
     if any(s['symbol'] not in META for s in STATE['shadows'].values()):
         raise RuntimeError('Saved shadow instrument unavailable; do not discard paired history.')
     risk_gate()
-    notify(f'🧪 {VERSION} gestart: PAPER\n{", ".join(META)}\n4H EMA20/50 + helling | 15m pullback + engulfing OF rejection-bevestiging\n'
+    notify(f'🧪 {VERSION} gestart: PAPER\n{", ".join(META)}\n4H EMA20/50 + helling | 15m PULLBACK OF CONSOLIDATIE-BREAKOUT\n'
            f'4-candle pullback | zonebuffer 0.25 ATR | wick 1.5× | signaal 5 min | drift 0.35 ATR\n'
            f'Startsaldo {INITIAL_CAPITAL:.2f} | risicodoel {RISK_PER_TRADE*100:g}% | maximaal {MAX_TRADES_PER_DAY} entries/dag\n'
-           f'1 positie | 1.8R | tijdslimiet 4 uur | geen echte orders')
+           f'2 posities | gezamenlijk risico maximaal 0.5% | totale positiewaarde maximaal 95% equity\n1.8R | tijdslimiet 4 uur | geen echte orders')
     notify('Alle geldige kandidaten worden vergeleken op een vaste selectiescore; geen bewezen winstkans. Nieuwe trades meten koersverloop en stop-uitvoering; beide patronen worden geteld.')
-    notify('Afstandsgrens 0.75 ATR actief. Basis blijft 1.8R; shadow test +1 nettoR→kostendekkende bid/ask-stop. Alleen volledig gesloten paren worden vergeleken; gaps kunnen ook bij BE verlies geven.')
+    notify('Pullback-afstandsgrens 0.75 ATR; breakout maximaal 0.50 ATR voorbij range. Basis blijft 1.8R; shadow test +1 nettoR→kostendekkende bid/ask-stop. Alleen volledig gesloten paren worden vergeleken; gaps kunnen ook bij BE verlies geven.')
     summary=historical_loss_summary()
     if summary:notify(summary)
     if skipped:notify('Niet beschikbaar, overgeslagen: '+', '.join(skipped))
@@ -878,6 +1021,8 @@ def main():
             if time.time()>=next_scan:
                 if not gate and len(STATE['positions'])<MAX_POSITIONS:
                     scan_entries(list(META),counts)
+                else:
+                    observe_signals(list(META),counts)
                 next_scan=time.time()+SCAN_SECONDS
             if time.time()-last_report>=REPORT_SECONDS:
                 reported = counts + Counter(OUTCOMES.values())
