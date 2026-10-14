@@ -1,5 +1,3 @@
-ccxt
-pandas
-pandas_ta
-flask
-requests
+polymarket-client==0.13.0
+requests>=2.32.3,<3
+flask>=3.1,<4
