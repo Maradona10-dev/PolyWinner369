@@ -37,7 +37,8 @@ from polymarket import AsyncPublicClient
 from polymarket.streams import MarketSpec
 from websockets.asyncio.client import connect
 
-VERSION = "7.0-BTC-Repricing-PAPER"
+VERSION = "7.1-BTC-Repricing-PAPER"
+COMPATIBLE_LEDGERS = {"7.0-BTC-Repricing-PAPER", VERSION}
 STAKE = float(os.getenv("PAPER_TRADE_AMOUNT", "7.50"))
 START_BALANCE = float(os.getenv("PAPER_BALANCE", "1000"))
 DATA_DIR = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or os.getenv("BOT_DATA_DIR", "."))
@@ -57,6 +58,13 @@ EXECUTION_DELAY = .250                  # plus actual REST round-trip time
 MAX_ENTRY_WAIT = 1.5
 MAX_BTC_AGE, MAX_BOOK_AGE = 1.0, 2.0
 MAX_FEED_SKEW = 1.5
+VOL_WINDOW_SECONDS = 180
+VOL_MIN_SECONDS = 60
+VOL_MIN_RETURNS = 30
+VOL_MAX_INTERVAL = 10
+HISTORY_EVENT_MAX_AGE = 10
+BOOK_REPAIR_INTERVAL = 3
+BTC_IDLE_RECONNECT = 15
 MAX_HOLD_SECONDS = 15
 EXIT_BEFORE_EXPIRY = 20
 STOP_LOSS_PER_SHARE = .04
@@ -110,6 +118,7 @@ class Book:
     tick: float = 0.
     minimum: float = 0.
     ready: bool = False
+    revision: int = 0
 
     def snapshot(self, payload, now):
         if str(payload.asset_id) != self.asset or str(payload.condition_id) != self.condition:
@@ -135,6 +144,7 @@ class Book:
             self.minimum = finite(minimum)
         self.bids, self.asks = bids, asks
         self.source, self.received, self.ready = ts, now, True
+        self.revision += 1
         return True
 
     def delta(self, change, ts, now):
@@ -152,6 +162,7 @@ class Book:
         else:
             levels[price] = size
         self.source, self.received = ts, now
+        self.revision += 1
 
     def check(self, now):
         if not self.ready or not fresh(self.source, self.received, now, MAX_BOOK_AGE):
@@ -219,41 +230,69 @@ def sell_quote(book, market, qty, now):
 class Spot:
     def __init__(self):
         self.price = self.source = self.received = 0.
-        self.samples = deque(maxlen=125)
+        self.samples = deque(maxlen=600)
+        self.segment = 0
+        self.event_stats = Counter()
+        self.event_ages = deque(maxlen=3000)
+        self.last_wire = 0.
 
-    def reset(self):
+    def reset(self, preserve_history=False):
+        # A disconnect invalidates the tradable price, not all recent volatility.
+        # Never calculate a return spanning a disconnected segment.
         self.price = self.source = self.received = 0.
-        self.samples.clear()
+        self.segment += 1
+        if not preserve_history:
+            self.samples.clear()
 
     def update(self, price, ts, now):
         price, ts = finite(price), finite(ts)
-        if price <= 0 or ts < self.source or not -.5 <= now-ts <= MAX_BTC_AGE:
+        age = now-ts
+        self.last_wire = now
+        self.event_stats["received"] += 1
+        self.event_ages.append(age)
+        latest = self.samples[-1][0] if self.samples else 0
+        if price <= 0 or ts < max(self.source, latest):
+            self.event_stats["out_of_order_or_invalid"] += 1
             return
-        if self.source and ts-self.source > 3:
-            self.samples.clear()
+        if not -.5 <= age <= HISTORY_EVENT_MAX_AGE:
+            self.event_stats["too_old_or_future"] += 1
+            return
+        # Historical observations may be useful even when too old for an entry.
+        # check() still applies the original one-second entry freshness limit.
         self.price, self.source, self.received = price, ts, now
+        self.event_stats["fresh" if age <= MAX_BTC_AGE else "history_only"] += 1
         second = int(ts)
+        point = (second, price, self.segment)
         if self.samples and self.samples[-1][0] == second:
-            self.samples[-1] = (second, price)
+            self.samples[-1] = point
         else:
-            self.samples.append((second, price))
+            self.samples.append(point)
+        while self.samples and self.samples[0][0] < ts-VOL_WINDOW_SECONDS:
+            self.samples.popleft()
 
     def check(self, now):
         if not fresh(self.source, self.received, now, MAX_BTC_AGE):
             raise Skip("btc_stale")
 
-    def sigma(self):
-        # Completed seconds only; use one-second realized log-return volatility.
+    def history_metrics(self):
+        # Irregular observed intervals: no invented candles or zero-return fills.
+        # Ignore the still-changing latest second and long/disconnected gaps.
         points = list(self.samples)[:-1]
-        if len(points) < 61:
-            raise Skip("volatility_warmup")
-        variance, seconds = 0., 0.
-        for (t0, p0), (t1, p1) in zip(points, points[1:]):
+        variance, seconds, returns, excluded = 0., 0., 0, 0
+        for (t0, p0, seg0), (t1, p1, seg1) in zip(points, points[1:]):
             dt = t1-t0
-            if dt <= 0 or dt > 2:
-                raise Skip("btc_history_gap")
+            if seg0 != seg1 or dt <= 0 or dt > VOL_MAX_INTERVAL:
+                excluded += 1
+                continue
             variance += math.log(p1/p0)**2
             seconds += dt
+            returns += 1
+        return variance, seconds, returns, excluded
+
+    def sigma(self):
+        variance, seconds, returns, _ = self.history_metrics()
+        if seconds < VOL_MIN_SECONDS or returns < VOL_MIN_RETURNS:
+            raise Skip("volatility_warmup")
         return max(1e-6, math.sqrt(variance/seconds))
 
 
@@ -308,9 +347,10 @@ class Ledger:
                          daily_stopped=False)
         if self.path.exists():
             self.data = json.loads(self.path.read_text())
-            if self.data.get("schema") != 1 or self.data.get("strategy") != VERSION:
+            if self.data.get("schema") != 1 or self.data.get("strategy") not in COMPATIBLE_LEDGERS:
                 raise LedgerError("Onbekende ledger; bestaande data niet overschreven")
             self.validate()
+        self.data["strategy"] = VERSION
         # A paper request interrupted before its atomic fill never filled.
         self.data["pending"] = None
         self.save()
@@ -445,6 +485,10 @@ class Engine:
         self.last_anchor = self.last_forecast = self.last_report = 0.
         self.last_exit_attempt = self.last_resolve = self.next_discovery = 0.
         self.stream_ok = False
+        self.stream_connected = False
+        self.last_book_event = 0.
+        self.book_diagnostics = {}
+        self.last_repair = {}
 
     def notify(self, text):
         LOG.info(text)
@@ -475,10 +519,11 @@ class Engine:
             try:
                 async with connect(BINANCE_WS, ping_interval=20, ping_timeout=20,
                                    open_timeout=10, max_queue=32) as ws:
-                    self.spot.reset()
+                    self.spot.reset(preserve_history=True)
                     self.anchors.clear()
                     delay = 1
-                    async for raw in ws:
+                    while True:
+                        raw = await asyncio.wait_for(ws.recv(), BTC_IDLE_RECONNECT)
                         event = json.loads(raw)
                         if event.get("e") == "aggTrade" and event.get("s") == "BTCUSDT":
                             self.spot.update(event["p"], finite(event["T"])/1000, time.time())
@@ -487,17 +532,19 @@ class Engine:
             except Exception as exc:
                 self.stats["btc_reconnect"] += 1
                 LOG.warning("BTC stream: %s", type(exc).__name__)
-            self.spot.reset()
+            self.spot.reset(preserve_history=True)
             self.anchors.clear()
             await asyncio.sleep(delay)
             delay = min(30, delay*2)
 
-    async def rest_book(self, direction):
-        asset = self.market["assets"][direction]
+    async def rest_book(self, direction, *, market=None, validate=True):
+        market = self.market if market is None else market
+        asset = market["assets"][direction]
         payload = await asyncio.wait_for(self.client.get_order_book(asset_id=asset), 3)
-        book = Book(asset, self.market["condition"])
+        book = Book(asset, market["condition"])
         book.snapshot(payload, time.time())
-        book.check(time.time())
+        if validate:
+            book.check(time.time())
         return book
 
     async def market_stream(self, market):
@@ -505,21 +552,26 @@ class Engine:
         while self.market == market:
             try:
                 self.stream_ok = False
+                self.stream_connected = False
                 self.anchors.clear()
                 # REST metadata then wait for the stream's full snapshots.
                 for direction in ("UP", "DOWN"):
-                    b = await self.rest_book(direction)
+                    b = await self.rest_book(direction, market=market, validate=False)
                     b.ready = False
                     self.books[direction] = b
                 spec = MarketSpec(asset_ids=list(market["assets"].values()), custom_feature_enabled=True)
                 async with await self.client.subscribe(spec) as stream:
                     delay = 1
-                    async for event in stream:
+                    self.stream_connected = True
+                    self.last_book_event = time.time()
+                    while True:
+                        event = await asyncio.wait_for(anext(stream), 15)
                         if getattr(stream, "dropped", 0):
                             raise Skip("stream_messages_dropped")
                         payload, now = event.payload, time.time()
                         if str(getattr(payload, "condition_id", "")) != market["condition"]:
                             continue
+                        self.last_book_event = now
                         if event.type == "book":
                             for b in self.books.values():
                                 if str(payload.asset_id) == b.asset:
@@ -533,6 +585,7 @@ class Engine:
                             for b in self.books.values():
                                 if str(payload.asset_id) == b.asset:
                                     b.tick = finite(payload.new_tick_size)
+                                    b.revision += 1
                         self.stream_ok = all(b.ready for b in self.books.values())
             except asyncio.CancelledError:
                 raise
@@ -540,6 +593,7 @@ class Engine:
                 self.stats["market_reconnect"] += 1
                 LOG.warning("Polymarket stream: %s", type(exc).__name__)
             self.stream_ok = False
+            self.stream_connected = False
             self.anchors.clear()
             for b in self.books.values():
                 b.ready = False
@@ -555,7 +609,63 @@ class Engine:
         self.anchors.clear()
         self.forecasts.clear()
         self.stream_ok = False
+        self.stream_connected = False
+        self.last_repair.clear()
+        self.book_diagnostics.clear()
         self.stream_task = asyncio.create_task(self.market_stream(market))
+
+    async def repair_book(self, direction, market):
+        before = self.books.get(direction)
+        revision = before.revision if before else -1
+        try:
+            candidate = await self.rest_book(direction, market=market, validate=False)
+            if self.market != market or not self.stream_connected:
+                return
+            live = self.books.get(direction)
+            # Do not overwrite a more recent stream update with an in-flight REST response.
+            changed = live is not before or (live and live.revision != revision)
+            if live and (candidate.source < live.source or
+                         (changed and candidate.source <= live.source)):
+                self.stats["repair_older_than_stream"] += 1
+                return
+            candidate.revision = (live.revision+1) if live else 1
+            self.books[direction] = candidate
+            self.stream_ok = len(self.books) == 2 and all(b.ready for b in self.books.values())
+            self.anchors.clear()  # new model anchor after resynchronization
+            self.forecasts.clear()
+            try:
+                candidate.check(time.time())
+                status = "hersteld"
+                self.stats["book_repaired"] += 1
+            except Skip as exc:
+                status = str(exc)
+                self.stats["rest_confirmed:"+status] += 1
+            self.book_diagnostics[direction] = status
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            status = "REST:"+type(exc).__name__
+            self.book_diagnostics[direction] = status
+            self.stats["repair_failed:"+type(exc).__name__] += 1
+
+    async def repair_books(self):
+        while True:
+            market = self.market
+            if market and time.time() < market["expiry"] and self.stream_connected:
+                tasks = []
+                for direction in ("UP", "DOWN"):
+                    try:
+                        if direction not in self.books:
+                            raise Skip("book_missing")
+                        self.books[direction].check(time.time())
+                    except Skip:
+                        key = (market["slug"], direction)
+                        if time.monotonic()-self.last_repair.get(key, -100) >= BOOK_REPAIR_INTERVAL:
+                            self.last_repair[key] = time.monotonic()
+                            tasks.append(self.repair_book(direction, market))
+                if tasks:
+                    await asyncio.gather(*tasks)
+            await asyncio.sleep(.5)
 
     def paired_mid(self, now):
         self.spot.check(now)
@@ -615,6 +725,8 @@ class Engine:
             if time.monotonic()-started > MAX_ENTRY_WAIT:
                 raise Skip("entry_too_slow")
             self.spot.check(now)
+            if anchor not in self.anchors:
+                raise Skip("anchor_invalidated")
             if abs(book.source-self.spot.source) > MAX_FEED_SKEW:
                 raise Skip("feed_time_skew")
             self.ledger.allowed(self.market, now)
@@ -694,25 +806,43 @@ class Engine:
                     f"Vrij paper saldo ${self.ledger.data['cash']:.2f}")
 
     def report(self):
+        now = time.time()
         d, s = self.ledger.data, self.scores
         trades = d["trades"]
         msg = (f"{VERSION}\nOpen {int(d['position'] is not None)} | gesloten {len(trades)} | "
                f"winst {sum(t['pnl']>0 for t in trades)}\n"
                f"Vrij ${d['cash']:.2f} | netto gerealiseerd ${sum(t['pnl'] for t in trades):+.2f}\n"
                f"Controles sinds vorig rapport (herhalingen mogelijk): {dict(self.stats)}\n")
+        _, seconds, returns, excluded = self.spot.history_metrics()
+        msg += (f"BTC historie: {seconds:.0f}/{VOL_MIN_SECONDS}s bruikbaar, "
+                f"{returns}/{VOL_MIN_RETURNS} rendementen, {excluded} intervallen overgeslagen.\n")
+        if self.spot.event_ages:
+            ages = sorted(self.spot.event_ages)
+            p95 = ages[min(len(ages)-1, int(len(ages)*.95))]
+            msg += (f"BTC berichtleeftijd p50/p95: {ages[len(ages)//2]*1000:.0f}/"
+                    f"{p95*1000:.0f} ms | berichten {dict(self.spot.event_stats)}\n")
+        msg += f"Huidige BTC-prijsleeftijd: {now-self.spot.source:.2f}s\n" if self.spot.source else "BTC: wacht op verse prijs\n"
+        for direction, b in self.books.items():
+            bid = f"{max(b.bids):.3f}" if b.bids else "leeg"
+            ask = f"{min(b.asks):.3f}" if b.asks else "leeg"
+            msg += (f"{direction}: bid {bid}, ask {ask}, niveaus {len(b.bids)}/{len(b.asks)}, "
+                    f"leeftijd {now-b.source:.1f}s | REST {self.book_diagnostics.get(direction, 'niet nodig')}\n")
         if s["n"]:
             msg += (f"2s quotevoorspelling, n={s['n']}: fout model {s['model_error']/s['n']:.4f}, "
                     f"onveranderde quote {s['baseline_error']/s['n']:.4f}. Lager is beter.\n")
         msg += "PAPER: geschatte fills/kosten; modelkans is ongekalibreerd. Geen live orders."
         self.notify(msg[:3900])
         self.stats.clear()
+        self.spot.event_stats.clear()
+        self.spot.event_ages.clear()
 
     async def run(self):
         self.notify(f"{VERSION} gestart\nBTC-only | inzet ${STAKE:.2f} | realtime feeds\n"
                     f"Bruto edge ≥{MIN_GROSS_EDGE:.2f}, netto ruimte ≥{MIN_NET_EDGE:.2f}/aandeel\n"
                     f"Max. houdtijd {MAX_HOLD_SECONDS}s (verkooppoging, geen vulgarantie).\n"
-                    "Aparte paper-administratie; oude momentumhistorie blijft behouden.")
-        jobs = [asyncio.create_task(self.spot_stream()), asyncio.create_task(self.telegram_worker())]
+                    "Feedherstel actief; bestaande paperhistorie en posities blijven behouden.")
+        jobs = [asyncio.create_task(self.spot_stream()), asyncio.create_task(self.telegram_worker()),
+                asyncio.create_task(self.repair_books())]
         try:
             while True:
                 now = time.time()
@@ -731,6 +861,8 @@ class Engine:
                         await self.manage_position()
                     else:
                         self.ledger.allowed(self.market, now)
+                        if not ENTRY_TIME_MIN <= self.market["expiry"]-now <= ENTRY_TIME_MAX:
+                            raise Skip("outside_entry_window")
                         anchor = self.observe(now)
                         direction = "UP" if self.spot.price > anchor["spot"] else "DOWN"
                         await self.enter(direction, anchor)
