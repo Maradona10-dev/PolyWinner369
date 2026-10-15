@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Polymarket momentum v6 — Python 3.11+, SDK 0.13.0.
+"""Polymarket momentum v6.1 — Python 3.11+, SDK 0.13.0.
 Momentum thresholds, RSI rounding, pair order and 120..255s window are from
 user-supplied v5.3. No pullback route. The old 15m check always returned NEUTRAL
 (10 closes <15 needed for RSI): preserved explicitly, NOT silently strengthened.
 Binance remains a SIGNAL reference only. Payoff uses official RESOLVED payouts.
 Paper buys walk real asks with an adverse one-tick estimate and dynamic fees.
 Paper is a snapshot simulation, not a reservation or guarantee of live fills.
+Two independent paper-only research portfolios test a 0.60 price cap and
+two consecutive momentum observations. Original strategy remains the baseline.
+Research positions have separate cash and cannot place live orders.
 LIVE: explicit Python setting, FOK with hard 0.70 cap; persisted intent BEFORE
 posting. Ambiguous submission blocks ALL new entries, never retries blindly.
 Live trade quantities/prices come from CONFIRMED account fills. Fee figures
@@ -31,16 +34,21 @@ from decimal import Decimal, ROUND_FLOOR
 import requests
 from polymarket import PublicClient, SecureClient, RelayerApiKey
 
-VERSION = '6.0-Polymarket-Momentum'
+VERSION = '6.1-Polymarket-Momentum-Lab'
 MODE = 'paper'                    # change to 'live' EXPLICITLY after account check
 PAIRS = ['BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT','XRPUSDT','DOGEUSDT','ZECUSDT']
 MAX_TRADES_PER_CYCLE = 2
 MAX_ALLOWABLE_ODDS = Decimal('0.70')
 PAPER_START = 1000.0
-PAPER_TRADE_AMOUNT = Decimal('7.5')  # all-in budget, including modeled fees
+PAPER_TRADE_AMOUNT = Decimal('7.50')  # all-in budget, including modeled fees
 LIVE_TRADE_AMOUNT = Decimal('5')    # all-in target; actual fees can change
 SCAN_INTERVAL_SEC = 10
 PAPER_SLIPPAGE_TICKS = 1
+# Experiments are PAPER ONLY, independent of the original portfolio.
+PAPER_RESEARCH = True
+RESEARCH_CAP = Decimal('0.60')   # hypothesis to test, not an optimized parameter
+CONFIRM_MIN_SECONDS = 3
+CONFIRM_MAX_SECONDS = 30
 MAX_BOOK_AGE = 15
 REPORT_SECONDS = 1800
 # False reproduces v5.3's EFFECTIVE neutral 15m behavior. True would be a
@@ -54,6 +62,9 @@ LIVE = None
 STATE = None
 STATE_FILE = None
 COUNTS = Counter()
+OBSERVATIONS = {}
+UNIQUE_CHECKS = set()
+UNIQUE_COUNTS = Counter()
 
 class Skip(Exception): pass
 
@@ -88,7 +99,14 @@ def load_state(wallet=None):
             raise RuntimeError('State hoort bij andere modus/wallet; niet overschrijven.')
     else:
         STATE={'mode':MODE,'wallet':wallet,'cash':PAPER_START,'trades':{},'started':time.time()}
-        save()
+    # Migrate in place: never overwrite original cash, trades or pending live intent.
+    if MODE=='paper' and PAPER_RESEARCH:
+        STATE.setdefault('research_started',time.time())
+        arms=STATE.setdefault('research',{})
+        for name in ('prijs060','bevestigd060'):
+            arms.setdefault(name,dict(cash=PAPER_START,trades={},started=time.time()))
+        STATE.setdefault('book_diagnostics',{})
+    save()
 
 
 def get_json(url,params=None):
@@ -192,15 +210,17 @@ def fee_per_share(price,record):
     return rate*((p*(1-p))**exponent)
 
 
-def paper_quote(book,record,budget):
+def paper_quote(book,record,budget,cap=None,slippage_ticks=None):
+    cap=MAX_ALLOWABLE_ODDS if cap is None else dec(cap)
+    slippage_ticks=PAPER_SLIPPAGE_TICKS if slippage_ticks is None else slippage_ticks
     now=time.time()
     if book.timestamp is None or not -5<=now-book.timestamp.timestamp()<=MAX_BOOK_AGE:raise Skip('book_stale')
     if str(book.asset_id)!=record['asset_id'] or str(book.condition_id)!=record['condition_id']:raise Skip('wrong_book')
     left=dec(budget);qty=Decimal(0);notional=Decimal(0);fee=Decimal(0)
     for level in sorted(book.asks,key=lambda x:x.price):
-        price=dec(level.price)+PAPER_SLIPPAGE_TICKS*dec(book.tick_size)
+        price=dec(level.price)+slippage_ticks*dec(book.tick_size)
         size=dec(level.size)
-        if price>MAX_ALLOWABLE_ODDS:break
+        if price>cap:break
         if size<=0 or price<=0:continue
         unitfee=fee_per_share(price,record)
         take=min(size,left/(price+unitfee))
@@ -247,13 +267,15 @@ def live_client():
     return client
 
 
-def open_trade(data,direction):
+def open_trade(data,direction,prepared=None):
     key=f'{data["cycle"]}:{data["symbol"]}:MOMENTUM'
     if key in STATE['trades']:return
     if any(t['status'] in ('intent','unknown','submitted','reconcile') for t in STATE['trades'].values()):
         raise Skip('live_reconciliation_pending')
-    _,contract=discover(data['symbol'],data['cycle'],direction)
-    book=PUBLIC.get_order_book(asset_id=contract['asset_id'])
+    if prepared is None:
+        _,contract=discover(data['symbol'],data['cycle'],direction)
+        book=PUBLIC.get_order_book(asset_id=contract['asset_id'])
+    else:contract,book=prepared
     amount=PAPER_TRADE_AMOUNT if MODE=='paper' else LIVE_TRADE_AMOUNT
     quote=paper_quote(book,contract,amount)
     if MODE=='paper' and dec(STATE['cash'])<dec(quote['spent']):raise Skip('paper_insufficient_cash')
@@ -340,23 +362,151 @@ def manage():
             save()
             label='PAPER netto geschat' if record['mode']=='paper' else 'LIVE resultaat geschat; redemption nog controleren'
             notify(f'{record["symbol"]} {record["direction"]} officieel RESOLVED\n'
-                   f'Uitbetaling/aandeel {payout:g} | {label}: {record["net_estimate"]:+.2f}\n'
-                   'Livewinst wordt niet automatisch als bijgeschreven saldo gemeld; geen automatische redemption.')
+                   f'Uitbetaling/aandeel {payout:g} | {label}: {record["net_estimate"]:+.2f}'
+                   + ('\nLivewinst nog niet als walletsaldotoename bevestigd; redemption controleren.' if record['mode']=='live' else ''))
         except OSError:raise
         except Exception as e:
             LOG.warning('Positiecontrole %s: %s',record['symbol'],type(e).__name__)
             COUNTS['management_'+type(e).__name__]+=1
 
 
+def count_check(data,reason):
+    """Raw polls plus unique coin/round/reason counts; neither means trade count."""
+    COUNTS[reason]+=1
+    key=(data['cycle'],data['symbol'],reason)
+    if key not in UNIQUE_CHECKS:
+        UNIQUE_CHECKS.add(key);UNIQUE_COUNTS[reason]+=1
+    # Keep memory bounded; reports explicitly describe their observation period.
+    UNIQUE_CHECKS.difference_update(k for k in list(UNIQUE_CHECKS) if k[0]<data['cycle']-3600)
+
+
+def observe(data,direction,now=None):
+    """Two consecutive qualifying observations, no future candles or backfills."""
+    now=time.time() if now is None else now
+    previous=OBSERVATIONS.get(data['symbol'])
+    current=dict(cycle=data['cycle'],direction=direction,price=data['price'],time=now)
+    OBSERVATIONS[data['symbol']]=current
+    if not direction or not previous or previous['direction']!=direction or previous['cycle']!=data['cycle']:
+        return False
+    dt=now-previous['time']
+    return (CONFIRM_MIN_SECONDS<=dt<=CONFIRM_MAX_SECONDS
+            and (data['price']-previous['price'])*(1 if direction=='UP' else -1)>=0)
+
+
+def book_reason(book,cap,budget,record):
+    """Classify failed quotes without guessing an unavailable market price."""
+    asks=[x for x in book.asks if dec(x.size)>0 and dec(x.price)>0]
+    if not asks:return 'empty_asks'
+    best=min(dec(x.price) for x in asks)
+    if best>cap:return 'price_above_cap'
+    if best+PAPER_SLIPPAGE_TICKS*dec(book.tick_size)>cap:return 'buffer_above_cap'
+    return 'depth_under_cap'
+
+
+def diagnose_book(data,direction,book,record):
+    key=f'{data["cycle"]}:{data["symbol"]}:{direction}'
+    results={}
+    for label,amount,cap,ticks in (
+        ('basis',PAPER_TRADE_AMOUNT,MAX_ALLOWABLE_ODDS,PAPER_SLIPPAGE_TICKS),
+        ('prijs060',PAPER_TRADE_AMOUNT,RESEARCH_CAP,PAPER_SLIPPAGE_TICKS),
+        ('basis_zonder_buffer',PAPER_TRADE_AMOUNT,MAX_ALLOWABLE_ODDS,0)):
+        try:
+            q=paper_quote(book,record,amount,cap=cap,slippage_ticks=ticks)
+            results[label]=dict(ok=True,vwap=q['average_price'],fee=q['fee_estimate'])
+        except Skip as e:
+            reason=str(e)
+            if reason=='insufficient_depth_under_price_cap':reason=book_reason(book,cap,amount,record)
+            results[label]=dict(ok=False,reason=reason)
+    asks=[float(x.price) for x in book.asks if dec(x.size)>0]
+    STATE['book_diagnostics'][key]=dict(symbol=data['symbol'],direction=direction,
+                                      at=time.time(),best_ask=min(asks) if asks else None,quotes=results)
+    # Only recent snapshots; full executed-trade records stay in their ledgers.
+    keys=sorted(STATE['book_diagnostics'],key=lambda k:STATE['book_diagnostics'][k]['at'])
+    for old in keys[:-80]:del STATE['book_diagnostics'][old]
+    if not results['basis']['ok']:count_check(data,'basis_'+results['basis']['reason'])
+    save()
+
+
+def research_scan(data,direction,confirmed):
+    """Independent paper portfolios. Never call an authenticated client here."""
+    if MODE!='paper' or not PAPER_RESEARCH:return None
+    _,contract=discover(data['symbol'],data['cycle'],direction)
+    book=PUBLIC.get_order_book(asset_id=contract['asset_id'])
+    diagnose_book(data,direction,book,contract)
+    key=f'{data["cycle"]}:{data["symbol"]}:MOMENTUM'
+    for name,arm in STATE['research'].items():
+        if key in arm['trades']:continue
+        if sum(t['cycle']==data['cycle'] for t in arm['trades'].values())>=MAX_TRADES_PER_CYCLE:continue
+        if name=='bevestigd060' and not confirmed:
+            count_check(data,'test_wacht_op_bevestiging');continue
+        try:
+            quote=paper_quote(book,contract,PAPER_TRADE_AMOUNT,cap=RESEARCH_CAP)
+            # Time checked after market discovery and diagnostics, not at scan start.
+            if not 120<=data['expiry']-time.time()<=255:raise Skip('signal_expired')
+            if dec(arm['cash'])<dec(quote['spent']):raise Skip('paper_insufficient_cash')
+            record=dict(data,**contract,**quote,direction=direction,key=key,opened=time.time(),
+                        mode='paper',status='open',arm=name,fee_basis='orderbook_model',
+                        second_observation_confirmed=bool(confirmed),price_cap=float(RESEARCH_CAP))
+            arm['trades'][key]=record;arm['cash']-=quote['spent'];save()
+            LOG.info('PAPER TEST %s %s %s VWAP %.4f',name,data['symbol'],direction,quote['average_price'])
+        except Skip as e:count_check(data,'test_'+name+'_'+str(e))
+    return contract,book
+
+
+def manage_research():
+    if MODE!='paper' or not PAPER_RESEARCH:return
+    # Shared resolution per condition, so two portfolios do not double API load.
+    payouts={}
+    for name,arm in STATE.get('research',{}).items():
+        for record in arm['trades'].values():
+            if record['status']!='open' or time.time()<record['expiry']+3:continue
+            if time.time()-record.get('last_resolution_check',0)<20:continue
+            record['last_resolution_check']=time.time()
+            try:
+                key=(record['condition_id'],record['outcome_index'])
+                if key not in payouts:payouts[key]=final_payout(record)
+                payout=payouts[key]
+                if payout is None:continue
+                value=record['shares']*payout
+                record.update(status='resolved',payout_per_share=payout,payout=value,
+                              net_estimate=value-record['spent'],resolved_at=time.time())
+                arm['cash']+=value;save()
+            except OSError:raise
+            except Exception as e:
+                LOG.warning('Research resolution %s: %s',name,type(e).__name__)
+                COUNTS['research_resolution_error']+=1
+
+
+def portfolio_line(label,trades):
+    closed=[t for t in trades if t['status']=='resolved']
+    open_=[t for t in trades if t['status']=='open']
+    wins=sum(t['net_estimate']>0 for t in closed)
+    net=sum(t['net_estimate'] for t in closed)
+    spent=sum(t['spent'] for t in closed)
+    roi=100*net/spent if spent else 0
+    return f'{label}: {len(closed)} afgerond, {wins} winst, netto {net:+.2f}, ROI op inzet {roi:+.1f}%, open {len(open_)}'
+
+
 def status():
-    closed=[t for t in STATE['trades'].values() if t['status']=='resolved']
-    open_=[t for t in STATE['trades'].values() if t['status']=='open']
-    uncertain=[t for t in STATE['trades'].values() if t['status'] in ('intent','unknown','submitted','reconcile')]
-    return (f'{VERSION} | {MODE.upper()}\nOpen {len(open_)} | wachtende/onzekere orders {len(uncertain)}\n'
-            f'Afgerond {len(closed)} | winst {sum(t["net_estimate"]>0 for t in closed)} | netto GESCHAT {sum(t["net_estimate"] for t in closed):+.2f}\n'
-            +(f'Paper vrij {STATE["cash"]:.2f} | inzet geblokkeerd in open trades {sum(t["spent"] for t in open_):.2f}\n' if MODE=='paper' else '')
-            +'Afwijzingen/controles: '+str(dict(COUNTS))+'\n'
-            +'Opslag: '+('Railway-volume ingesteld; koppeling controleren' if os.getenv('RAILWAY_VOLUME_MOUNT_PATH') else 'lokaal; volume nodig voor behoud bij deployment'))
+    trades=list(STATE['trades'].values())
+    uncertain=sum(t['status'] in ('intent','unknown','submitted','reconcile') for t in trades)
+    lines=[f'{VERSION} | {MODE.upper()}',portfolio_line('Basis totaal',trades),f'Onzekere orders {uncertain}']
+    if MODE=='paper':
+        lines.append(f'Paper vrij {STATE["cash"]:.2f} | all-in inzet {PAPER_TRADE_AMOUNT:.2f}')
+        if PAPER_RESEARCH:
+            start=STATE['research_started']
+            lines.append('VERGELIJKING VANAF '+datetime.fromtimestamp(start,timezone.utc).strftime('%d-%m %H:%M UTC'))
+            lines.append(portfolio_line('Basis 0.70 nieuw',[t for t in trades if t.get('opened',0)>=start]))
+            for name,arm in STATE['research'].items():lines.append(portfolio_line(name,list(arm['trades'].values())))
+            lines.append('Tests hebben eigen fictief saldo; aantallen kunnen verschillen. Netto/ROI blijven simulaties.')
+            recent=sorted(STATE.get('book_diagnostics',{}).values(),key=lambda d:d['at'],reverse=True)[:2]
+            for item in recent:
+                q=item['quotes']['basis'];result=f'VWAP {q["vwap"]:.3f}' if q['ok'] else q['reason']
+                lines.append(f'Laatste boek {item["symbol"]} {item["direction"]}: {result}')
+    lines.append('Unieke munt/ronde/reden sinds rapport: '+str(dict(UNIQUE_COUNTS)))
+    lines.append('Ruwe herhaalde controles: '+str(dict(COUNTS)))
+    lines.append('Opslag: '+('Railway-volume ingesteld; koppeling controleren' if os.getenv('RAILWAY_VOLUME_MOUNT_PATH') else 'lokaal; volume nodig voor behoud bij deployment'))
+    return '\n'.join(lines)
 
 
 def main():
@@ -375,7 +525,8 @@ def main():
     load_state(str(LIVE.wallet) if LIVE else None)
     notify(f'{VERSION} gestart | {MODE.upper()}\nAlleen oorspronkelijke MOMENTUM-regels, 120–255s resterend.\n'
            'Echte orderboeken, plafond 0.70; officiële resolutie. 15m-filter neutraal zoals oorspronkelijke code.\n'
-           'Binance bepaalt signaal, niet Polymarket-afrekening. Paperresultaat blijft een simulatie.')
+           'Binance bepaalt signaal, niet Polymarket-afrekening. Paperresultaat blijft een simulatie.'
+           + (f'\nPAPER vergelijking: basis 0.70 / prijs060 / bevestigd060. Elk eigen saldo; inzet {PAPER_TRADE_AMOUNT:.2f}.' if MODE=='paper' and PAPER_RESEARCH else ''))
     if 'PORT' in os.environ:
         from flask import Flask
         app=Flask(__name__)
@@ -386,18 +537,32 @@ def main():
     report=0
     try:
         while True:
-            manage()
+            manage();manage_research()
             cycle=int(time.time())//300*300
             count=sum(t['cycle']==cycle for t in STATE['trades'].values())
             for symbol in PAIRS:
                 manage()
-                if count>=MAX_TRADES_PER_CYCLE:break
+                # Recompute after every attempt, including post-save notification errors.
+                count=sum(t['cycle']==cycle for t in STATE['trades'].values())
+                if count>=MAX_TRADES_PER_CYCLE and not (MODE=='paper' and PAPER_RESEARCH):break
                 try:
                     data=signal_data(symbol)
                     if data['cycle']!=cycle:break
-                    direction=momentum(symbol,data['rsi'],data['delta'],data['volume_ratio'],data['expiry']-time.time(),data['trend'])
-                    if not direction:COUNTS['no_momentum']+=1;continue
-                    before=len(STATE['trades']);open_trade(data,direction)
+                    remaining=data['expiry']-time.time()
+                    direction=momentum(symbol,data['rsi'],data['delta'],data['volume_ratio'],remaining,data['trend'])
+                    confirmed=observe(data,direction)
+                    if not direction:
+                        count_check(data,'outside_window' if not 120<=remaining<=255 else 'no_momentum');continue
+                    prepared=None
+                    try:prepared=research_scan(data,direction,confirmed)
+                    except OSError:raise
+                    except Exception as e:
+                        # An experimental portfolio may not prevent a baseline attempt.
+                        LOG.warning('Research scan %s: %s',symbol,type(e).__name__)
+                        COUNTS['research_scan_error']+=1
+                    if count>=MAX_TRADES_PER_CYCLE:
+                        count_check(data,'basis_round_limit');continue
+                    before=len(STATE['trades']);open_trade(data,direction,prepared=prepared)
                     count+=len(STATE['trades'])-before
                 except Skip as e:COUNTS[str(e)]+=1
                 except requests.RequestException as e:COUNTS[type(e).__name__]+=1
@@ -405,11 +570,12 @@ def main():
                 except Exception as e:
                     LOG.warning('Scan %s: %s',symbol,type(e).__name__);COUNTS[type(e).__name__]+=1
             if time.time()-report>=REPORT_SECONDS:
-                notify(status());COUNTS.clear();report=time.time()
+                notify(status());COUNTS.clear();UNIQUE_COUNTS.clear();UNIQUE_CHECKS.clear();report=time.time()
             if 'PORT' in os.environ:heartbeat[0]=time.time()
             time.sleep(SCAN_INTERVAL_SEC)
     finally:
         save();PUBLIC.close()
         if LIVE:LIVE.close()
+        lock.close()
 
 if __name__=='__main__':main()
