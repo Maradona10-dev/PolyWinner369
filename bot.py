@@ -1,7 +1,17 @@
 """BTC 5m repricing + public event recording + offline replay — PAPER ONLY.
 Python 3.12. Start as usual: python bot.py
 
-v7.3 adds a bounded local receive-order journal, retaining ~1GiB in replay/.
+v7.4: observation candidates and paper execution limits are separate.
+Eligible candidates are sampled at most once per 10 seconds, including while
+accounts are blocked. Rejected/cancelled candidates do not consume the cap of
+two actual paper entries per account per market. Existing fill counts migrate
+from closed trades and open positions. Old balances/history are preserved.
+Both filled and rejected quotes have hypothetical 1/2/5/15-second follow-ups;
+the five-minute report shows separate cohorts, missing observations and costs.
+These overlapping observations are not independent trades or account PnL.
+The cost guard, sizing, one-tick stress and exit rules have not been relaxed.
+
+The bounded local receive-order journal retains ~1GiB in replay/.
 Market changes, BTC updates, atomic L2 snapshots/deltas, reconnects, eligible
 signals and 100ms decision clocks are recorded without blocking on disk.
 Existing ledgers are preserved. A recording/clock failure blocks NEW entries.
@@ -66,8 +76,8 @@ from polymarket import AsyncPublicClient
 from polymarket.streams import MarketSpec
 from websockets.asyncio.client import connect
 
-VERSION = "7.3-BTC-Replay-PAPER"
-COMPATIBLE_LEDGERS = {"7.0-BTC-Repricing-PAPER", "7.1-BTC-Repricing-PAPER", "7.2-BTC-Paired-PAPER", VERSION}
+VERSION = "7.4-BTC-Candidate-PAPER"
+COMPATIBLE_LEDGERS = {"7.0-BTC-Repricing-PAPER", "7.1-BTC-Repricing-PAPER", "7.2-BTC-Paired-PAPER", "7.3-BTC-Replay-PAPER", VERSION}
 STAKE = float(os.getenv("PAPER_TRADE_AMOUNT", "7.50"))
 START_BALANCE = float(os.getenv("PAPER_BALANCE", "1000"))
 DATA_DIR = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or os.getenv("BOT_DATA_DIR", "."))
@@ -78,7 +88,8 @@ MARKOUT_HORIZONS = (1, 2, 5, 15)
 MARKOUT_TOLERANCE = .4
 ENTRY_STOP_BUFFER = .005
 LAB_TAKE_PROFIT = .01
-MAX_TRIALS_PER_ROUND = 2
+MAX_PAPER_ENTRIES_PER_ROUND = 2
+CANDIDATE_INTERVAL = 10  # Sample eligible candidates, also while paper accounts are blocked.
 BINANCE_WS = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
 # Experimental starting settings, not optimized performance claims.
 MIN_GROSS_EDGE = .05
@@ -232,6 +243,7 @@ class Book:
 def buy_quote(book, market, budget, now):
     book.check(now)
     remaining, qty, notional, fees = budget, 0., 0., 0.
+    raw_notional = slippage_cost = 0.
     for price, size in sorted(book.asks.items()):
         price += SLIPPAGE_TICKS*book.tick
         if price > MAX_PRICE:
@@ -242,6 +254,8 @@ def buy_quote(book, market, budget, now):
         take = min(size, remaining/(price+unit_fee))
         qty += take
         notional += take*price
+        raw_notional += take*(price-SLIPPAGE_TICKS*book.tick)
+        slippage_cost += take*SLIPPAGE_TICKS*book.tick
         fees += take*unit_fee
         remaining -= take*(price+unit_fee)
         if remaining < 1e-8:
@@ -252,18 +266,22 @@ def buy_quote(book, market, budget, now):
     qty = math.floor(qty*1_000_000)/1_000_000
     if qty < book.minimum:
         raise Skip("minimum_order_size")
-    return dict(qty=qty, spent=notional+fees, fee=fees, price=notional/qty)
+    return dict(qty=qty, spent=notional+fees, fee=fees, price=notional/qty,
+                raw_notional=raw_notional, slippage_cost=slippage_cost)
 
 
 def sell_quote(book, market, qty, now):
     book.check(now)
     remaining, notional, fees = qty, 0., 0.
+    raw_notional = slippage_cost = 0.
     for price, size in sorted(book.bids.items(), reverse=True):
         price -= SLIPPAGE_TICKS*book.tick
         if price <= 0:
             continue
         take = min(size, remaining)
         notional += take*price
+        raw_notional += take*(price+SLIPPAGE_TICKS*book.tick)
+        slippage_cost += take*SLIPPAGE_TICKS*book.tick
         fees += take*fee_unit(price, market)
         remaining -= take
         if remaining < 1e-8:
@@ -272,7 +290,8 @@ def sell_quote(book, market, qty, now):
         raise Skip("insufficient_bid_depth")
     if qty < book.minimum:
         raise Skip("minimum_exit_size")
-    return dict(received=notional-fees, fee=fees, price=notional/qty)
+    return dict(received=notional-fees, fee=fees, price=notional/qty,
+                raw_notional=raw_notional, slippage_cost=slippage_cost)
 
 
 class Spot:
@@ -965,6 +984,49 @@ def cost_guard(book, market, quote, now):
     return immediate, loss
 
 
+def cost_breakdown(book, quote, immediate):
+    """All components in dollars per credited share; sum equals immediate net loss.
+
+    Depth includes conservative share-floor rounding. Slippage is the configured
+    extra tick stress, not measured slippage. Fees use the market's fee schedule.
+    """
+    qty = quote['qty']
+    spread = book.spread()
+    fees = (quote['fee']+immediate['fee'])/qty
+    slippage = (quote['slippage_cost']+immediate['slippage_cost'])/qty
+    total = (quote['spent']-immediate['received'])/qty
+    return dict(spread=spread, fees=fees, slippage=slippage,
+                depth_and_rounding=total-spread-fees-slippage, total=total)
+
+
+def candidate_summary(data):
+    """Descriptive per-arm cohorts; overlapping observations are not independent trades."""
+    results = {}
+    for name in ARM_NAMES:
+        results[name] = {}
+        for cohort in ('filled', 'rejected'):
+            trials = [t for t in data['trials'] if t.get('arms',{}).get(name,{}).get('status') == cohort]
+            costs = [t['arms'][name]['costs'] for t in trials if t['arms'][name].get('costs')]
+            summary = dict(candidates=len(trials), cost_n=len(costs), costs={}, horizons={})
+            if costs:
+                summary['costs'] = {key:sum(c[key] for c in costs)/len(costs) for key in costs[0]}
+            for horizon in MARKOUT_HORIZONS:
+                key = str(horizon)
+                samples = [t.get('markouts',{}).get(key,{}).get('arms',{}).get(name) for t in trials]
+                observed = [s for s in samples if s and s['status']=='observed']
+                priced = [s for s in observed if 'price_pnl' in s and 'total_fees' in s]
+                missing = sum(bool(s and s['status']!='observed') for s in samples)
+                summary['horizons'][key] = dict(n=len(observed), missing=missing,
+                    pending=sum(s is None for s in samples),
+                    net_mean=sum(s['hypothetical_net'] for s in observed)/len(observed) if observed else None,
+                    price_mean=sum(s['price_pnl'] for s in priced)/len(priced) if priced else None,
+                    fees_mean=sum(s['total_fees'] for s in priced)/len(priced) if priced else None,
+                    priced_n=len(priced),
+                    positive=sum(s['hypothetical_net']>0 for s in observed))
+            results[name][cohort] = summary
+    return results
+
+
 def lab_summary(data):
     """Full-account and matched-cohort results are deliberately separate."""
     totals = {}
@@ -994,6 +1056,18 @@ class ComparisonLedger:
             self.data = json.loads(self.path.read_text())
             if self.data.get('schema') != 2 or self.data.get('experiment') != 'paired-v1':
                 raise LedgerError('Onbekende vergelijking; bestand niet overschreven')
+        # Migrate from the old attempt cap. Derive actual fills from accounting;
+        # rejected/cancelled candidates never spend the paper-entry allowance.
+        if 'fill_counts' not in self.data:
+            self.data['fill_counts'] = {name:{} for name in ARM_NAMES}
+            for name,a in self.data['arms'].items():
+                counts = self.data['fill_counts'][name]
+                for t in a['trades']:
+                    counts[t['market']] = counts.get(t['market'],0)+1
+                p = a['position']
+                if p:
+                    slug = p['market']['slug']
+                    counts[slug] = counts.get(slug,0)+1
         self.validate()
         # Atomic fills are either present in both account state and trial, or absent.
         for trial in self.data['trials']:
@@ -1051,23 +1125,26 @@ class ComparisonLedger:
             raise Skip('both_accounts_blocked')
         if now-max(d['last_trial'],d['last_exit']) < COOLDOWN_SECONDS:
             raise Skip('comparison_cooldown')
-        if d['round_counts'].get(market['slug'],0) >= MAX_TRIALS_PER_ROUND:
+        if all(d['fill_counts'][name].get(market['slug'],0) >= MAX_PAPER_ENTRIES_PER_ROUND for name in ARM_NAMES):
             raise Skip('comparison_round_limit')
 
+    def observation_allowed(self, market, now):
+        if any(t['status']=='pending' for t in self.data['trials'][-2:]):
+            raise Skip('comparison_pending')
+        if now-self.data['last_trial'] < CANDIDATE_INTERVAL:
+            raise Skip('candidate_sampling_interval')
+
     def begin(self, market, direction, now):
-        self.allowed(market, now)
+        self.observation_allowed(market, now)
         trial = dict(id=self.data['next_id'], market=market.copy(), signal=direction,
                      created=now, status='pending', arms={}, markouts={},
                      policy=dict(stake=STAKE, target=LAB_TAKE_PROFIT, stop=STOP_LOSS_PER_SHARE,
                                  stop_buffer=ENTRY_STOP_BUFFER, hold_seconds=MAX_HOLD_SECONDS,
                                  execution_delay=EXECUTION_DELAY, slippage_ticks=SLIPPAGE_TICKS))
+        trial['policy']['version'] = VERSION
         self.data['next_id'] += 1
         self.data['trials'].append(trial)
         self.data['last_trial'] = now
-        counts = self.data['round_counts']
-        counts[market['slug']] = counts.get(market['slug'],0)+1
-        if len(counts) > 100:
-            self.data['round_counts'] = dict(list(counts.items())[-50:])
         self.save()
         return trial
 
@@ -1083,6 +1160,8 @@ class ComparisonLedger:
             a = self.data['arms'][name]
             if r['status'] == 'filled' and (a['position'] or r['quote']['spent'] > a['cash']):
                 raise LedgerError('Dubbele of ongedekte paperpositie')
+            if r['status']=='filled' and self.data['fill_counts'][name].get(trial['market']['slug'],0) >= MAX_PAPER_ENTRIES_PER_ROUND:
+                raise LedgerError('Paperinstaplimiet overschreden')
         trial.update(status='observing', entered=now, arms=decisions)
         for name,r in decisions.items():
             if r['status'] != 'filled':
@@ -1093,6 +1172,11 @@ class ComparisonLedger:
             a['position'] = dict(**q, trial_id=trial['id'], direction=r['direction'],
                                  market=trial['market'].copy(), entered=now,
                                  immediate_exit=r['immediate_exit'], baseline_loss=r['baseline_loss'])
+            counts = self.data['fill_counts'][name]
+            slug = trial['market']['slug']
+            counts[slug] = counts.get(slug,0)+1
+            if len(counts) > 100:
+                self.data['fill_counts'][name] = dict(list(counts.items())[-50:])
         self.save()
 
     def close(self, name, proceeds, fee, reason, now):
@@ -1126,6 +1210,7 @@ class ComparisonEngine(Engine):
         self.exit_attempts = {}
         self.observe_task = None
         self.research_task = None
+        self.last_candidate_notice = 0.
 
     async def paired_entry(self, trial, anchor):
         market, direction = trial['market'], trial['signal']
@@ -1169,12 +1254,20 @@ class ComparisonEngine(Engine):
                     if b.spread() > MAX_SPREAD:
                         raise Skip('spread')
                     q = buy_quote(b, market, STAKE, now)
-                    row.update(quote=q, bid=max(b.bids), ask=min(b.asks), book_source=b.source)
+                    row.update(quote=q, bid=max(b.bids), ask=min(b.asks), book_source=b.source,
+                               entry_mid=b.mid())
                     immediate = sell_quote(b, market, q['qty'], now)
                     row.update(immediate_exit=immediate['received'],
-                               baseline_loss=(q['spent']-immediate['received'])/q['qty'])
+                               baseline_loss=(q['spent']-immediate['received'])/q['qty'],
+                               costs=cost_breakdown(b,q,immediate))
                     cost_guard(b, market, q, now)
                     a = self.lab.data['arms'][name]
+                    if a['position']:
+                        raise Skip('paper_position_open')
+                    if self.lab.data['fill_counts'][name].get(market['slug'],0) >= MAX_PAPER_ENTRIES_PER_ROUND:
+                        raise Skip('paper_round_fill_limit')
+                    if now-self.lab.data['last_exit'] < COOLDOWN_SECONDS:
+                        raise Skip('paper_exit_cooldown')
                     if a['daily_stopped'] or a['cash'] < q['spent']:
                         raise Skip('account_limit')
                     row['status'] = 'filled'
@@ -1193,8 +1286,18 @@ class ComparisonEngine(Engine):
                                  f"{r['baseline_loss']:.4f}/aandeel")
                 else:
                     lines.append(f"{label} {r['direction']}: overgeslagen — {r['reason']}")
-            lines.append('Gelijke netto exitregels; vervolgmetingen op 1/2/5/15s. Alleen paper.')
-            self.notify('\n'.join(lines))
+                if r.get('costs'):
+                    c = r['costs']
+                    lines.append(f"Kosten cent/aandeel: spread {100*c['spread']:.2f}, "
+                                 f"fees {100*c['fees']:.2f}, extra slippage {100*c['slippage']:.2f}, "
+                                 f"diepte/afronding {100*c['depth_and_rounding']:.2f}; "
+                                 f"totaal {100*c['total']:.2f} (grens {100*(STOP_LOSS_PER_SHARE-ENTRY_STOP_BUFFER):.2f}).")
+            lines.append('Ook afgewezen quotes volgen we op 1/2/5/15s. Metingen wijzigen geen saldo.')
+            if any(r['status']=='filled' for r in decisions.values()) or now-self.last_candidate_notice >= REPORT_SECONDS:
+                self.notify('\n'.join(lines))
+                self.last_candidate_notice = now
+            else:
+                LOG.info('Kandidaat #%s gemeten; beide paperinstappen afgewezen', trial['id'])
         except asyncio.CancelledError:
             self.lab.cancel(trial,'shutdown_before_fill')
             raise
@@ -1237,7 +1340,10 @@ class ComparisonEngine(Engine):
                         out.update(status='observed', bid=max(b.bids), ask=min(b.asks),
                                    source=b.source, mid=b.mid(), price=q['price'],
                                    received=q['received'], exit_fee=q['fee'],
-                                   hypothetical_net=q['received']-row['quote']['spent'])
+                                   hypothetical_net=q['received']-row['quote']['spent'],
+                                   price_pnl=q['received']+q['fee']-row['quote']['spent']+row['quote']['fee'],
+                                   total_fees=q['fee']+row['quote']['fee'],
+                                   mid_move=b.mid()-row['entry_mid'] if 'entry_mid' in row else None)
                     except (Skip,KeyError) as exc:
                         out['reason'] = str(exc)
             if len(trial['markouts']) == len(MARKOUT_HORIZONS):
@@ -1361,7 +1467,7 @@ class ComparisonEngine(Engine):
 
     def report(self):
         totals,paired = lab_summary(self.lab.data)
-        lines = [VERSION, 'Nieuwe vergelijking; twee afzonderlijke fictieve accounts.']
+        lines = [VERSION, 'Twee paperaccounts; kostenfilter actief.']
         for name,a in self.lab.data['arms'].items():
             t = totals[name]
             lines.append(f"{name.upper()}: gesloten {t['n']}, winst {t['wins']}, "
@@ -1373,26 +1479,28 @@ class ComparisonEngine(Engine):
                          f"waarvan kosten bij verliesgrens: {costs}")
         lines.append(f"Beide uitgevoerd én gesloten: {paired['n']} paren | "
                      f"origineel ${paired['original']:+.2f}, reverse ${paired['reverse']:+.2f}")
-        for horizon in MARKOUT_HORIZONS:
-            rows = []
-            missing = 0
-            for tr in self.lab.data['trials']:
-                if not all(tr.get('arms',{}).get(n,{}).get('status') == 'filled' for n in ARM_NAMES):
+        measured = candidate_summary({'trials':self.lab.data['trials'][-200:]})
+        lines.append('VERVOLGMETINGEN — laatste 200 kandidaten, inclusief afwijzingen.')
+        for name in ARM_NAMES:
+            for cohort,label in (('filled','paper uitgevoerd'),('rejected','afgewezen')):
+                summary = measured[name][cohort]
+                lines.append(f"{name.upper()} {label}: {summary['candidates']} kandidaten")
+                c = summary['costs']
+                if c:
+                    lines.append(f"Gem. kosten cent/aandeel (n={summary['cost_n']}): "
+                                 f"spread {100*c['spread']:.2f} + fees {100*c['fees']:.2f} + "
+                                 f"slip {100*c['slippage']:.2f} + diepte/afr. {100*c['depth_and_rounding']:.2f} "
+                                 f"= {100*c['total']:.2f}")
+                if not summary['candidates']:
                     continue
-                sample = tr['markouts'].get(str(horizon))
-                if sample is None:
-                    continue
-                arms = sample['arms']
-                if all(arms[n]['status'] == 'observed' for n in ARM_NAMES):
-                    rows.append(tuple(arms[n]['hypothetical_net'] for n in ARM_NAMES))
-                else:
-                    missing += 1
-            if rows:
-                av = [sum(r[i] for r in rows)/len(rows) for i in (0,1)]
-                lines.append(f"Vasthouden {horizon}s, netto hypothetisch gem./paar: "
-                             f"O ${av[0]:+.3f}, R ${av[1]:+.3f} | n={len(rows)}, ontbreekt={missing}")
-            else:
-                lines.append(f"Vasthouden {horizon}s: nog geen complete paren; ontbreekt={missing}")
+                for horizon,s in summary['horizons'].items():
+                    value = f"${s['net_mean']:+.3f}" if s['net_mean'] is not None else 'onbekend'
+                    lines.append(f"{horizon}s netto hypothetisch gem. {value}, "
+                                 f"positief {s['positive']}/{s['n']}, mist {s['missing']}, wacht {s['pending']}")
+                    if s['priced_n']:
+                        lines.append(f"  Prijs-PnL ${s['price_mean']:+.3f} − fees ${s['fees_mean']:.3f} "
+                                     f"(gem., n={s['priced_n']}; slippage zit in prijs).")
+        lines.append('Overlap mogelijk: dit zijn geen onafhankelijke trades of extra saldowinsten.')
         _,seconds,returns,_ = self.spot.history_metrics()
         lines.append(f"BTC historie {seconds:.0f}s / {returns} rendementen | "
                      f"boekherstel {self.book_diagnostics}")
@@ -1408,7 +1516,14 @@ class ComparisonEngine(Engine):
         if delays:
             lines.insert(2, f"Gemeten instapvertraging p50/p95: {delays[len(delays)//2]:.0f}/"
                          f"{delays[min(len(delays)-1,int(len(delays)*.95))]:.0f} ms (n={len(delays)}).")
-        self.notify('\n'.join(lines)[:3900])
+        message = ''
+        for line in lines:
+            if len(message)+len(line)+1 > 3800:
+                self.notify(message)
+                message = VERSION+' — vervolg\n'
+            message += line+'\n'
+        if message:
+            self.notify(message.rstrip())
         self.stats.clear()
         self.spot.event_stats.clear()
         self.spot.event_ages.clear()
@@ -1420,7 +1535,7 @@ class ComparisonEngine(Engine):
                     f"{STOP_LOSS_PER_SHARE-ENTRY_STOP_BUFFER:.3f}/aandeel.\n"
                     f"Gelijke exits: netto +{LAB_TAKE_PROFIT:.2f}/aandeel, "
                     f"-{STOP_LOSS_PER_SHARE:.2f}/aandeel of na {MAX_HOLD_SECONDS}s.\n"
-                    "Max. 2 vergelijkmomenten per 5m-ronde. Oude posities worden eerst afgehandeld.\n"
+                    "Max. 2 paperinstappen per variant per ronde. Kandidaten blijven gemeten, maximaal elke 10s.\n"
                     "BTC/L2-opname + offline replay actief. Geen Marketlens-account nodig.")
         self.observe_task = asyncio.create_task(self.markout_worker())
         self.research_task = asyncio.create_task(self.research_worker())
@@ -1453,7 +1568,7 @@ class ComparisonEngine(Engine):
                             raise Skip('comparison_pending')
                         if RECORDER is not None and RECORDER.failed:
                             raise Skip('recorder_failed_entries_paused')
-                        self.lab.allowed(self.market,now)
+                        self.lab.observation_allowed(self.market,now)
                         if not ENTRY_TIME_MIN <= self.market['expiry']-now <= ENTRY_TIME_MAX:
                             raise Skip('outside_entry_window')
                         anchor = self.observe(now)
@@ -1643,6 +1758,7 @@ class TapeReplay:
         self.stats = Counter()
         self.session = None
         self.round_counts = Counter()
+        self.recorded_versions = set()
         self.last_trial = self.last_exit = -float('inf')
         self.trial_id = 0
         self.last_time = 0.
@@ -1684,6 +1800,10 @@ class TapeReplay:
                 a = self.accounts[name]
                 if a['position'] or a['stopped'] or a['cash'] < self.stake:
                     raise Skip('account_limit')
+                if self.round_counts[(name,market['slug'])] >= MAX_PAPER_ENTRIES_PER_ROUND:
+                    raise Skip('paper_round_fill_limit')
+                if now-self.last_exit < COOLDOWN_SECONDS:
+                    raise Skip('paper_exit_cooldown')
                 b = self.get_book(side,market,now)
                 if abs(b.source-self.spot['source']) > MAX_FEED_SKEW:
                     raise Skip('feed_time_skew')
@@ -1692,6 +1812,7 @@ class TapeReplay:
                 q = buy_quote(b,market,self.stake,now)
                 cost_guard(b,market,q,now)
                 a['cash'] -= q['spent']
+                self.round_counts[(name,market['slug'])] += 1
                 a['position'] = dict(**q,direction=side,market=market,entered=now,
                                      trial_id=trial_id,exit_pending=False,next_exit=now)
             except Skip as exc:
@@ -1779,15 +1900,17 @@ class TapeReplay:
         self.roll_day(now)
         if kind == 'session':
             self.recorded_stakes.add(row['signal_stake'])
-            if row.get('version') != VERSION:
+            self.recorded_versions.add(row.get('version'))
+            if row.get('version') not in ('7.3-BTC-Replay-PAPER',VERSION):
                 raise ValueError('Replay requires matching recording version')
         elif kind in ('market','checkpoint'):
             m = row['market']
             if not self.market or m['slug'] != self.market['slug']:
                 self.market, self.books = m, {}
             if kind == 'checkpoint':
-                if row.get('version',VERSION) != VERSION:
+                if row.get('version',VERSION) not in ('7.3-BTC-Replay-PAPER',VERSION):
                     raise ValueError('Replay requires matching checkpoint version')
+                self.recorded_versions.add(row.get('version',VERSION))
                 if 'signal_stake' in row:
                     self.recorded_stakes.add(row['signal_stake'])
                 self.spot = row['spot']
@@ -1821,14 +1944,10 @@ class TapeReplay:
             self.schedule_exits(now)  # Same ~100ms decision cadence as the online loop.
         if kind == 'signal':
             pending = any(j[1]=='entry' for j in self.jobs)
-            flat = all(a['position'] is None for a in self.accounts.values())
-            if (flat and not pending and self.market and row['slug']==self.market['slug']
-                    and now-max(self.last_trial,self.last_exit) >= COOLDOWN_SECONDS
-                    and self.round_counts[row['slug']] < MAX_TRIALS_PER_ROUND
-                    and any(not a['stopped'] and a['cash'] >= self.stake for a in self.accounts.values())):
+            if (not pending and self.market and row['slug']==self.market['slug']
+                    and now-self.last_trial >= CANDIDATE_INTERVAL):
                 self.trial_id += 1
                 self.last_trial = now
-                self.round_counts[row['slug']] += 1
                 self.jobs.append((now+self.latency,'entry',
                                   (self.market.copy(),row['direction'],row['anchor'],self.trial_id,self.session)))
         self.last_time = now
@@ -1849,6 +1968,7 @@ class TapeReplay:
         paired = set(maps['original']) & set(maps['reverse'])
         return dict(version=VERSION,mode='OFFLINE_REPLAY_PAPER',latency_ms=self.latency*1000,
                     stake=self.stake,recorded_signal_stakes=sorted(self.recorded_stakes),
+                    recorded_versions=sorted(self.recorded_versions),entry_cap_policy='actual_fills_per_arm',
                     arms=arms,matched_closed_pairs=dict(n=len(paired),**{
                         n:sum(maps[n][i]['pnl'] for i in paired) for n in ARM_NAMES}),
                     pending_orders=len(self.jobs),counters=dict(self.stats),
