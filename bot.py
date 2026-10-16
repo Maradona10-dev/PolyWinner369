@@ -1,4 +1,22 @@
-"""BTC 5m repricing experiment — PAPER ONLY, Python 3.12.
+"""BTC 5m repricing + public event recording + offline replay — PAPER ONLY.
+Python 3.12. Start as usual: python bot.py
+
+v7.3 adds a bounded local receive-order journal, retaining ~1GiB in replay/.
+Market changes, BTC updates, atomic L2 snapshots/deltas, reconnects, eligible
+signals and 100ms decision clocks are recorded without blocking on disk.
+Existing ledgers are preserved. A recording/clock failure blocks NEW entries.
+
+Replay your recorded events (no network/Telegram/ledger writes):
+    python bot.py --replay 'replay/tape-*.jsonl' --latency-ms 250 --stake 5
+    python bot.py --replay 'replay/tape-*.jsonl' --latency-ms 500 --stake 5
+    python bot.py --replay 'replay/tape-*.jsonl' --latency-ms 1000 --stake 5
+Adjust replay/ to your BOT_DATA_DIR or Railway volume directory if configured.
+Replay varies execution delay/stake with the recorded signal generator fixed.
+It never looks at later quotes, assumes a maker fill, or invents settlement.
+Unfinished positions/pending orders are explicitly reported at the tape end.
+This is an independent taker simulator, not Marketlens SDK integration.
+No external historical-data account or API key is required. No performance
+claim follows from the synthetic tests; collect real events before comparison.
 
 requirements.txt (existing):
     polymarket-client==0.13.0
@@ -35,6 +53,9 @@ import math
 import os
 from pathlib import Path
 import signal
+import argparse
+import queue
+import uuid
 from statistics import NormalDist
 import threading
 import time
@@ -45,8 +66,8 @@ from polymarket import AsyncPublicClient
 from polymarket.streams import MarketSpec
 from websockets.asyncio.client import connect
 
-VERSION = "7.2-BTC-Paired-PAPER"
-COMPATIBLE_LEDGERS = {"7.0-BTC-Repricing-PAPER", "7.1-BTC-Repricing-PAPER", VERSION}
+VERSION = "7.3-BTC-Replay-PAPER"
+COMPATIBLE_LEDGERS = {"7.0-BTC-Repricing-PAPER", "7.1-BTC-Repricing-PAPER", "7.2-BTC-Paired-PAPER", VERSION}
 STAKE = float(os.getenv("PAPER_TRADE_AMOUNT", "7.50"))
 START_BALANCE = float(os.getenv("PAPER_BALANCE", "1000"))
 DATA_DIR = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or os.getenv("BOT_DATA_DIR", "."))
@@ -91,6 +112,18 @@ SLIPPAGE_TICKS = 1
 NORMAL = NormalDist()
 LOG = logging.getLogger("repricing")
 HEALTH = {"heartbeat": 0., "mode": "PAPER", "version": VERSION}
+RECORDER = None
+
+
+def record(kind, **data):
+    if RECORDER is not None:
+        RECORDER.emit(kind, **data)
+
+
+def record_book(direction, book):
+    record('book', direction=direction, asset=book.asset, condition=book.condition,
+           bids=list(book.bids.items()), asks=list(book.asks.items()),
+           source=book.source, received=book.received, tick=book.tick, minimum=book.minimum)
 
 
 class LedgerError(RuntimeError):
@@ -535,6 +568,7 @@ class Engine:
                 async with connect(BINANCE_WS, ping_interval=20, ping_timeout=20,
                                    open_timeout=10, max_queue=32) as ws:
                     self.spot.reset(preserve_history=True)
+                    record('spot_reset')
                     self.anchors.clear()
                     delay = 1
                     while True:
@@ -542,12 +576,15 @@ class Engine:
                         event = json.loads(raw)
                         if event.get("e") == "aggTrade" and event.get("s") == "BTCUSDT":
                             self.spot.update(event["p"], finite(event["T"])/1000, time.time())
+                            record('spot', price=self.spot.price, source=self.spot.source,
+                                   received=self.spot.received)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self.stats["btc_reconnect"] += 1
                 LOG.warning("BTC stream: %s", type(exc).__name__)
             self.spot.reset(preserve_history=True)
+            record('spot_reset')
             self.anchors.clear()
             await asyncio.sleep(delay)
             delay = min(30, delay*2)
@@ -590,17 +627,28 @@ class Engine:
                         if event.type == "book":
                             for b in self.books.values():
                                 if str(payload.asset_id) == b.asset:
-                                    b.snapshot(payload, now)
+                                    if b.snapshot(payload, now):
+                                        record_book(next(d for d,v in self.books.items() if v is b), b)
                         elif event.type == "price_change":
                             ts = stamp(payload.timestamp) if payload.timestamp is not None else 0.
+                            updates = []
                             for change in payload.price_changes:
                                 for b in self.books.values():
+                                    revision = b.revision
                                     b.delta(change, ts, now)
+                                    if b.revision != revision:
+                                        updates.append(dict(direction=next(d for d,v in self.books.items() if v is b),
+                                                            price=finite(change.price), size=finite(change.size),
+                                                            side=getattr(change.side, 'value', change.side),
+                                                            source=b.source, received=b.received))
+                            if updates:
+                                record('deltas', updates=updates)
                         elif event.type == "tick_size_change":
                             for b in self.books.values():
                                 if str(payload.asset_id) == b.asset:
                                     b.tick = finite(payload.new_tick_size)
                                     b.revision += 1
+                                    record_book(next(d for d,v in self.books.items() if v is b), b)
                         self.stream_ok = all(b.ready for b in self.books.values())
             except asyncio.CancelledError:
                 raise
@@ -609,6 +657,7 @@ class Engine:
                 LOG.warning("Polymarket stream: %s", type(exc).__name__)
             self.stream_ok = False
             self.stream_connected = False
+            record('book_reset')
             self.anchors.clear()
             for b in self.books.values():
                 b.ready = False
@@ -621,6 +670,7 @@ class Engine:
             with contextlib.suppress(asyncio.CancelledError):
                 await self.stream_task
         self.market, self.books = market, {}
+        record('market', market=market)
         self.anchors.clear()
         self.forecasts.clear()
         self.stream_ok = False
@@ -645,6 +695,7 @@ class Engine:
                 return
             candidate.revision = (live.revision+1) if live else 1
             self.books[direction] = candidate
+            record_book(direction, candidate)
             self.stream_ok = len(self.books) == 2 and all(b.ready for b in self.books.values())
             self.anchors.clear()  # new model anchor after resynchronization
             self.forecasts.clear()
@@ -1074,6 +1125,7 @@ class ComparisonEngine(Engine):
         self.exit_tasks = {}
         self.exit_attempts = {}
         self.observe_task = None
+        self.research_task = None
 
     async def paired_entry(self, trial, anchor):
         market, direction = trial['market'], trial['signal']
@@ -1088,6 +1140,8 @@ class ComparisonEngine(Engine):
             now = time.time()
             if self.market != market or time.monotonic()-started > MAX_ENTRY_WAIT:
                 raise Skip('pair_changed_or_too_slow')
+            if RECORDER is not None and RECORDER.failed:
+                raise Skip('recorder_failed_entries_paused')
             self.spot.check(now)
             if anchor not in self.anchors:
                 raise Skip('anchor_invalidated')
@@ -1196,6 +1250,33 @@ class ComparisonEngine(Engine):
             self.record_markouts(time.time())
             await asyncio.sleep(.05)
 
+    async def research_worker(self):
+        """Record eligible signals even when a paper account already has a position."""
+        last_checkpoint = 0.
+        while True:
+            now = time.time()
+            record('clock')
+            if self.market and now-last_checkpoint >= 5:
+                books = {d:dict(asset=b.asset, condition=b.condition,
+                                bids=list(b.bids.items()), asks=list(b.asks.items()),
+                                source=b.source,received=b.received,tick=b.tick,minimum=b.minimum)
+                         for d,b in self.books.items() if b.ready}
+                record('checkpoint',version=VERSION,signal_stake=STAKE,
+                       market=self.market.copy(),books=books,
+                       spot=dict(price=self.spot.price,source=self.spot.source,received=self.spot.received))
+                last_checkpoint = now
+            if self.market and self.stream_ok:
+                try:
+                    anchor = self.observe(now)
+                    direction = 'UP' if self.spot.price > anchor['spot'] else 'DOWN'
+                    entry_assessment(self.books[direction], self.market, direction, anchor,
+                                     self.spot.price, STAKE, now)
+                    record('signal', direction=direction, anchor=anchor.copy(),
+                           slug=self.market['slug'])
+                except (Skip, KeyError):
+                    pass
+            await asyncio.sleep(.1)
+
     def comparison_exit_reason(self, p, now):
         if now-p['entered'] >= MAX_HOLD_SECONDS:
             return 'time_limit'
@@ -1260,6 +1341,9 @@ class ComparisonEngine(Engine):
         if self.observe_task and self.observe_task.done():
             self.observe_task.result()
             raise LedgerError('Vervolgmetingen onverwacht gestopt')
+        if self.research_task and self.research_task.done():
+            self.research_task.result()
+            raise LedgerError('Replaymetingen onverwacht gestopt')
 
     def schedule_exits(self, now):
         for name,a in self.lab.data['arms'].items():
@@ -1317,6 +1401,13 @@ class ComparisonEngine(Engine):
         lines.append(f"Oude test: {len(legacy['trades'])} gesloten, "
                      f"netto ${sum(t['pnl'] for t in legacy['trades']):+.2f}; niet meegeteld.")
         lines.append('PAPER: geschatte fills. Vervolgmetingen zijn geen extra winst/verliesboekingen.')
+        if RECORDER is not None:
+            lines.insert(1, f"Replay-opname: {'FOUT — entries geblokkeerd' if RECORDER.failed else 'actief'}; "
+                         f"{RECORDER.written} events geschreven, wachtrij {RECORDER.pending}.")
+        delays = sorted(t['execution_ms'] for t in self.lab.data['trials'] if t.get('execution_ms'))
+        if delays:
+            lines.insert(2, f"Gemeten instapvertraging p50/p95: {delays[len(delays)//2]:.0f}/"
+                         f"{delays[min(len(delays)-1,int(len(delays)*.95))]:.0f} ms (n={len(delays)}).")
         self.notify('\n'.join(lines)[:3900])
         self.stats.clear()
         self.spot.event_stats.clear()
@@ -1329,10 +1420,13 @@ class ComparisonEngine(Engine):
                     f"{STOP_LOSS_PER_SHARE-ENTRY_STOP_BUFFER:.3f}/aandeel.\n"
                     f"Gelijke exits: netto +{LAB_TAKE_PROFIT:.2f}/aandeel, "
                     f"-{STOP_LOSS_PER_SHARE:.2f}/aandeel of na {MAX_HOLD_SECONDS}s.\n"
-                    "Max. 2 vergelijkmomenten per 5m-ronde. Oude posities worden eerst afgehandeld.")
+                    "Max. 2 vergelijkmomenten per 5m-ronde. Oude posities worden eerst afgehandeld.\n"
+                    "BTC/L2-opname + offline replay actief. Geen Marketlens-account nodig.")
         self.observe_task = asyncio.create_task(self.markout_worker())
+        self.research_task = asyncio.create_task(self.research_worker())
         jobs = [asyncio.create_task(self.spot_stream()),asyncio.create_task(self.telegram_worker()),
-                asyncio.create_task(self.repair_books()),self.observe_task]
+                asyncio.create_task(self.repair_books()),self.observe_task,
+                self.research_task]
         try:
             while True:
                 now = time.time()
@@ -1357,6 +1451,8 @@ class ComparisonEngine(Engine):
                         self.schedule_exits(now)
                         if self.entry_task:
                             raise Skip('comparison_pending')
+                        if RECORDER is not None and RECORDER.failed:
+                            raise Skip('recorder_failed_entries_paused')
                         self.lab.allowed(self.market,now)
                         if not ENTRY_TIME_MIN <= self.market['expiry']-now <= ENTRY_TIME_MAX:
                             raise Skip('outside_entry_window')
@@ -1390,6 +1486,378 @@ class ComparisonEngine(Engine):
             self.lab.save()
 
 
+class TapeRecorder:
+    """Bounded nonblocking public-data journal. Disk work never runs on the feed loop.
+
+    Retains at most 64 x ~16MiB chunks (~1GiB), deleting oldest closed chunks.
+    A queue overflow/disk error/clock jump permanently blocks new entries this run.
+    Existing positions are still managed. Truncated tails are not silently replayed.
+    """
+    def __init__(self, directory, max_bytes=16*1024*1024, max_files=64):
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.max_bytes, self.max_files = max_bytes, max_files
+        self.session = uuid.uuid4().hex
+        self.queue = queue.Queue(maxsize=20000)
+        self.failed = False
+        self.closed = False
+        self.written = self.seq = 0
+        self.wall, self.mono = time.time(), time.monotonic()
+        self.thread = threading.Thread(target=self._writer, daemon=True)
+        self.thread.start()
+        self.emit('session', version=VERSION, signal_stake=STAKE,
+                  policy=dict(min_gross_edge=MIN_GROSS_EDGE, min_net_edge=MIN_NET_EDGE,
+                              min_btc_move=MIN_BTC_MOVE, min_model_move=MIN_MODEL_MOVE,
+                              take_profit=LAB_TAKE_PROFIT, stop=STOP_LOSS_PER_SHARE,
+                              hold=MAX_HOLD_SECONDS, slippage_ticks=SLIPPAGE_TICKS))
+
+    @property
+    def pending(self):
+        return self.queue.qsize()
+
+    def emit(self, kind, **data):
+        if self.failed or self.closed:
+            return
+        now = time.time()
+        if abs((now-self.wall)-(time.monotonic()-self.mono)) > .5:
+            self.failed = True
+            LOG.error('Clock jump: nieuwe paperentries gepauzeerd')
+            return
+        self.seq += 1
+        row = dict(schema=1, session=self.session, seq=self.seq, time=now, kind=kind, **data)
+        try:
+            self.queue.put_nowait(row)
+        except queue.Full:
+            self.failed = True
+            LOG.error('Replay-wachtrij vol: nieuwe paperentries gepauzeerd')
+
+    def _writer(self):
+        handle = None
+        size = 0
+        last_flush = time.monotonic()
+        try:
+            while True:
+                try:
+                    row = self.queue.get(timeout=.5)
+                except queue.Empty:
+                    if handle:
+                        handle.flush()
+                    continue
+                if row is None:
+                    self.queue.task_done()
+                    break
+                if handle is None or size >= self.max_bytes:
+                    if handle:
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                        handle.close()
+                    path = self.directory / f"tape-{time.time_ns():020d}-{self.session[:8]}.jsonl"
+                    handle = path.open('x', encoding='utf-8')
+                    size = 0
+                    files = sorted(self.directory.glob('tape-*.jsonl'))
+                    for old in files[:-self.max_files]:
+                        old.unlink()
+                line = json.dumps(row, allow_nan=False, separators=(',', ':'))+'\n'
+                handle.write(line)
+                size += len(line.encode('utf-8'))
+                self.written += 1
+                self.queue.task_done()
+                if time.monotonic()-last_flush >= 1:
+                    handle.flush()
+                    last_flush = time.monotonic()
+        except Exception:
+            self.failed = True
+            LOG.exception('Replay-opslag defect; bestaande posities blijven beheerd')
+        finally:
+            if handle and not handle.closed:
+                with contextlib.suppress(OSError):
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                    handle.close()
+
+    def close(self):
+        self.closed = True
+        if self.thread.is_alive():
+            try:
+                self.queue.put(None, timeout=1)
+            except queue.Full:
+                self.failed = True
+                return
+            self.thread.join(timeout=5)
+            if self.thread.is_alive():
+                self.failed = True
+
+
+def tape_rows(paths):
+    """Strict receive-order replay; missing chunks or malformed records are errors."""
+    previous_time, session, seq = -1., None, 0
+    seen = set()
+    for path in paths:
+        with Path(path).open(encoding='utf-8') as f:
+            for line_number, line in enumerate(f, 1):
+                try:
+                    row = json.loads(line)
+                    if row['schema'] != 1 or finite(row['time']) < previous_time:
+                        raise ValueError('wrong schema or receive times out of order')
+                    if row['session'] == session:
+                        if row['seq'] != seq+1:
+                            raise ValueError('missing or duplicated event/chunk')
+                    elif row['session'] in seen:
+                        raise ValueError('interleaved recording sessions')
+                    else:
+                        seen.add(row['session'])
+                    previous_time, session, seq = row['time'], row['session'], row['seq']
+                except (ValueError, KeyError, TypeError) as exc:
+                    raise ValueError(f'Invalid tape {Path(path).name}:{line_number}: {exc}') from exc
+                yield row
+
+
+def restored_book(row):
+    b = Book(row['asset'], row['condition'])
+    b.bids = {finite(p):finite(q) for p,q in row['bids']}
+    b.asks = {finite(p):finite(q) for p,q in row['asks']}
+    if any(not 0 < p < 1 or q <= 0 for side in (b.bids,b.asks) for p,q in side.items()):
+        raise ValueError('Invalid recorded depth')
+    b.source, b.received = finite(row['source']), finite(row['received'])
+    b.tick, b.minimum = finite(row['tick']), finite(row['minimum'])
+    b.ready = True
+    return b
+
+
+class TapeReplay:
+    """Taker-only historical execution at delayed times, never future quotes.
+
+    Reuses buy_quote/sell_quote/fees/cost_guard and original signal confirmation.
+    No maker orders, queue-priority claims, official settlement or network calls.
+    Signal parameters stay fixed: this is execution sensitivity, not optimization.
+    """
+    def __init__(self, latency=.5, stake=7.5, balance=1000.):
+        if not 0 <= finite(latency) <= 10 or not 0 < finite(stake) <= finite(balance):
+            raise ValueError('Invalid latency/stake/balance')
+        self.latency, self.stake = latency, stake
+        self.accounts = {n:dict(cash=balance, initial=balance, position=None, trades=[],
+                                day='', day_start=balance, stopped=False,
+                                peak=balance, max_drawdown=0.) for n in ARM_NAMES}
+        self.market, self.books, self.spot = None, {}, dict(price=0., source=0., received=0.)
+        self.jobs = []
+        self.stats = Counter()
+        self.session = None
+        self.round_counts = Counter()
+        self.last_trial = self.last_exit = -float('inf')
+        self.trial_id = 0
+        self.last_time = 0.
+        self.recorded_stakes = set()
+
+    def fresh_spot(self, now):
+        if not fresh(self.spot['source'],self.spot['received'],now,MAX_BTC_AGE):
+            raise Skip('btc_stale')
+
+    def get_book(self, direction, market, now):
+        if not self.market or self.market['slug'] != market['slug']:
+            raise Skip('wrong_replay_market')
+        b = self.books.get(direction)
+        if not b or b.asset != market['assets'][direction]:
+            raise Skip('missing_replay_book')
+        b.check(now)
+        return b
+
+    def roll_day(self, now):
+        day = datetime.fromtimestamp(now,timezone.utc).date().isoformat()
+        for a in self.accounts.values():
+            if a['day'] != day:
+                p = a['position']
+                a.update(day=day,day_start=a['cash']+(p['spent'] if p else 0.),stopped=False)
+
+    def entry(self, payload, now):
+        market, direction, anchor, trial_id, session = payload
+        if session != self.session:
+            raise Skip('session_interrupted_entry')
+        self.fresh_spot(now)
+        if not self.market or self.market['slug'] != market['slug']:
+            raise Skip('market_changed')
+        b = self.get_book(direction,market,now)
+        if abs(b.source-self.spot['source']) > MAX_FEED_SKEW:
+            raise Skip('feed_time_skew')
+        entry_assessment(b,market,direction,anchor,self.spot['price'],self.stake,now)
+        for name, side in zip(ARM_NAMES,(direction,'DOWN' if direction=='UP' else 'UP')):
+            try:
+                a = self.accounts[name]
+                if a['position'] or a['stopped'] or a['cash'] < self.stake:
+                    raise Skip('account_limit')
+                b = self.get_book(side,market,now)
+                if abs(b.source-self.spot['source']) > MAX_FEED_SKEW:
+                    raise Skip('feed_time_skew')
+                if b.spread() > MAX_SPREAD:
+                    raise Skip('spread')
+                q = buy_quote(b,market,self.stake,now)
+                cost_guard(b,market,q,now)
+                a['cash'] -= q['spent']
+                a['position'] = dict(**q,direction=side,market=market,entered=now,
+                                     trial_id=trial_id,exit_pending=False,next_exit=now)
+            except Skip as exc:
+                self.stats[name+':entry:'+str(exc)] += 1
+
+    def execute_exit(self, payload, now):
+        name, reason = payload
+        a = self.accounts[name]
+        p = a['position']
+        if not p:
+            return
+        try:
+            if now >= p['market']['expiry']:
+                raise Skip('expired_unresolved')
+            b = self.get_book(p['direction'],p['market'],now)
+            q = sell_quote(b,p['market'],p['qty'],now)
+            pnl = q['received']-p['spent']
+            a['cash'] += q['received']
+            a['trades'].append(dict(trial_id=p['trial_id'],pnl=pnl,
+                                    fees=p['fee']+q['fee'],reason=reason,
+                                    entered=p['entered'],exited=now,qty=p['qty']))
+            a['position'] = None
+            a['peak'] = max(a['peak'],a['cash'])
+            a['max_drawdown'] = max(a['max_drawdown'],1-a['cash']/a['peak'])
+            a['stopped'] = a['cash'] <= a['day_start']*(1-DAILY_LOSS_FRACTION)
+            self.last_exit = now
+        except Skip as exc:
+            p['exit_pending'] = False
+            p['next_exit'] = now+1
+            self.stats[name+':exit:'+str(exc)] += 1
+
+    def due(self, before, inclusive=False):
+        while self.jobs:
+            self.jobs.sort(key=lambda j:j[0])
+            due, kind, payload = self.jobs[0]
+            if due > before or (due == before and not inclusive):
+                break
+            self.jobs.pop(0)
+            self.roll_day(due)
+            try:
+                if kind == 'entry':
+                    self.entry(payload,due)
+                else:
+                    self.execute_exit(payload,due)
+            except Skip as exc:
+                self.stats['delayed_entry:'+str(exc)] += 1
+
+    def schedule_exits(self, now):
+        for name,a in self.accounts.items():
+            p = a['position']
+            if not p or p['exit_pending'] or now < p['next_exit']:
+                continue
+            if now >= p['market']['expiry']:
+                continue  # Never manufacture a resolution from Binance or the last quote.
+            reason = None
+            if now-p['entered'] >= MAX_HOLD_SECONDS:
+                reason = 'time_limit'
+            elif p['market']['expiry']-now <= EXIT_BEFORE_EXPIRY:
+                reason = 'before_expiry'
+            else:
+                try:
+                    self.fresh_spot(now)
+                    b = self.get_book(p['direction'],p['market'],now)
+                    q = sell_quote(b,p['market'],p['qty'],now)
+                    net = (q['received']-p['spent'])/p['qty']
+                    if net >= LAB_TAKE_PROFIT:
+                        reason = 'net_target'
+                    elif net <= -STOP_LOSS_PER_SHARE:
+                        reason = 'loss_limit'
+                except Skip:
+                    reason = 'data_stale'
+            if reason:
+                p['exit_pending'] = True
+                self.jobs.append((now+self.latency,'exit',(name,reason)))
+
+    def step(self, row):
+        now, kind = row['time'], row['kind']
+        self.due(now)  # Execute BEFORE applying any later book information.
+        if row['session'] != self.session:
+            if self.session is not None:
+                self.stats['recording_restart'] += 1
+            self.session = row['session']
+            self.market, self.books = None, {}
+            self.spot = dict(price=0.,source=0.,received=0.)
+        self.roll_day(now)
+        if kind == 'session':
+            self.recorded_stakes.add(row['signal_stake'])
+            if row.get('version') != VERSION:
+                raise ValueError('Replay requires matching recording version')
+        elif kind in ('market','checkpoint'):
+            m = row['market']
+            if not self.market or m['slug'] != self.market['slug']:
+                self.market, self.books = m, {}
+            if kind == 'checkpoint':
+                if row.get('version',VERSION) != VERSION:
+                    raise ValueError('Replay requires matching checkpoint version')
+                if 'signal_stake' in row:
+                    self.recorded_stakes.add(row['signal_stake'])
+                self.spot = row['spot']
+                self.books = {d:restored_book(b) for d,b in row['books'].items()}
+        elif kind == 'book':
+            if self.market and row['condition'] == self.market['condition']:
+                self.books[row['direction']] = restored_book(row)
+        elif kind in ('delta', 'deltas'):
+            for update in row['updates'] if kind == 'deltas' else [row]:
+                b = self.books.get(update['direction'])
+                if b and update['source'] >= b.source:
+                    if update['side'] not in ('BUY','SELL'):
+                        raise ValueError('Invalid recorded book side')
+                    price,size = finite(update['price']),finite(update['size'])
+                    if not 0 < price < 1 or size < 0:
+                        raise ValueError('Invalid recorded book update')
+                    side = b.bids if update['side']=='BUY' else b.asks
+                    if size == 0:
+                        side.pop(price,None)
+                    else:
+                        side[price] = size
+                    b.source, b.received = update['source'], update['received']
+        elif kind == 'book_reset':
+            self.books.clear()
+        elif kind == 'spot_reset':
+            self.spot = dict(price=0.,source=0.,received=0.)
+        elif kind == 'spot':
+            self.spot = {k:row[k] for k in ('price','source','received')}
+        self.due(now,inclusive=True)
+        if kind == 'clock':
+            self.schedule_exits(now)  # Same ~100ms decision cadence as the online loop.
+        if kind == 'signal':
+            pending = any(j[1]=='entry' for j in self.jobs)
+            flat = all(a['position'] is None for a in self.accounts.values())
+            if (flat and not pending and self.market and row['slug']==self.market['slug']
+                    and now-max(self.last_trial,self.last_exit) >= COOLDOWN_SECONDS
+                    and self.round_counts[row['slug']] < MAX_TRIALS_PER_ROUND
+                    and any(not a['stopped'] and a['cash'] >= self.stake for a in self.accounts.values())):
+                self.trial_id += 1
+                self.last_trial = now
+                self.round_counts[row['slug']] += 1
+                self.jobs.append((now+self.latency,'entry',
+                                  (self.market.copy(),row['direction'],row['anchor'],self.trial_id,self.session)))
+        self.last_time = now
+        self.stats['events'] += 1
+
+    def result(self):
+        arms = {}
+        for name,a in self.accounts.items():
+            rows = a['trades']
+            p = a['position']
+            arms[name] = dict(closed=len(rows),wins=sum(t['pnl']>0 for t in rows),
+                              realized_pnl=sum(t['pnl'] for t in rows),
+                              closed_trade_fees=sum(t['fees'] for t in rows),
+                              cash=a['cash'],open_position=bool(p),
+                              open_cost=p['spent'] if p else 0.,
+                              max_realized_drawdown=a['max_drawdown'])
+        maps = {n:{t['trial_id']:t for t in a['trades']} for n,a in self.accounts.items()}
+        paired = set(maps['original']) & set(maps['reverse'])
+        return dict(version=VERSION,mode='OFFLINE_REPLAY_PAPER',latency_ms=self.latency*1000,
+                    stake=self.stake,recorded_signal_stakes=sorted(self.recorded_stakes),
+                    arms=arms,matched_closed_pairs=dict(n=len(paired),**{
+                        n:sum(maps[n][i]['pnl'] for i in paired) for n in ARM_NAMES}),
+                    pending_orders=len(self.jobs),counters=dict(self.stats),
+                    limitations=['Fixed recorded signal generator; execution sensitivity only.',
+                                 'Taker fills only; no queue priority simulation.',
+                                 'No official settlement data: expired/open positions stay unresolved.',
+                                 'Quotes are historical observed depth; not guaranteed live fills.'])
+
+
 def start_health_server():
     if not os.getenv("PORT"):
         return
@@ -1404,6 +1872,7 @@ def start_health_server():
 
 
 async def main():
+    global RECORDER
     if importlib.metadata.version("polymarket-client") != "0.13.0":
         raise RuntimeError("requirements.txt vereist polymarket-client==0.13.0")
     if not 0 < finite(STAKE) <= finite(START_BALANCE):
@@ -1414,15 +1883,41 @@ async def main():
     with (DATA_DIR / "polymarket_latency_paper.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         start_health_server()
-        async with AsyncPublicClient() as client:
-            engine = ComparisonEngine(client, Ledger(), ComparisonLedger())
-            task = asyncio.create_task(engine.run())
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                asyncio.get_running_loop().add_signal_handler(sig, task.cancel)
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        RECORDER = TapeRecorder(DATA_DIR / 'replay')
+        try:
+            async with AsyncPublicClient() as client:
+                engine = ComparisonEngine(client, Ledger(), ComparisonLedger())
+                task = asyncio.create_task(engine.run())
+                for sig in (signal.SIGINT, signal.SIGTERM):
+                    asyncio.get_running_loop().add_signal_handler(sig, task.cancel)
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        finally:
+            await asyncio.to_thread(RECORDER.close)
+
+
+def cli():
+    parser = argparse.ArgumentParser(description='BTC 5m paper experiment + offline event replay')
+    parser.add_argument('--replay', nargs='+', metavar='JSONL',
+                        help='recording files or quoted glob, e.g. "replay/tape-*.jsonl"')
+    parser.add_argument('--latency-ms', type=float, default=500.,
+                        help='total simulated decision-to-fill delay, replay only (default 500ms)')
+    parser.add_argument('--stake',type=float,default=STAKE,help='all-in replay stake')
+    args = parser.parse_args()
+    if args.replay:
+        import glob
+        paths = sorted(set(p for pattern in args.replay for p in glob.glob(pattern)))
+        if not paths:
+            parser.error('Geen replay-opnamen gevonden; laat de bot eerst data verzamelen.')
+        replay = TapeReplay(args.latency_ms/1000,args.stake,START_BALANCE)
+        for row in tape_rows(paths):
+            replay.step(row)
+        # Never run pending orders beyond the last recorded receive time.
+        print(json.dumps(replay.result(),indent=2,allow_nan=False))
+    else:
+        asyncio.run(main())
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    asyncio.run(main())
+    cli()
