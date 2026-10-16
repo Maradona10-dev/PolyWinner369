@@ -9,7 +9,15 @@ The pinned SDK supplies websockets>=13,<16. No wallet or trading API is used.
 Optional environment: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, PAPER_TRADE_AMOUNT
 (default 7.50), PAPER_BALANCE (default 1000), BOT_DATA_DIR, PORT.
 Use a Railway volume for persistence. The separate ledger is
-polymarket_latency_paper.json. Changing PAPER_BALANCE does not reset a ledger.
+polymarket_latency_comparison.json, with two separate fictitious accounts.
+Old polymarket_latency_paper.json is retained; an old position is managed to exit.
+Changing PAPER_BALANCE does not reset a ledger. Both comparison arms use the
+same net +0.01/share target, -0.04/share loss limit, and 15s maximum hold attempt.
+A delayed entry is rejected if immediate round-trip loss is >=0.035/share.
+Both sides use their own ask/bid depth, fees and one adverse tick each way.
+Markouts at 1/2/5/15s continue after exits and never change account cash.
+Missing/late observations remain missing, including across a restart.
+Reverse is a research counterfactual, not a claim of positive model edge.
 
 This is an uncalibrated quote-repricing model, NOT an established win probability.
 Paper executions use fresh REST depth AFTER a simulated delay, both fees and
@@ -37,12 +45,19 @@ from polymarket import AsyncPublicClient
 from polymarket.streams import MarketSpec
 from websockets.asyncio.client import connect
 
-VERSION = "7.1-BTC-Repricing-PAPER"
-COMPATIBLE_LEDGERS = {"7.0-BTC-Repricing-PAPER", VERSION}
+VERSION = "7.2-BTC-Paired-PAPER"
+COMPATIBLE_LEDGERS = {"7.0-BTC-Repricing-PAPER", "7.1-BTC-Repricing-PAPER", VERSION}
 STAKE = float(os.getenv("PAPER_TRADE_AMOUNT", "7.50"))
 START_BALANCE = float(os.getenv("PAPER_BALANCE", "1000"))
 DATA_DIR = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or os.getenv("BOT_DATA_DIR", "."))
-STATE_PATH = DATA_DIR / "polymarket_latency_paper.json"
+STATE_PATH = DATA_DIR / "polymarket_latency_paper.json"  # legacy: close existing positions only
+LAB_PATH = DATA_DIR / "polymarket_latency_comparison.json"
+ARM_NAMES = ("original", "reverse")
+MARKOUT_HORIZONS = (1, 2, 5, 15)
+MARKOUT_TOLERANCE = .4
+ENTRY_STOP_BUFFER = .005
+LAB_TAKE_PROFIT = .01
+MAX_TRIALS_PER_ROUND = 2
 BINANCE_WS = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
 # Experimental starting settings, not optimized performance claims.
 MIN_GROSS_EDGE = .05
@@ -889,6 +904,492 @@ class Engine:
             self.ledger.save()
 
 
+
+def cost_guard(book, market, quote, now):
+    """Reject an entry already at/near its all-in stop, never hide its fees."""
+    immediate = sell_quote(book, market, quote['qty'], now)
+    loss = (quote['spent']-immediate['received'])/quote['qty']
+    if loss >= STOP_LOSS_PER_SHARE-ENTRY_STOP_BUFFER:
+        raise Skip('roundtrip_cost_near_stop')
+    return immediate, loss
+
+
+def lab_summary(data):
+    """Full-account and matched-cohort results are deliberately separate."""
+    totals = {}
+    for name, account in data['arms'].items():
+        rows = account['trades']
+        totals[name] = dict(n=len(rows), wins=sum(t['pnl'] > 0 for t in rows),
+                            pnl=sum(t['pnl'] for t in rows), fees=sum(t['fees'] for t in rows))
+    maps = {name:{t['trial_id']:t for t in a['trades'] if t.get('trial_id') is not None}
+            for name,a in data['arms'].items()}
+    paired_ids = set(maps['original']) & set(maps['reverse'])
+    paired = dict(n=len(paired_ids), **{name:sum(maps[name][i]['pnl'] for i in paired_ids)
+                                      for name in ARM_NAMES})
+    return totals, paired
+
+
+class ComparisonLedger:
+    """One atomic file: two accounts, paired decisions, follow-up quote observations."""
+    def __init__(self, path=LAB_PATH):
+        self.path = Path(path)
+        def account():
+            return dict(initial=START_BALANCE, cash=START_BALANCE, position=None, trades=[],
+                        day='', day_start=START_BALANCE, daily_stopped=False)
+        self.data = dict(schema=2, experiment='paired-v1', created=time.time(),
+                         arms={name:account() for name in ARM_NAMES}, trials=[], next_id=1,
+                         round_counts={}, last_trial=0., last_exit=0.)
+        if self.path.exists():
+            self.data = json.loads(self.path.read_text())
+            if self.data.get('schema') != 2 or self.data.get('experiment') != 'paired-v1':
+                raise LedgerError('Onbekende vergelijking; bestand niet overschreven')
+        self.validate()
+        # Atomic fills are either present in both account state and trial, or absent.
+        for trial in self.data['trials']:
+            if trial['status'] == 'pending':
+                trial.update(status='interrupted', reason='restart_before_fill')
+        self.save()
+
+    def validate(self):
+        d = self.data
+        if set(d['arms']) != set(ARM_NAMES):
+            raise LedgerError('Vergelijkingsarmen ontbreken')
+        ids = [t['id'] for t in d['trials']]
+        if len(ids) != len(set(ids)):
+            raise LedgerError('Dubbele trial-ID')
+        for a in d['arms'].values():
+            if finite(a['cash']) < -1e-6 or finite(a['initial']) <= 0:
+                raise LedgerError('Ongeldig vergelijkingssaldo')
+            expected = a['initial']+sum(finite(t['pnl']) for t in a['trades'])
+            if a['position']:
+                expected -= finite(a['position']['spent'])
+            if abs(expected-a['cash']) > 1e-5:
+                raise LedgerError('Vergelijkingssaldo sluit niet aan')
+
+    def save(self):
+        try:
+            self.validate()
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix('.tmp')
+            with tmp.open('w') as f:
+                json.dump(self.data, f, allow_nan=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise LedgerError('Vergelijking niet veilig opgeslagen') from exc
+
+    def roll_day(self, now):
+        day = datetime.fromtimestamp(now, timezone.utc).date().isoformat()
+        changed = False
+        for a in self.data['arms'].values():
+            if a['day'] != day:
+                p = a['position']
+                a.update(day=day, day_start=a['cash']+(p['spent'] if p else 0), daily_stopped=False)
+                changed = True
+        if changed:
+            self.save()
+
+    def allowed(self, market, now):
+        d = self.data
+        if any(a['position'] for a in d['arms'].values()):
+            raise Skip('comparison_position_open')
+        if any(t['status'] == 'pending' for t in d['trials'][-2:]):
+            raise Skip('comparison_pending')
+        if all(a['daily_stopped'] or a['cash'] < STAKE for a in d['arms'].values()):
+            raise Skip('both_accounts_blocked')
+        if now-max(d['last_trial'],d['last_exit']) < COOLDOWN_SECONDS:
+            raise Skip('comparison_cooldown')
+        if d['round_counts'].get(market['slug'],0) >= MAX_TRIALS_PER_ROUND:
+            raise Skip('comparison_round_limit')
+
+    def begin(self, market, direction, now):
+        self.allowed(market, now)
+        trial = dict(id=self.data['next_id'], market=market.copy(), signal=direction,
+                     created=now, status='pending', arms={}, markouts={},
+                     policy=dict(stake=STAKE, target=LAB_TAKE_PROFIT, stop=STOP_LOSS_PER_SHARE,
+                                 stop_buffer=ENTRY_STOP_BUFFER, hold_seconds=MAX_HOLD_SECONDS,
+                                 execution_delay=EXECUTION_DELAY, slippage_ticks=SLIPPAGE_TICKS))
+        self.data['next_id'] += 1
+        self.data['trials'].append(trial)
+        self.data['last_trial'] = now
+        counts = self.data['round_counts']
+        counts[market['slug']] = counts.get(market['slug'],0)+1
+        if len(counts) > 100:
+            self.data['round_counts'] = dict(list(counts.items())[-50:])
+        self.save()
+        return trial
+
+    def cancel(self, trial, reason):
+        trial.update(status='cancelled', reason=reason)
+        self.save()
+
+    def commit(self, trial, decisions, now):
+        if trial['status'] != 'pending' or set(decisions) != set(ARM_NAMES):
+            raise LedgerError('Ongeldige vergelijkingstransactie')
+        # Validate every arm before any balance changes.
+        for name,r in decisions.items():
+            a = self.data['arms'][name]
+            if r['status'] == 'filled' and (a['position'] or r['quote']['spent'] > a['cash']):
+                raise LedgerError('Dubbele of ongedekte paperpositie')
+        trial.update(status='observing', entered=now, arms=decisions)
+        for name,r in decisions.items():
+            if r['status'] != 'filled':
+                continue
+            q = r['quote']
+            a = self.data['arms'][name]
+            a['cash'] -= q['spent']
+            a['position'] = dict(**q, trial_id=trial['id'], direction=r['direction'],
+                                 market=trial['market'].copy(), entered=now,
+                                 immediate_exit=r['immediate_exit'], baseline_loss=r['baseline_loss'])
+        self.save()
+
+    def close(self, name, proceeds, fee, reason, now):
+        a = self.data['arms'][name]
+        p = a['position']
+        proceeds, fee = finite(proceeds), finite(fee)
+        if not p or proceeds < 0 or fee < 0:
+            raise LedgerError('Ongeldige vergelijkingsuitstap')
+        t = dict(trial_id=p['trial_id'], direction=p['direction'], market=p['market']['slug'],
+                 entry_time=p['entered'], exit_time=now, seconds=now-p['entered'], qty=p['qty'],
+                 spent=p['spent'], received=proceeds, fees=p['fee']+fee,
+                 pnl=proceeds-p['spent'], reason=reason)
+        t['price_pnl'] = t['pnl']+t['fees']
+        a['cash'] += proceeds
+        a['trades'].append(t)
+        a['position'] = None
+        if a['cash'] <= a['day_start']*(1-DAILY_LOSS_FRACTION):
+            a['daily_stopped'] = True
+        self.data['last_exit'] = now
+        self.save()
+        return t
+
+
+class ComparisonEngine(Engine):
+    """Feeds and legacy exits reused; new entries only through the paired engine."""
+    def __init__(self, client, legacy, lab):
+        super().__init__(client, legacy)
+        self.lab = lab
+        self.entry_task = None
+        self.exit_tasks = {}
+        self.exit_attempts = {}
+        self.observe_task = None
+
+    async def paired_entry(self, trial, anchor):
+        market, direction = trial['market'], trial['signal']
+        other = 'DOWN' if direction == 'UP' else 'UP'
+        started = time.monotonic()
+        try:
+            await asyncio.sleep(EXECUTION_DELAY)
+            # Same observation window; do not fetch reverse only after original fills.
+            results = await asyncio.gather(
+                self.rest_book(direction, market=market), self.rest_book(other, market=market),
+                return_exceptions=True)
+            now = time.time()
+            if self.market != market or time.monotonic()-started > MAX_ENTRY_WAIT:
+                raise Skip('pair_changed_or_too_slow')
+            self.spot.check(now)
+            if anchor not in self.anchors:
+                raise Skip('anchor_invalidated')
+            original_book, reverse_book = results
+            if isinstance(original_book, BaseException):
+                raise Skip('original_book_unavailable')
+            if abs(original_book.source-self.spot.source) > MAX_FEED_SKEW:
+                raise Skip('feed_time_skew')
+            # Confirm the ORIGINAL trigger again after latency; reverse is its counterfactual.
+            _, ref, _, _ = entry_assessment(original_book, market, direction, anchor,
+                                            self.spot.price, STAKE, now)
+            trial['model_reference'] = ref
+            trial['btc_at_fill'] = self.spot.price
+            trial['execution_ms'] = (time.monotonic()-started)*1000
+            decisions = {}
+            for name, side, b in zip(ARM_NAMES,(direction,other),results):
+                row = dict(direction=side, status='rejected', quote=None)
+                decisions[name] = row
+                try:
+                    if isinstance(b, BaseException):
+                        raise Skip('book_unavailable')
+                    b.check(now)
+                    if abs(b.source-self.spot.source) > MAX_FEED_SKEW:
+                        raise Skip('feed_time_skew')
+                    if b.spread() > MAX_SPREAD:
+                        raise Skip('spread')
+                    q = buy_quote(b, market, STAKE, now)
+                    row.update(quote=q, bid=max(b.bids), ask=min(b.asks), book_source=b.source)
+                    immediate = sell_quote(b, market, q['qty'], now)
+                    row.update(immediate_exit=immediate['received'],
+                               baseline_loss=(q['spent']-immediate['received'])/q['qty'])
+                    cost_guard(b, market, q, now)
+                    a = self.lab.data['arms'][name]
+                    if a['daily_stopped'] or a['cash'] < q['spent']:
+                        raise Skip('account_limit')
+                    row['status'] = 'filled'
+                except Skip as exc:
+                    row['reason'] = str(exc)
+                    self.stats[name+':'+str(exc)] += 1
+            # One atomic save includes both fill decisions and all debits.
+            self.lab.commit(trial, decisions, now)
+            lines = [f"PAPER VERGELIJKING #{trial['id']} | BTC signaal {direction}",
+                     f"Uitvoering na {trial['execution_ms']:.0f} ms incl. vertraging"]
+            for name,r in decisions.items():
+                label = 'ORIGINEEL' if name == 'original' else 'REVERSE'
+                if r['status'] == 'filled':
+                    lines.append(f"{label} {r['direction']}: ${r['quote']['spent']:.2f}, "
+                                 f"koop {r['quote']['price']:.4f}, directe verkoopfrictie "
+                                 f"{r['baseline_loss']:.4f}/aandeel")
+                else:
+                    lines.append(f"{label} {r['direction']}: overgeslagen — {r['reason']}")
+            lines.append('Gelijke netto exitregels; vervolgmetingen op 1/2/5/15s. Alleen paper.')
+            self.notify('\n'.join(lines))
+        except asyncio.CancelledError:
+            self.lab.cancel(trial,'shutdown_before_fill')
+            raise
+        except LedgerError:
+            raise
+        except Exception as exc:
+            reason = str(exc) if isinstance(exc,Skip) else type(exc).__name__
+            self.lab.cancel(trial,reason)
+            self.stats['pair_cancel:'+reason] += 1
+
+    def record_markouts(self, now):
+        """Contemporaneous observations only. Never substitute a later successful price."""
+        changed = False
+        for trial in self.lab.data['trials']:
+            if trial['status'] != 'observing':
+                continue
+            elapsed = now-trial['entered']
+            for horizon in MARKOUT_HORIZONS:
+                key = str(horizon)
+                if key in trial['markouts'] or elapsed < horizon:
+                    continue
+                sample = dict(observed_at=now, delay=elapsed-horizon, arms={})
+                trial['markouts'][key] = sample
+                changed = True
+                for name,row in trial['arms'].items():
+                    out = dict(status='missing', executed=row['status']=='filled')
+                    sample['arms'][name] = out
+                    if elapsed-horizon > MARKOUT_TOLERANCE:
+                        out['reason'] = 'missed_window_or_restart'
+                        continue
+                    if not row.get('quote'):
+                        out['reason'] = 'no_entry_quote'
+                        continue
+                    if self.market != trial['market']:
+                        out['reason'] = 'different_market'
+                        continue
+                    try:
+                        b = self.books[row['direction']]
+                        q = sell_quote(b,trial['market'],row['quote']['qty'],now)
+                        out.update(status='observed', bid=max(b.bids), ask=min(b.asks),
+                                   source=b.source, mid=b.mid(), price=q['price'],
+                                   received=q['received'], exit_fee=q['fee'],
+                                   hypothetical_net=q['received']-row['quote']['spent'])
+                    except (Skip,KeyError) as exc:
+                        out['reason'] = str(exc)
+            if len(trial['markouts']) == len(MARKOUT_HORIZONS):
+                trial['status'] = 'observed'
+        if changed:
+            self.lab.save()
+
+    async def markout_worker(self):
+        while True:
+            self.record_markouts(time.time())
+            await asyncio.sleep(.05)
+
+    def comparison_exit_reason(self, p, now):
+        if now-p['entered'] >= MAX_HOLD_SECONDS:
+            return 'time_limit'
+        if p['market']['expiry']-now <= EXIT_BEFORE_EXPIRY:
+            return 'before_expiry'
+        try:
+            self.spot.check(now)
+            b = self.books[p['direction']]
+            q = sell_quote(b,p['market'],p['qty'],now)
+        except (Skip,KeyError):
+            return 'data_stale'
+        net_per_share = (q['received']-p['spent'])/p['qty']
+        if net_per_share >= LAB_TAKE_PROFIT:
+            return 'net_target'
+        if net_per_share <= -STOP_LOSS_PER_SHARE:
+            return 'loss_limit'
+        return None
+
+    async def close_comparison(self, name, reason):
+        p = self.lab.data['arms'][name]['position']
+        if not p:
+            return
+        try:
+            now = time.time()
+            if now >= p['market']['expiry']:
+                rs = await asyncio.wait_for(self.client.get_resolutions(condition_ids=p['market']['condition']),5)
+                payout = resolved_payout(rs,p['market'],p['direction'])
+                if payout is None:
+                    return
+                t = self.lab.close(name,p['qty']*payout,0.,'resolution_fallback',time.time())
+            else:
+                await asyncio.sleep(EXECUTION_DELAY)
+                if time.time() >= p['market']['expiry']:
+                    return
+                b = await self.rest_book(p['direction'],market=p['market'])
+                now = time.time()
+                if now >= p['market']['expiry']:
+                    return
+                q = sell_quote(b,p['market'],p['qty'],now)
+                t = self.lab.close(name,q['received'],q['fee'],reason,now)
+            self.stats[name+':exit:'+t['reason']] += 1
+            self.notify(f"PAPER {name.upper()} #{p['trial_id']} {p['direction']} gesloten\n"
+                        f"{t['reason']} | netto ${t['pnl']:+.2f} | duur {t['seconds']:.1f}s\n"
+                        f"Prijsresultaat ${t['price_pnl']:+.2f}, beide fees ${t['fees']:.4f}\n"
+                        "Vervolgmetingen blijven doorlopen tot 15s na instap.")
+        except LedgerError:
+            raise
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.stats[name+':exit_unavailable:'+type(exc).__name__] += 1
+            # No available bid = no invented sale. Position stays in the ledger.
+
+    def reap_tasks(self):
+        if self.entry_task and self.entry_task.done():
+            self.entry_task.result()
+            self.entry_task = None
+        for name,task in list(self.exit_tasks.items()):
+            if task.done():
+                task.result()
+                del self.exit_tasks[name]
+        if self.observe_task and self.observe_task.done():
+            self.observe_task.result()
+            raise LedgerError('Vervolgmetingen onverwacht gestopt')
+
+    def schedule_exits(self, now):
+        for name,a in self.lab.data['arms'].items():
+            p = a['position']
+            if not p or name in self.exit_tasks:
+                continue
+            expired = now >= p['market']['expiry']
+            interval = 20 if expired else 1
+            if now-self.exit_attempts.get(name,0) < interval:
+                continue
+            reason = 'resolution_fallback' if expired else self.comparison_exit_reason(p,now)
+            if reason:
+                self.exit_attempts[name] = now
+                self.exit_tasks[name] = asyncio.create_task(self.close_comparison(name,reason))
+
+    def report(self):
+        totals,paired = lab_summary(self.lab.data)
+        lines = [VERSION, 'Nieuwe vergelijking; twee afzonderlijke fictieve accounts.']
+        for name,a in self.lab.data['arms'].items():
+            t = totals[name]
+            lines.append(f"{name.upper()}: gesloten {t['n']}, winst {t['wins']}, "
+                         f"netto ${t['pnl']:+.2f}, fees ${t['fees']:.2f}, "
+                         f"open {int(a['position'] is not None)}, vrij ${a['cash']:.2f}")
+            rejected = [tr.get('arms',{}).get(name,{}) for tr in self.lab.data['trials']]
+            costs = sum(r.get('reason') == 'roundtrip_cost_near_stop' for r in rejected)
+            lines.append(f"Afgewezen {name}: {sum(r.get('status') == 'rejected' for r in rejected)}, "
+                         f"waarvan kosten bij verliesgrens: {costs}")
+        lines.append(f"Beide uitgevoerd én gesloten: {paired['n']} paren | "
+                     f"origineel ${paired['original']:+.2f}, reverse ${paired['reverse']:+.2f}")
+        for horizon in MARKOUT_HORIZONS:
+            rows = []
+            missing = 0
+            for tr in self.lab.data['trials']:
+                if not all(tr.get('arms',{}).get(n,{}).get('status') == 'filled' for n in ARM_NAMES):
+                    continue
+                sample = tr['markouts'].get(str(horizon))
+                if sample is None:
+                    continue
+                arms = sample['arms']
+                if all(arms[n]['status'] == 'observed' for n in ARM_NAMES):
+                    rows.append(tuple(arms[n]['hypothetical_net'] for n in ARM_NAMES))
+                else:
+                    missing += 1
+            if rows:
+                av = [sum(r[i] for r in rows)/len(rows) for i in (0,1)]
+                lines.append(f"Vasthouden {horizon}s, netto hypothetisch gem./paar: "
+                             f"O ${av[0]:+.3f}, R ${av[1]:+.3f} | n={len(rows)}, ontbreekt={missing}")
+            else:
+                lines.append(f"Vasthouden {horizon}s: nog geen complete paren; ontbreekt={missing}")
+        _,seconds,returns,_ = self.spot.history_metrics()
+        lines.append(f"BTC historie {seconds:.0f}s / {returns} rendementen | "
+                     f"boekherstel {self.book_diagnostics}")
+        lines.append('Controles (herhalingen): '+str(dict(self.stats.most_common(12))))
+        legacy = self.ledger.data
+        lines.append(f"Oude test: {len(legacy['trades'])} gesloten, "
+                     f"netto ${sum(t['pnl'] for t in legacy['trades']):+.2f}; niet meegeteld.")
+        lines.append('PAPER: geschatte fills. Vervolgmetingen zijn geen extra winst/verliesboekingen.')
+        self.notify('\n'.join(lines)[:3900])
+        self.stats.clear()
+        self.spot.event_stats.clear()
+        self.spot.event_ages.clear()
+
+    async def run(self):
+        self.notify(f"{VERSION} gestart | ALLEEN PAPER\n"
+                    f"ORIGINEEL versus REVERSE, elk eigen saldo; inzet ${STAKE:.2f} per variant.\n"
+                    f"Instap geweigerd bij directe verkoopfrictie ≥"
+                    f"{STOP_LOSS_PER_SHARE-ENTRY_STOP_BUFFER:.3f}/aandeel.\n"
+                    f"Gelijke exits: netto +{LAB_TAKE_PROFIT:.2f}/aandeel, "
+                    f"-{STOP_LOSS_PER_SHARE:.2f}/aandeel of na {MAX_HOLD_SECONDS}s.\n"
+                    "Max. 2 vergelijkmomenten per 5m-ronde. Oude posities worden eerst afgehandeld.")
+        self.observe_task = asyncio.create_task(self.markout_worker())
+        jobs = [asyncio.create_task(self.spot_stream()),asyncio.create_task(self.telegram_worker()),
+                asyncio.create_task(self.repair_books()),self.observe_task]
+        try:
+            while True:
+                now = time.time()
+                HEALTH['heartbeat'] = now
+                self.reap_tasks()
+                try:
+                    self.ledger.roll_day(now)
+                    self.lab.roll_day(now)
+                    legacy = self.ledger.data['position']
+                    positions = [a['position'] for a in self.lab.data['arms'].values() if a['position']]
+                    required = legacy['market'] if legacy else (positions[0]['market'] if positions else None)
+                    if required and self.market != required:
+                        await self.switch_market(required)
+                    if not required and not self.entry_task and (not self.market or now >= self.market['expiry']):
+                        if now < self.next_discovery:
+                            raise Skip('discovery_backoff')
+                        self.next_discovery = now+5
+                        await self.switch_market(await discover(self.client,int(now//300)*300))
+                    if legacy:
+                        await self.manage_position()  # never creates new legacy trades
+                    else:
+                        self.schedule_exits(now)
+                        if self.entry_task:
+                            raise Skip('comparison_pending')
+                        self.lab.allowed(self.market,now)
+                        if not ENTRY_TIME_MIN <= self.market['expiry']-now <= ENTRY_TIME_MAX:
+                            raise Skip('outside_entry_window')
+                        anchor = self.observe(now)
+                        direction = 'UP' if self.spot.price > anchor['spot'] else 'DOWN'
+                        # Keep the signal generator fixed for both directions.
+                        entry_assessment(self.books[direction],self.market,direction,anchor,
+                                         self.spot.price,STAKE,now)
+                        trial = self.lab.begin(self.market,direction,now)
+                        self.entry_task = asyncio.create_task(self.paired_entry(trial,anchor))
+                except Skip as exc:
+                    self.stats[str(exc)] += 1
+                except LedgerError:
+                    raise
+                except Exception as exc:
+                    self.stats['api_error:'+type(exc).__name__] += 1
+                    LOG.warning('Vergelijking tijdelijk gepauzeerd: %s',type(exc).__name__)
+                    await asyncio.sleep(1)
+                if time.time()-self.last_report >= REPORT_SECONDS:
+                    self.report()
+                    self.last_report = time.time()
+                await asyncio.sleep(.1)
+        finally:
+            for task in [self.stream_task,self.entry_task,*self.exit_tasks.values()]:
+                if task:
+                    jobs.append(task)
+            for task in jobs:
+                task.cancel()
+            await asyncio.gather(*jobs,return_exceptions=True)
+            self.ledger.save()
+            self.lab.save()
+
+
 def start_health_server():
     if not os.getenv("PORT"):
         return
@@ -914,7 +1415,7 @@ async def main():
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         start_health_server()
         async with AsyncPublicClient() as client:
-            engine = Engine(client, Ledger())
+            engine = ComparisonEngine(client, Ledger(), ComparisonLedger())
             task = asyncio.create_task(engine.run())
             for sig in (signal.SIGINT, signal.SIGTERM):
                 asyncio.get_running_loop().add_signal_handler(sig, task.cancel)
