@@ -1,7 +1,15 @@
 """BTC 5m repricing + public event recording + offline replay — PAPER ONLY.
 Python 3.12. Start as usual: python bot.py
 
-v7.4: observation candidates and paper execution limits are separate.
+v7.5: cost-aware paper risk with immutable per-position exit policies.
+New entries reject round-trip friction above 7 cents/share. The all-in stop is
+max(4 cents, measured entry/exit friction + 2 cents), capped at 10 cents/share.
+This deliberately allows more downside than v7.4; it is an unvalidated PAPER
+experiment, not improved profitability. Fees, depth and stress ticks remain.
+Old open positions retain their original exit limits. Reports separate policy
+versions and show distinct market rounds rather than implying independence.
+
+Observation candidates and paper execution limits are separate.
 Eligible candidates are sampled at most once per 10 seconds, including while
 accounts are blocked. Rejected/cancelled candidates do not consume the cap of
 two actual paper entries per account per market. Existing fill counts migrate
@@ -9,7 +17,7 @@ from closed trades and open positions. Old balances/history are preserved.
 Both filled and rejected quotes have hypothetical 1/2/5/15-second follow-ups;
 the five-minute report shows separate cohorts, missing observations and costs.
 These overlapping observations are not independent trades or account PnL.
-The cost guard, sizing, one-tick stress and exit rules have not been relaxed.
+The original BTC signal, sizing, one-tick stress and 15s holding limit remain.
 
 The bounded local receive-order journal retains ~1GiB in replay/.
 Market changes, BTC updates, atomic L2 snapshots/deltas, reconnects, eligible
@@ -40,7 +48,8 @@ Use a Railway volume for persistence. The separate ledger is
 polymarket_latency_comparison.json, with two separate fictitious accounts.
 Old polymarket_latency_paper.json is retained; an old position is managed to exit.
 Changing PAPER_BALANCE does not reset a ledger. Both comparison arms use the
-same net +0.01/share target, -0.04/share loss limit, and 15s maximum hold attempt.
+same net +0.01/share target, cost-aware stop rule and 15s maximum hold attempt.
+Each arm pays its own friction and freezes its own resulting stop at entry.
 A delayed entry is rejected if immediate round-trip loss is >=0.035/share.
 Both sides use their own ask/bid depth, fees and one adverse tick each way.
 Markouts at 1/2/5/15s continue after exits and never change account cash.
@@ -60,6 +69,7 @@ import importlib.metadata
 import json
 import logging
 import math
+from statistics import median
 import os
 from pathlib import Path
 import signal
@@ -76,8 +86,9 @@ from polymarket import AsyncPublicClient
 from polymarket.streams import MarketSpec
 from websockets.asyncio.client import connect
 
-VERSION = "7.4-BTC-Candidate-PAPER"
-COMPATIBLE_LEDGERS = {"7.0-BTC-Repricing-PAPER", "7.1-BTC-Repricing-PAPER", "7.2-BTC-Paired-PAPER", "7.3-BTC-Replay-PAPER", VERSION}
+VERSION = "7.5-BTC-CostAware-PAPER"
+PREVIOUS_VERSION = "7.4-BTC-Candidate-PAPER"
+COMPATIBLE_LEDGERS = {"7.0-BTC-Repricing-PAPER", "7.1-BTC-Repricing-PAPER", "7.2-BTC-Paired-PAPER", "7.3-BTC-Replay-PAPER", PREVIOUS_VERSION, VERSION}
 STAKE = float(os.getenv("PAPER_TRADE_AMOUNT", "7.50"))
 START_BALANCE = float(os.getenv("PAPER_BALANCE", "1000"))
 DATA_DIR = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or os.getenv("BOT_DATA_DIR", "."))
@@ -114,7 +125,10 @@ BOOK_REPAIR_INTERVAL = 3
 BTC_IDLE_RECONNECT = 15
 MAX_HOLD_SECONDS = 15
 EXIT_BEFORE_EXPIRY = 20
-STOP_LOSS_PER_SHARE = .04
+STOP_LOSS_PER_SHARE = .04  # Legacy/floor. New paired entries freeze a cost-aware stop.
+MAX_ROUNDTRIP_COST = .07
+POST_COST_LOSS_ROOM = .02
+MAX_COST_AWARE_STOP = .10
 MAX_ENTRIES_PER_ROUND = 2
 COOLDOWN_SECONDS = 10
 DAILY_LOSS_FRACTION = .03
@@ -984,6 +998,42 @@ def cost_guard(book, market, quote, now):
     return immediate, loss
 
 
+
+def cost_aware_risk(book, market, quote, now):
+    """Bounded new-entry policy. Cost is real friction, never subtracted from PnL.
+
+    The legacy four-cent stop could be inside the initial loss. Leave two cents
+    of adverse movement after paying friction, while refusing expensive books.
+    Stops are triggers, not guaranteed fills; all observed sell depth still applies.
+    """
+    immediate = sell_quote(book, market, quote['qty'], now)
+    loss = (quote['spent']-immediate['received'])/quote['qty']
+    if not math.isfinite(loss) or loss < 0:
+        raise Skip('invalid_roundtrip_cost')
+    if loss > MAX_ROUNDTRIP_COST:
+        raise Skip('roundtrip_cost_cap')
+    stop = max(STOP_LOSS_PER_SHARE, loss+POST_COST_LOSS_ROOM)
+    if stop > MAX_COST_AWARE_STOP:
+        raise Skip('cost_aware_stop_cap')
+    return dict(version=VERSION, mode='cost_aware', stop_per_share=stop,
+                target_per_share=LAB_TAKE_PROFIT, max_hold_seconds=MAX_HOLD_SECONDS,
+                baseline_loss=loss, max_cost=MAX_ROUNDTRIP_COST,
+                post_cost_room=POST_COST_LOSS_ROOM)
+
+
+def position_exit_limits(position):
+    """Old positions have their old limits; updates never widen an existing stop."""
+    policy = position.get('exit_policy') or {}
+    return (policy.get('target_per_share', LAB_TAKE_PROFIT),
+            policy.get('stop_per_share', STOP_LOSS_PER_SHARE),
+            policy.get('max_hold_seconds', MAX_HOLD_SECONDS))
+
+
+def trial_version(trial):
+    # v7.2/v7.3 rows predate the version field. Never label them current.
+    return trial.get('policy',{}).get('version', 'older_unversioned')
+
+
 def cost_breakdown(book, quote, immediate):
     """All components in dollars per credited share; sum equals immediate net loss.
 
@@ -1007,7 +1057,8 @@ def candidate_summary(data):
         for cohort in ('filled', 'rejected'):
             trials = [t for t in data['trials'] if t.get('arms',{}).get(name,{}).get('status') == cohort]
             costs = [t['arms'][name]['costs'] for t in trials if t['arms'][name].get('costs')]
-            summary = dict(candidates=len(trials), cost_n=len(costs), costs={}, horizons={})
+            summary = dict(candidates=len(trials), rounds=len({t['market']['slug'] for t in trials}),
+                           cost_n=len(costs), costs={}, horizons={})
             if costs:
                 summary['costs'] = {key:sum(c[key] for c in costs)/len(costs) for key in costs[0]}
             for horizon in MARKOUT_HORIZONS:
@@ -1023,6 +1074,23 @@ def candidate_summary(data):
                     fees_mean=sum(s['total_fees'] for s in priced)/len(priced) if priced else None,
                     priced_n=len(priced),
                     positive=sum(s['hypothetical_net']>0 for s in observed))
+                # Equal weight per market round reduces repeated-candidate weighting.
+                # This is descriptive clustering, not proof of independence/significance.
+                grouped = {}
+                per_share = []
+                for trial, sample in zip(trials,samples):
+                    q = trial['arms'][name].get('quote')
+                    if sample and sample['status']=='observed' and q and q['qty'] > 0:
+                        value = sample['hypothetical_net']/q['qty']
+                        per_share.append(value)
+                        grouped.setdefault(trial['market']['slug'],[]).append(value)
+                round_means = [sum(values)/len(values) for values in grouped.values()]
+                summary['horizons'][key].update(
+                    net_per_share_mean=sum(per_share)/len(per_share) if per_share else None,
+                    net_per_share_median=median(per_share) if per_share else None,
+                    round_n=len(round_means),
+                    round_mean_per_share=sum(round_means)/len(round_means) if round_means else None,
+                    round_positive=sum(v>0 for v in round_means))
             results[name][cohort] = summary
     return results
 
@@ -1068,6 +1136,17 @@ class ComparisonLedger:
                 if p:
                     slug = p['market']['slug']
                     counts[slug] = counts.get(slug,0)+1
+        # Freeze pre-update exits before changing entry policy. History/cash unchanged.
+        versions = {t['id']:trial_version(t) for t in self.data['trials']}
+        for a in self.data['arms'].values():
+            for t in a['trades']:
+                t.setdefault('policy_version',versions.get(t.get('trial_id'),'older_unversioned'))
+            p = a['position']
+            if p:
+                p.setdefault('policy_version',versions.get(p.get('trial_id'),'older_unversioned'))
+                p.setdefault('exit_policy',dict(version=p['policy_version'],mode='fixed',
+                    stop_per_share=STOP_LOSS_PER_SHARE,target_per_share=LAB_TAKE_PROFIT,
+                    max_hold_seconds=MAX_HOLD_SECONDS))
         self.validate()
         # Atomic fills are either present in both account state and trial, or absent.
         for trial in self.data['trials']:
@@ -1141,7 +1220,9 @@ class ComparisonLedger:
                      policy=dict(stake=STAKE, target=LAB_TAKE_PROFIT, stop=STOP_LOSS_PER_SHARE,
                                  stop_buffer=ENTRY_STOP_BUFFER, hold_seconds=MAX_HOLD_SECONDS,
                                  execution_delay=EXECUTION_DELAY, slippage_ticks=SLIPPAGE_TICKS))
-        trial['policy']['version'] = VERSION
+        trial['policy'].update(version=VERSION, risk_mode='cost_aware',
+                               max_cost=MAX_ROUNDTRIP_COST, post_cost_room=POST_COST_LOSS_ROOM,
+                               max_stop=MAX_COST_AWARE_STOP)
         self.data['next_id'] += 1
         self.data['trials'].append(trial)
         self.data['last_trial'] = now
@@ -1171,7 +1252,13 @@ class ComparisonLedger:
             a['cash'] -= q['spent']
             a['position'] = dict(**q, trial_id=trial['id'], direction=r['direction'],
                                  market=trial['market'].copy(), entered=now,
-                                 immediate_exit=r['immediate_exit'], baseline_loss=r['baseline_loss'])
+                                 immediate_exit=r['immediate_exit'], baseline_loss=r['baseline_loss'],
+                                 policy_version=trial_version(trial),
+                                 exit_policy=r.get('exit_policy') or dict(
+                                     version=trial_version(trial), mode='fixed',
+                                     stop_per_share=trial['policy']['stop'],
+                                     target_per_share=trial['policy']['target'],
+                                     max_hold_seconds=trial['policy']['hold_seconds']))
             counts = self.data['fill_counts'][name]
             slug = trial['market']['slug']
             counts[slug] = counts.get(slug,0)+1
@@ -1190,6 +1277,8 @@ class ComparisonLedger:
                  spent=p['spent'], received=proceeds, fees=p['fee']+fee,
                  pnl=proceeds-p['spent'], reason=reason)
         t['price_pnl'] = t['pnl']+t['fees']
+        t['policy_version'] = p.get('policy_version','older_unversioned')
+        t['exit_policy'] = p.get('exit_policy')
         a['cash'] += proceeds
         a['trades'].append(t)
         a['position'] = None
@@ -1260,7 +1349,7 @@ class ComparisonEngine(Engine):
                     row.update(immediate_exit=immediate['received'],
                                baseline_loss=(q['spent']-immediate['received'])/q['qty'],
                                costs=cost_breakdown(b,q,immediate))
-                    cost_guard(b, market, q, now)
+                    row['exit_policy'] = cost_aware_risk(b, market, q, now)
                     a = self.lab.data['arms'][name]
                     if a['position']:
                         raise Skip('paper_position_open')
@@ -1291,7 +1380,10 @@ class ComparisonEngine(Engine):
                     lines.append(f"Kosten cent/aandeel: spread {100*c['spread']:.2f}, "
                                  f"fees {100*c['fees']:.2f}, extra slippage {100*c['slippage']:.2f}, "
                                  f"diepte/afronding {100*c['depth_and_rounding']:.2f}; "
-                                 f"totaal {100*c['total']:.2f} (grens {100*(STOP_LOSS_PER_SHARE-ENTRY_STOP_BUFFER):.2f}).")
+                                 f"totaal {100*c['total']:.2f} (kostenplafond {100*MAX_ROUNDTRIP_COST:.2f}).")
+                if r.get('exit_policy'):
+                    lines.append(f"Netto verliestrigger {100*r['exit_policy']['stop_per_share']:.2f} cent/aandeel; "
+                                 f"{100*POST_COST_LOSS_ROOM:.1f} cent ruimte boven aanvangskosten.")
             lines.append('Ook afgewezen quotes volgen we op 1/2/5/15s. Metingen wijzigen geen saldo.')
             if any(r['status']=='filled' for r in decisions.values()) or now-self.last_candidate_notice >= REPORT_SECONDS:
                 self.notify('\n'.join(lines))
@@ -1384,7 +1476,8 @@ class ComparisonEngine(Engine):
             await asyncio.sleep(.1)
 
     def comparison_exit_reason(self, p, now):
-        if now-p['entered'] >= MAX_HOLD_SECONDS:
+        target, stop, hold = position_exit_limits(p)
+        if now-p['entered'] >= hold:
             return 'time_limit'
         if p['market']['expiry']-now <= EXIT_BEFORE_EXPIRY:
             return 'before_expiry'
@@ -1395,9 +1488,9 @@ class ComparisonEngine(Engine):
         except (Skip,KeyError):
             return 'data_stale'
         net_per_share = (q['received']-p['spent'])/p['qty']
-        if net_per_share >= LAB_TAKE_PROFIT:
+        if net_per_share >= target:
             return 'net_target'
-        if net_per_share <= -STOP_LOSS_PER_SHARE:
+        if net_per_share <= -stop:
             return 'loss_limit'
         return None
 
@@ -1466,56 +1559,74 @@ class ComparisonEngine(Engine):
                 self.exit_tasks[name] = asyncio.create_task(self.close_comparison(name,reason))
 
     def report(self):
+        now = time.time()
         totals,paired = lab_summary(self.lab.data)
-        lines = [VERSION, 'Twee paperaccounts; kostenfilter actief.']
+        current = [t for t in self.lab.data['trials'] if trial_version(t)==VERSION]
+        recent = current[-200:]
+        new_count = sum(t['created'] >= now-REPORT_SECONDS for t in current)
+        lines = [VERSION, 'ALLEEN PAPER — nieuwe kostenbewuste proef.',
+                 'Vervolgmetingen zijn geen extra winst/verliesboekingen.',
+                 f"Nieuwe kandidaten laatste 5min: {new_count}; deze versie totaal {len(current)}."]
+        if current:
+            lines.append(f"Laatste kandidaat {max(0,now-current[-1]['created'])/60:.1f} minuten geleden.")
         for name,a in self.lab.data['arms'].items():
             t = totals[name]
-            lines.append(f"{name.upper()}: gesloten {t['n']}, winst {t['wins']}, "
-                         f"netto ${t['pnl']:+.2f}, fees ${t['fees']:.2f}, "
-                         f"open {int(a['position'] is not None)}, vrij ${a['cash']:.2f}")
-            rejected = [tr.get('arms',{}).get(name,{}) for tr in self.lab.data['trials']]
-            costs = sum(r.get('reason') == 'roundtrip_cost_near_stop' for r in rejected)
-            lines.append(f"Afgewezen {name}: {sum(r.get('status') == 'rejected' for r in rejected)}, "
-                         f"waarvan kosten bij verliesgrens: {costs}")
-        lines.append(f"Beide uitgevoerd én gesloten: {paired['n']} paren | "
-                     f"origineel ${paired['original']:+.2f}, reverse ${paired['reverse']:+.2f}")
-        measured = candidate_summary({'trials':self.lab.data['trials'][-200:]})
-        lines.append('VERVOLGMETINGEN — laatste 200 kandidaten, inclusief afwijzingen.')
+            own = [row for row in a['trades'] if row.get('policy_version')==VERSION]
+            lines.append(f"{name.upper()} saldo vrij ${a['cash']:.2f}, open {int(a['position'] is not None)} | "
+                         f"v7.5 gesloten {len(own)}, netto ${sum(r['pnl'] for r in own):+.2f} | "
+                         f"alle versies {t['n']} trades, ${t['pnl']:+.2f}")
+            if a['position']:
+                target,stop,hold = position_exit_limits(a['position'])
+                lines.append(f"Open: netto doel {100*target:.1f}c, stoptrigger {100*stop:.2f}c/aandeel, {hold}s.")
+            reasons = Counter(tr.get('arms',{}).get(name,{}).get('reason') for tr in current
+                              if tr.get('arms',{}).get(name,{}).get('status')=='rejected')
+            if reasons:
+                lines.append(f"Afgewezen {name} v7.5: {dict(reasons.most_common(4))}")
+        lines.append(f"Historisch beide uitgevoerd/gesloten: {paired['n']} paren | "
+                     f"O ${paired['original']:+.2f}, R ${paired['reverse']:+.2f}")
+        lines.append('VERVOLGMETINGEN: alleen v7.5, laatste 200 kandidaten; netto incl. kosten.')
+        measured = candidate_summary({'trials':recent})
         for name in ARM_NAMES:
             for cohort,label in (('filled','paper uitgevoerd'),('rejected','afgewezen')):
                 summary = measured[name][cohort]
-                lines.append(f"{name.upper()} {label}: {summary['candidates']} kandidaten")
+                lines.append(f"{name.upper()} {label}: {summary['candidates']} kandidaten / "
+                             f"{summary['rounds']} verschillende 5m-rondes")
                 c = summary['costs']
                 if c:
-                    lines.append(f"Gem. kosten cent/aandeel (n={summary['cost_n']}): "
-                                 f"spread {100*c['spread']:.2f} + fees {100*c['fees']:.2f} + "
-                                 f"slip {100*c['slippage']:.2f} + diepte/afr. {100*c['depth_and_rounding']:.2f} "
-                                 f"= {100*c['total']:.2f}")
+                    lines.append(f"Gem. kosten cent/aandeel n={summary['cost_n']}: spread {100*c['spread']:.2f} + "
+                                 f"fees {100*c['fees']:.2f} + slip {100*c['slippage']:.2f} + "
+                                 f"diepte/afr. {100*c['depth_and_rounding']:.2f} = {100*c['total']:.2f}")
                 if not summary['candidates']:
                     continue
-                for horizon,s in summary['horizons'].items():
-                    value = f"${s['net_mean']:+.3f}" if s['net_mean'] is not None else 'onbekend'
-                    lines.append(f"{horizon}s netto hypothetisch gem. {value}, "
-                                 f"positief {s['positive']}/{s['n']}, mist {s['missing']}, wacht {s['pending']}")
-                    if s['priced_n']:
-                        lines.append(f"  Prijs-PnL ${s['price_mean']:+.3f} − fees ${s['fees_mean']:.3f} "
-                                     f"(gem., n={s['priced_n']}; slippage zit in prijs).")
-        lines.append('Overlap mogelijk: dit zijn geen onafhankelijke trades of extra saldowinsten.')
+                for horizon,stats in summary['horizons'].items():
+                    value = f"${stats['net_mean']:+.3f}" if stats['net_mean'] is not None else 'onbekend'
+                    lines.append(f"{horizon}s netto hypothetisch gem. {value}; positief {stats['positive']}/{stats['n']}, "
+                                 f"mist {stats['missing']}, wacht {stats['pending']}")
+                h = summary['horizons']['5']
+                if h['round_n']:
+                    lines.append(f"5s per ronde gelijk gewogen: {100*h['round_mean_per_share']:+.2f}c/aandeel, "
+                                 f"{h['round_positive']}/{h['round_n']} rondes positief; "
+                                 f"mediaan kandidaat {100*h['net_per_share_median']:+.2f}c.")
+                if h['priced_n']:
+                    lines.append(f"5s Prijs-PnL ${h['price_mean']:+.3f} − fees ${h['fees_mean']:.3f} gem.; "
+                                 'extra slippage zit in prijs.')
+        historical = Counter(trial_version(t) for t in self.lab.data['trials'] if trial_version(t)!=VERSION)
+        if historical:
+            lines.append('Eerdere kandidaten apart bewaard: '+str(dict(historical)))
+        lines.append('Overlap/correlatie mogelijk. Gemiddelden zijn geen bewijs van winstgevendheid.')
         _,seconds,returns,_ = self.spot.history_metrics()
-        lines.append(f"BTC historie {seconds:.0f}s / {returns} rendementen | "
-                     f"boekherstel {self.book_diagnostics}")
-        lines.append('Controles (herhalingen): '+str(dict(self.stats.most_common(12))))
+        lines.append(f"BTC historie {seconds:.0f}s/{returns} rendementen | boekherstel {self.book_diagnostics}")
+        lines.append('Controles (herhalingen): '+str(dict(self.stats.most_common(8))))
         legacy = self.ledger.data
-        lines.append(f"Oude test: {len(legacy['trades'])} gesloten, "
-                     f"netto ${sum(t['pnl'] for t in legacy['trades']):+.2f}; niet meegeteld.")
-        lines.append('PAPER: geschatte fills. Vervolgmetingen zijn geen extra winst/verliesboekingen.')
+        lines.append(f"Oude test: {len(legacy['trades'])} gesloten; niet meegeteld.")
         if RECORDER is not None:
-            lines.insert(1, f"Replay-opname: {'FOUT — entries geblokkeerd' if RECORDER.failed else 'actief'}; "
-                         f"{RECORDER.written} events geschreven, wachtrij {RECORDER.pending}.")
-        delays = sorted(t['execution_ms'] for t in self.lab.data['trials'] if t.get('execution_ms'))
+            lines.insert(1, f"Opname {'FOUT — entries geblokkeerd' if RECORDER.failed else 'actief'}: "
+                         f"{RECORDER.written} events, wachtrij {RECORDER.pending}.")
+        delays = sorted(t['execution_ms'] for t in current if t.get('execution_ms'))
         if delays:
-            lines.insert(2, f"Gemeten instapvertraging p50/p95: {delays[len(delays)//2]:.0f}/"
-                         f"{delays[min(len(delays)-1,int(len(delays)*.95))]:.0f} ms (n={len(delays)}).")
+            lines.insert(2, f"Instapvertraging incl. {EXECUTION_DELAY*1000:.0f}ms simulatie p50/p95: "
+                         f"{delays[len(delays)//2]:.0f}/{delays[min(len(delays)-1,int(len(delays)*.95))]:.0f}ms "
+                         f"(n={len(delays)}); geen gemeten marktvertraging.")
         message = ''
         for line in lines:
             if len(message)+len(line)+1 > 3800:
@@ -1531,10 +1642,11 @@ class ComparisonEngine(Engine):
     async def run(self):
         self.notify(f"{VERSION} gestart | ALLEEN PAPER\n"
                     f"ORIGINEEL versus REVERSE, elk eigen saldo; inzet ${STAKE:.2f} per variant.\n"
-                    f"Instap geweigerd bij directe verkoopfrictie ≥"
-                    f"{STOP_LOSS_PER_SHARE-ENTRY_STOP_BUFFER:.3f}/aandeel.\n"
-                    f"Gelijke exits: netto +{LAB_TAKE_PROFIT:.2f}/aandeel, "
-                    f"-{STOP_LOSS_PER_SHARE:.2f}/aandeel of na {MAX_HOLD_SECONDS}s.\n"
+                    f"Kostenplafond {100*MAX_ROUNDTRIP_COST:.1f} cent/aandeel.\n"
+                    f"Nieuwe netto verliestrigger: max(4 cent, kosten + {100*POST_COST_LOSS_ROOM:.0f} cent), "
+                    f"maximaal {100*MAX_COST_AWARE_STOP:.0f} cent/aandeel. Meer verliesruimte dan v7.4.\n"
+                    f"Netto doel +{100*LAB_TAKE_PROFIT:.0f} cent/aandeel; tijdlimiet {MAX_HOLD_SECONDS}s.\n"
+                    "Oude open posities behouden hun uitstapregels.\n"
                     "Max. 2 paperinstappen per variant per ronde. Kandidaten blijven gemeten, maximaal elke 10s.\n"
                     "BTC/L2-opname + offline replay actief. Geen Marketlens-account nodig.")
         self.observe_task = asyncio.create_task(self.markout_worker())
@@ -1624,7 +1736,9 @@ class TapeRecorder:
                   policy=dict(min_gross_edge=MIN_GROSS_EDGE, min_net_edge=MIN_NET_EDGE,
                               min_btc_move=MIN_BTC_MOVE, min_model_move=MIN_MODEL_MOVE,
                               take_profit=LAB_TAKE_PROFIT, stop=STOP_LOSS_PER_SHARE,
-                              hold=MAX_HOLD_SECONDS, slippage_ticks=SLIPPAGE_TICKS))
+                              hold=MAX_HOLD_SECONDS, slippage_ticks=SLIPPAGE_TICKS,
+                              risk_mode='cost_aware',cost_cap=MAX_ROUNDTRIP_COST,
+                              post_cost_room=POST_COST_LOSS_ROOM,stop_cap=MAX_COST_AWARE_STOP))
 
     @property
     def pending(self):
@@ -1810,11 +1924,12 @@ class TapeReplay:
                 if b.spread() > MAX_SPREAD:
                     raise Skip('spread')
                 q = buy_quote(b,market,self.stake,now)
-                cost_guard(b,market,q,now)
+                risk = cost_aware_risk(b,market,q,now)
                 a['cash'] -= q['spent']
                 self.round_counts[(name,market['slug'])] += 1
                 a['position'] = dict(**q,direction=side,market=market,entered=now,
-                                     trial_id=trial_id,exit_pending=False,next_exit=now)
+                                     trial_id=trial_id,exit_pending=False,next_exit=now,
+                                     policy_version=VERSION,exit_policy=risk)
             except Skip as exc:
                 self.stats[name+':entry:'+str(exc)] += 1
 
@@ -1868,7 +1983,8 @@ class TapeReplay:
             if now >= p['market']['expiry']:
                 continue  # Never manufacture a resolution from Binance or the last quote.
             reason = None
-            if now-p['entered'] >= MAX_HOLD_SECONDS:
+            target, stop, hold = position_exit_limits(p)
+            if now-p['entered'] >= hold:
                 reason = 'time_limit'
             elif p['market']['expiry']-now <= EXIT_BEFORE_EXPIRY:
                 reason = 'before_expiry'
@@ -1878,9 +1994,9 @@ class TapeReplay:
                     b = self.get_book(p['direction'],p['market'],now)
                     q = sell_quote(b,p['market'],p['qty'],now)
                     net = (q['received']-p['spent'])/p['qty']
-                    if net >= LAB_TAKE_PROFIT:
+                    if net >= target:
                         reason = 'net_target'
-                    elif net <= -STOP_LOSS_PER_SHARE:
+                    elif net <= -stop:
                         reason = 'loss_limit'
                 except Skip:
                     reason = 'data_stale'
@@ -1901,14 +2017,14 @@ class TapeReplay:
         if kind == 'session':
             self.recorded_stakes.add(row['signal_stake'])
             self.recorded_versions.add(row.get('version'))
-            if row.get('version') not in ('7.3-BTC-Replay-PAPER',VERSION):
+            if row.get('version') not in ('7.3-BTC-Replay-PAPER',PREVIOUS_VERSION,VERSION):
                 raise ValueError('Replay requires matching recording version')
         elif kind in ('market','checkpoint'):
             m = row['market']
             if not self.market or m['slug'] != self.market['slug']:
                 self.market, self.books = m, {}
             if kind == 'checkpoint':
-                if row.get('version',VERSION) not in ('7.3-BTC-Replay-PAPER',VERSION):
+                if row.get('version',VERSION) not in ('7.3-BTC-Replay-PAPER',PREVIOUS_VERSION,VERSION):
                     raise ValueError('Replay requires matching checkpoint version')
                 self.recorded_versions.add(row.get('version',VERSION))
                 if 'signal_stake' in row:
@@ -1969,10 +2085,13 @@ class TapeReplay:
         return dict(version=VERSION,mode='OFFLINE_REPLAY_PAPER',latency_ms=self.latency*1000,
                     stake=self.stake,recorded_signal_stakes=sorted(self.recorded_stakes),
                     recorded_versions=sorted(self.recorded_versions),entry_cap_policy='actual_fills_per_arm',
+                    evaluated_exit_policy=dict(version=VERSION,mode='cost_aware',
+                        cost_cap=MAX_ROUNDTRIP_COST,post_cost_room=POST_COST_LOSS_ROOM,
+                        stop_cap=MAX_COST_AWARE_STOP),
                     arms=arms,matched_closed_pairs=dict(n=len(paired),**{
                         n:sum(maps[n][i]['pnl'] for i in paired) for n in ARM_NAMES}),
                     pending_orders=len(self.jobs),counters=dict(self.stats),
-                    limitations=['Fixed recorded signal generator; execution sensitivity only.',
+                    limitations=['Fixed recorded signal generator; current v7.5 cost-aware execution policy applied, not an exact old-version replay.',
                                  'Taker fills only; no queue priority simulation.',
                                  'No official settlement data: expired/open positions stay unresolved.',
                                  'Quotes are historical observed depth; not guaranteed live fills.'])
