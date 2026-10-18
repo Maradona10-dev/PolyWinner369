@@ -1,7 +1,16 @@
 """BTC 5m repricing + public event recording + offline replay — PAPER ONLY.
 Python 3.12. Start as usual: python bot.py
 
-v7.6: original signal only; reverse quotes are shadow observations, not trades.
+v7.7: separate strict ENTRY freshness from bounded EXIT BTC freshness.
+New entries still require BTC <=1 second old. New positions may bridge a brief
+BTC tick gap up to 3 seconds ONLY while executable Polymarket quotes remain fresh.
+Stops/targets keep running; missing/disconnected feeds still trigger an exit.
+This is an unvalidated paper experiment, not evidence of improved performance.
+Profit exits are rechecked after execution delay: a vanished net target does not
+force a voluntary loss, but stops, time limits and data outages always take priority.
+Old positions keep their frozen rules. Replay uses the same new exit evaluator.
+
+Original signal only; reverse quotes are shadow observations, not trades.
 Risk sizing reduces the all-in stake when the frozen stop would risk more than
 PAPER_MAX_STOP_RISK (default $1). This is a planned trigger loss, NOT a guarantee:
 gaps, failed exits and latency can lose more, up to the entire all-in stake.
@@ -95,11 +104,11 @@ from polymarket import AsyncPublicClient
 from polymarket.streams import MarketSpec
 from websockets.asyncio.client import connect
 
-VERSION = "7.6-BTC-RiskBudget-PAPER"
-PREVIOUS_VERSION = "7.5-BTC-CostAware-PAPER"
+VERSION = "7.7-BTC-ExitQuality-PAPER"
+PREVIOUS_VERSION = "7.6-BTC-RiskBudget-PAPER"
 VERSION_LABEL = VERSION.split('-')[0]
-COMPATIBLE_LEDGERS = {"7.0-BTC-Repricing-PAPER", "7.1-BTC-Repricing-PAPER", "7.2-BTC-Paired-PAPER", "7.3-BTC-Replay-PAPER", "7.4-BTC-Candidate-PAPER", PREVIOUS_VERSION, VERSION}
-REPLAY_VERSIONS = {"7.3-BTC-Replay-PAPER", "7.4-BTC-Candidate-PAPER", PREVIOUS_VERSION, VERSION}
+COMPATIBLE_LEDGERS = {"7.0-BTC-Repricing-PAPER", "7.1-BTC-Repricing-PAPER", "7.2-BTC-Paired-PAPER", "7.3-BTC-Replay-PAPER", "7.4-BTC-Candidate-PAPER", "7.5-BTC-CostAware-PAPER", PREVIOUS_VERSION, VERSION}
+REPLAY_VERSIONS = {"7.3-BTC-Replay-PAPER", "7.4-BTC-Candidate-PAPER", "7.5-BTC-CostAware-PAPER", PREVIOUS_VERSION, VERSION}
 STAKE = float(os.getenv("PAPER_TRADE_AMOUNT", "7.50"))
 MAX_STOP_RISK = float(os.getenv("PAPER_MAX_STOP_RISK", "1.00"))
 REVERSE_PAPER_ENABLED = False  # Research quotes only; never enables live trading.
@@ -128,6 +137,7 @@ MIN_MODEL_MOVE = .025
 EXECUTION_DELAY = .250                  # plus actual REST round-trip time
 MAX_ENTRY_WAIT = 1.5
 MAX_BTC_AGE, MAX_BOOK_AGE = 1.0, 2.0
+EXIT_BTC_MAX_AGE = 3.0  # New positions only; never used to approve an entry.
 MAX_FEED_SKEW = 1.5
 VOL_WINDOW_SECONDS = 180
 VOL_MIN_SECONDS = 60
@@ -573,6 +583,7 @@ class Engine:
         self.spot = Spot()
         self.market, self.books, self.stream_task = None, {}, None
         self.anchors = deque(maxlen=80)
+        self.last_anchor_reset = 'startup_or_evicted'
         self.forecasts = deque(maxlen=100)
         self.scores = dict(n=0, model_error=0., baseline_error=0.)
         self.stats = Counter()
@@ -584,6 +595,12 @@ class Engine:
         self.last_book_event = 0.
         self.book_diagnostics = {}
         self.last_repair = {}
+
+    def invalidate_anchors(self, reason):
+        if self.anchors:
+            self.last_anchor_reset = reason
+            self.stats['anchor_reset:'+reason] += 1
+        self.anchors.clear()
 
     def notify(self, text):
         LOG.info(text)
@@ -616,7 +633,7 @@ class Engine:
                                    open_timeout=10, max_queue=32) as ws:
                     self.spot.reset(preserve_history=True)
                     record('spot_reset')
-                    self.anchors.clear()
+                    self.invalidate_anchors("btc_connect")
                     delay = 1
                     while True:
                         raw = await asyncio.wait_for(ws.recv(), BTC_IDLE_RECONNECT)
@@ -632,7 +649,7 @@ class Engine:
                 LOG.warning("BTC stream: %s", type(exc).__name__)
             self.spot.reset(preserve_history=True)
             record('spot_reset')
-            self.anchors.clear()
+            self.invalidate_anchors("btc_disconnect")
             await asyncio.sleep(delay)
             delay = min(30, delay*2)
 
@@ -652,7 +669,7 @@ class Engine:
             try:
                 self.stream_ok = False
                 self.stream_connected = False
-                self.anchors.clear()
+                self.invalidate_anchors("book_connect")
                 # REST metadata then wait for the stream's full snapshots.
                 for direction in ("UP", "DOWN"):
                     b = await self.rest_book(direction, market=market, validate=False)
@@ -705,7 +722,7 @@ class Engine:
             self.stream_ok = False
             self.stream_connected = False
             record('book_reset')
-            self.anchors.clear()
+            self.invalidate_anchors("book_disconnect")
             for b in self.books.values():
                 b.ready = False
             await asyncio.sleep(delay)
@@ -718,7 +735,7 @@ class Engine:
                 await self.stream_task
         self.market, self.books = market, {}
         record('market', market=market)
-        self.anchors.clear()
+        self.invalidate_anchors("market_change")
         self.forecasts.clear()
         self.stream_ok = False
         self.stream_connected = False
@@ -744,7 +761,7 @@ class Engine:
             self.books[direction] = candidate
             record_book(direction, candidate)
             self.stream_ok = len(self.books) == 2 and all(b.ready for b in self.books.values())
-            self.anchors.clear()  # new model anchor after resynchronization
+            self.invalidate_anchors("book_resync")  # new model anchor after resynchronization
             self.forecasts.clear()
             try:
                 candidate.check(time.time())
@@ -799,8 +816,8 @@ class Engine:
         try:
             p = self.paired_mid(now)
             sigma = self.spot.sigma()
-        except Skip:
-            self.anchors.clear()
+        except Skip as exc:
+            self.invalidate_anchors("observation:"+str(exc))
             self.forecasts.clear()
             raise
         if now-self.last_anchor >= .1:
@@ -839,7 +856,7 @@ class Engine:
                 raise Skip("entry_too_slow")
             self.spot.check(now)
             if anchor not in self.anchors:
-                raise Skip("anchor_invalidated")
+                raise Skip("anchor_invalidated:"+self.last_anchor_reset)
             if abs(book.source-self.spot.source) > MAX_FEED_SKEW:
                 raise Skip("feed_time_skew")
             self.ledger.allowed(self.market, now)
@@ -1032,7 +1049,8 @@ def cost_aware_risk(book, market, quote, now):
     return dict(version=VERSION, mode='cost_aware', stop_per_share=stop,
                 target_per_share=LAB_TAKE_PROFIT, max_hold_seconds=MAX_HOLD_SECONDS,
                 baseline_loss=loss, max_cost=MAX_ROUNDTRIP_COST,
-                post_cost_room=POST_COST_LOSS_ROOM)
+                post_cost_room=POST_COST_LOSS_ROOM, exit_btc_max_age=EXIT_BTC_MAX_AGE,
+                revalidate_profit_exit=True)
 
 
 def position_exit_limits(position):
@@ -1041,6 +1059,60 @@ def position_exit_limits(position):
     return (policy.get('target_per_share', LAB_TAKE_PROFIT),
             policy.get('stop_per_share', STOP_LOSS_PER_SHARE),
             policy.get('max_hold_seconds', MAX_HOLD_SECONDS))
+
+
+def exit_btc_fresh(position, source, received, now):
+    limit = (position.get('exit_policy') or {}).get('exit_btc_max_age', MAX_BTC_AGE)
+    return fresh(source, received, now, limit)
+
+
+def evaluated_exit(position, now, source, received, book):
+    """Same causal exit policy in online paper and offline replay.
+
+    A missing book never produces a synthetic fill. This only requests a sale;
+    the executor must still obtain fresh sufficient depth after the delay.
+    """
+    target, stop, hold = position_exit_limits(position)
+    if now-position['entered'] >= hold:
+        return 'time_limit'
+    if position['market']['expiry']-now <= EXIT_BEFORE_EXPIRY:
+        return 'before_expiry'
+    try:
+        if book is None:
+            raise Skip('book_missing')
+        quote = sell_quote(book, position['market'], position['qty'], now)
+    except Skip:
+        return 'data_stale'
+    # Keep old positions' BTC-first semantics after an upgrade.
+    if not exit_btc_fresh(position, source, received, now):
+        return 'data_stale'
+    net = (quote['received']-position['spent'])/position['qty']
+    if net <= -stop:
+        return 'loss_limit'
+    if net >= target:
+        return 'net_target'
+    return None
+
+
+def revalidated_exit_reason(position, requested, quote, now, source, received):
+    """Guard voluntary profit taking, never cancel a protective exit.
+
+    Paper-only price guard, not a claim that a live market order can be recalled.
+    The quote already includes depth, fees and adverse-tick stress.
+    """
+    if requested != 'net_target' or not (position.get('exit_policy') or {}).get('revalidate_profit_exit',False):
+        return requested
+    target, stop, hold = position_exit_limits(position)
+    if now-position['entered'] >= hold:
+        return 'time_limit'
+    if position['market']['expiry']-now <= EXIT_BEFORE_EXPIRY:
+        return 'before_expiry'
+    if not exit_btc_fresh(position, source, received, now):
+        return 'data_stale'
+    net = (quote['received']-position['spent'])/position['qty']
+    if net <= -stop:
+        return 'loss_limit'
+    return 'net_target' if net >= target else None
 
 
 def risk_budgeted_quote(book, market, budget, now, max_stop_risk):
@@ -1175,6 +1247,7 @@ class ComparisonLedger:
     """One atomic file: two accounts, paired decisions, follow-up quote observations."""
     def __init__(self, path=LAB_PATH):
         self.path = Path(path)
+        self.loaded_existing = self.path.exists()
         def account():
             return dict(initial=START_BALANCE, cash=START_BALANCE, position=None, trades=[],
                         day='', day_start=START_BALANCE, daily_stopped=False)
@@ -1344,6 +1417,7 @@ class ComparisonLedger:
         t['entry_price'] = p['price']
         t['exit_trigger'] = p.get('exit_trigger')
         t['exit_fill'] = p.get('exit_fill')
+        t['profit_exit_deferrals'] = p.get('profit_exit_deferrals',0)
         t['planned_stop_loss'] = p['qty']*position_exit_limits(p)[1]
         t['stop_overshoot'] = max(0., -t['pnl']-t['planned_stop_loss'])
         a['cash'] += proceeds
@@ -1386,7 +1460,7 @@ class ComparisonEngine(Engine):
                 raise Skip('recorder_failed_entries_paused')
             self.spot.check(now)
             if anchor not in self.anchors:
-                raise Skip('anchor_invalidated')
+                raise Skip('anchor_invalidated:'+self.last_anchor_reset)
             original_book, reverse_book = results
             if isinstance(original_book, BaseException):
                 raise Skip('original_book_unavailable')
@@ -1560,23 +1634,8 @@ class ComparisonEngine(Engine):
             await asyncio.sleep(.1)
 
     def comparison_exit_reason(self, p, now):
-        target, stop, hold = position_exit_limits(p)
-        if now-p['entered'] >= hold:
-            return 'time_limit'
-        if p['market']['expiry']-now <= EXIT_BEFORE_EXPIRY:
-            return 'before_expiry'
-        try:
-            self.spot.check(now)
-            b = self.books[p['direction']]
-            q = sell_quote(b,p['market'],p['qty'],now)
-        except (Skip,KeyError):
-            return 'data_stale'
-        net_per_share = (q['received']-p['spent'])/p['qty']
-        if net_per_share >= target:
-            return 'net_target'
-        if net_per_share <= -stop:
-            return 'loss_limit'
-        return None
+        return evaluated_exit(p, now, self.spot.source, self.spot.received,
+                              self.books.get(p['direction']))
 
     def exit_observation(self, p, now, reason):
         """Explain the trigger without weakening freshness or manufacturing a fill."""
@@ -1587,10 +1646,10 @@ class ComparisonEngine(Engine):
                    btc_source_age=age(self.spot.source), btc_receive_age=age(self.spot.received),
                    book_source_age=age(b.source) if b else None,
                    book_receive_age=age(b.received) if b else None, issues=[])
-        try:
-            self.spot.check(now)
-        except Skip as exc:
-            out['issues'].append(str(exc))
+        out['entry_btc_fresh'] = fresh(self.spot.source,self.spot.received,now,MAX_BTC_AGE)
+        out['exit_btc_max_age'] = (p.get('exit_policy') or {}).get('exit_btc_max_age',MAX_BTC_AGE)
+        if not exit_btc_fresh(p,self.spot.source,self.spot.received,now):
+            out['issues'].append('btc_stale')
         try:
             if not b:
                 raise Skip('book_missing')
@@ -1606,6 +1665,7 @@ class ComparisonEngine(Engine):
             return
         if p.get('exit_trigger',{}).get('reason') != reason:
             p['exit_trigger'] = self.exit_observation(p, time.time(), reason)
+        attempt_started = p['exit_trigger']['time']
         try:
             now = time.time()
             if now >= p['market']['expiry']:
@@ -1623,9 +1683,20 @@ class ComparisonEngine(Engine):
                 if now >= p['market']['expiry']:
                     return
                 q = sell_quote(b,p['market'],p['qty'],now)
+                confirmed = revalidated_exit_reason(p,reason,q,now,self.spot.source,self.spot.received)
+                if confirmed is None:
+                    self.stats[name+':profit_quote_faded'] += 1
+                    p['profit_exit_deferrals'] = p.get('profit_exit_deferrals',0)+1
+                    p['profit_retry_after'] = now+1
+                    self.exit_attempts[name] = 0.  # Protective exits must not wait for a profit retry.
+                    self.lab.save()
+                    return
+                if confirmed != reason:
+                    reason = confirmed
+                    p['exit_trigger'] = self.exit_observation(p,now,reason)
                 p['exit_fill'] = dict(time=now, price=q['price'], source_age=now-b.source,
                                       receive_age=now-b.received,
-                                      decision_to_fill_ms=1000*(now-p['exit_trigger']['time']))
+                                      decision_to_fill_ms=1000*(now-attempt_started))
                 t = self.lab.close(name,q['received'],q['fee'],reason,now)
             self.stats[name+':exit:'+t['reason']] += 1
             diagnostic = ''
@@ -1673,6 +1744,8 @@ class ComparisonEngine(Engine):
             if now-self.exit_attempts.get(name,0) < interval:
                 continue
             reason = 'resolution_fallback' if expired else self.comparison_exit_reason(p,now)
+            if reason == 'net_target' and now < p.get('profit_retry_after',0):
+                continue
             if reason:
                 # Capture before yielding; a fresh tick must not erase the stale trigger.
                 p['exit_trigger'] = self.exit_observation(p, now, reason)
@@ -1710,6 +1783,14 @@ class ComparisonEngine(Engine):
                 lines.append(f"Slechtste ${s['worst']:+.2f}; max. gerealiseerde terugval ${s['realized_drawdown']:.2f}; "
                              f"stopoverschrijdingen {s['stop_overshoots']}.")
                 lines.append('Uitstappen: '+str(s['reasons']))
+                lines.append(f"Prijsresultaat vóór fees ${s['pnl']+s['fees']:+.2f}; "
+                             f"na fees ${s['pnl']:+.2f}. Spread en gesimuleerde slippage zitten al in prijs.")
+                issues = Counter(issue for r in own if r['reason']=='data_stale'
+                                 for issue in (r.get('exit_trigger') or {}).get('issues',['niet vastgelegd']))
+                if issues:
+                    lines.append('Data-uitstappen, oorzaken: '+str(dict(issues)))
+                lines.append(f"Winstuitstap vervallen na hercontrole: "
+                             f"{sum(r.get('profit_exit_deferrals',0) for r in own)} bij gesloten trades.")
             if a['daily_stopped']:
                 lines.append(f"{name.upper()}: dagverliesstop actief; posities blijven beheerd.")
             if a['position']:
@@ -1790,11 +1871,20 @@ class ComparisonEngine(Engine):
                     f"Nieuwe netto verliestrigger: max(4 cent, kosten + {100*POST_COST_LOSS_ROOM:.0f} cent), "
                     f"maximaal {100*MAX_COST_AWARE_STOP:.0f} cent/aandeel.\n"
                     f"Netto doel +{100*LAB_TAKE_PROFIT:.0f} cent/aandeel; tijdlimiet {MAX_HOLD_SECONDS}s.\n"
+                    f"Nieuwe posities: BTC-tickpauze maximaal {EXIT_BTC_MAX_AGE:.0f}s bij vers orderboek; "
+                    f"instappen blijven maximaal {MAX_BTC_AGE:.0f}s oude BTC-data gebruiken.\n"
+                    "Vrijwillige winstuitstap opnieuw getoetst na vertraging; beschermende exits blijven actief.\n"
                     "Oude open posities behouden hun uitstapregels.\n"
                     "Bestaande saldi/historie blijven behouden; ook oude reverse-posities worden gesloten.\n"
                     "Max. 2 paperinstappen per ronde. Kandidaten blijven gemeten, maximaal elke 10s.\n"
                     "Compacte status elke 5min; uitgebreide metingen elke 30min.\n"
                     "BTC/L2-opname + offline replay actief. Geen Marketlens-account nodig.")
+        history = sum(len(a['trades']) for a in self.lab.data['arms'].values())
+        self.notify(f"Historie: {'bestaand bestand geladen' if self.lab.loaded_existing else 'NIEUW bestand gestart'}, "
+                    f"{history} gesloten papertrades.\n"
+                    + ('Railway-volumepad ingesteld.' if os.getenv('RAILWAY_VOLUME_MOUNT_PATH') else
+                       'Geen Railway-volumepad gedetecteerd. Controleer blijvende opslag vóór een volgende deploy; '
+                       'alleen code wijzigen bewaart lokale saldi niet.'))
         self.observe_task = asyncio.create_task(self.markout_worker())
         self.research_task = asyncio.create_task(self.research_worker())
         jobs = [asyncio.create_task(self.spot_stream()),asyncio.create_task(self.telegram_worker()),
@@ -1885,6 +1975,7 @@ class TapeRecorder:
                               hold=MAX_HOLD_SECONDS, slippage_ticks=SLIPPAGE_TICKS,
                               risk_mode='cost_aware',cost_cap=MAX_ROUNDTRIP_COST,
                               max_stop_risk=MAX_STOP_RISK,reverse_paper=REVERSE_PAPER_ENABLED,
+                              exit_btc_max_age=EXIT_BTC_MAX_AGE,revalidate_profit_exit=True,
                               post_cost_room=POST_COST_LOSS_ROOM,stop_cap=MAX_COST_AWARE_STOP))
 
     @property
@@ -2101,6 +2192,14 @@ class TapeReplay:
                 raise Skip('expired_unresolved')
             b = self.get_book(p['direction'],p['market'],now)
             q = sell_quote(b,p['market'],p['qty'],now)
+            confirmed = revalidated_exit_reason(p,reason,q,now,self.spot['source'],self.spot['received'])
+            if confirmed is None:
+                p['exit_pending'] = False
+                p['next_exit'] = now
+                p['profit_retry_after'] = now+1
+                self.stats[name+':profit_quote_faded'] += 1
+                return
+            reason = confirmed
             pnl = q['received']-p['spent']
             a['cash'] += q['received']
             a['trades'].append(dict(trial_id=p['trial_id'],pnl=pnl,
@@ -2139,24 +2238,10 @@ class TapeReplay:
                 continue
             if now >= p['market']['expiry']:
                 continue  # Never manufacture a resolution from Binance or the last quote.
-            reason = None
-            target, stop, hold = position_exit_limits(p)
-            if now-p['entered'] >= hold:
-                reason = 'time_limit'
-            elif p['market']['expiry']-now <= EXIT_BEFORE_EXPIRY:
-                reason = 'before_expiry'
-            else:
-                try:
-                    self.fresh_spot(now)
-                    b = self.get_book(p['direction'],p['market'],now)
-                    q = sell_quote(b,p['market'],p['qty'],now)
-                    net = (q['received']-p['spent'])/p['qty']
-                    if net >= target:
-                        reason = 'net_target'
-                    elif net <= -stop:
-                        reason = 'loss_limit'
-                except Skip:
-                    reason = 'data_stale'
+            b = self.books.get(p['direction']) if self.market and self.market['slug']==p['market']['slug'] else None
+            reason = evaluated_exit(p, now, self.spot['source'], self.spot['received'], b)
+            if reason == 'net_target' and now < p.get('profit_retry_after',0):
+                continue
             if reason:
                 p['exit_pending'] = True
                 self.jobs.append((now+self.latency,'exit',(name,reason)))
@@ -2245,7 +2330,8 @@ class TapeReplay:
                     evaluated_exit_policy=dict(version=VERSION,mode='cost_aware',
                         cost_cap=MAX_ROUNDTRIP_COST,post_cost_room=POST_COST_LOSS_ROOM,
                         stop_cap=MAX_COST_AWARE_STOP,max_stop_risk=self.max_stop_risk,
-                        reverse_paper=self.reverse_paper),
+                        reverse_paper=self.reverse_paper,exit_btc_max_age=EXIT_BTC_MAX_AGE,
+                        revalidate_profit_exit=True),
                     arms=arms,matched_closed_pairs=dict(n=len(paired),**{
                         n:sum(maps[n][i]['pnl'] for i in paired) for n in ARM_NAMES}),
                     pending_orders=len(self.jobs),counters=dict(self.stats),
