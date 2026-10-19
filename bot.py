@@ -1,2415 +1,2155 @@
-"""BTC 5m HOLD TO OFFICIAL RESOLUTION — PAPER ONLY, v7.8.
-Python 3.12; python bot.py. Requirements unchanged:
-polymarket-client==0.13.0, requests>=2.32,<3, flask>=3,<4.
+"""BTC Lead v1 — PAPER ONLY.
 
-New paper positions hold to the official market payout. NO profit sale, stop
-sale, stale-data sale or 15-second timeout. Full all-in stake can be lost.
-Default/hard cap $5 including taker purchase fee and adverse entry tick.
-PAPER_TRADE_AMOUNT can lower this cap; change HOLD_STAKE_CAP in Python to raise it.
-One original position at a time, one entry per market. Reverse remains shadow.
-Existing positions keep their frozen old policy. History and cash are preserved.
-
-Entry uses the existing BTC impulse and uncalibrated probability model, fresh
-BTC/L2, spread/depth checks and a hypothetical settlement edge AFTER purchase
-costs. This is a new unvalidated strategy, not a proven prediction of the winner.
-No exit trading fee or exit slippage is charged on official settlement.
-Unknown resolution stays pending, with stake reserved, including after restart.
-Binance price, market expiry and last quotes NEVER determine settlement.
-
-Optional environment: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, PAPER_TRADE_AMOUNT,
-PAPER_BALANCE (1000), BOT_DATA_DIR, RAILWAY_VOLUME_MOUNT_PATH, PORT.
-Use persistent storage for polymarket_latency_comparison.json and replay/.
-Legacy account file polymarket_latency_paper.json is retained.
-No wallet, private key, authenticated orders or live execution in this bot.
-
-The 1/2/5/15s markouts are hypothetical sale research, NOT held-position PnL.
-Replay uses current policy on recorded signals; without official settlement
-records it leaves positions unresolved and cannot evaluate this hold strategy.
-    python bot.py --replay 'replay/tape-*.jsonl' --latency-ms 500 --stake 5
+Public order books and authenticated, read-only PolyBolt reference prices.
+No private key, live order endpoint or early sale is used.
 """
+
 import asyncio
-import contextlib
-from collections import Counter, deque
-from dataclasses import dataclass, field
+import bisect
+from collections import Counter
+from contextlib import suppress
 from datetime import datetime, timezone
-import importlib.metadata
+import fcntl
+import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
 import math
-from statistics import median
 import os
 from pathlib import Path
-import signal
-import argparse
-import queue
-import uuid
-from statistics import NormalDist
+import random
+import sqlite3
 import threading
 import time
 
 import requests
-from flask import Flask, jsonify
 from polymarket import AsyncPublicClient
-from polymarket.streams import MarketSpec
 from websockets.asyncio.client import connect
 
-VERSION = "7.8-BTC-Hold5m-PAPER"
-PREVIOUS_VERSION = "7.7-BTC-ExitQuality-PAPER"
-VERSION_LABEL = VERSION.split('-')[0]
-COMPATIBLE_LEDGERS = {"7.0-BTC-Repricing-PAPER", "7.1-BTC-Repricing-PAPER", "7.2-BTC-Paired-PAPER", "7.3-BTC-Replay-PAPER", "7.4-BTC-Candidate-PAPER", "7.5-BTC-CostAware-PAPER", "7.6-BTC-RiskBudget-PAPER", PREVIOUS_VERSION, VERSION}
-REPLAY_VERSIONS = {"7.3-BTC-Replay-PAPER", "7.4-BTC-Candidate-PAPER", "7.5-BTC-CostAware-PAPER", "7.6-BTC-RiskBudget-PAPER", PREVIOUS_VERSION, VERSION}
-HOLD_TO_RESOLUTION = True
-HOLD_STAKE_CAP = 5.00  # Entire amount including purchase fee is at risk.
-STAKE = min(HOLD_STAKE_CAP, float(os.getenv("PAPER_TRADE_AMOUNT", "5.00")))
-if not math.isfinite(STAKE) or STAKE <= 0:
-    raise ValueError("PAPER_TRADE_AMOUNT moet positief en eindig zijn")
-MAX_STOP_RISK = float(os.getenv("PAPER_MAX_STOP_RISK", "1.00"))
-REVERSE_PAPER_ENABLED = False  # Research quotes only; never enables live trading.
-START_BALANCE = float(os.getenv("PAPER_BALANCE", "1000"))
-DATA_DIR = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or os.getenv("BOT_DATA_DIR", "."))
-STATE_PATH = DATA_DIR / "polymarket_latency_paper.json"  # legacy: close existing positions only
-LAB_PATH = DATA_DIR / "polymarket_latency_comparison.json"
-ARM_NAMES = ("original", "reverse")
-MARKOUT_HORIZONS = (1, 2, 5, 15)
-MARKOUT_TOLERANCE = .4
-ENTRY_STOP_BUFFER = .005
-LAB_TAKE_PROFIT = .01
-MAX_PAPER_ENTRIES_PER_ROUND = 2
-CANDIDATE_INTERVAL = 10  # Sample eligible candidates, also while paper accounts are blocked.
-BINANCE_WS = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
-# Experimental starting settings, not optimized performance claims.
-MIN_GROSS_EDGE = .05
-MIN_NET_EDGE = .01
-MAX_SPREAD = .025
-MODEL_MARGIN = .005
-MIN_PRICE, MAX_PRICE = .10, .90
-ENTRY_TIME_MIN, ENTRY_TIME_MAX = 45, 270
-ANCHOR_AGE, ANCHOR_MAX_AGE = 1.0, 2.0
-MIN_BTC_MOVE = .0001                    # 1 basis point
-MIN_MODEL_MOVE = .025
-EXECUTION_DELAY = .250                  # plus actual REST round-trip time
-MAX_ENTRY_WAIT = 1.5
-MAX_BTC_AGE, MAX_BOOK_AGE = 1.0, 2.0
-EXIT_BTC_MAX_AGE = 3.0  # New positions only; never used to approve an entry.
-MAX_FEED_SKEW = 1.5
-VOL_WINDOW_SECONDS = 180
-VOL_MIN_SECONDS = 60
-VOL_MIN_RETURNS = 30
-VOL_MAX_INTERVAL = 10
-HISTORY_EVENT_MAX_AGE = 10
-BOOK_REPAIR_INTERVAL = 3
-BTC_IDLE_RECONNECT = 15
-MAX_HOLD_SECONDS = 15
-EXIT_BEFORE_EXPIRY = 20
-STOP_LOSS_PER_SHARE = .04  # Legacy/floor. New paired entries freeze a cost-aware stop.
-MAX_ROUNDTRIP_COST = .07
-POST_COST_LOSS_ROOM = .02
-MAX_COST_AWARE_STOP = .10
-MAX_ENTRIES_PER_ROUND = 2
-COOLDOWN_SECONDS = 10
-DAILY_LOSS_FRACTION = .03
-REPORT_SECONDS = 300
-DETAIL_REPORT_SECONDS = 1800  # Full research tables every 30min; compact status every 5min.
+
+# ============================================================
+# CONFIGURATIE
+# ============================================================
+
+VERSION = "1.0-BTC-Lead-TWAP-PAPER"
+
+# Nieuwe instellingen staan hier.
+# Oude LIVE_TRADING- of momentum-instellingen worden niet gebruikt.
+PAPER_STAKE = 5.0
+INITIAL_CASH = 1000.0
+
+# Minimaal voordeel per aandeel, na geschatte aankoopkosten.
+# Vergelijking met de conservatieve ondergrens van de kansschatting.
+MIN_NET_EDGE = 0.03
+
+# Benodigde historische data per vergelijkbare categorie.
+MIN_SAMPLES = 100
+MIN_DAYS = 3
+TRAIN_DAYS = 30
+
+MAX_DAILY_LOSS = 0.03
+MAX_DAILY_ENTRIES = 12
+
+MAX_PRICE = 0.95
+MAX_SPREAD = 0.04
+
+FEED_MAX_AGE = 2.5
+MAX_TICK_GAP = 3.0
+BOOK_MAX_AGE = 3.0
+
+LATENCY_SECONDS = 0.5
 SLIPPAGE_TICKS = 1
-NORMAL = NormalDist()
-LOG = logging.getLogger("repricing")
-HEALTH = {"heartbeat": 0., "mode": "PAPER", "version": VERSION}
-RECORDER = None
+
+# Vaste meetmomenten: seconden resterend in de vijfminutenmarkt.
+CHECKPOINTS = (
+    300,
+    285,
+    240,
+    180,
+    120,
+    90,
+    60,
+    45,
+    30,
+    15,
+)
+
+# Voorsprong in basispunten.
+# 1 basispunt = 0,01%.
+GAP_EDGES = (
+    0,
+    2,
+    5,
+    10,
+    20,
+    50,
+    float("inf"),
+)
+
+SCHEMA = "btc_chainlink60_projected_v1"
+
+DATA_DIR = Path(
+    os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+    or os.getenv("BOT_DATA_DIR", "data")
+)
+
+# Nieuwe proef, gescheiden van de oude bot.
+DB_NAME = "btc_lead_v1.sqlite3"
+
+WS_URL = "wss://ws-live-v2.polymarket.com/ws"
+
+SPOT = "price.crypto"
+TWAP = "price.crypto.twap"
+
+LOG = logging.getLogger("btc-lead")
 
 
-def record(kind, **data):
-    if RECORDER is not None:
-        RECORDER.emit(kind, **data)
-
-
-def record_book(direction, book):
-    record('book', direction=direction, asset=book.asset, condition=book.condition,
-           bids=list(book.bids.items()), asks=list(book.asks.items()),
-           source=book.source, received=book.received, tick=book.tick, minimum=book.minimum)
-
-
-class LedgerError(RuntimeError):
-    """Local persistence failed: stop rather than lose paper accounting."""
-
+# ============================================================
+# ALGEMENE HULPFUNCTIES
+# ============================================================
 
 class Skip(Exception):
-    """A named rejection; never silently substitute old data or fake fills."""
+    pass
 
 
-def finite(value):
-    x = float(value)
-    if not math.isfinite(x):
-        raise ValueError("Non-finite number")
-    return x
+def number(value):
+    result = float(value)
+
+    if not math.isfinite(result):
+        raise Skip("niet_eindig_getal")
+
+    return result
 
 
-def stamp(value):
-    return value.timestamp() if isinstance(value, datetime) else finite(value)
+def day(timestamp):
+    return datetime.fromtimestamp(
+        timestamp,
+        timezone.utc,
+    ).date().isoformat()
 
 
-def fresh(ts, received, now, limit):
-    return ts > 0 and received > 0 and -.5 <= now-ts <= limit and 0 <= now-received <= limit
+def unix_ms(value):
+    # PolyBolt levert timestamps in milliseconden.
+    result = number(value) / 1000
+
+    if result < 1_600_000_000:
+        raise Skip("timestamp_eenheid")
+
+    return result
 
 
-def fee_unit(price, market):
-    if not 0 < price < 1:
-        raise Skip("invalid_fee_price")
-    return market["fee_rate"] * (price * (1-price)) ** market["fee_exponent"]
+def gap_bin(bp):
+    return max(
+        0,
+        min(
+            len(GAP_EDGES) - 2,
+            bisect.bisect_right(GAP_EDGES, abs(bp)) - 1,
+        ),
+    )
 
 
-@dataclass
-class Book:
-    asset: str
-    condition: str
-    bids: dict = field(default_factory=dict)
-    asks: dict = field(default_factory=dict)
-    source: float = 0.
-    received: float = 0.
-    tick: float = 0.
-    minimum: float = 0.
-    ready: bool = False
-    revision: int = 0
+def wilson_lower(wins, n, z=1.96):
+    """
+    Conservatieve statistische ondergrens.
 
-    def snapshot(self, payload, now):
-        if str(payload.asset_id) != self.asset or str(payload.condition_id) != self.condition:
-            raise Skip("wrong_book")
-        ts = stamp(payload.timestamp) if payload.timestamp is not None else 0.
-        if self.ready and ts < self.source:
-            return False
-        def levels(items):
-            out = {}
-            for item in items:
-                price, size = finite(item.price), finite(item.size)
-                if not 0 < price < 1 or size < 0:
-                    raise Skip("invalid_book_level")
-                if size > 0:
-                    out[price] = size
-            return out
-        bids, asks = levels(payload.bids), levels(payload.asks)
-        tick = getattr(payload, "tick_size", None)
-        minimum = getattr(payload, "min_order_size", None)
-        if tick is not None:
-            self.tick = finite(tick)
-        if minimum is not None:
-            self.minimum = finite(minimum)
-        self.bids, self.asks = bids, asks
-        self.source, self.received, self.ready = ts, now, True
-        self.revision += 1
-        return True
+    Geen garantie: marktwaarnemingen kunnen gecorreleerd zijn
+    en marktomstandigheden kunnen veranderen.
+    """
+    if n <= 0:
+        return 0.0
 
-    def delta(self, change, ts, now):
-        if str(change.asset_id) != self.asset or not self.ready or ts < self.source:
-            return
-        side = getattr(change.side, "value", change.side)
-        if side not in ("BUY", "SELL"):
-            raise Skip("invalid_book_side")
-        price, size = finite(change.price), finite(change.size)
-        if not 0 < price < 1 or size < 0:
-            raise Skip("invalid_book_delta")
-        levels = self.bids if side == "BUY" else self.asks
-        if size == 0:
-            levels.pop(price, None)
+    p = wins / n
+
+    return (
+        p
+        + z * z / (2 * n)
+        - z * math.sqrt(
+            p * (1 - p) / n
+            + z * z / (4 * n * n)
+        )
+    ) / (1 + z * z / n)
+
+
+def history_estimate(rows, now):
+    """
+    Iedere rij:
+    market_start, observed_time, resolved_time, leader_won.
+
+    Alleen uitslagen die al bekend waren vóór de beslissing.
+    Iedere markt telt maximaal één keer binnen deze categorie.
+    """
+    valid = [
+        row
+        for row in rows
+        if now - TRAIN_DAYS * 86400 <= row[0] < now
+        and row[1] < row[2] < now
+        and row[3] in (0, 1)
+    ]
+
+    unique = {
+        row[0]: row
+        for row in valid
+    }
+
+    n = len(unique)
+    wins = sum(row[3] for row in unique.values())
+    days = len({day(row[0]) for row in unique.values()})
+
+    return {
+        "n": n,
+        "wins": wins,
+        "days": days,
+        "p": wins / n if n else None,
+        "lower": wilson_lower(wins, n),
+        "ready": (
+            n >= MIN_SAMPLES
+            and days >= MIN_DAYS
+        ),
+    }
+
+
+# ============================================================
+# CHAINLINK REFERENTIEPRIJZEN
+# ============================================================
+
+class Reference:
+    """
+    Bewaart Chainlink spot en officiële TWAP-waarnemingen.
+    Geen Binance-fallback.
+    """
+
+    def __init__(self):
+        self.points = {
+            SPOT: {},
+            TWAP: {},
+        }
+
+        self.connected = False
+        self.state = "wachten_op_feed"
+        self.sequences = {}
+        self.acks = set()
+
+    def reset(self):
+        # Na herverbinden eerst nieuwe snapshots gebruiken.
+        self.points = {
+            SPOT: {},
+            TWAP: {},
+        }
+
+        self.sequences.clear()
+        self.acks.clear()
+        self.connected = False
+
+    def apply(self, message, now):
+        channel = message.get("channel")
+
+        if channel not in self.points:
+            return []
+
+        if message.get("v") != 1:
+            raise Skip("feed_protocol")
+
+        sequence = message.get("seq")
+
+        if (
+            not isinstance(sequence, int)
+            or isinstance(sequence, bool)
+        ):
+            raise Skip("feed_sequence_ontbreekt")
+
+        previous = self.sequences.get(channel)
+
+        if (
+            message.get("dropped", 0)
+            or (
+                previous is not None
+                and sequence != previous + 1
+            )
+        ):
+            raise Skip("feed_sequence_gat")
+
+        self.sequences[channel] = sequence
+
+        payload = message.get("payload", {})
+
+        if (
+            payload.get("symbol") != "btcusd"
+            or payload.get("source") != "chainlink"
+        ):
+            raise Skip("verkeerde_referentiebron")
+
+        if (
+            channel == TWAP
+            and payload.get("window_seconds") != 60
+        ):
+            raise Skip("verkeerd_twap_venster")
+
+        is_snapshot = message.get("snapshot") is True
+
+        items = (
+            payload.get("data", [])
+            if is_snapshot
+            else [payload]
+        )
+
+        if not isinstance(items, list):
+            raise Skip("feed_snapshot_formaat")
+
+        added = []
+
+        for item in items:
+            timestamp = unix_ms(item["timestamp"])
+
+            value = number(
+                item.get(
+                    "full_accuracy_value",
+                    item.get("value"),
+                )
+            )
+
+            if (
+                value <= 0
+                or timestamp > now + 0.5
+                or now - timestamp > 600
+            ):
+                raise Skip("feed_prijs_of_tijd")
+
+            if (
+                item.get("is_carried_forward")
+                or payload.get("is_carried_forward")
+            ):
+                raise Skip("feed_doorgerolde_prijs")
+
+            existing = self.points[channel].get(timestamp)
+
+            if existing and not math.isclose(
+                existing[0],
+                value,
+                rel_tol=1e-12,
+            ):
+                raise Skip("feed_herziening")
+
+            self.points[channel][timestamp] = (
+                value,
+                now,
+            )
+
+            added.append(
+                (
+                    channel,
+                    timestamp,
+                    value,
+                    now,
+                )
+            )
+
+        for kind in self.points:
+            self.points[kind] = {
+                timestamp: value
+                for timestamp, value in self.points[kind].items()
+                if timestamp >= now - 900
+            }
+
+        self.connected = self.acks == {SPOT, TWAP}
+
+        self.state = (
+            "verbonden"
+            if self.connected
+            else "wachten_op_abonnement"
+        )
+
+        return added
+
+    def current(self, now):
+        if (
+            not self.connected
+            or not self.points[SPOT]
+            or not self.points[TWAP]
+        ):
+            raise Skip("chainlink_niet_gereed")
+
+        for kind in (SPOT, TWAP):
+            timestamp = max(self.points[kind])
+            _, received = self.points[kind][timestamp]
+
+            if (
+                not 0 <= now - timestamp <= FEED_MAX_AGE
+                or not 0 <= now - received <= FEED_MAX_AGE
+            ):
+                raise Skip("chainlink_verouderd")
+
+        timestamp = max(self.points[SPOT])
+
+        return (
+            timestamp,
+            self.points[SPOT][timestamp][0],
+        )
+
+    def strike(self, start):
+        # Alleen de TWAP exact op de marktstart.
+        # Eén seconde later is een andere referentie.
+        point = self.points[TWAP].get(float(start))
+
+        if point is None:
+            raise Skip(
+                "start_twap_ontbreekt_wacht_volgende_ronde"
+            )
+
+        return point[0]
+
+    def projected(self, end, now, spot):
+        begin = end - 60
+
+        samples = sorted(
+            (timestamp, value[0])
+            for timestamp, value in self.points[SPOT].items()
+            if timestamp <= now
+        )
+
+        before = [
+            (timestamp, value)
+            for timestamp, value in samples
+            if timestamp <= begin
+        ]
+
+        if (
+            not before
+            or begin - before[-1][0] > MAX_TICK_GAP
+        ):
+            raise Skip("eind_twap_historie_ontbreekt")
+
+        last_timestamp, last_price = before[-1]
+        cursor = begin
+        integral = 0.0
+
+        for timestamp, price in samples:
+            if timestamp <= begin:
+                continue
+
+            if timestamp - last_timestamp > MAX_TICK_GAP:
+                raise Skip("eind_twap_datagat")
+
+            integral += last_price * (timestamp - cursor)
+
+            cursor = timestamp
+            last_timestamp = timestamp
+            last_price = price
+
+        if now - last_timestamp > FEED_MAX_AGE:
+            raise Skip("eind_twap_verouderd")
+
+        integral += last_price * (now - cursor)
+
+        # Projectie: de nog onbekende seconden krijgen de huidige koers.
+        # Dit is nadrukkelijk niet de officiële eind-TWAP.
+        projected = (
+            integral
+            + spot * (end - now)
+        ) / 60
+
+        return (
+            projected,
+            integral,
+            now - begin,
+        )
+
+    def feature(self, market, now):
+        start = market["start"]
+        end = market["end"]
+
+        remaining = end - now
+
+        if not 0 < remaining <= 300:
+            raise Skip("buiten_ronde")
+
+        spot_timestamp, spot = self.current(now)
+        strike = self.strike(start)
+
+        if remaining <= 60:
+            reference, integral, elapsed = self.projected(
+                end,
+                now,
+                spot,
+            )
+
+            kind = "projected_twap"
+
         else:
-            levels[price] = size
-        self.source, self.received = ts, now
-        self.revision += 1
+            reference = spot
+            integral = None
+            elapsed = 0.0
+            kind = "spot_lead"
 
-    def check(self, now):
-        if not self.ready or not fresh(self.source, self.received, now, MAX_BOOK_AGE):
-            raise Skip("book_stale")
-        if not self.bids or not self.asks:
-            raise Skip("book_empty")
-        if max(self.bids) >= min(self.asks):
-            raise Skip("book_crossed")
-        if not 0 < self.tick < 1 or self.minimum <= 0:
-            raise Skip("book_metadata_missing")
+        bp = (reference / strike - 1) * 10000
 
-    def mid(self):
-        return (max(self.bids) + min(self.asks))/2
+        if abs(bp) < 1e-8:
+            raise Skip("geen_voorsprong")
 
-    def spread(self):
-        return min(self.asks)-max(self.bids)
+        return {
+            "kind": kind,
+            "side": "UP" if bp > 0 else "DOWN",
+            "gap_bp": abs(bp),
+            "gap_bin": gap_bin(bp),
+            "strike": strike,
+            "spot": spot,
+            "spot_ts": spot_timestamp,
+            "reference": reference,
+            "integral": integral,
+            "elapsed_final": elapsed,
+            "remaining": remaining,
+            "at": now,
+        }
 
 
-def buy_quote(book, market, budget, now):
-    book.check(now)
-    remaining, qty, notional, fees = budget, 0., 0., 0.
-    raw_notional = slippage_cost = 0.
-    for price, size in sorted(book.asks.items()):
-        price += SLIPPAGE_TICKS*book.tick
+# ============================================================
+# PAPER AANKOOPPRIJS EN KOSTEN
+# ============================================================
+
+def quote(book, market, side, budget, now):
+    if (
+        str(book.asset_id) != market["assets"][side]
+        or str(book.condition_id) != market["condition"]
+    ):
+        raise Skip("verkeerd_orderboek")
+
+    if (
+        book.timestamp is None
+        or not -0.5 <= (
+            now - book.timestamp.timestamp()
+        ) <= BOOK_MAX_AGE
+    ):
+        raise Skip("orderboek_verouderd")
+
+    tick = number(book.tick_size)
+    minimum = number(book.min_order_size)
+
+    if (
+        not 0 < tick < 1
+        or minimum <= 0
+        or budget <= 0
+    ):
+        raise Skip("orderboek_metadata")
+
+    bids = [
+        (number(level.price), number(level.size))
+        for level in book.bids
+    ]
+
+    asks = [
+        (number(level.price), number(level.size))
+        for level in book.asks
+    ]
+
+    if any(
+        not 0 < price < 1 or size < 0
+        for price, size in bids + asks
+    ):
+        raise Skip("ongeldig_orderboek")
+
+    bids = [
+        (price, size)
+        for price, size in bids
+        if size > 0
+    ]
+
+    asks = [
+        (price, size)
+        for price, size in asks
+        if size > 0
+    ]
+
+    if not asks or not bids:
+        raise Skip("leeg_orderboek")
+
+    spread = (
+        min(price for price, size in asks)
+        - max(price for price, size in bids)
+    )
+
+    if not 0 < spread <= MAX_SPREAD:
+        raise Skip("spread")
+
+    left = budget
+    qty = 0.0
+    fees = 0.0
+    notional = 0.0
+
+    for raw_price, size in sorted(asks):
+        price = raw_price + tick * SLIPPAGE_TICKS
+
         if price > MAX_PRICE:
             break
-        if price < MIN_PRICE:
-            raise Skip("price_outside_range")
-        unit_fee = fee_unit(price, market)
-        take = min(size, remaining/(price+unit_fee))
+
+        fee = market["fee_rate"] * (
+            price * (1 - price)
+        ) ** market["fee_exponent"]
+
+        take = min(
+            size,
+            left / (price + fee),
+        )
+
         qty += take
-        notional += take*price
-        raw_notional += take*(price-SLIPPAGE_TICKS*book.tick)
-        slippage_cost += take*SLIPPAGE_TICKS*book.tick
-        fees += take*unit_fee
-        remaining -= take*(price+unit_fee)
-        if remaining < 1e-8:
+        fees += take * fee
+        notional += take * price
+
+        left -= take * (price + fee)
+
+        if left < 1e-9:
             break
-    if remaining > 1e-6:
-        raise Skip("insufficient_ask_depth")
-    # Conservative: retain cost but floor credited shares to 6 decimals.
-    qty = math.floor(qty*1_000_000)/1_000_000
-    if qty < book.minimum:
-        raise Skip("minimum_order_size")
-    return dict(qty=qty, spent=notional+fees, fee=fees, price=notional/qty,
-                raw_notional=raw_notional, slippage_cost=slippage_cost)
+
+    if left > 1e-6:
+        raise Skip(
+            "onvoldoende_dieptes_onder_prijsplafond"
+        )
+
+    # Conservatief: aandelen naar beneden afronden.
+    qty = math.floor(qty * 1e6) / 1e6
+
+    if qty < minimum:
+        raise Skip("minimum_aandelen")
+
+    return {
+        "qty": qty,
+        "spent": notional + fees,
+        "fee": fees,
+        "vwap": notional / qty,
+        "all_in": (notional + fees) / qty,
+        "spread": spread,
+        "price_bin": min(
+            9,
+            int((notional / qty) * 10),
+        ),
+        "book_ts": book.timestamp.timestamp(),
+    }
 
 
-def sell_quote(book, market, qty, now):
-    book.check(now)
-    remaining, notional, fees = qty, 0., 0.
-    raw_notional = slippage_cost = 0.
-    for price, size in sorted(book.bids.items(), reverse=True):
-        price -= SLIPPAGE_TICKS*book.tick
-        if price <= 0:
-            continue
-        take = min(size, remaining)
-        notional += take*price
-        raw_notional += take*(price+SLIPPAGE_TICKS*book.tick)
-        slippage_cost += take*SLIPPAGE_TICKS*book.tick
-        fees += take*fee_unit(price, market)
-        remaining -= take
-        if remaining < 1e-8:
-            break
-    if remaining > 1e-6:
-        raise Skip("insufficient_bid_depth")
-    if qty < book.minimum:
-        raise Skip("minimum_exit_size")
-    return dict(received=notional-fees, fee=fees, price=notional/qty,
-                raw_notional=raw_notional, slippage_cost=slippage_cost)
+# ============================================================
+# MARKT VINDEN EN OFFICIËLE UITSLAG
+# ============================================================
+
+async def discover(client, start):
+    slug = f"btc-updown-5m-{start}"
+
+    market = await asyncio.wait_for(
+        client.get_market(slug=slug),
+        8,
+    )
+
+    state = market.state
+
+    if (
+        market.slug != slug
+        or not market.condition_id
+        or state.end_date is None
+        or abs(
+            state.end_date.timestamp() - start - 300
+        ) > 0.1
+    ):
+        raise Skip("verkeerde_markt_of_eindtijd")
+
+    if (
+        state.closed
+        or not state.active
+        or not state.accepting_orders
+        or not state.enable_order_book
+    ):
+        raise Skip("markt_niet_open")
+
+    description = (market.description or "").lower()
+
+    if (
+        "chainlink" not in description
+        or not any(
+            word in description
+            for word in (
+                "twap",
+                "time-weighted",
+                "time weighted",
+            )
+        )
+    ):
+        raise Skip("twap_marktregels_niet_bevestigd")
+
+    source = str(market.resolution.source or "")
+
+    if (
+        not source.startswith("https://data.chain.link/")
+        or "btc-usd-twap-60s" not in source
+    ):
+        raise Skip("60s_btc_resolutiebron_niet_bevestigd")
+
+    schedule = market.trading.fee_schedule
+
+    if (
+        market.trading.fees_enabled is not False
+        and schedule is None
+    ):
+        raise Skip("fee_onbekend")
+
+    rate = (
+        number(schedule.rate)
+        if schedule
+        and market.trading.fees_enabled is not False
+        else 0.0
+    )
+
+    exponent = (
+        number(schedule.exponent)
+        if schedule
+        else 1.0
+    )
+
+    if (
+        not 0 <= rate <= 1
+        or not 0 <= exponent <= 10
+    ):
+        raise Skip("fee_schema_ongeldig")
+
+    version = getattr(
+        market.version,
+        "value",
+        market.version,
+    )
+
+    if version not in ("v1", "v2"):
+        raise Skip("marktversie_onbekend")
+
+    assets = {}
+    indices = {}
+
+    for index, outcome in enumerate(
+        (
+            market.outcomes.yes,
+            market.outcomes.no,
+        )
+    ):
+        label = outcome.label.strip().upper()
+
+        asset = (
+            outcome.position_id
+            if version == "v2"
+            else outcome.token_id
+        )
+
+        if label not in ("UP", "DOWN") or not asset:
+            raise Skip("uitkomst_mapping")
+
+        assets[label] = str(asset)
+        indices[label] = index
+
+    if (
+        len(assets) != 2
+        or len(set(assets.values())) != 2
+    ):
+        raise Skip("uitkomst_mapping")
+
+    return {
+        "start": start,
+        "end": start + 300,
+        "slug": slug,
+        "condition": str(market.condition_id),
+        "assets": assets,
+        "indices": indices,
+        "fee_rate": rate,
+        "fee_exponent": exponent,
+        "seconds_delay": max(
+            0,
+            number(market.trading.seconds_delay or 0),
+        ),
+        "rules_hash": hashlib.sha256(
+            (description + source).encode()
+        ).hexdigest(),
+        "description": description,
+        "resolution_source": source,
+    }
 
 
-class Spot:
-    def __init__(self):
-        self.price = self.source = self.received = 0.
-        self.samples = deque(maxlen=600)
-        self.segment = 0
-        self.event_stats = Counter()
-        self.event_ages = deque(maxlen=3000)
-        self.last_wire = 0.
+def payout(resolutions, market):
+    matches = [
+        resolution
+        for resolution in resolutions
+        if str(resolution.condition_id)
+        == market["condition"]
+        and getattr(
+            resolution.status,
+            "value",
+            resolution.status,
+        ) == "resolved"
+    ]
 
-    def reset(self, preserve_history=False):
-        # A disconnect invalidates the tradable price, not all recent volatility.
-        # Never calculate a return spanning a disconnected segment.
-        self.price = self.source = self.received = 0.
-        self.segment += 1
-        if not preserve_history:
-            self.samples.clear()
+    if (
+        len(matches) != 1
+        or matches[0].payouts is None
+    ):
+        return None
 
-    def update(self, price, ts, now):
-        price, ts = finite(price), finite(ts)
-        age = now-ts
-        self.last_wire = now
-        self.event_stats["received"] += 1
-        self.event_ages.append(age)
-        latest = self.samples[-1][0] if self.samples else 0
-        if price <= 0 or ts < max(self.source, latest):
-            self.event_stats["out_of_order_or_invalid"] += 1
-            return
-        if not -.5 <= age <= HISTORY_EVENT_MAX_AGE:
-            self.event_stats["too_old_or_future"] += 1
-            return
-        # Historical observations may be useful even when too old for an entry.
-        # check() still applies the original one-second entry freshness limit.
-        self.price, self.source, self.received = price, ts, now
-        self.event_stats["fresh" if age <= MAX_BTC_AGE else "history_only"] += 1
-        second = int(ts)
-        point = (second, price, self.segment)
-        if self.samples and self.samples[-1][0] == second:
-            self.samples[-1] = point
-        else:
-            self.samples.append(point)
-        while self.samples and self.samples[0][0] < ts-VOL_WINDOW_SECONDS:
-            self.samples.popleft()
+    values = [
+        number(value)
+        for value in matches[0].payouts
+    ]
 
-    def check(self, now):
-        if not fresh(self.source, self.received, now, MAX_BTC_AGE):
-            raise Skip("btc_stale")
+    if (
+        len(values) != 2
+        or any(
+            value < 0 or value > 1
+            for value in values
+        )
+        or abs(sum(values) - 1) > 1e-8
+    ):
+        raise Skip("ongeldige_officiele_uitbetaling")
 
-    def history_metrics(self):
-        # Irregular observed intervals: no invented candles or zero-return fills.
-        # Ignore the still-changing latest second and long/disconnected gaps.
-        points = list(self.samples)[:-1]
-        variance, seconds, returns, excluded = 0., 0., 0, 0
-        for (t0, p0, seg0), (t1, p1, seg1) in zip(points, points[1:]):
-            dt = t1-t0
-            if seg0 != seg1 or dt <= 0 or dt > VOL_MAX_INTERVAL:
-                excluded += 1
-                continue
-            variance += math.log(p1/p0)**2
-            seconds += dt
-            returns += 1
-        return variance, seconds, returns, excluded
-
-    def sigma(self):
-        variance, seconds, returns, _ = self.history_metrics()
-        if seconds < VOL_MIN_SECONDS or returns < VOL_MIN_RETURNS:
-            raise Skip("volatility_warmup")
-        return max(1e-6, math.sqrt(variance/seconds))
+    return {
+        side: values[index]
+        for side, index in market["indices"].items()
+    }
 
 
-def model_probability(anchor, spot, now, expiry):
-    # Implied digital-price response, anchored BEFORE the observed spot move.
-    # No claim that this is the real settlement probability or official strike.
-    t0, t1 = expiry-anchor["time"], expiry-now
-    sigma = anchor["sigma"]
-    if t1 <= 0 or t0 <= 0 or now < anchor["time"] or sigma <= 0:
-        raise Skip("model_time")
-    p0 = min(.95, max(.05, anchor["p"]))
-    numerator = NORMAL.inv_cdf(p0)*sigma*math.sqrt(t0) + math.log(spot/anchor["spot"])
-    return min(.995, max(.005, NORMAL.cdf(numerator/(sigma*math.sqrt(t1)))))
+# ============================================================
+# DATABASE EN PAPERBOEKHOUDING
+# ============================================================
 
+class Store:
+    def __init__(self, path):
+        self.db = sqlite3.connect(path)
+        self.db.row_factory = sqlite3.Row
 
-def entry_assessment(book, market, direction, anchor, spot_price, budget, now, hold=False):
-    remaining = market["expiry"]-now
-    if not ENTRY_TIME_MIN <= remaining <= ENTRY_TIME_MAX:
-        raise Skip("outside_entry_window")
-    if not 0 <= now-anchor["time"] <= ANCHOR_MAX_AGE+MAX_ENTRY_WAIT:
-        raise Skip("anchor_expired")
-    up = model_probability(anchor, spot_price, now, market["expiry"])
-    ref = up if direction == "UP" else 1-up
-    base = anchor["p"] if direction == "UP" else 1-anchor["p"]
-    move = math.log(spot_price/anchor["spot"])*(1 if direction == "UP" else -1)
-    if move < MIN_BTC_MOVE or ref-base < MIN_MODEL_MOVE:
-        raise Skip("no_btc_impulse")
-    book.check(now)
-    if book.spread() > MAX_SPREAD:
-        raise Skip("spread")
-    quote = buy_quote(book, market, budget, now)
-    if ref-quote["price"] < MIN_GROSS_EDGE:
-        raise Skip("gross_edge")
-    if hold:
-        # Model probability is an uncalibrated hypothesis, NOT guaranteed payout.
-        edge = ref - MODEL_MARGIN - quote['spent']/quote['qty']
-        if edge < MIN_NET_EDGE:
-            raise Skip('settlement_edge_after_entry_costs')
-        return quote, ref, 1., edge
-    # Quote scenario: fair mid less half-spread, uncertainty and adverse sell tick.
-    target_bid = min(.99, ref-book.spread()/2-MODEL_MARGIN)
-    target_fill = target_bid-SLIPPAGE_TICKS*book.tick
-    if target_fill <= 0:
-        raise Skip("target_price")
-    edge = target_fill-fee_unit(target_fill, market)-quote["spent"]/quote["qty"]
-    if edge < MIN_NET_EDGE:
-        raise Skip("edge_after_costs")
-    sell_quote(book, market, quote["qty"], now)  # current full-size exit depth
-    return quote, ref, target_bid, edge
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=FULL")
 
+        self.db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS account(
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                schema TEXT,
+                initial REAL,
+                cash REAL,
+                day TEXT,
+                day_start REAL,
+                entries INTEGER
+            );
 
-def strategy_assessment(book, market, direction, anchor, spot_price, budget, now):
-    return entry_assessment(book, market, direction, anchor, spot_price,
-                            min(budget,HOLD_STAKE_CAP) if HOLD_TO_RESOLUTION else budget,
-                            now, hold=HOLD_TO_RESOLUTION)
+            CREATE TABLE IF NOT EXISTS markets(
+                start INTEGER PRIMARY KEY,
+                data TEXT NOT NULL,
+                resolved_at REAL,
+                up REAL,
+                down REAL,
+                last_poll REAL DEFAULT 0
+            );
 
+            CREATE TABLE IF NOT EXISTS observations(
+                start INTEGER,
+                checkpoint INTEGER,
+                at REAL,
+                kind TEXT,
+                side TEXT,
+                gap_bin INTEGER,
+                price_bin INTEGER,
+                details TEXT,
+                result INTEGER,
+                PRIMARY KEY(start, checkpoint)
+            );
 
-def is_hold(position):
-    return (position.get('exit_policy') or {}).get('mode') == 'hold_to_resolution'
+            CREATE INDEX IF NOT EXISTS obs_cell
+            ON observations(
+                checkpoint,
+                kind,
+                side,
+                gap_bin,
+                price_bin
+            );
 
+            CREATE TABLE IF NOT EXISTS positions(
+                start INTEGER PRIMARY KEY,
+                side TEXT,
+                qty REAL,
+                spent REAL,
+                fee REAL,
+                entered REAL,
+                details TEXT,
+                resolved_at REAL,
+                proceeds REAL,
+                pnl REAL
+            );
 
-def strategy_quote(book, market, budget, now, max_stop_risk):
-    if not HOLD_TO_RESOLUTION:
-        return risk_budgeted_quote(book, market, budget, now, max_stop_risk)
-    q = buy_quote(book, market, min(budget,HOLD_STAKE_CAP), now)
-    return q, dict(version=VERSION,mode='hold_to_resolution',
-                   max_loss=q['spent'],planned_stop_loss=q['spent'],
-                   stop_per_share=q['spent']/q['qty'],target_per_share=1.,
-                   max_hold_seconds=None,requested_spend=budget,actual_spend=q['spent'])
+            CREATE TABLE IF NOT EXISTS ticks(
+                channel TEXT,
+                ts REAL,
+                value REAL,
+                received REAL,
+                PRIMARY KEY(channel, ts)
+            );
 
+            CREATE TABLE IF NOT EXISTS skips(
+                reason TEXT PRIMARY KEY,
+                count INTEGER
+            );
+            """
+        )
 
-def entry_round_limit():
-    return 1 if HOLD_TO_RESOLUTION else MAX_PAPER_ENTRIES_PER_ROUND
+        with self.db:
+            self.db.execute(
+                """
+                INSERT OR IGNORE INTO account
+                VALUES(1, ?, ?, ?, ?, ?, 0)
+                """,
+                (
+                    SCHEMA,
+                    INITIAL_CASH,
+                    INITIAL_CASH,
+                    day(time.time()),
+                    INITIAL_CASH,
+                ),
+            )
 
+        if self.account()["schema"] != SCHEMA:
+            raise RuntimeError(
+                "Database hoort bij andere strategie; "
+                "niet overschrijven"
+            )
 
-def hold_account_check(account, quote):
-    # Reserve worst-case loss against remaining realized daily budget.
-    remaining = account['cash']-account['day_start']*(1-DAILY_LOSS_FRACTION)
-    if HOLD_TO_RESOLUTION and quote['spent'] > remaining + 1e-9:
-        raise Skip('remaining_daily_loss_budget')
+        self.verify()
 
+    def account(self):
+        row = self.db.execute(
+            "SELECT * FROM account WHERE id=1"
+        ).fetchone()
 
-class Ledger:
-    def __init__(self, path=STATE_PATH):
-        self.path = Path(path)
-        self.data = dict(schema=1, strategy=VERSION, cash=START_BALANCE,
-                         initial=START_BALANCE, position=None, trades=[], pending=None,
-                         round_counts={}, last_exit=0., day="", day_start=START_BALANCE,
-                         daily_stopped=False)
-        if self.path.exists():
-            self.data = json.loads(self.path.read_text())
-            if self.data.get("schema") != 1 or self.data.get("strategy") not in COMPATIBLE_LEDGERS:
-                raise LedgerError("Onbekende ledger; bestaande data niet overschreven")
-            self.validate()
-        self.data["strategy"] = VERSION
-        # A paper request interrupted before its atomic fill never filled.
-        self.data["pending"] = None
-        self.save()
+        return dict(row)
 
-    def validate(self):
-        d = self.data
-        if finite(d["cash"]) < -1e-6 or finite(d["initial"]) <= 0:
-            raise LedgerError("Ongeldig paper saldo")
-        expected = d["initial"] + sum(finite(t["pnl"]) for t in d["trades"])
-        if d["position"]:
-            expected -= finite(d["position"]["spent"])
-        if abs(expected-d["cash"]) > 1e-5:
-            raise LedgerError("Ledger sluit niet aan; herstel data voor herstart")
+    def verify(self):
+        account = self.account()
 
-    def save(self):
-        try:
-            self._save()
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            raise LedgerError("Paperadministratie kon niet veilig worden opgeslagen") from exc
+        used = self.db.execute(
+            """
+            SELECT
+                COALESCE(SUM(spent), 0),
+                COALESCE(SUM(proceeds), 0)
+            FROM positions
+            """
+        ).fetchone()
 
-    def _save(self):
-        self.validate()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        with tmp.open("w") as f:
-            json.dump(self.data, f, allow_nan=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self.path)
+        expected_cash = (
+            account["initial"]
+            - used[0]
+            + used[1]
+        )
+
+        if not math.isclose(
+            account["cash"],
+            expected_cash,
+            abs_tol=1e-6,
+        ):
+            raise RuntimeError(
+                "Paperboekhouding sluit niet aan; gestopt"
+            )
 
     def roll_day(self, now):
-        day = datetime.fromtimestamp(now, timezone.utc).date().isoformat()
-        if day != self.data["day"]:
-            # Realized-balance baseline (not a hard mark-to-market loss cap).
-            p = self.data["position"]
-            self.data.update(day=day, day_start=self.data["cash"]+(p["spent"] if p else 0),
-                             daily_stopped=False)
-            self.save()
+        account = self.account()
 
-    def allowed(self, market, now):
-        d = self.data
-        if d["position"] or d["daily_stopped"] or d["cash"] < STAKE:
-            raise Skip("portfolio_limit")
-        if now-d["last_exit"] < COOLDOWN_SECONDS:
-            raise Skip("cooldown")
-        if d["round_counts"].get(market["slug"], 0) >= MAX_ENTRIES_PER_ROUND:
-            raise Skip("round_limit")
+        if account["day"] != day(now):
+            reserved = self.db.execute(
+                """
+                SELECT COALESCE(SUM(spent), 0)
+                FROM positions
+                WHERE resolved_at IS NULL
+                """
+            ).fetchone()[0]
 
-    def enter(self, position):
-        if self.data["position"] or position["spent"] > self.data["cash"]:
-            raise LedgerError("Invalid paper entry")
-        self.data["cash"] -= position["spent"]
-        self.data["position"] = position
-        self.data["pending"] = None
-        counts = self.data["round_counts"]
-        counts[position["market"]["slug"]] = counts.get(position["market"]["slug"], 0)+1
-        if len(counts) > 100:
-            self.data["round_counts"] = dict(list(counts.items())[-50:])
-        self.save()
+            with self.db:
+                self.db.execute(
+                    """
+                    UPDATE account
+                    SET day=?, day_start=?, entries=0
+                    WHERE id=1
+                    """,
+                    (
+                        day(now),
+                        account["cash"] + reserved,
+                    ),
+                )
 
-    def close(self, proceeds, fee, reason, now):
-        p = self.data["position"]
-        if not p or proceeds < 0:
-            raise LedgerError("Invalid paper exit")
-        trade = dict(direction=p["direction"], market=p["market"]["slug"],
-                     entry_time=p["entered"], exit_time=now, seconds=now-p["entered"],
-                     spent=p["spent"], received=proceeds, qty=p["qty"],
-                     fees=p["fee"]+fee, pnl=proceeds-p["spent"], reason=reason)
-        self.data["cash"] += proceeds
-        self.data["trades"].append(trade)
-        self.data.update(position=None, pending=None, last_exit=now)
-        if self.data["cash"] <= self.data["day_start"]*(1-DAILY_LOSS_FRACTION):
-            self.data["daily_stopped"] = True
-        self.save()
-        return trade
+    def skip(self, reason):
+        with self.db:
+            self.db.execute(
+                """
+                INSERT INTO skips VALUES(?, 1)
+                ON CONFLICT(reason)
+                DO UPDATE SET count=count+1
+                """,
+                (reason,),
+            )
+
+    def market(self, market):
+        with self.db:
+            self.db.execute(
+                """
+                INSERT OR IGNORE INTO markets(start, data)
+                VALUES(?, ?)
+                """,
+                (
+                    market["start"],
+                    json.dumps(market),
+                ),
+            )
+
+    def ticks(self, rows):
+        with self.db:
+            self.db.executemany(
+                """
+                INSERT OR IGNORE INTO ticks
+                VALUES(?, ?, ?, ?)
+                """,
+                rows,
+            )
+
+    def estimate(self, checkpoint, feature, quote_data, now):
+        rows = self.db.execute(
+            """
+            SELECT
+                o.start,
+                o.at,
+                m.resolved_at,
+                o.result
+            FROM observations o
+            JOIN markets m USING(start)
+            WHERE checkpoint=?
+              AND kind=?
+              AND side=?
+              AND gap_bin=?
+              AND price_bin=?
+              AND o.start>=?
+              AND m.resolved_at<?
+              AND o.result IN (0, 1)
+            """,
+            (
+                checkpoint,
+                feature["kind"],
+                feature["side"],
+                feature["gap_bin"],
+                quote_data["price_bin"],
+                now - TRAIN_DAYS * 86400,
+                now,
+            ),
+        ).fetchall()
+
+        return history_estimate(rows, now)
+
+    def observed(self, start, checkpoint):
+        row = self.db.execute(
+            """
+            SELECT 1
+            FROM observations
+            WHERE start=? AND checkpoint=?
+            """,
+            (
+                start,
+                checkpoint,
+            ),
+        ).fetchone()
+
+        return row is not None
+
+    def observe(
+        self,
+        market,
+        checkpoint,
+        feature,
+        quote_data,
+        estimate,
+    ):
+        details = {
+            "feature": feature,
+            "quote": quote_data,
+            "estimate_before_result": estimate,
+        }
+
+        with self.db:
+            self.db.execute(
+                """
+                INSERT OR IGNORE INTO observations
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    market["start"],
+                    checkpoint,
+                    feature["at"],
+                    feature["kind"],
+                    feature["side"],
+                    feature["gap_bin"],
+                    quote_data["price_bin"],
+                    json.dumps(details),
+                ),
+            )
+
+    def can_enter(self, start, spent):
+        already_traded = self.db.execute(
+            """
+            SELECT 1
+            FROM positions
+            WHERE start=?
+            """,
+            (start,),
+        ).fetchone()
+
+        if already_traded:
+            raise Skip("al_gehandeld_deze_ronde")
+
+        open_position = self.db.execute(
+            """
+            SELECT 1
+            FROM positions
+            WHERE resolved_at IS NULL
+            """
+        ).fetchone()
+
+        if open_position:
+            raise Skip("positie_of_afrekening_nog_open")
+
+        account = self.account()
+
+        if account["entries"] >= MAX_DAILY_ENTRIES:
+            raise Skip("daglimiet_aantal")
+
+        if (
+            spent > PAPER_STAKE + 1e-6
+            or spent <= 0
+            or account["cash"] < spent
+        ):
+            raise Skip("onvoldoende_paperbudget")
+
+        minimum_cash = (
+            account["day_start"]
+            * (1 - MAX_DAILY_LOSS)
+        )
+
+        if account["cash"] - spent < minimum_cash - 1e-6:
+            raise Skip("daglimiet_maximaal_verlies")
+
+    def enter(
+        self,
+        market,
+        feature,
+        quote_data,
+        estimate,
+        now,
+    ):
+        self.can_enter(
+            market["start"],
+            quote_data["spent"],
+        )
+
+        details = json.dumps(
+            {
+                "feature": feature,
+                "quote": quote_data,
+                "estimate": estimate,
+            }
+        )
+
+        with self.db:
+            self.db.execute(
+                """
+                INSERT INTO positions
+                VALUES(
+                    ?, ?, ?, ?, ?, ?, ?,
+                    NULL, NULL, NULL
+                )
+                """,
+                (
+                    market["start"],
+                    feature["side"],
+                    quote_data["qty"],
+                    quote_data["spent"],
+                    quote_data["fee"],
+                    now,
+                    details,
+                ),
+            )
+
+            self.db.execute(
+                """
+                UPDATE account
+                SET cash=cash-?, entries=entries+1
+                WHERE id=1
+                """,
+                (quote_data["spent"],),
+            )
+
+        self.verify()
+
+    def settle(self, market, pay, now):
+        row = self.db.execute(
+            """
+            SELECT resolved_at
+            FROM markets
+            WHERE start=?
+            """,
+            (market["start"],),
+        ).fetchone()
+
+        if row is None or row[0] is not None:
+            return None
+
+        trade = self.db.execute(
+            """
+            SELECT *
+            FROM positions
+            WHERE start=?
+              AND resolved_at IS NULL
+            """,
+            (market["start"],),
+        ).fetchone()
+
+        result = None
+
+        with self.db:
+            self.db.execute(
+                """
+                UPDATE markets
+                SET resolved_at=?, up=?, down=?
+                WHERE start=?
+                """,
+                (
+                    now,
+                    pay["UP"],
+                    pay["DOWN"],
+                    market["start"],
+                ),
+            )
+
+            # Alleen binaire uitslagen gebruiken als trainingslabels.
+            if sorted(pay.values()) == [0.0, 1.0]:
+                for side in ("UP", "DOWN"):
+                    self.db.execute(
+                        """
+                        UPDATE observations
+                        SET result=?
+                        WHERE start=? AND side=?
+                        """,
+                        (
+                            int(pay[side]),
+                            market["start"],
+                            side,
+                        ),
+                    )
+
+            if trade:
+                proceeds = (
+                    trade["qty"]
+                    * pay[trade["side"]]
+                )
+
+                pnl = proceeds - trade["spent"]
+
+                self.db.execute(
+                    """
+                    UPDATE positions
+                    SET resolved_at=?, proceeds=?, pnl=?
+                    WHERE start=?
+                    """,
+                    (
+                        now,
+                        proceeds,
+                        pnl,
+                        market["start"],
+                    ),
+                )
+
+                self.db.execute(
+                    """
+                    UPDATE account
+                    SET cash=cash+?
+                    WHERE id=1
+                    """,
+                    (proceeds,),
+                )
+
+                result = {
+                    "side": trade["side"],
+                    "pnl": pnl,
+                    "proceeds": proceeds,
+                }
+
+        self.verify()
+
+        return result
 
 
-async def discover(client, cycle):
-    slug = f"btc-updown-5m-{cycle}"
-    m = await asyncio.wait_for(client.get_market(slug=slug), 8)
-    s = m.state
-    if m.slug != slug or not m.condition_id or s.end_date is None:
-        raise Skip("wrong_market")
-    if abs(s.end_date.timestamp()-(cycle+300)) > 1:
-        raise Skip("wrong_expiry")
-    if s.closed or not s.active or not s.accepting_orders or not s.enable_order_book:
-        raise Skip("market_not_tradable")
-    f = m.trading.fee_schedule
-    if m.trading.fees_enabled is not False and f is None:
-        raise Skip("fee_unknown")
-    rate = finite(f.rate) if f and m.trading.fees_enabled is not False else 0.
-    exponent = finite(f.exponent) if f else 1.
-    if not 0 <= rate <= 1 or not 0 <= exponent <= 10:
-        raise Skip("fee_invalid")
-    assets, indices = {}, {}
-    version = getattr(m.version, "value", m.version)
-    if version not in ("v1", "v2"):
-        raise Skip("unsupported_market_version")
-    for i, outcome in enumerate((m.outcomes.yes, m.outcomes.no)):
-        label = outcome.label.strip().upper()
-        asset = outcome.position_id if version == "v2" else outcome.token_id
-        if label not in ("UP", "DOWN") or not asset:
-            raise Skip("outcome_mapping")
-        assets[label], indices[label] = str(asset), i
-    if len(assets) != 2 or len(set(assets.values())) != 2:
-        raise Skip("outcome_mapping")
-    return dict(slug=slug, condition=str(m.condition_id), expiry=cycle+300,
-                assets=assets, indices=indices, fee_rate=rate, fee_exponent=exponent)
+# ============================================================
+# BOT
+# ============================================================
 
+class Bot:
+    def __init__(self, store):
+        self.store = store
+        self.ref = Reference()
 
-def resolved_payout(resolutions, market, direction):
-    matches = [r for r in resolutions if str(r.condition_id) == market["condition"]
-               and getattr(r.status, "value", r.status) == "resolved"]
-    if len(matches) != 1 or matches[0].payouts is None:
-        return None
-    payouts = list(map(finite, matches[0].payouts))
-    if len(payouts) != 2 or any(p < 0 or p > 1 for p in payouts) or abs(sum(payouts)-1) > 1e-8:
-        raise Skip("invalid_resolution")
-    return payouts[market["indices"][direction]]
+        self.market = None
 
+        self.last_report = 0
+        self.last_discovery = 0
+        self.last_resolve = 0
+        self.last_cleanup = 0
 
-class Engine:
-    def __init__(self, client, ledger):
-        self.client, self.ledger = client, ledger
-        self.spot = Spot()
-        self.market, self.books, self.stream_task = None, {}, None
-        self.anchors = deque(maxlen=80)
-        self.last_anchor_reset = 'startup_or_evicted'
-        self.forecasts = deque(maxlen=100)
-        self.scores = dict(n=0, model_error=0., baseline_error=0.)
-        self.stats = Counter()
-        self.messages = asyncio.Queue(maxsize=100)
-        self.last_anchor = self.last_forecast = self.last_report = 0.
-        self.last_exit_attempt = self.last_resolve = self.next_discovery = 0.
-        self.stream_ok = False
-        self.stream_connected = False
-        self.last_book_event = 0.
-        self.book_diagnostics = {}
-        self.last_repair = {}
+        self.last_cell = None
 
-    def invalidate_anchors(self, reason):
-        if self.anchors:
-            self.last_anchor_reset = reason
-            self.stats['anchor_reset:'+reason] += 1
-        self.anchors.clear()
+        self.messages = asyncio.Queue(maxsize=50)
 
-    def notify(self, text):
-        LOG.info(text)
-        with contextlib.suppress(asyncio.QueueFull):
-            self.messages.put_nowait(text)
+        self.health = {
+            "version": VERSION,
+            "mode": "PAPER",
+            "status": "starting",
+        }
 
-    async def telegram_worker(self):
-        token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip().removeprefix("bot")
-        chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-        def send(text):
-            try:
-                r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                                  json={"chat_id": chat, "text": text,
-                                        "disable_web_page_preview": True}, timeout=8)
-                if not r.ok or not r.json().get("ok"):
-                    LOG.warning("Telegram bericht niet afgeleverd (HTTP %s)", r.status_code)
-            except Exception:
-                LOG.warning("Telegram tijdelijk niet bereikbaar")  # no secret-bearing URL
+        self.started = time.time()
+        self.attempted = set()
+
+    def notify(self, message):
+        LOG.info(message)
+
+        with suppress(asyncio.QueueFull):
+            self.messages.put_nowait(message)
+
+    async def telegram(self):
+        token = os.getenv(
+            "TELEGRAM_BOT_TOKEN",
+            "",
+        ).strip()
+
+        if token.startswith("bot"):
+            token = token[3:]
+
+        chat = os.getenv(
+            "TELEGRAM_CHAT_ID",
+            "",
+        ).strip()
+
         while True:
             message = await self.messages.get()
+
             if token and chat:
-                await asyncio.to_thread(send, message)
+                def send():
+                    # Geen URLs of exceptions met tokens loggen.
+                    try:
+                        response = requests.post(
+                            (
+                                "https://api.telegram.org/"
+                                f"bot{token}/sendMessage"
+                            ),
+                            json={
+                                "chat_id": chat,
+                                "text": message[:4000],
+                                "disable_web_page_preview": True,
+                            },
+                            timeout=8,
+                        )
+
+                        return (
+                            response.status_code == 200
+                            and response.json().get("ok") is True
+                        )
+
+                    except Exception:
+                        return False
+
+                delivered = await asyncio.to_thread(send)
+
+                if not delivered:
+                    LOG.warning(
+                        "Telegram niet bezorgd; bot draait verder"
+                    )
+
             self.messages.task_done()
 
-    async def spot_stream(self):
+    async def reference_feed(self):
+        auth = {
+            "apiKey": os.getenv(
+                "POLYMARKET_API_KEY",
+                "",
+            ).strip(),
+
+            "secret": os.getenv(
+                "POLYMARKET_API_SECRET",
+                "",
+            ).strip(),
+
+            "passphrase": os.getenv(
+                "POLYMARKET_API_PASSPHRASE",
+                "",
+            ).strip(),
+        }
+
+        if not all(auth.values()):
+            self.ref.state = "API_credentials_ontbreken"
+
+            self.notify(
+                "BTC Lead: referentiefeed wacht op "
+                "POLYMARKET_API_KEY, POLYMARKET_API_SECRET "
+                "en POLYMARKET_API_PASSPHRASE. "
+                "Geen private key nodig; uitsluitend paper."
+            )
+
+            return
+
         delay = 1
+
         while True:
-            try:
-                async with connect(BINANCE_WS, ping_interval=20, ping_timeout=20,
-                                   open_timeout=10, max_queue=32) as ws:
-                    self.spot.reset(preserve_history=True)
-                    record('spot_reset')
-                    self.invalidate_anchors("btc_connect")
-                    delay = 1
-                    while True:
-                        raw = await asyncio.wait_for(ws.recv(), BTC_IDLE_RECONNECT)
-                        event = json.loads(raw)
-                        if event.get("e") == "aggTrade" and event.get("s") == "BTCUSDT":
-                            self.spot.update(event["p"], finite(event["T"])/1000, time.time())
-                            record('spot', price=self.spot.price, source=self.spot.source,
-                                   received=self.spot.received)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.stats["btc_reconnect"] += 1
-                LOG.warning("BTC stream: %s", type(exc).__name__)
-            self.spot.reset(preserve_history=True)
-            record('spot_reset')
-            self.invalidate_anchors("btc_disconnect")
-            await asyncio.sleep(delay)
-            delay = min(30, delay*2)
+            self.ref.reset()
 
-    async def rest_book(self, direction, *, market=None, validate=True):
-        market = self.market if market is None else market
-        asset = market["assets"][direction]
-        payload = await asyncio.wait_for(self.client.get_order_book(asset_id=asset), 3)
-        book = Book(asset, market["condition"])
-        book.snapshot(payload, time.time())
-        if validate:
-            book.check(time.time())
-        return book
-
-    async def market_stream(self, market):
-        delay = 1
-        while self.market == market:
             try:
-                self.stream_ok = False
-                self.stream_connected = False
-                self.invalidate_anchors("book_connect")
-                # REST metadata then wait for the stream's full snapshots.
-                for direction in ("UP", "DOWN"):
-                    b = await self.rest_book(direction, market=market, validate=False)
-                    b.ready = False
-                    self.books[direction] = b
-                spec = MarketSpec(asset_ids=list(market["assets"].values()), custom_feature_enabled=True)
-                async with await self.client.subscribe(spec) as stream:
+                async with connect(
+                    WS_URL,
+                    open_timeout=10,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    max_queue=1024,
+                    max_size=262144,
+                ) as websocket:
+
+                    await websocket.send(
+                        json.dumps(
+                            {
+                                "op": "auth",
+                                "rid": "a1",
+                                "auth": auth,
+                            }
+                        )
+                    )
+
+                    reply = json.loads(
+                        await asyncio.wait_for(
+                            websocket.recv(),
+                            10,
+                        )
+                    )
+
+                    if reply.get("op") != "authed":
+                        raise Skip("feed_auth_mislukt")
+
+                    await websocket.send(
+                        json.dumps(
+                            {
+                                "op": "subscribe",
+                                "rid": "s1",
+                                "subscriptions": [
+                                    {
+                                        "channel": SPOT,
+                                        "filter": {
+                                            "symbol": "btcusd",
+                                            "provider": "chainlink",
+                                        },
+                                    },
+                                    {
+                                        "channel": TWAP,
+                                        "filter": {
+                                            "symbol": "btcusd",
+                                            "window_seconds": 60,
+                                        },
+                                    },
+                                ],
+                            }
+                        )
+                    )
+
                     delay = 1
-                    self.stream_connected = True
-                    self.last_book_event = time.time()
+
                     while True:
-                        event = await asyncio.wait_for(anext(stream), 15)
-                        if getattr(stream, "dropped", 0):
-                            raise Skip("stream_messages_dropped")
-                        payload, now = event.payload, time.time()
-                        if str(getattr(payload, "condition_id", "")) != market["condition"]:
+                        message = json.loads(
+                            await asyncio.wait_for(
+                                websocket.recv(),
+                                15,
+                            )
+                        )
+
+                        operation = message.get("op")
+
+                        if operation == "error":
+                            raise Skip(
+                                "feed_abonnement_geweigerd"
+                            )
+
+                        if (
+                            operation == "subscribed"
+                            and message.get("channel")
+                            in (SPOT, TWAP)
+                        ):
+                            provider = message.get("provider")
+
+                            if (
+                                provider is not None
+                                and provider != "chainlink"
+                            ):
+                                raise Skip(
+                                    "feed_verkeerde_provider"
+                                )
+
+                            self.ref.acks.add(
+                                message["channel"]
+                            )
+
                             continue
-                        self.last_book_event = now
-                        if event.type == "book":
-                            for b in self.books.values():
-                                if str(payload.asset_id) == b.asset:
-                                    if b.snapshot(payload, now):
-                                        record_book(next(d for d,v in self.books.items() if v is b), b)
-                        elif event.type == "price_change":
-                            ts = stamp(payload.timestamp) if payload.timestamp is not None else 0.
-                            updates = []
-                            for change in payload.price_changes:
-                                for b in self.books.values():
-                                    revision = b.revision
-                                    b.delta(change, ts, now)
-                                    if b.revision != revision:
-                                        updates.append(dict(direction=next(d for d,v in self.books.items() if v is b),
-                                                            price=finite(change.price), size=finite(change.size),
-                                                            side=getattr(change.side, 'value', change.side),
-                                                            source=b.source, received=b.received))
-                            if updates:
-                                record('deltas', updates=updates)
-                        elif event.type == "tick_size_change":
-                            for b in self.books.values():
-                                if str(payload.asset_id) == b.asset:
-                                    b.tick = finite(payload.new_tick_size)
-                                    b.revision += 1
-                                    record_book(next(d for d,v in self.books.items() if v is b), b)
-                        self.stream_ok = all(b.ready for b in self.books.values())
+
+                        if operation is not None:
+                            continue
+
+                        rows = self.ref.apply(
+                            message,
+                            time.time(),
+                        )
+
+                        self.store.ticks(rows)
+
             except asyncio.CancelledError:
                 raise
+
+            except sqlite3.Error:
+                raise
+
             except Exception as exc:
-                self.stats["market_reconnect"] += 1
-                LOG.warning("Polymarket stream: %s", type(exc).__name__)
-            self.stream_ok = False
-            self.stream_connected = False
-            record('book_reset')
-            self.invalidate_anchors("book_disconnect")
-            for b in self.books.values():
-                b.ready = False
-            await asyncio.sleep(delay)
-            delay = min(20, delay*2)
+                self.ref.connected = False
 
-    async def switch_market(self, market):
-        if self.stream_task:
-            self.stream_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self.stream_task
-        self.market, self.books = market, {}
-        record('market', market=market)
-        self.invalidate_anchors("market_change")
-        self.forecasts.clear()
-        self.stream_ok = False
-        self.stream_connected = False
-        self.last_repair.clear()
-        self.book_diagnostics.clear()
-        self.stream_task = asyncio.create_task(self.market_stream(market))
+                self.ref.state = (
+                    str(exc)
+                    if isinstance(exc, Skip)
+                    else type(exc).__name__
+                )
 
-    async def repair_book(self, direction, market):
-        before = self.books.get(direction)
-        revision = before.revision if before else -1
-        try:
-            candidate = await self.rest_book(direction, market=market, validate=False)
-            if self.market != market or not self.stream_connected:
-                return
-            live = self.books.get(direction)
-            # Do not overwrite a more recent stream update with an in-flight REST response.
-            changed = live is not before or (live and live.revision != revision)
-            if live and (candidate.source < live.source or
-                         (changed and candidate.source <= live.source)):
-                self.stats["repair_older_than_stream"] += 1
-                return
-            candidate.revision = (live.revision+1) if live else 1
-            self.books[direction] = candidate
-            record_book(direction, candidate)
-            self.stream_ok = len(self.books) == 2 and all(b.ready for b in self.books.values())
-            self.invalidate_anchors("book_resync")  # new model anchor after resynchronization
-            self.forecasts.clear()
+                LOG.warning(
+                    "Referentiefeed onderbroken: %s",
+                    self.ref.state,
+                )
+
+                await asyncio.sleep(
+                    min(30, delay) + random.random()
+                )
+
+                delay = min(30, delay * 2)
+
+    async def resolutions(self, client, now):
+        # Roterende batch: één probleemmarkt blokkeert niet alles.
+        rows = self.store.db.execute(
+            """
+            SELECT start, data
+            FROM markets
+            WHERE resolved_at IS NULL
+              AND start+300<=?
+            ORDER BY last_poll
+            LIMIT 8
+            """,
+            (now,),
+        ).fetchall()
+
+        for row in rows:
+            market = json.loads(row["data"])
+
+            with self.store.db:
+                self.store.db.execute(
+                    """
+                    UPDATE markets
+                    SET last_poll=?
+                    WHERE start=?
+                    """,
+                    (
+                        time.time(),
+                        row["start"],
+                    ),
+                )
+
             try:
-                candidate.check(time.time())
-                status = "hersteld"
-                self.stats["book_repaired"] += 1
+                resolutions = await asyncio.wait_for(
+                    client.get_resolutions(
+                        condition_ids=market["condition"],
+                    ),
+                    5,
+                )
+
+                pay = payout(
+                    resolutions,
+                    market,
+                )
+
+                if pay is None:
+                    continue
+
+                result = self.store.settle(
+                    market,
+                    pay,
+                    time.time(),
+                )
+
+                if result:
+                    self.notify(
+                        "PAPER officieel afgerond "
+                        f"{result['side']} | "
+                        f"netto {result['pnl']:+.2f} USD\n"
+                        f"{market['slug']}"
+                    )
+
             except Skip as exc:
-                status = str(exc)
-                self.stats["rest_confirmed:"+status] += 1
-            self.book_diagnostics[direction] = status
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            status = "REST:"+type(exc).__name__
-            self.book_diagnostics[direction] = status
-            self.stats["repair_failed:"+type(exc).__name__] += 1
+                self.store.skip(str(exc))
 
-    async def repair_books(self):
+            except (asyncio.TimeoutError, OSError):
+                self.store.skip(
+                    "afrekening_tijdelijk_onbereikbaar"
+                )
+
+            except sqlite3.Error:
+                raise
+
+            except Exception as exc:
+                LOG.warning(
+                    "Afrekening API: %s",
+                    type(exc).__name__,
+                )
+
+    async def settlement_worker(self, client):
         while True:
-            market = self.market
-            if market and time.time() < market["expiry"] and self.stream_connected:
-                tasks = []
-                for direction in ("UP", "DOWN"):
-                    try:
-                        if direction not in self.books:
-                            raise Skip("book_missing")
-                        self.books[direction].check(time.time())
-                    except Skip:
-                        key = (market["slug"], direction)
-                        if time.monotonic()-self.last_repair.get(key, -100) >= BOOK_REPAIR_INTERVAL:
-                            self.last_repair[key] = time.monotonic()
-                            tasks.append(self.repair_book(direction, market))
-                if tasks:
-                    await asyncio.gather(*tasks)
-            await asyncio.sleep(.5)
+            self.store.roll_day(time.time())
 
-    def paired_mid(self, now):
-        self.spot.check(now)
-        if not self.stream_ok or len(self.books) != 2:
-            raise Skip("market_stream_warmup")
-        for b in self.books.values():
-            b.check(now)
-            if abs(b.source-self.spot.source) > MAX_FEED_SKEW:
-                raise Skip("feed_time_skew")
-            if b.spread() > MAX_SPREAD:
-                raise Skip("spread")
-        up, down = self.books["UP"].mid(), self.books["DOWN"].mid()
-        if abs(up+down-1) > .04:
-            raise Skip("inconsistent_outcomes")
-        return up/(up+down)
+            await self.resolutions(
+                client,
+                time.time(),
+            )
 
-    def observe(self, now):
-        try:
-            p = self.paired_mid(now)
-            sigma = self.spot.sigma()
-        except Skip as exc:
-            self.invalidate_anchors("observation:"+str(exc))
-            self.forecasts.clear()
-            raise
-        if now-self.last_anchor >= .1:
-            self.anchors.append(dict(time=now, p=p, spot=self.spot.price, sigma=sigma))
-            self.last_anchor = now
-        while self.forecasts and self.forecasts[0][0] <= now:
-            due, prediction, baseline = self.forecasts.popleft()
-            if now-due <= .5:
-                self.scores["n"] += 1
-                self.scores["model_error"] += abs(prediction-p)
-                self.scores["baseline_error"] += abs(baseline-p)
-        eligible = [a for a in self.anchors if ANCHOR_AGE <= now-a["time"] <= ANCHOR_MAX_AGE]
-        if not eligible:
-            raise Skip("anchor_warmup")
-        anchor = eligible[-1]
-        if now-self.last_forecast >= 1:
-            prediction = model_probability(anchor, self.spot.price, now, self.market["expiry"])
-            self.forecasts.append((now+2, prediction, p))
-            self.last_forecast = now
-        return anchor
+            await asyncio.sleep(10)
 
-    async def enter(self, direction, anchor):
+    async def measure(self, client, checkpoint):
+        market = self.market
+        start = market["start"]
+
+        self.attempted.add(
+            (start, checkpoint)
+        )
+
+        # Vaste meetmomenten, geen herhaalde pogingen
+        # totdat toevallig een gunstige quote verschijnt.
+        feature = self.ref.feature(
+            market,
+            time.time(),
+        )
+
+        book = await asyncio.wait_for(
+            client.get_order_book(
+                asset_id=market["assets"][feature["side"]],
+            ),
+            3,
+        )
+
         now = time.time()
-        self.ledger.allowed(self.market, now)
-        self.spot.check(now)
-        entry_assessment(self.books[direction], self.market, direction, anchor, self.spot.price, STAKE, now)
-        self.stats["candidate"] += 1
-        started = time.monotonic()
-        self.ledger.data["pending"] = dict(direction=direction, time=now)
-        self.ledger.save()
-        try:
-            await asyncio.sleep(EXECUTION_DELAY)
-            book = await self.rest_book(direction)
-            now = time.time()
-            if time.monotonic()-started > MAX_ENTRY_WAIT:
-                raise Skip("entry_too_slow")
-            self.spot.check(now)
-            if anchor not in self.anchors:
-                raise Skip("anchor_invalidated:"+self.last_anchor_reset)
-            if abs(book.source-self.spot.source) > MAX_FEED_SKEW:
-                raise Skip("feed_time_skew")
-            self.ledger.allowed(self.market, now)
-            quote, ref, target, edge = entry_assessment(book, self.market, direction, anchor,
-                                                       self.spot.price, STAKE, now)
-            position = dict(**quote, direction=direction, market=self.market.copy(),
-                            anchor=anchor.copy(), target=target, reference_entry=ref,
-                            entered=now, delay_ms=(time.monotonic()-started)*1000)
-            self.ledger.enter(position)
-            self.stats["entry"] += 1
-            self.notify(f"PAPER {direction} BTC 5m — HERPRIJZING\n"
-                        f"All-in ${quote['spent']:.2f} | {quote['qty']:.6f} aandelen\n"
-                        f"Koop VWAP {quote['price']:.4f} | model {ref:.4f}\n"
-                        f"Doel-bid {target:.4f} | geschatte netto ruimte {edge:.4f}/aandeel\n"
-                        f"Vertraging incl. REST: {position['delay_ms']:.0f} ms\n"
-                        f"https://polymarket.com/event/{self.market['slug']}")
-        except Skip as exc:
-            self.stats["cancel_after_delay:"+str(exc)] += 1
-        finally:
-            self.ledger.data["pending"] = None
-            self.ledger.save()
 
-    def exit_reason(self, p, now):
-        if now-p["entered"] >= MAX_HOLD_SECONDS:
-            return "time_limit"
-        if p["market"]["expiry"]-now <= EXIT_BEFORE_EXPIRY:
-            return "before_expiry"
-        try:
-            self.spot.check(now)
-            up = model_probability(p["anchor"], self.spot.price, now, p["market"]["expiry"])
-            ref = up if p["direction"] == "UP" else 1-up
-            if ref < p["reference_entry"]-.025:
-                return "model_reversal"
-        except Skip:
-            return "data_stale"
-        try:
-            b = self.books[p["direction"]]
-            quote = sell_quote(b, p["market"], p["qty"], now)
-            if max(b.bids) >= p["target"]:
-                return "repriced"
-            if (quote["received"]-p["spent"])/p["qty"] <= -STOP_LOSS_PER_SHARE:
-                return "loss_limit"
-        except (Skip, KeyError):
-            return "data_stale"
-        return None
+        feature = self.ref.feature(
+            market,
+            now,
+        )
 
-    async def manage_position(self):
-        p, now = self.ledger.data["position"], time.time()
-        if now >= p["market"]["expiry"]:
-            if now-self.last_resolve >= 20:
-                self.last_resolve = now
-                rs = await asyncio.wait_for(self.client.get_resolutions(condition_ids=p["market"]["condition"]), 5)
-                payout = resolved_payout(rs, p["market"], p["direction"])
-                if payout is not None:
-                    t = self.ledger.close(p["qty"]*payout, 0., "resolution_fallback", time.time())
-                    self.notify(f"PAPER noodafrekening na expiry: ${t['pnl']:+.2f}. "
-                                "Geen tijdige verkoop mogelijk; officiële uitkomst gebruikt.")
+        if abs(feature["remaining"] - checkpoint) > 2:
+            raise Skip("meetmoment_gemist")
+
+        quote_data = quote(
+            book,
+            market,
+            feature["side"],
+            PAPER_STAKE,
+            now,
+        )
+
+        estimate = self.store.estimate(
+            checkpoint,
+            feature,
+            quote_data,
+            now,
+        )
+
+        self.last_cell = {
+            **estimate,
+            "gap_bp": feature["gap_bp"],
+            "remaining": round(feature["remaining"]),
+            "side": feature["side"],
+            "all_in": quote_data["all_in"],
+        }
+
+        if self.store.observed(start, checkpoint):
             return
-        reason = self.exit_reason(p, now)
-        if not reason or now-self.last_exit_attempt < 1:
-            return
-        self.last_exit_attempt = now
-        await asyncio.sleep(EXECUTION_DELAY)
-        if time.time() >= p["market"]["expiry"]:
-            return
-        book = await self.rest_book(p["direction"])
-        now = time.time()
-        if now >= p["market"]["expiry"]:
-            return
-        quote = sell_quote(book, p["market"], p["qty"], now)
-        # Once triggered we execute at refreshed bids, even if price deteriorated.
-        t = self.ledger.close(quote["received"], quote["fee"], reason, now)
-        self.stats["exit:"+reason] += 1
-        self.notify(f"PAPER {p['direction']} GESLOTEN: {reason}\n"
-                    f"Verkoop VWAP {quote['price']:.4f} | netto ${t['pnl']:+.2f}\n"
-                    f"Beide fees ${t['fees']:.4f} | duur {t['seconds']:.1f}s\n"
-                    f"Vrij paper saldo ${self.ledger.data['cash']:.2f}")
+
+        self.store.observe(
+            market,
+            checkpoint,
+            feature,
+            quote_data,
+            estimate,
+        )
+
+        if not estimate["ready"]:
+            raise Skip(
+                "data_verzamelen_onvoldoende_vergelijkbare_rondes"
+            )
+
+        if (
+            estimate["lower"] - quote_data["all_in"]
+            < MIN_NET_EDGE
+        ):
+            raise Skip("onvoldoende_netto_edge")
+
+        self.store.can_enter(
+            start,
+            quote_data["spent"],
+        )
+
+        await asyncio.sleep(
+            max(
+                LATENCY_SECONDS,
+                market.get("seconds_delay", 0),
+            )
+        )
+
+        book_after = await asyncio.wait_for(
+            client.get_order_book(
+                asset_id=market["assets"][feature["side"]],
+            ),
+            3,
+        )
+
+        now_after = time.time()
+
+        feature_after = self.ref.feature(
+            market,
+            now_after,
+        )
+
+        if (
+            abs(feature_after["remaining"] - checkpoint)
+            > 3
+        ):
+            raise Skip("instap_te_laat")
+
+        if any(
+            feature_after[key] != feature[key]
+            for key in (
+                "side",
+                "kind",
+                "gap_bin",
+            )
+        ):
+            raise Skip("voorsprong_veranderd")
+
+        quote_after = quote(
+            book_after,
+            market,
+            feature_after["side"],
+            PAPER_STAKE,
+            now_after,
+        )
+
+        if (
+            quote_after["price_bin"]
+            != quote_data["price_bin"]
+        ):
+            raise Skip("prijsklasse_veranderd")
+
+        if (
+            estimate["lower"] - quote_after["all_in"]
+            < MIN_NET_EDGE
+        ):
+            raise Skip("edge_verdwenen_na_latency")
+
+        self.store.enter(
+            market,
+            feature_after,
+            quote_after,
+            estimate,
+            now_after,
+        )
+
+        self.notify(
+            f"PAPER BTC {feature_after['side']} | "
+            f"all-in {quote_after['spent']:.2f} USD\n"
+            f"Lead {feature_after['gap_bp']:.2f} bp | "
+            f"resterend {feature_after['remaining']:.0f}s | "
+            f"{feature_after['kind']}\n"
+            f"Historisch {estimate['p']:.1%}, "
+            f"ondergrens {estimate['lower']:.1%}; "
+            f"n={estimate['n']}\n"
+            f"Kost/aandeel {quote_after['all_in']:.4f}, "
+            f"geschatte fee {quote_after['fee']:.4f}\n"
+            "Vasthouden tot officiële uitslag. "
+            f"https://polymarket.com/event/{market['slug']}"
+        )
 
     def report(self):
+        account = self.store.account()
+        db = self.store.db
+
+        closed, wins, pnl = db.execute(
+            """
+            SELECT
+                COUNT(*),
+                COALESCE(SUM(pnl>0), 0),
+                COALESCE(SUM(pnl), 0)
+            FROM positions
+            WHERE resolved_at IS NOT NULL
+            """
+        ).fetchone()
+
+        opened, reserved = db.execute(
+            """
+            SELECT
+                COUNT(*),
+                COALESCE(SUM(spent), 0)
+            FROM positions
+            WHERE resolved_at IS NULL
+            """
+        ).fetchone()
+
+        observed = db.execute(
+            "SELECT COUNT(*) FROM observations"
+        ).fetchone()[0]
+
+        resolved = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM markets
+            WHERE resolved_at IS NOT NULL
+            """
+        ).fetchone()[0]
+
+        skips = dict(
+            db.execute(
+                """
+                SELECT reason, count
+                FROM skips
+                ORDER BY count DESC
+                LIMIT 6
+                """
+            ).fetchall()
+        )
+
+        report_data = {
+            "version": VERSION,
+            "at": time.time(),
+            "account": account,
+            "closed": closed,
+            "wins": wins,
+            "net_pnl": pnl,
+            "open": opened,
+            "reserved": reserved,
+            "observations": observed,
+            "resolved_markets": resolved,
+            "last_cell": self.last_cell,
+            "skips": skips,
+            "trades": [
+                dict(row)
+                for row in db.execute(
+                    """
+                    SELECT *
+                    FROM positions
+                    ORDER BY start DESC
+                    LIMIT 1000
+                    """
+                )
+            ],
+        }
+
+        for trade in report_data["trades"]:
+            trade["details"] = json.loads(
+                trade["details"]
+            )
+
+        # Deelbaar rapport zonder API-credentials of Telegram-ID.
+        path = DATA_DIR / "btc_lead_report.json"
+        temporary = path.with_suffix(".tmp")
+
+        with temporary.open("w") as output:
+            json.dump(
+                report_data,
+                output,
+                indent=2,
+                allow_nan=False,
+            )
+
+            output.flush()
+            os.fsync(output.fileno())
+
+        os.replace(
+            temporary,
+            path,
+        )
+
+        self.notify(
+            f"{VERSION}\n"
+            f"Feed: {self.ref.state}\n"
+            f"Paper vrij {account['cash']:.2f} | "
+            f"gereserveerd {reserved:.2f} | "
+            f"open {opened}\n"
+            f"Afgerond {closed}, winst {wins}, "
+            f"netto {pnl:+.2f} USD\n"
+            f"Dataset: {observed} meetpunten, "
+            f"{resolved} afgeronde rondes\n"
+            "Laatste vergelijkbare cel: "
+            f"{json.dumps(self.last_cell, ensure_ascii=False)}\n"
+            "Controles: "
+            f"{json.dumps(skips, ensure_ascii=False)}\n"
+            "Geen kansen ingebouwd uit onbevestigde percentages. "
+            "Eerst data verzamelen; daarna alleen edge na kosten."
+        )
+
+    async def cycle(self, client):
         now = time.time()
-        d, s = self.ledger.data, self.scores
-        trades = d["trades"]
-        msg = (f"{VERSION}\nOpen {int(d['position'] is not None)} | gesloten {len(trades)} | "
-               f"winst {sum(t['pnl']>0 for t in trades)}\n"
-               f"Vrij ${d['cash']:.2f} | netto gerealiseerd ${sum(t['pnl'] for t in trades):+.2f}\n"
-               f"Controles sinds vorig rapport (herhalingen mogelijk): {dict(self.stats)}\n")
-        _, seconds, returns, excluded = self.spot.history_metrics()
-        msg += (f"BTC historie: {seconds:.0f}/{VOL_MIN_SECONDS}s bruikbaar, "
-                f"{returns}/{VOL_MIN_RETURNS} rendementen, {excluded} intervallen overgeslagen.\n")
-        if self.spot.event_ages:
-            ages = sorted(self.spot.event_ages)
-            p95 = ages[min(len(ages)-1, int(len(ages)*.95))]
-            msg += (f"BTC berichtleeftijd p50/p95: {ages[len(ages)//2]*1000:.0f}/"
-                    f"{p95*1000:.0f} ms | berichten {dict(self.spot.event_stats)}\n")
-        msg += f"Huidige BTC-prijsleeftijd: {now-self.spot.source:.2f}s\n" if self.spot.source else "BTC: wacht op verse prijs\n"
-        for direction, b in self.books.items():
-            bid = f"{max(b.bids):.3f}" if b.bids else "leeg"
-            ask = f"{min(b.asks):.3f}" if b.asks else "leeg"
-            msg += (f"{direction}: bid {bid}, ask {ask}, niveaus {len(b.bids)}/{len(b.asks)}, "
-                    f"leeftijd {now-b.source:.1f}s | REST {self.book_diagnostics.get(direction, 'niet nodig')}\n")
-        if s["n"]:
-            msg += (f"2s quotevoorspelling, n={s['n']}: fout model {s['model_error']/s['n']:.4f}, "
-                    f"onveranderde quote {s['baseline_error']/s['n']:.4f}. Lager is beter.\n")
-        msg += "PAPER: geschatte fills/kosten; modelkans is ongekalibreerd. Geen live orders."
-        self.notify(msg[:3900])
-        self.stats.clear()
-        self.spot.event_stats.clear()
-        self.spot.event_ages.clear()
+        self.store.roll_day(now)
 
-    async def run(self):
-        self.notify(f"{VERSION} gestart\nBTC-only | inzet ${STAKE:.2f} | realtime feeds\n"
-                    f"Bruto edge ≥{MIN_GROSS_EDGE:.2f}, netto ruimte ≥{MIN_NET_EDGE:.2f}/aandeel\n"
-                    f"Max. houdtijd {MAX_HOLD_SECONDS}s (verkooppoging, geen vulgarantie).\n"
-                    "Feedherstel actief; bestaande paperhistorie en posities blijven behouden.")
-        jobs = [asyncio.create_task(self.spot_stream()), asyncio.create_task(self.telegram_worker()),
-                asyncio.create_task(self.repair_books())]
-        try:
-            while True:
-                now = time.time()
-                HEALTH["heartbeat"] = now
-                try:
-                    self.ledger.roll_day(now)
-                    p = self.ledger.data["position"]
-                    if p and self.market != p["market"]:
-                        await self.switch_market(p["market"])
-                    if not p and (not self.market or now >= self.market["expiry"]):
-                        if now < self.next_discovery:
-                            raise Skip("discovery_backoff")
-                        self.next_discovery = now+5
-                        await self.switch_market(await discover(self.client, int(now//300)*300))
-                    if p:
-                        await self.manage_position()
-                    else:
-                        self.ledger.allowed(self.market, now)
-                        if not ENTRY_TIME_MIN <= self.market["expiry"]-now <= ENTRY_TIME_MAX:
-                            raise Skip("outside_entry_window")
-                        anchor = self.observe(now)
-                        direction = "UP" if self.spot.price > anchor["spot"] else "DOWN"
-                        await self.enter(direction, anchor)
-                except Skip as exc:
-                    self.stats[str(exc)] += 1
-                except LedgerError:
-                    # Persistence/invariant failures are fatal; do not continue on bad state.
-                    LOG.exception("Fatale lokale fout; paperproces stopt")
-                    raise
-                except Exception as exc:
-                    self.stats["api_error:"+type(exc).__name__] += 1
-                    LOG.warning("API tijdelijk niet beschikbaar: %s", type(exc).__name__)
-                    await asyncio.sleep(1)
-                if time.time()-self.last_report >= REPORT_SECONDS:
-                    self.report()
-                    self.last_report = time.time()
-                await asyncio.sleep(.1)
-        finally:
-            if self.stream_task:
-                jobs.append(self.stream_task)
-            for task in jobs:
-                task.cancel()
-            await asyncio.gather(*jobs, return_exceptions=True)
-            self.ledger.save()
-
-
-
-def cost_guard(book, market, quote, now):
-    """Reject an entry already at/near its all-in stop, never hide its fees."""
-    immediate = sell_quote(book, market, quote['qty'], now)
-    loss = (quote['spent']-immediate['received'])/quote['qty']
-    if loss >= STOP_LOSS_PER_SHARE-ENTRY_STOP_BUFFER:
-        raise Skip('roundtrip_cost_near_stop')
-    return immediate, loss
-
-
-
-def cost_aware_risk(book, market, quote, now):
-    """Bounded new-entry policy. Cost is real friction, never subtracted from PnL.
-
-    The legacy four-cent stop could be inside the initial loss. Leave two cents
-    of adverse movement after paying friction, while refusing expensive books.
-    Stops are triggers, not guaranteed fills; all observed sell depth still applies.
-    """
-    immediate = sell_quote(book, market, quote['qty'], now)
-    loss = (quote['spent']-immediate['received'])/quote['qty']
-    if not math.isfinite(loss) or loss < 0:
-        raise Skip('invalid_roundtrip_cost')
-    if loss > MAX_ROUNDTRIP_COST:
-        raise Skip('roundtrip_cost_cap')
-    stop = max(STOP_LOSS_PER_SHARE, loss+POST_COST_LOSS_ROOM)
-    if stop > MAX_COST_AWARE_STOP:
-        raise Skip('cost_aware_stop_cap')
-    return dict(version=VERSION, mode='cost_aware', stop_per_share=stop,
-                target_per_share=LAB_TAKE_PROFIT, max_hold_seconds=MAX_HOLD_SECONDS,
-                baseline_loss=loss, max_cost=MAX_ROUNDTRIP_COST,
-                post_cost_room=POST_COST_LOSS_ROOM, exit_btc_max_age=EXIT_BTC_MAX_AGE,
-                revalidate_profit_exit=True)
-
-
-def position_exit_limits(position):
-    """Old positions have their old limits; updates never widen an existing stop."""
-    policy = position.get('exit_policy') or {}
-    return (policy.get('target_per_share', LAB_TAKE_PROFIT),
-            policy.get('stop_per_share', STOP_LOSS_PER_SHARE),
-            policy.get('max_hold_seconds', MAX_HOLD_SECONDS))
-
-
-def exit_btc_fresh(position, source, received, now):
-    limit = (position.get('exit_policy') or {}).get('exit_btc_max_age', MAX_BTC_AGE)
-    return fresh(source, received, now, limit)
-
-
-def evaluated_exit(position, now, source, received, book):
-    """Same causal exit policy in online paper and offline replay.
-
-    A missing book never produces a synthetic fill. This only requests a sale;
-    the executor must still obtain fresh sufficient depth after the delay.
-    """
-    if is_hold(position):
-        return None  # Only official resolution may close this position.
-    target, stop, hold = position_exit_limits(position)
-    if now-position['entered'] >= hold:
-        return 'time_limit'
-    if position['market']['expiry']-now <= EXIT_BEFORE_EXPIRY:
-        return 'before_expiry'
-    try:
-        if book is None:
-            raise Skip('book_missing')
-        quote = sell_quote(book, position['market'], position['qty'], now)
-    except Skip:
-        return 'data_stale'
-    # Keep old positions' BTC-first semantics after an upgrade.
-    if not exit_btc_fresh(position, source, received, now):
-        return 'data_stale'
-    net = (quote['received']-position['spent'])/position['qty']
-    if net <= -stop:
-        return 'loss_limit'
-    if net >= target:
-        return 'net_target'
-    return None
-
-
-def revalidated_exit_reason(position, requested, quote, now, source, received):
-    """Guard voluntary profit taking, never cancel a protective exit.
-
-    Paper-only price guard, not a claim that a live market order can be recalled.
-    The quote already includes depth, fees and adverse-tick stress.
-    """
-    if requested != 'net_target' or not (position.get('exit_policy') or {}).get('revalidate_profit_exit',False):
-        return requested
-    target, stop, hold = position_exit_limits(position)
-    if now-position['entered'] >= hold:
-        return 'time_limit'
-    if position['market']['expiry']-now <= EXIT_BEFORE_EXPIRY:
-        return 'before_expiry'
-    if not exit_btc_fresh(position, source, received, now):
-        return 'data_stale'
-    net = (quote['received']-position['spent'])/position['qty']
-    if net <= -stop:
-        return 'loss_limit'
-    return 'net_target' if net >= target else None
-
-
-def risk_budgeted_quote(book, market, budget, now, max_stop_risk):
-    """Shrink stake, never widen the stop to fit a dollar risk budget.
-
-    Every trial size is repriced against actual depth, fees and stress ticks.
-    Full-stake cost/depth failures remain rejections; this is not a relaxed filter.
-    Minimum order sizes are respected. Planned loss is not a guaranteed maximum.
-    """
-    if not 0 < finite(max_stop_risk) or not 0 < finite(budget):
-        raise Skip('invalid_risk_budget')
-    requested = budget
-    for _ in range(6):
-        try:
-            q = buy_quote(book, market, budget, now)
-        except Skip as exc:
-            if str(exc) == 'minimum_order_size' and budget < requested:
-                raise Skip('risk_budget_below_minimum_size') from exc
-            raise
-        policy = cost_aware_risk(book, market, q, now)
-        planned = q['qty']*policy['stop_per_share']
-        if planned <= max_stop_risk + 1e-9:
-            policy.update(max_stop_risk=max_stop_risk, planned_stop_loss=planned,
-                          requested_spend=requested, actual_spend=q['spent'])
-            return q, policy
-        budget *= max_stop_risk/planned * .999999
-    raise Skip('risk_budget_not_converged')
-
-
-def execution_summary(rows):
-    """Realized-only trade metrics, never hypothetical markouts or open PnL."""
-    wins = [r['pnl'] for r in rows if r['pnl'] > 0]
-    losses = [r['pnl'] for r in rows if r['pnl'] < 0]
-    cumulative = peak = drawdown = 0.
-    for r in rows:
-        cumulative += r['pnl']
-        peak = max(peak, cumulative)
-        drawdown = max(drawdown, peak-cumulative)
-    return dict(n=len(rows), wins=len(wins), pnl=cumulative,
-                fees=sum(r['fees'] for r in rows),
-                mean=cumulative/len(rows) if rows else None,
-                winrate=len(wins)/len(rows) if rows else None,
-                profit_factor=sum(wins)/-sum(losses) if losses else None,
-                worst=min((r['pnl'] for r in rows), default=0.),
-                realized_drawdown=drawdown,
-                reasons=dict(Counter(r['reason'] for r in rows)),
-                stop_overshoots=sum(r.get('stop_overshoot',0.) > 1e-6 for r in rows))
-
-
-def trial_version(trial):
-    # v7.2/v7.3 rows predate the version field. Never label them current.
-    return trial.get('policy',{}).get('version', 'older_unversioned')
-
-
-def cost_breakdown(book, quote, immediate):
-    """All components in dollars per credited share; sum equals immediate net loss.
-
-    Depth includes conservative share-floor rounding. Slippage is the configured
-    extra tick stress, not measured slippage. Fees use the market's fee schedule.
-    """
-    qty = quote['qty']
-    spread = book.spread()
-    fees = (quote['fee']+immediate['fee'])/qty
-    slippage = (quote['slippage_cost']+immediate['slippage_cost'])/qty
-    total = (quote['spent']-immediate['received'])/qty
-    return dict(spread=spread, fees=fees, slippage=slippage,
-                depth_and_rounding=total-spread-fees-slippage, total=total)
-
-
-def candidate_summary(data):
-    """Descriptive per-arm cohorts; overlapping observations are not independent trades."""
-    results = {}
-    for name in ARM_NAMES:
-        results[name] = {}
-        for cohort in ('filled', 'rejected', 'shadow'):
-            trials = [t for t in data['trials'] if t.get('arms',{}).get(name,{}).get('status') == cohort]
-            costs = [t['arms'][name]['costs'] for t in trials if t['arms'][name].get('costs')]
-            summary = dict(candidates=len(trials), rounds=len({t['market']['slug'] for t in trials}),
-                           cost_n=len(costs), costs={}, horizons={})
-            if costs:
-                summary['costs'] = {key:sum(c[key] for c in costs)/len(costs) for key in costs[0]}
-            for horizon in MARKOUT_HORIZONS:
-                key = str(horizon)
-                samples = [t.get('markouts',{}).get(key,{}).get('arms',{}).get(name) for t in trials]
-                observed = [s for s in samples if s and s['status']=='observed']
-                priced = [s for s in observed if 'price_pnl' in s and 'total_fees' in s]
-                missing = sum(bool(s and s['status']!='observed') for s in samples)
-                summary['horizons'][key] = dict(n=len(observed), missing=missing,
-                    pending=sum(s is None for s in samples),
-                    net_mean=sum(s['hypothetical_net'] for s in observed)/len(observed) if observed else None,
-                    price_mean=sum(s['price_pnl'] for s in priced)/len(priced) if priced else None,
-                    fees_mean=sum(s['total_fees'] for s in priced)/len(priced) if priced else None,
-                    priced_n=len(priced),
-                    positive=sum(s['hypothetical_net']>0 for s in observed))
-                # Equal weight per market round reduces repeated-candidate weighting.
-                # This is descriptive clustering, not proof of independence/significance.
-                grouped = {}
-                per_share = []
-                for trial, sample in zip(trials,samples):
-                    q = trial['arms'][name].get('quote')
-                    if sample and sample['status']=='observed' and q and q['qty'] > 0:
-                        value = sample['hypothetical_net']/q['qty']
-                        per_share.append(value)
-                        grouped.setdefault(trial['market']['slug'],[]).append(value)
-                round_means = [sum(values)/len(values) for values in grouped.values()]
-                summary['horizons'][key].update(
-                    net_per_share_mean=sum(per_share)/len(per_share) if per_share else None,
-                    net_per_share_median=median(per_share) if per_share else None,
-                    round_n=len(round_means),
-                    round_mean_per_share=sum(round_means)/len(round_means) if round_means else None,
-                    round_positive=sum(v>0 for v in round_means))
-            results[name][cohort] = summary
-    return results
-
-
-def lab_summary(data):
-    """Full-account and matched-cohort results are deliberately separate."""
-    totals = {}
-    for name, account in data['arms'].items():
-        rows = account['trades']
-        totals[name] = dict(n=len(rows), wins=sum(t['pnl'] > 0 for t in rows),
-                            pnl=sum(t['pnl'] for t in rows), fees=sum(t['fees'] for t in rows))
-    maps = {name:{t['trial_id']:t for t in a['trades'] if t.get('trial_id') is not None}
-            for name,a in data['arms'].items()}
-    paired_ids = set(maps['original']) & set(maps['reverse'])
-    paired = dict(n=len(paired_ids), **{name:sum(maps[name][i]['pnl'] for i in paired_ids)
-                                      for name in ARM_NAMES})
-    return totals, paired
-
-
-class ComparisonLedger:
-    """One atomic file: two accounts, paired decisions, follow-up quote observations."""
-    def __init__(self, path=LAB_PATH):
-        self.path = Path(path)
-        self.loaded_existing = self.path.exists()
-        def account():
-            return dict(initial=START_BALANCE, cash=START_BALANCE, position=None, trades=[],
-                        day='', day_start=START_BALANCE, daily_stopped=False)
-        self.data = dict(schema=2, experiment='paired-v1', created=time.time(),
-                         arms={name:account() for name in ARM_NAMES}, trials=[], next_id=1,
-                         round_counts={}, last_trial=0., last_exit=0.)
-        if self.path.exists():
-            self.data = json.loads(self.path.read_text())
-            if self.data.get('schema') != 2 or self.data.get('experiment') != 'paired-v1':
-                raise LedgerError('Onbekende vergelijking; bestand niet overschreven')
-        # Migrate from the old attempt cap. Derive actual fills from accounting;
-        # rejected/cancelled candidates never spend the paper-entry allowance.
-        if 'fill_counts' not in self.data:
-            self.data['fill_counts'] = {name:{} for name in ARM_NAMES}
-            for name,a in self.data['arms'].items():
-                counts = self.data['fill_counts'][name]
-                for t in a['trades']:
-                    counts[t['market']] = counts.get(t['market'],0)+1
-                p = a['position']
-                if p:
-                    slug = p['market']['slug']
-                    counts[slug] = counts.get(slug,0)+1
-        # Freeze pre-update exits before changing entry policy. History/cash unchanged.
-        versions = {t['id']:trial_version(t) for t in self.data['trials']}
-        for a in self.data['arms'].values():
-            for t in a['trades']:
-                t.setdefault('policy_version',versions.get(t.get('trial_id'),'older_unversioned'))
-            p = a['position']
-            if p:
-                p.setdefault('policy_version',versions.get(p.get('trial_id'),'older_unversioned'))
-                p.setdefault('exit_policy',dict(version=p['policy_version'],mode='fixed',
-                    stop_per_share=STOP_LOSS_PER_SHARE,target_per_share=LAB_TAKE_PROFIT,
-                    max_hold_seconds=MAX_HOLD_SECONDS))
-        self.validate()
-        # Atomic fills are either present in both account state and trial, or absent.
-        for trial in self.data['trials']:
-            if trial['status'] == 'pending':
-                trial.update(status='interrupted', reason='restart_before_fill')
-        self.save()
-
-    def validate(self):
-        d = self.data
-        if set(d['arms']) != set(ARM_NAMES):
-            raise LedgerError('Vergelijkingsarmen ontbreken')
-        ids = [t['id'] for t in d['trials']]
-        if len(ids) != len(set(ids)):
-            raise LedgerError('Dubbele trial-ID')
-        for a in d['arms'].values():
-            if finite(a['cash']) < -1e-6 or finite(a['initial']) <= 0:
-                raise LedgerError('Ongeldig vergelijkingssaldo')
-            expected = a['initial']+sum(finite(t['pnl']) for t in a['trades'])
-            if a['position']:
-                expected -= finite(a['position']['spent'])
-            if abs(expected-a['cash']) > 1e-5:
-                raise LedgerError('Vergelijkingssaldo sluit niet aan')
-
-    def save(self):
-        try:
-            self.validate()
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix('.tmp')
-            with tmp.open('w') as f:
-                json.dump(self.data, f, allow_nan=False, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, self.path)
-        except (OSError, ValueError, TypeError, KeyError) as exc:
-            raise LedgerError('Vergelijking niet veilig opgeslagen') from exc
-
-    def roll_day(self, now):
-        day = datetime.fromtimestamp(now, timezone.utc).date().isoformat()
-        changed = False
-        for a in self.data['arms'].values():
-            if a['day'] != day:
-                p = a['position']
-                a.update(day=day, day_start=a['cash']+(p['spent'] if p else 0), daily_stopped=False)
-                changed = True
-        if changed:
-            self.save()
-
-    def allowed(self, market, now):
-        d = self.data
-        if any(a['position'] for a in d['arms'].values()):
-            raise Skip('comparison_position_open')
-        if any(t['status'] == 'pending' for t in d['trials'][-2:]):
-            raise Skip('comparison_pending')
-        if all(a['daily_stopped'] or a['cash'] < STAKE for a in d['arms'].values()):
-            raise Skip('both_accounts_blocked')
-        if now-max(d['last_trial'],d['last_exit']) < COOLDOWN_SECONDS:
-            raise Skip('comparison_cooldown')
-        if all(d['fill_counts'][name].get(market['slug'],0) >= MAX_PAPER_ENTRIES_PER_ROUND for name in ARM_NAMES):
-            raise Skip('comparison_round_limit')
-
-    def observation_allowed(self, market, now):
-        if any(t['status']=='pending' for t in self.data['trials'][-2:]):
-            raise Skip('comparison_pending')
-        if now-self.data['last_trial'] < CANDIDATE_INTERVAL:
-            raise Skip('candidate_sampling_interval')
-
-    def begin(self, market, direction, now):
-        self.observation_allowed(market, now)
-        trial = dict(id=self.data['next_id'], market=market.copy(), signal=direction,
-                     created=now, status='pending', arms={}, markouts={},
-                     policy=dict(stake=STAKE, target=LAB_TAKE_PROFIT, stop=STOP_LOSS_PER_SHARE,
-                                 stop_buffer=ENTRY_STOP_BUFFER, hold_seconds=MAX_HOLD_SECONDS,
-                                 execution_delay=EXECUTION_DELAY, slippage_ticks=SLIPPAGE_TICKS))
-        trial['policy'].update(version=VERSION, risk_mode='hold_to_resolution' if HOLD_TO_RESOLUTION else 'cost_aware',
-                               max_cost=MAX_ROUNDTRIP_COST, post_cost_room=POST_COST_LOSS_ROOM,
-                               max_stop=MAX_COST_AWARE_STOP, max_stop_risk=MAX_STOP_RISK,
-                               reverse_paper=REVERSE_PAPER_ENABLED)
-        self.data['next_id'] += 1
-        self.data['trials'].append(trial)
-        self.data['last_trial'] = now
-        self.save()
-        return trial
-
-    def cancel(self, trial, reason):
-        trial.update(status='cancelled', reason=reason)
-        self.save()
-
-    def commit(self, trial, decisions, now):
-        if trial['status'] != 'pending' or set(decisions) != set(ARM_NAMES):
-            raise LedgerError('Ongeldige vergelijkingstransactie')
-        # Validate every arm before any balance changes.
-        for name,r in decisions.items():
-            a = self.data['arms'][name]
-            if r['status'] == 'filled' and (a['position'] or r['quote']['spent'] > a['cash']):
-                raise LedgerError('Dubbele of ongedekte paperpositie')
-            if r['status']=='filled' and self.data['fill_counts'][name].get(trial['market']['slug'],0) >= entry_round_limit():
-                raise LedgerError('Paperinstaplimiet overschreden')
-        trial.update(status='observing', entered=now, arms=decisions)
-        for name,r in decisions.items():
-            if r['status'] != 'filled':
-                continue
-            q = r['quote']
-            a = self.data['arms'][name]
-            a['cash'] -= q['spent']
-            a['position'] = dict(**q, trial_id=trial['id'], direction=r['direction'],
-                                 market=trial['market'].copy(), entered=now,
-                                 immediate_exit=r['immediate_exit'], baseline_loss=r['baseline_loss'],
-                                 policy_version=trial_version(trial),
-                                 exit_policy=r.get('exit_policy') or dict(
-                                     version=trial_version(trial), mode='fixed',
-                                     stop_per_share=trial['policy']['stop'],
-                                     target_per_share=trial['policy']['target'],
-                                     max_hold_seconds=trial['policy']['hold_seconds']))
-            counts = self.data['fill_counts'][name]
-            slug = trial['market']['slug']
-            counts[slug] = counts.get(slug,0)+1
-            if len(counts) > 100:
-                self.data['fill_counts'][name] = dict(list(counts.items())[-50:])
-        self.save()
-
-    def close(self, name, proceeds, fee, reason, now):
-        a = self.data['arms'][name]
-        p = a['position']
-        proceeds, fee = finite(proceeds), finite(fee)
-        if not p or proceeds < 0 or fee < 0:
-            raise LedgerError('Ongeldige vergelijkingsuitstap')
-        t = dict(trial_id=p['trial_id'], direction=p['direction'], market=p['market']['slug'],
-                 entry_time=p['entered'], exit_time=now, seconds=now-p['entered'], qty=p['qty'],
-                 spent=p['spent'], received=proceeds, fees=p['fee']+fee,
-                 pnl=proceeds-p['spent'], reason=reason)
-        t['price_pnl'] = t['pnl']+t['fees']
-        t['policy_version'] = p.get('policy_version','older_unversioned')
-        t['exit_policy'] = p.get('exit_policy')
-        t['entry_price'] = p['price']
-        t['exit_trigger'] = p.get('exit_trigger')
-        t['exit_fill'] = p.get('exit_fill')
-        t['profit_exit_deferrals'] = p.get('profit_exit_deferrals',0)
-        t['planned_stop_loss'] = p['qty']*position_exit_limits(p)[1]
-        t['stop_overshoot'] = max(0., -t['pnl']-t['planned_stop_loss'])
-        a['cash'] += proceeds
-        a['trades'].append(t)
-        a['position'] = None
-        if a['cash'] <= a['day_start']*(1-DAILY_LOSS_FRACTION):
-            a['daily_stopped'] = True
-        self.data['last_exit'] = now
-        self.save()
-        return t
-
-
-class ComparisonEngine(Engine):
-    """Feeds and legacy exits reused; new entries only through the paired engine."""
-    def __init__(self, client, legacy, lab):
-        super().__init__(client, legacy)
-        self.lab = lab
-        self.entry_task = None
-        self.exit_tasks = {}
-        self.exit_attempts = {}
-        self.observe_task = None
-        self.research_task = None
-        self.last_candidate_notice = 0.
-        self.last_detail_report = 0.
-
-    async def paired_entry(self, trial, anchor):
-        market, direction = trial['market'], trial['signal']
-        other = 'DOWN' if direction == 'UP' else 'UP'
-        started = time.monotonic()
-        try:
-            await asyncio.sleep(EXECUTION_DELAY)
-            # Same observation window; do not fetch reverse only after original fills.
-            results = await asyncio.gather(
-                self.rest_book(direction, market=market), self.rest_book(other, market=market),
-                return_exceptions=True)
-            now = time.time()
-            if self.market != market or time.monotonic()-started > MAX_ENTRY_WAIT:
-                raise Skip('pair_changed_or_too_slow')
-            if RECORDER is not None and RECORDER.failed:
-                raise Skip('recorder_failed_entries_paused')
-            self.spot.check(now)
-            if anchor not in self.anchors:
-                raise Skip('anchor_invalidated:'+self.last_anchor_reset)
-            original_book, reverse_book = results
-            if isinstance(original_book, BaseException):
-                raise Skip('original_book_unavailable')
-            if abs(original_book.source-self.spot.source) > MAX_FEED_SKEW:
-                raise Skip('feed_time_skew')
-            # Confirm the ORIGINAL trigger again after latency; reverse is its counterfactual.
-            _, ref, _, _ = strategy_assessment(original_book, market, direction, anchor,
-                                            self.spot.price, STAKE, now)
-            trial['model_reference'] = ref
-            trial['btc_at_fill'] = self.spot.price
-            trial['execution_ms'] = (time.monotonic()-started)*1000
-            decisions = {}
-            for name, side, b in zip(ARM_NAMES,(direction,other),results):
-                row = dict(direction=side, status='rejected', quote=None)
-                decisions[name] = row
-                try:
-                    if isinstance(b, BaseException):
-                        raise Skip('book_unavailable')
-                    b.check(now)
-                    if abs(b.source-self.spot.source) > MAX_FEED_SKEW:
-                        raise Skip('feed_time_skew')
-                    if b.spread() > MAX_SPREAD:
-                        raise Skip('spread')
-                    # Retain rejected-entry research quotes without treating them as fills.
-                    q = buy_quote(b,market,min(STAKE,HOLD_STAKE_CAP) if HOLD_TO_RESOLUTION else STAKE,now)
-                    row.update(quote=q,entry_mid=b.mid())
-                    try:
-                        immediate = sell_quote(b,market,q['qty'],now)
-                        row.update(immediate_exit=immediate['received'],
-                                   baseline_loss=(q['spent']-immediate['received'])/q['qty'],
-                                   costs=cost_breakdown(b,q,immediate))
-                    except Skip:
-                        if not HOLD_TO_RESOLUTION:
-                            raise
-                    q, risk_policy = strategy_quote(b, market, STAKE, now,
-                                                     trial['policy']['max_stop_risk'])
-                    if name == 'original':
-                        strategy_assessment(b,market,direction,anchor,self.spot.price,q['spent'],now)
-                    row.update(quote=q,bid=max(b.bids),ask=min(b.asks),book_source=b.source,
-                               entry_mid=b.mid(),exit_policy=risk_policy,
-                               immediate_exit=None,baseline_loss=None)
-                    try:
-                        immediate = sell_quote(b,market,q['qty'],now)
-                        row.update(immediate_exit=immediate['received'],
-                                   baseline_loss=(q['spent']-immediate['received'])/q['qty'],
-                                   costs=cost_breakdown(b,q,immediate))
-                    except Skip:
-                        if not HOLD_TO_RESOLUTION:
-                            raise
-                    if name == 'reverse' and not trial['policy']['reverse_paper']:
-                        row.update(status='shadow', reason='research_only')
-                        continue
-                    a = self.lab.data['arms'][name]
-                    if a['position'] or (HOLD_TO_RESOLUTION and any(x['position'] for x in self.lab.data['arms'].values())):
-                        raise Skip('paper_position_open')
-                    if self.lab.data['fill_counts'][name].get(market['slug'],0) >= entry_round_limit():
-                        raise Skip('paper_round_fill_limit')
-                    if now-self.lab.data['last_exit'] < COOLDOWN_SECONDS:
-                        raise Skip('paper_exit_cooldown')
-                    if a['daily_stopped'] or a['cash'] < q['spent']:
-                        raise Skip('account_limit')
-                    hold_account_check(a,q)
-                    row['status'] = 'filled'
-                except Skip as exc:
-                    row['reason'] = str(exc)
-                    self.stats[name+':'+str(exc)] += 1
-            # One atomic save includes both fill decisions and all debits.
-            self.lab.commit(trial, decisions, now)
-            lines = [f"PAPER VERGELIJKING #{trial['id']} | BTC signaal {direction}",
-                     f"Uitvoering na {trial['execution_ms']:.0f} ms incl. vertraging"]
-            for name,r in decisions.items():
-                label = 'ORIGINEEL' if name == 'original' else 'REVERSE'
-                if r['status'] == 'filled':
-                    lines.append(f"{label} {r['direction']}: ${r['quote']['spent']:.2f}, "
-                                 f"koop {r['quote']['price']:.4f}, aankoopfee ${r['quote']['fee']:.4f}")
-                elif r['status'] == 'shadow':
-                    lines.append(f"{label} {r['direction']}: alleen vervolgmeting, geen paperpositie/saldowijziging.")
-                else:
-                    lines.append(f"{label} {r['direction']}: overgeslagen — {r['reason']}")
-                if r.get('costs') and not HOLD_TO_RESOLUTION:
-                    c = r['costs']
-                    lines.append(f"Kosten cent/aandeel: spread {100*c['spread']:.2f}, "
-                                 f"fees {100*c['fees']:.2f}, extra slippage {100*c['slippage']:.2f}, "
-                                 f"diepte/afronding {100*c['depth_and_rounding']:.2f}; "
-                                 f"totaal {100*c['total']:.2f} (kostenplafond {100*MAX_ROUNDTRIP_COST:.2f}).")
-                if r.get('exit_policy') and is_hold(r):
-                    lines.append(f"Vasthouden tot officiële uitslag; maximaal verlies ${r['quote']['spent']:.2f}.")
-                    lines.append(f"Einde ronde UTC: {datetime.fromtimestamp(market['expiry'],timezone.utc):%H:%M:%S}; daarna wachten op bevestiging.")
-                elif r.get('exit_policy'):
-                    lines.append(f"Netto verliestrigger {100*r['exit_policy']['stop_per_share']:.2f} cent/aandeel; "
-                                 f"{100*POST_COST_LOSS_ROOM:.1f} cent ruimte boven aanvangskosten.")
-                    lines.append(f"Berekend stopverlies ${r['exit_policy']['planned_stop_loss']:.2f} "
-                                 f"(budget ${r['exit_policy']['max_stop_risk']:.2f}); "
-                                 "uitvoeringsverlies kan hoger zijn.")
-            lines.append('Ook afgewezen quotes volgen we op 1/2/5/15s. Metingen wijzigen geen saldo.')
-            if any(r['status']=='filled' for r in decisions.values()) or now-self.last_candidate_notice >= REPORT_SECONDS:
-                self.notify('\n'.join(lines))
-                self.last_candidate_notice = now
-            else:
-                LOG.info('Kandidaat #%s gemeten; beide paperinstappen afgewezen', trial['id'])
-        except asyncio.CancelledError:
-            self.lab.cancel(trial,'shutdown_before_fill')
-            raise
-        except LedgerError:
-            raise
-        except Exception as exc:
-            reason = str(exc) if isinstance(exc,Skip) else type(exc).__name__
-            self.lab.cancel(trial,reason)
-            self.stats['pair_cancel:'+reason] += 1
-
-    def record_markouts(self, now):
-        """Contemporaneous observations only. Never substitute a later successful price."""
-        changed = False
-        for trial in self.lab.data['trials']:
-            if trial['status'] != 'observing':
-                continue
-            elapsed = now-trial['entered']
-            for horizon in MARKOUT_HORIZONS:
-                key = str(horizon)
-                if key in trial['markouts'] or elapsed < horizon:
-                    continue
-                sample = dict(observed_at=now, delay=elapsed-horizon, arms={})
-                trial['markouts'][key] = sample
-                changed = True
-                for name,row in trial['arms'].items():
-                    out = dict(status='missing', executed=row['status']=='filled')
-                    sample['arms'][name] = out
-                    if elapsed-horizon > MARKOUT_TOLERANCE:
-                        out['reason'] = 'missed_window_or_restart'
-                        continue
-                    if not row.get('quote'):
-                        out['reason'] = 'no_entry_quote'
-                        continue
-                    if self.market != trial['market']:
-                        out['reason'] = 'different_market'
-                        continue
-                    try:
-                        b = self.books[row['direction']]
-                        q = sell_quote(b,trial['market'],row['quote']['qty'],now)
-                        out.update(status='observed', bid=max(b.bids), ask=min(b.asks),
-                                   source=b.source, mid=b.mid(), price=q['price'],
-                                   received=q['received'], exit_fee=q['fee'],
-                                   hypothetical_net=q['received']-row['quote']['spent'],
-                                   price_pnl=q['received']+q['fee']-row['quote']['spent']+row['quote']['fee'],
-                                   total_fees=q['fee']+row['quote']['fee'],
-                                   mid_move=b.mid()-row['entry_mid'] if 'entry_mid' in row else None)
-                    except (Skip,KeyError) as exc:
-                        out['reason'] = str(exc)
-            if len(trial['markouts']) == len(MARKOUT_HORIZONS):
-                trial['status'] = 'observed'
-        if changed:
-            self.lab.save()
-
-    async def markout_worker(self):
-        while True:
-            self.record_markouts(time.time())
-            await asyncio.sleep(.05)
-
-    async def research_worker(self):
-        """Record eligible signals even when a paper account already has a position."""
-        last_checkpoint = 0.
-        while True:
-            now = time.time()
-            record('clock')
-            if self.market and now-last_checkpoint >= 5:
-                books = {d:dict(asset=b.asset, condition=b.condition,
-                                bids=list(b.bids.items()), asks=list(b.asks.items()),
-                                source=b.source,received=b.received,tick=b.tick,minimum=b.minimum)
-                         for d,b in self.books.items() if b.ready}
-                record('checkpoint',version=VERSION,signal_stake=STAKE,
-                       market=self.market.copy(),books=books,
-                       spot=dict(price=self.spot.price,source=self.spot.source,received=self.spot.received))
-                last_checkpoint = now
-            if self.market and self.stream_ok:
-                try:
-                    anchor = self.observe(now)
-                    direction = 'UP' if self.spot.price > anchor['spot'] else 'DOWN'
-                    strategy_assessment(self.books[direction], self.market, direction, anchor,
-                                     self.spot.price, STAKE, now)
-                    record('signal', direction=direction, anchor=anchor.copy(),
-                           slug=self.market['slug'])
-                except (Skip, KeyError):
-                    pass
-            await asyncio.sleep(.1)
-
-    def comparison_exit_reason(self, p, now):
-        return evaluated_exit(p, now, self.spot.source, self.spot.received,
-                              self.books.get(p['direction']))
-
-    def exit_observation(self, p, now, reason):
-        """Explain the trigger without weakening freshness or manufacturing a fill."""
-        b = self.books.get(p['direction'])
-        def age(ts):
-            return now-ts if ts and math.isfinite(ts) else None
-        out = dict(time=now, reason=reason,
-                   btc_source_age=age(self.spot.source), btc_receive_age=age(self.spot.received),
-                   book_source_age=age(b.source) if b else None,
-                   book_receive_age=age(b.received) if b else None, issues=[])
-        out['entry_btc_fresh'] = fresh(self.spot.source,self.spot.received,now,MAX_BTC_AGE)
-        out['exit_btc_max_age'] = (p.get('exit_policy') or {}).get('exit_btc_max_age',MAX_BTC_AGE)
-        if not exit_btc_fresh(p,self.spot.source,self.spot.received,now):
-            out['issues'].append('btc_stale')
-        try:
-            if not b:
-                raise Skip('book_missing')
-            q = sell_quote(b, p['market'], p['qty'], now)
-            out['quoted_net'] = q['received']-p['spent']
-        except Skip as exc:
-            out['issues'].append(str(exc))
-        return out
-
-    async def close_comparison(self, name, reason):
-        p = self.lab.data['arms'][name]['position']
-        if not p:
-            return
-        if p.get('exit_trigger',{}).get('reason') != reason:
-            p['exit_trigger'] = self.exit_observation(p, time.time(), reason)
-        attempt_started = p['exit_trigger']['time']
-        try:
-            now = time.time()
-            if is_hold(p) and now < p['market']['expiry']:
-                return
-            if now >= p['market']['expiry']:
-                rs = await asyncio.wait_for(self.client.get_resolutions(condition_ids=p['market']['condition']),5)
-                payout = resolved_payout(rs,p['market'],p['direction'])
-                if payout is None:
-                    return
-                t = self.lab.close(name,p['qty']*payout,0.,
-                                   'official_resolution' if is_hold(p) else 'resolution_fallback',time.time())
-            else:
-                await asyncio.sleep(EXECUTION_DELAY)
-                if time.time() >= p['market']['expiry']:
-                    return
-                b = await self.rest_book(p['direction'],market=p['market'])
-                now = time.time()
-                if now >= p['market']['expiry']:
-                    return
-                q = sell_quote(b,p['market'],p['qty'],now)
-                confirmed = revalidated_exit_reason(p,reason,q,now,self.spot.source,self.spot.received)
-                if confirmed is None:
-                    self.stats[name+':profit_quote_faded'] += 1
-                    p['profit_exit_deferrals'] = p.get('profit_exit_deferrals',0)+1
-                    p['profit_retry_after'] = now+1
-                    self.exit_attempts[name] = 0.  # Protective exits must not wait for a profit retry.
-                    self.lab.save()
-                    return
-                if confirmed != reason:
-                    reason = confirmed
-                    p['exit_trigger'] = self.exit_observation(p,now,reason)
-                p['exit_fill'] = dict(time=now, price=q['price'], source_age=now-b.source,
-                                      receive_age=now-b.received,
-                                      decision_to_fill_ms=1000*(now-attempt_started))
-                t = self.lab.close(name,q['received'],q['fee'],reason,now)
-            self.stats[name+':exit:'+t['reason']] += 1
-            diagnostic = ''
-            if reason == 'data_stale':
-                ob = p['exit_trigger']
-                ages = ', '.join(f"{key}={ob[key]:.2f}s" if ob[key] is not None else f"{key}=ontbreekt"
-                                 for key in ('btc_source_age','book_source_age'))
-                diagnostic = f"\nDatatrigger: {', '.join(ob['issues']) or 'onbekend'}; {ages}."
-            if t['stop_overshoot'] > 1e-6:
-                diagnostic += f"\nVerlies ${t['stop_overshoot']:.2f} boven berekend stopverlies (geen fillgarantie)."
-            self.notify(f"PAPER {name.upper()} #{p['trial_id']} {p['direction']} gesloten\n"
-                        f"{t['reason']} | netto ${t['pnl']:+.2f} | duur {t['seconds']:.1f}s\n"
-                        f"Prijsresultaat ${t['price_pnl']:+.2f}, totale fees ${t['fees']:.4f}\n"
-                        "Vervolgmetingen blijven doorlopen tot 15s na instap."+diagnostic)
-        except LedgerError:
-            raise
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            self.stats[name+':exit_unavailable:'+type(exc).__name__] += 1
-            # No available bid = no invented sale. Position stays in the ledger.
-
-    def reap_tasks(self):
-        if self.entry_task and self.entry_task.done():
-            self.entry_task.result()
-            self.entry_task = None
-        for name,task in list(self.exit_tasks.items()):
-            if task.done():
-                task.result()
-                del self.exit_tasks[name]
-        if self.observe_task and self.observe_task.done():
-            self.observe_task.result()
-            raise LedgerError('Vervolgmetingen onverwacht gestopt')
-        if self.research_task and self.research_task.done():
-            self.research_task.result()
-            raise LedgerError('Replaymetingen onverwacht gestopt')
-
-    def schedule_exits(self, now):
-        for name,a in self.lab.data['arms'].items():
-            p = a['position']
-            if not p or name in self.exit_tasks:
-                continue
-            expired = now >= p['market']['expiry']
-            interval = 20 if expired else 1
-            if now-self.exit_attempts.get(name,0) < interval:
-                continue
-            reason = 'resolution_fallback' if expired else self.comparison_exit_reason(p,now)
-            if reason == 'net_target' and now < p.get('profit_retry_after',0):
-                continue
-            if reason:
-                # Capture before yielding; a fresh tick must not erase the stale trigger.
-                p['exit_trigger'] = self.exit_observation(p, now, reason)
-                self.exit_attempts[name] = now
-                self.exit_tasks[name] = asyncio.create_task(self.close_comparison(name,reason))
-
-    def report(self):
         now = time.time()
-        totals,paired = lab_summary(self.lab.data)
-        current = [t for t in self.lab.data['trials'] if trial_version(t)==VERSION]
-        recent = current[-200:]
-        new_count = sum(t['created'] >= now-REPORT_SECONDS for t in current)
-        lines = [VERSION, 'ALLEEN PAPER — ORIGINAL actief; REVERSE alleen meten.',
-                 'Nieuwe posities wachten op officiële uitslag; geen tussentijdse verkoop. Nieuw maximaal verlies = volledige inzet.',
-                 'Vervolgmetingen zijn hypothetische verkopen, geen extra winst/verliesboekingen.',
-                 f"Nieuwe kandidaten laatste 5min: {new_count}; deze versie totaal {len(current)}."]
-        stages = Counter(t['status'] for t in current)
-        cancellations = Counter(t.get('reason','onbekend') for t in current
-                                if t['status'] in ('cancelled','interrupted'))
-        lines.append('Kandidaten: '+str(dict(stages)))
-        if cancellations:
-            lines.append('Vervallen vóór uitvoering: '+str(dict(cancellations.most_common(5))))
-        if current:
-            lines.append(f"Laatste kandidaat {max(0,now-current[-1]['created'])/60:.1f} minuten geleden.")
-        for name,a in self.lab.data['arms'].items():
-            t = totals[name]
-            own = [row for row in a['trades'] if row.get('policy_version')==VERSION]
-            lines.append(f"{name.upper()} saldo vrij ${a['cash']:.2f}, open {int(a['position'] is not None)} | "
-                         f"v{VERSION_LABEL} gesloten {len(own)}, netto ${sum(r['pnl'] for r in own):+.2f} | "
-                         f"alle versies {t['n']} trades, ${t['pnl']:+.2f}")
-            if own:
-                s = execution_summary(own)
-                pf = f"{s['profit_factor']:.2f}" if s['profit_factor'] is not None else 'n.v.t. (geen verliezen)'
-                lines.append(f"Geboekt: winst {s['wins']}/{s['n']}, gemiddeld ${s['mean']:+.3f}, "
-                             f"profit factor {pf}, fees ${s['fees']:.2f}.")
-                lines.append(f"Slechtste ${s['worst']:+.2f}; max. gerealiseerde terugval ${s['realized_drawdown']:.2f}; "
-                             f"stopoverschrijdingen {s['stop_overshoots']}.")
-                lines.append('Uitstappen: '+str(s['reasons']))
-                lines.append(f"Prijsresultaat vóór fees ${s['pnl']+s['fees']:+.2f}; "
-                             f"na fees ${s['pnl']:+.2f}. Spread en gesimuleerde slippage zitten al in prijs.")
-                issues = Counter(issue for r in own if r['reason']=='data_stale'
-                                 for issue in (r.get('exit_trigger') or {}).get('issues',['niet vastgelegd']))
-                if issues:
-                    lines.append('Data-uitstappen, oorzaken: '+str(dict(issues)))
-                lines.append(f"Winstuitstap vervallen na hercontrole: "
-                             f"{sum(r.get('profit_exit_deferrals',0) for r in own)} bij gesloten trades.")
-            if a['daily_stopped']:
-                lines.append(f"{name.upper()}: dagverliesstop actief; posities blijven beheerd.")
-            if a['position'] and is_hold(a['position']):
-                p = a['position']
-                status = 'wacht op officiële uitslag' if now >= p['market']['expiry'] else f"nog {p['market']['expiry']-now:.0f}s tot ronde-einde"
-                lines.append(f"Open {p['direction']}: inzet ${p['spent']:.2f} gereserveerd; {status}.")
-            elif a['position']:
-                target,stop,hold = position_exit_limits(a['position'])
-                lines.append(f"Open: netto doel {100*target:.1f}c, stoptrigger {100*stop:.2f}c/aandeel, {hold}s.")
-            reasons = Counter(tr.get('arms',{}).get(name,{}).get('reason') for tr in current
-                              if tr.get('arms',{}).get(name,{}).get('status')=='rejected')
-            if reasons:
-                lines.append(f"Afgewezen {name} v{VERSION_LABEL}: {dict(reasons.most_common(4))}")
-        lines.append(f"Historisch beide uitgevoerd/gesloten: {paired['n']} paren | "
-                     f"O ${paired['original']:+.2f}, R ${paired['reverse']:+.2f}")
-        detailed = now-self.last_detail_report >= DETAIL_REPORT_SECONDS
-        if detailed:
-            self.last_detail_report = now
-            lines.append(f'VERVOLGMETINGEN: alleen v{VERSION_LABEL}, laatste 200 kandidaten; netto incl. kosten.')
-            measured = candidate_summary({'trials':recent})
-            for name in ARM_NAMES:
-                for cohort,label in (('filled','paper uitgevoerd'),('rejected','afgewezen'),('shadow','alleen gemeten')):
-                    summary = measured[name][cohort]
-                    if cohort == 'shadow' and not summary['candidates']:
-                        continue
-                    lines.append(f"{name.upper()} {label}: {summary['candidates']} kandidaten / "
-                                 f"{summary['rounds']} verschillende 5m-rondes")
-                    c = summary['costs']
-                    if c:
-                        lines.append(f"Gem. kosten cent/aandeel n={summary['cost_n']}: spread {100*c['spread']:.2f} + "
-                                     f"fees {100*c['fees']:.2f} + slip {100*c['slippage']:.2f} + "
-                                     f"diepte/afr. {100*c['depth_and_rounding']:.2f} = {100*c['total']:.2f}")
-                    if not summary['candidates']:
-                        continue
-                    for horizon,stats in summary['horizons'].items():
-                        value = f"${stats['net_mean']:+.3f}" if stats['net_mean'] is not None else 'onbekend'
-                        lines.append(f"{horizon}s netto hypothetisch gem. {value}; positief {stats['positive']}/{stats['n']}, "
-                                     f"mist {stats['missing']}, wacht {stats['pending']}")
-                    h = summary['horizons']['5']
-                    if h['round_n']:
-                        lines.append(f"5s per ronde gelijk gewogen: {100*h['round_mean_per_share']:+.2f}c/aandeel, "
-                                     f"{h['round_positive']}/{h['round_n']} rondes positief; "
-                                     f"mediaan kandidaat {100*h['net_per_share_median']:+.2f}c.")
-                    if h['priced_n']:
-                        lines.append(f"5s Prijs-PnL ${h['price_mean']:+.3f} − fees ${h['fees_mean']:.3f} gem.; "
-                                     'extra slippage zit in prijs.')
-        historical = Counter(trial_version(t) for t in self.lab.data['trials'] if trial_version(t)!=VERSION)
-        if historical:
-            lines.append('Eerdere kandidaten apart bewaard: '+str(dict(historical)))
-        lines.append('Overlap/correlatie mogelijk. Gemiddelden zijn geen bewijs van winstgevendheid.')
-        _,seconds,returns,_ = self.spot.history_metrics()
-        lines.append(f"BTC historie {seconds:.0f}s/{returns} rendementen | boekherstel {self.book_diagnostics}")
-        lines.append('Controles (herhalingen): '+str(dict(self.stats.most_common(8))))
-        legacy = self.ledger.data
-        lines.append(f"Oude test: {len(legacy['trades'])} gesloten; niet meegeteld.")
-        if RECORDER is not None:
-            lines.insert(1, f"Opname {'FOUT — entries geblokkeerd' if RECORDER.failed else 'actief'}: "
-                         f"{RECORDER.written} events, wachtrij {RECORDER.pending}.")
-        delays = sorted(t['execution_ms'] for t in current if t.get('execution_ms'))
-        if delays:
-            lines.insert(2, f"Instapvertraging incl. {EXECUTION_DELAY*1000:.0f}ms simulatie p50/p95: "
-                         f"{delays[len(delays)//2]:.0f}/{delays[min(len(delays)-1,int(len(delays)*.95))]:.0f}ms "
-                         f"(n={len(delays)}); geen gemeten marktvertraging.")
-        message = ''
-        for line in lines:
-            if len(message)+len(line)+1 > 3800:
-                self.notify(message)
-                message = VERSION+' — vervolg\n'
-            message += line+'\n'
-        if message:
-            self.notify(message.rstrip())
-        self.stats.clear()
-        self.spot.event_stats.clear()
-        self.spot.event_ages.clear()
+        start = int(now // 300) * 300
 
-    async def run(self):
-        self.notify(f"{VERSION} gestart | ALLEEN PAPER\n"
-                    f"Inzet maximaal ${STAKE:.2f} inclusief aankoopfee. Volledige inzet kan verloren gaan.\n"
-                    "Nieuwe posities blijven staan tot officiële uitslag; geen stop, winstverkoop of 15s-exit.\n"
-                    "Geen verkoopfee bij afrekening. Onbekende uitslag blijft wachten, nooit gokken op Binance.\n"
-                    "Eén positie tegelijk en één instap per ronde. REVERSE alleen onderzoek.\n"
-                    "BTC-impulsmodel is niet gekalibreerd voor einduitslagen; nieuwe papertest.\n"
-                    "Oude open posities houden hun oorspronkelijke regels; saldi en historie blijven behouden.")
-        history = sum(len(a['trades']) for a in self.lab.data['arms'].values())
-        self.notify(f"Historie: {'bestaand bestand geladen' if self.lab.loaded_existing else 'NIEUW bestand gestart'}, "
-                    f"{history} gesloten papertrades.\n"
-                    + ('Railway-volumepad ingesteld.' if os.getenv('RAILWAY_VOLUME_MOUNT_PATH') else
-                       'Geen Railway-volumepad gedetecteerd. Controleer blijvende opslag vóór een volgende deploy; '
-                       'alleen code wijzigen bewaart lokale saldi niet.'))
-        self.observe_task = asyncio.create_task(self.markout_worker())
-        self.research_task = asyncio.create_task(self.research_worker())
-        jobs = [asyncio.create_task(self.spot_stream()),asyncio.create_task(self.telegram_worker()),
-                asyncio.create_task(self.repair_books()),self.observe_task,
-                self.research_task]
-        try:
-            while True:
-                now = time.time()
-                HEALTH['heartbeat'] = now
-                self.reap_tasks()
-                try:
-                    self.ledger.roll_day(now)
-                    self.lab.roll_day(now)
-                    legacy = self.ledger.data['position']
-                    positions = [a['position'] for a in self.lab.data['arms'].values() if a['position']]
-                    self.schedule_exits(now)  # Settlement must work even if expired market feeds fail.
-                    required = legacy['market'] if legacy else (positions[0]['market'] if positions else None)
-                    if required and self.market != required:
-                        await self.switch_market(required)
-                    if not required and not self.entry_task and (not self.market or now >= self.market['expiry']):
-                        if now < self.next_discovery:
-                            raise Skip('discovery_backoff')
-                        self.next_discovery = now+5
-                        await self.switch_market(await discover(self.client,int(now//300)*300))
-                    if legacy:
-                        await self.manage_position()  # never creates new legacy trades
-                    else:
-                        self.schedule_exits(now)
-                        if self.entry_task:
-                            raise Skip('comparison_pending')
-                        if RECORDER is not None and RECORDER.failed:
-                            raise Skip('recorder_failed_entries_paused')
-                        self.lab.observation_allowed(self.market,now)
-                        if not ENTRY_TIME_MIN <= self.market['expiry']-now <= ENTRY_TIME_MAX:
-                            raise Skip('outside_entry_window')
-                        anchor = self.observe(now)
-                        direction = 'UP' if self.spot.price > anchor['spot'] else 'DOWN'
-                        # Keep the signal generator fixed for both directions.
-                        strategy_assessment(self.books[direction],self.market,direction,anchor,
-                                         self.spot.price,STAKE,now)
-                        trial = self.lab.begin(self.market,direction,now)
-                        self.entry_task = asyncio.create_task(self.paired_entry(trial,anchor))
-                except Skip as exc:
-                    self.stats[str(exc)] += 1
-                except LedgerError:
-                    raise
-                except Exception as exc:
-                    self.stats['api_error:'+type(exc).__name__] += 1
-                    LOG.warning('Vergelijking tijdelijk gepauzeerd: %s',type(exc).__name__)
-                    await asyncio.sleep(1)
-                if time.time()-self.last_report >= REPORT_SECONDS:
-                    self.report()
-                    self.last_report = time.time()
-                await asyncio.sleep(.1)
-        finally:
-            for task in [self.stream_task,self.entry_task,*self.exit_tasks.values()]:
-                if task:
-                    jobs.append(task)
-            for task in jobs:
-                task.cancel()
-            await asyncio.gather(*jobs,return_exceptions=True)
-            self.ledger.save()
-            self.lab.save()
+        needs_market = (
+            self.market is None
+            or self.market["start"] != start
+        )
 
+        if (
+            needs_market
+            and now - self.last_discovery >= 10
+        ):
+            self.last_discovery = now
+            self.market = None
 
-class TapeRecorder:
-    """Bounded nonblocking public-data journal. Disk work never runs on the feed loop.
+            self.market = await discover(
+                client,
+                start,
+            )
 
-    Retains at most 64 x ~16MiB chunks (~1GiB), deleting oldest closed chunks.
-    A queue overflow/disk error/clock jump permanently blocks new entries this run.
-    Existing positions are still managed. Truncated tails are not silently replayed.
-    """
-    def __init__(self, directory, max_bytes=16*1024*1024, max_files=64):
-        self.directory = Path(directory)
-        self.directory.mkdir(parents=True, exist_ok=True)
-        self.max_bytes, self.max_files = max_bytes, max_files
-        self.session = uuid.uuid4().hex
-        self.queue = queue.Queue(maxsize=20000)
-        self.failed = False
-        self.closed = False
-        self.written = self.seq = 0
-        self.wall, self.mono = time.time(), time.monotonic()
-        self.thread = threading.Thread(target=self._writer, daemon=True)
-        self.thread.start()
-        self.emit('session', version=VERSION, signal_stake=STAKE,
-                  policy=dict(min_gross_edge=MIN_GROSS_EDGE, min_net_edge=MIN_NET_EDGE,
-                              min_btc_move=MIN_BTC_MOVE, min_model_move=MIN_MODEL_MOVE,
-                              take_profit=LAB_TAKE_PROFIT, stop=STOP_LOSS_PER_SHARE,
-                              hold=MAX_HOLD_SECONDS, slippage_ticks=SLIPPAGE_TICKS,
-                              risk_mode='cost_aware',cost_cap=MAX_ROUNDTRIP_COST,
-                              max_stop_risk=MAX_STOP_RISK,reverse_paper=REVERSE_PAPER_ENABLED,
-                              exit_btc_max_age=EXIT_BTC_MAX_AGE,revalidate_profit_exit=True,
-                              post_cost_room=POST_COST_LOSS_ROOM,stop_cap=MAX_COST_AWARE_STOP))
+            self.store.market(self.market)
 
-    @property
-    def pending(self):
-        return self.queue.qsize()
+            self.attempted = {
+                item
+                for item in self.attempted
+                if item[0] == start
+            }
 
-    def emit(self, kind, **data):
-        if self.failed or self.closed:
-            return
-        now = time.time()
-        if abs((now-self.wall)-(time.monotonic()-self.mono)) > .5:
-            self.failed = True
-            LOG.error('Clock jump: nieuwe paperentries gepauzeerd')
-            return
-        self.seq += 1
-        row = dict(schema=1, session=self.session, seq=self.seq, time=now, kind=kind, **data)
-        try:
-            self.queue.put_nowait(row)
-        except queue.Full:
-            self.failed = True
-            LOG.error('Replay-wachtrij vol: nieuwe paperentries gepauzeerd')
+        if (
+            self.market
+            and self.market["start"] == start
+        ):
+            remaining = (
+                self.market["end"]
+                - time.time()
+            )
 
-    def _writer(self):
-        handle = None
-        size = 0
-        last_flush = time.monotonic()
-        try:
-            while True:
-                try:
-                    row = self.queue.get(timeout=.5)
-                except queue.Empty:
-                    if handle:
-                        handle.flush()
-                    continue
-                if row is None:
-                    self.queue.task_done()
+            for checkpoint in CHECKPOINTS:
+                if (
+                    0 <= checkpoint - remaining <= 1.5
+                    and (start, checkpoint)
+                    not in self.attempted
+                ):
+                    await self.measure(
+                        client,
+                        checkpoint,
+                    )
+
                     break
-                if handle is None or size >= self.max_bytes:
-                    if handle:
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                        handle.close()
-                    path = self.directory / f"tape-{time.time_ns():020d}-{self.session[:8]}.jsonl"
-                    handle = path.open('x', encoding='utf-8')
-                    size = 0
-                    files = sorted(self.directory.glob('tape-*.jsonl'))
-                    for old in files[:-self.max_files]:
-                        old.unlink()
-                line = json.dumps(row, allow_nan=False, separators=(',', ':'))+'\n'
-                handle.write(line)
-                size += len(line.encode('utf-8'))
-                self.written += 1
-                self.queue.task_done()
-                if time.monotonic()-last_flush >= 1:
-                    handle.flush()
-                    last_flush = time.monotonic()
-        except Exception:
-            self.failed = True
-            LOG.exception('Replay-opslag defect; bestaande posities blijven beheerd')
-        finally:
-            if handle and not handle.closed:
-                with contextlib.suppress(OSError):
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                    handle.close()
 
-    def close(self):
-        self.closed = True
-        if self.thread.is_alive():
+    async def run(self):
+        self.notify(
+            f"{VERSION} gestart. Nieuwe paperproef: "
+            f"BTC, {PAPER_STAKE:.2f} USD all-in, "
+            "maximaal één positie.\n"
+            "Historische cellen worden opgebouwd uit officiële "
+            "resultaten; zonder voldoende data geen orders.\n"
+            "Bewaar btc_lead_v1.sqlite3 op een Railway-volume. "
+            "Oude bot stoppen om dubbele processen te voorkomen."
+        )
+
+        async with AsyncPublicClient() as client:
+            feed = asyncio.create_task(
+                self.reference_feed()
+            )
+
+            telegram = asyncio.create_task(
+                self.telegram()
+            )
+
+            settlement = asyncio.create_task(
+                self.settlement_worker(client)
+            )
+
             try:
-                self.queue.put(None, timeout=1)
-            except queue.Full:
-                self.failed = True
-                return
-            self.thread.join(timeout=5)
-            if self.thread.is_alive():
-                self.failed = True
+                while True:
+                    if (
+                        feed.done()
+                        and feed.exception() is not None
+                    ):
+                        raise feed.exception()
+
+                    if settlement.done():
+                        raise (
+                            settlement.exception()
+                            or RuntimeError(
+                                "Afrekeningstaak gestopt"
+                            )
+                        )
+
+                    try:
+                        await self.cycle(client)
+
+                    except Skip as exc:
+                        self.store.skip(str(exc))
+
+                    except (sqlite3.Error, RuntimeError):
+                        raise
+
+                    except Exception as exc:
+                        self.store.skip(
+                            "api_fout_"
+                            + type(exc).__name__
+                        )
+
+                        LOG.warning(
+                            "Cyclus overgeslagen: %s",
+                            type(exc).__name__,
+                        )
+
+                    now = time.time()
+
+                    self.health.update(
+                        status="running",
+                        feed=self.ref.state,
+                        last_cycle=now,
+                    )
+
+                    if now - self.last_report >= 900:
+                        self.last_report = now
+                        self.report()
+
+                    if now - self.last_cleanup >= 3600:
+                        self.last_cleanup = now
+
+                        with self.store.db:
+                            self.store.db.execute(
+                                """
+                                DELETE FROM ticks
+                                WHERE ts<?
+                                """,
+                                (now - 7 * 86400,),
+                            )
+
+                    await asyncio.sleep(0.25)
+
+            finally:
+                feed.cancel()
+                telegram.cancel()
+                settlement.cancel()
+
+                await asyncio.gather(
+                    feed,
+                    telegram,
+                    settlement,
+                    return_exceptions=True,
+                )
 
 
-def tape_rows(paths):
-    """Strict receive-order replay; missing chunks or malformed records are errors."""
-    previous_time, session, seq = -1., None, 0
-    seen = set()
-    for path in paths:
-        with Path(path).open(encoding='utf-8') as f:
-            for line_number, line in enumerate(f, 1):
-                try:
-                    row = json.loads(line)
-                    if row['schema'] != 1 or finite(row['time']) < previous_time:
-                        raise ValueError('wrong schema or receive times out of order')
-                    if row['session'] == session:
-                        if row['seq'] != seq+1:
-                            raise ValueError('missing or duplicated event/chunk')
-                    elif row['session'] in seen:
-                        raise ValueError('interleaved recording sessions')
-                    else:
-                        seen.add(row['session'])
-                    previous_time, session, seq = row['time'], row['session'], row['seq']
-                except (ValueError, KeyError, TypeError) as exc:
-                    raise ValueError(f'Invalid tape {Path(path).name}:{line_number}: {exc}') from exc
-                yield row
+# ============================================================
+# RAILWAY HEALTH-ENDPOINT
+# ============================================================
 
-
-def restored_book(row):
-    b = Book(row['asset'], row['condition'])
-    b.bids = {finite(p):finite(q) for p,q in row['bids']}
-    b.asks = {finite(p):finite(q) for p,q in row['asks']}
-    if any(not 0 < p < 1 or q <= 0 for side in (b.bids,b.asks) for p,q in side.items()):
-        raise ValueError('Invalid recorded depth')
-    b.source, b.received = finite(row['source']), finite(row['received'])
-    b.tick, b.minimum = finite(row['tick']), finite(row['minimum'])
-    b.ready = True
-    return b
-
-
-class TapeReplay:
-    """Taker-only historical execution at delayed times, never future quotes.
-
-    Reuses buy_quote/sell_quote/fees/cost_guard and original signal confirmation.
-    No maker orders, queue-priority claims, official settlement or network calls.
-    Signal parameters stay fixed: this is execution sensitivity, not optimization.
-    """
-    def __init__(self, latency=.5, stake=7.5, balance=1000.):
-        if not 0 <= finite(latency) <= 10 or not 0 < finite(stake) <= finite(balance):
-            raise ValueError('Invalid latency/stake/balance')
-        self.latency, self.stake = latency, min(stake,HOLD_STAKE_CAP) if HOLD_TO_RESOLUTION else stake
-        self.reverse_paper = REVERSE_PAPER_ENABLED
-        self.max_stop_risk = finite(MAX_STOP_RISK)
-        if self.max_stop_risk <= 0:
-            raise ValueError('Invalid stop risk budget')
-        self.accounts = {n:dict(cash=balance, initial=balance, position=None, trades=[],
-                                day='', day_start=balance, stopped=False,
-                                peak=balance, max_drawdown=0.) for n in ARM_NAMES}
-        self.market, self.books, self.spot = None, {}, dict(price=0., source=0., received=0.)
-        self.jobs = []
-        self.stats = Counter()
-        self.session = None
-        self.round_counts = Counter()
-        self.recorded_versions = set()
-        self.last_trial = self.last_exit = -float('inf')
-        self.trial_id = 0
-        self.last_time = 0.
-        self.recorded_stakes = set()
-
-    def fresh_spot(self, now):
-        if not fresh(self.spot['source'],self.spot['received'],now,MAX_BTC_AGE):
-            raise Skip('btc_stale')
-
-    def get_book(self, direction, market, now):
-        if not self.market or self.market['slug'] != market['slug']:
-            raise Skip('wrong_replay_market')
-        b = self.books.get(direction)
-        if not b or b.asset != market['assets'][direction]:
-            raise Skip('missing_replay_book')
-        b.check(now)
-        return b
-
-    def roll_day(self, now):
-        day = datetime.fromtimestamp(now,timezone.utc).date().isoformat()
-        for a in self.accounts.values():
-            if a['day'] != day:
-                p = a['position']
-                a.update(day=day,day_start=a['cash']+(p['spent'] if p else 0.),stopped=False)
-
-    def entry(self, payload, now):
-        market, direction, anchor, trial_id, session = payload
-        if session != self.session:
-            raise Skip('session_interrupted_entry')
-        self.fresh_spot(now)
-        if not self.market or self.market['slug'] != market['slug']:
-            raise Skip('market_changed')
-        b = self.get_book(direction,market,now)
-        if abs(b.source-self.spot['source']) > MAX_FEED_SKEW:
-            raise Skip('feed_time_skew')
-        strategy_assessment(b,market,direction,anchor,self.spot['price'],self.stake,now)
-        for name, side in zip(ARM_NAMES,(direction,'DOWN' if direction=='UP' else 'UP')):
-            try:
-                if name == 'reverse' and not self.reverse_paper:
-                    self.stats['reverse:research_only'] += 1
-                    continue
-                a = self.accounts[name]
-                if a['position'] or a['stopped']:
-                    raise Skip('account_limit')
-                if self.round_counts[(name,market['slug'])] >= entry_round_limit():
-                    raise Skip('paper_round_fill_limit')
-                if now-self.last_exit < COOLDOWN_SECONDS:
-                    raise Skip('paper_exit_cooldown')
-                b = self.get_book(side,market,now)
-                if abs(b.source-self.spot['source']) > MAX_FEED_SKEW:
-                    raise Skip('feed_time_skew')
-                if b.spread() > MAX_SPREAD:
-                    raise Skip('spread')
-                q, risk = strategy_quote(b,market,self.stake,now,self.max_stop_risk)
-                if name == 'original':
-                    strategy_assessment(b,market,direction,anchor,self.spot['price'],q['spent'],now)
-                if a['cash'] < q['spent']:
-                    raise Skip('account_limit')
-                hold_account_check(a,q)
-                a['cash'] -= q['spent']
-                self.round_counts[(name,market['slug'])] += 1
-                a['position'] = dict(**q,direction=side,market=market,entered=now,
-                                     trial_id=trial_id,exit_pending=False,next_exit=now,
-                                     policy_version=VERSION,exit_policy=risk)
-            except Skip as exc:
-                self.stats[name+':entry:'+str(exc)] += 1
-
-    def execute_exit(self, payload, now):
-        name, reason = payload
-        a = self.accounts[name]
-        p = a['position']
-        if not p:
-            return
-        try:
-            if now >= p['market']['expiry']:
-                raise Skip('expired_unresolved')
-            b = self.get_book(p['direction'],p['market'],now)
-            q = sell_quote(b,p['market'],p['qty'],now)
-            confirmed = revalidated_exit_reason(p,reason,q,now,self.spot['source'],self.spot['received'])
-            if confirmed is None:
-                p['exit_pending'] = False
-                p['next_exit'] = now
-                p['profit_retry_after'] = now+1
-                self.stats[name+':profit_quote_faded'] += 1
-                return
-            reason = confirmed
-            pnl = q['received']-p['spent']
-            a['cash'] += q['received']
-            a['trades'].append(dict(trial_id=p['trial_id'],pnl=pnl,
-                                    fees=p['fee']+q['fee'],reason=reason,
-                                    entered=p['entered'],exited=now,qty=p['qty']))
-            a['position'] = None
-            a['peak'] = max(a['peak'],a['cash'])
-            a['max_drawdown'] = max(a['max_drawdown'],1-a['cash']/a['peak'])
-            a['stopped'] = a['cash'] <= a['day_start']*(1-DAILY_LOSS_FRACTION)
-            self.last_exit = now
-        except Skip as exc:
-            p['exit_pending'] = False
-            p['next_exit'] = now+1
-            self.stats[name+':exit:'+str(exc)] += 1
-
-    def due(self, before, inclusive=False):
-        while self.jobs:
-            self.jobs.sort(key=lambda j:j[0])
-            due, kind, payload = self.jobs[0]
-            if due > before or (due == before and not inclusive):
-                break
-            self.jobs.pop(0)
-            self.roll_day(due)
-            try:
-                if kind == 'entry':
-                    self.entry(payload,due)
-                else:
-                    self.execute_exit(payload,due)
-            except Skip as exc:
-                self.stats['delayed_entry:'+str(exc)] += 1
-
-    def schedule_exits(self, now):
-        for name,a in self.accounts.items():
-            p = a['position']
-            if not p or p['exit_pending'] or now < p['next_exit']:
-                continue
-            if now >= p['market']['expiry']:
-                continue  # Never manufacture a resolution from Binance or the last quote.
-            b = self.books.get(p['direction']) if self.market and self.market['slug']==p['market']['slug'] else None
-            reason = evaluated_exit(p, now, self.spot['source'], self.spot['received'], b)
-            if reason == 'net_target' and now < p.get('profit_retry_after',0):
-                continue
-            if reason:
-                p['exit_pending'] = True
-                self.jobs.append((now+self.latency,'exit',(name,reason)))
-
-    def step(self, row):
-        now, kind = row['time'], row['kind']
-        self.due(now)  # Execute BEFORE applying any later book information.
-        if row['session'] != self.session:
-            if self.session is not None:
-                self.stats['recording_restart'] += 1
-            self.session = row['session']
-            self.market, self.books = None, {}
-            self.spot = dict(price=0.,source=0.,received=0.)
-        self.roll_day(now)
-        if kind == 'session':
-            self.recorded_stakes.add(row['signal_stake'])
-            self.recorded_versions.add(row.get('version'))
-            if row.get('version') not in REPLAY_VERSIONS:
-                raise ValueError('Replay requires matching recording version')
-        elif kind in ('market','checkpoint'):
-            m = row['market']
-            if not self.market or m['slug'] != self.market['slug']:
-                self.market, self.books = m, {}
-            if kind == 'checkpoint':
-                if row.get('version',VERSION) not in REPLAY_VERSIONS:
-                    raise ValueError('Replay requires matching checkpoint version')
-                self.recorded_versions.add(row.get('version',VERSION))
-                if 'signal_stake' in row:
-                    self.recorded_stakes.add(row['signal_stake'])
-                self.spot = row['spot']
-                self.books = {d:restored_book(b) for d,b in row['books'].items()}
-        elif kind == 'book':
-            if self.market and row['condition'] == self.market['condition']:
-                self.books[row['direction']] = restored_book(row)
-        elif kind in ('delta', 'deltas'):
-            for update in row['updates'] if kind == 'deltas' else [row]:
-                b = self.books.get(update['direction'])
-                if b and update['source'] >= b.source:
-                    if update['side'] not in ('BUY','SELL'):
-                        raise ValueError('Invalid recorded book side')
-                    price,size = finite(update['price']),finite(update['size'])
-                    if not 0 < price < 1 or size < 0:
-                        raise ValueError('Invalid recorded book update')
-                    side = b.bids if update['side']=='BUY' else b.asks
-                    if size == 0:
-                        side.pop(price,None)
-                    else:
-                        side[price] = size
-                    b.source, b.received = update['source'], update['received']
-        elif kind == 'book_reset':
-            self.books.clear()
-        elif kind == 'spot_reset':
-            self.spot = dict(price=0.,source=0.,received=0.)
-        elif kind == 'spot':
-            self.spot = {k:row[k] for k in ('price','source','received')}
-        self.due(now,inclusive=True)
-        if kind == 'clock':
-            self.schedule_exits(now)  # Same ~100ms decision cadence as the online loop.
-        if kind == 'signal':
-            pending = any(j[1]=='entry' for j in self.jobs)
-            if (not pending and self.market and row['slug']==self.market['slug']
-                    and now-self.last_trial >= CANDIDATE_INTERVAL):
-                self.trial_id += 1
-                self.last_trial = now
-                self.jobs.append((now+self.latency,'entry',
-                                  (self.market.copy(),row['direction'],row['anchor'],self.trial_id,self.session)))
-        self.last_time = now
-        self.stats['events'] += 1
-
-    def result(self):
-        arms = {}
-        for name,a in self.accounts.items():
-            rows = a['trades']
-            p = a['position']
-            arms[name] = dict(closed=len(rows),wins=sum(t['pnl']>0 for t in rows),
-                              realized_pnl=sum(t['pnl'] for t in rows),
-                              closed_trade_fees=sum(t['fees'] for t in rows),
-                              cash=a['cash'],open_position=bool(p),
-                              open_cost=p['spent'] if p else 0.,
-                              max_realized_drawdown=a['max_drawdown'])
-        maps = {n:{t['trial_id']:t for t in a['trades']} for n,a in self.accounts.items()}
-        paired = set(maps['original']) & set(maps['reverse'])
-        return dict(version=VERSION,mode='OFFLINE_REPLAY_PAPER',latency_ms=self.latency*1000,
-                    stake=self.stake,recorded_signal_stakes=sorted(self.recorded_stakes),
-                    recorded_versions=sorted(self.recorded_versions),entry_cap_policy='actual_fills_per_arm',
-                    evaluated_exit_policy=dict(version=VERSION,mode='hold_to_resolution' if HOLD_TO_RESOLUTION else 'cost_aware',
-                        cost_cap=MAX_ROUNDTRIP_COST,post_cost_room=POST_COST_LOSS_ROOM,
-                        stop_cap=MAX_COST_AWARE_STOP,max_stop_risk=self.max_stop_risk,
-                        reverse_paper=self.reverse_paper,exit_btc_max_age=EXIT_BTC_MAX_AGE,
-                        revalidate_profit_exit=True),
-                    arms=arms,matched_closed_pairs=dict(n=len(paired),**{
-                        n:sum(maps[n][i]['pnl'] for i in paired) for n in ARM_NAMES}),
-                    pending_orders=len(self.jobs),counters=dict(self.stats),
-                    limitations=['Fixed recorded signal generator; current hold/execution policy applied, not an exact old-version replay.',
-                                 'Reverse is observation-only by default; this replay reports no new reverse trades.',
-                                 'Taker fills only; no queue priority simulation.',
-                                 'No official settlement data: expired/open positions stay unresolved.',
-                                 'Quotes are historical observed depth; not guaranteed live fills.'])
-
-
-def start_health_server():
+def health_server(bot):
     if not os.getenv("PORT"):
         return
-    app = Flask(__name__)
-    @app.get("/")
-    @app.get("/health")
-    def health():
-        alive = time.time()-HEALTH["heartbeat"] < 60
-        return jsonify(**HEALTH, alive=alive), 200 if alive else 503
-    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ["PORT"]),
-                                           use_reloader=False), daemon=True).start()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path not in (
+                "/",
+                "/health",
+            ):
+                self.send_error(404)
+                return
+
+            payload = json.dumps(
+                bot.health
+            ).encode()
+
+            self.send_response(200)
+
+            self.send_header(
+                "Content-Type",
+                "application/json",
+            )
+
+            self.send_header(
+                "Content-Length",
+                str(len(payload)),
+            )
+
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(
+        (
+            "0.0.0.0",
+            int(os.environ["PORT"]),
+        ),
+        Handler,
+    )
+
+    threading.Thread(
+        target=server.serve_forever,
+        daemon=True,
+    ).start()
 
 
-async def main():
-    global RECORDER
-    if importlib.metadata.version("polymarket-client") != "0.13.0":
-        raise RuntimeError("requirements.txt vereist polymarket-client==0.13.0")
-    if not 0 < finite(STAKE) <= finite(START_BALANCE):
-        raise RuntimeError("Ongeldige PAPER_TRADE_AMOUNT/PAPER_BALANCE")
-    if not 0 < finite(MAX_STOP_RISK) <= finite(START_BALANCE):
-        raise RuntimeError("Ongeldig PAPER_MAX_STOP_RISK")
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    # Railway/Linux: prevent two local processes spending the same paper ledger.
-    import fcntl
-    with (DATA_DIR / "polymarket_latency_paper.lock").open("w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        start_health_server()
-        RECORDER = TapeRecorder(DATA_DIR / 'replay')
+# ============================================================
+# START
+# ============================================================
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+    if not (
+        0 < PAPER_STAKE <= 5
+        and 0 < MIN_NET_EDGE < 1
+        and MIN_SAMPLES >= 100
+        and MIN_DAYS >= 3
+    ):
+        raise RuntimeError(
+            "Ongeldige paperconfiguratie"
+        )
+
+    DATA_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # Blokkeer dubbele processen op dezelfde database.
+    # Railway moet daarnaast op één replica blijven staan.
+    lock_path = DATA_DIR / "btc_lead_v1.lock"
+
+    with lock_path.open("w") as lock:
+        fcntl.flock(
+            lock,
+            fcntl.LOCK_EX | fcntl.LOCK_NB,
+        )
+
+        store = Store(
+            DATA_DIR / DB_NAME
+        )
+
+        bot = Bot(store)
+        health_server(bot)
+
         try:
-            async with AsyncPublicClient() as client:
-                engine = ComparisonEngine(client, Ledger(), ComparisonLedger())
-                task = asyncio.create_task(engine.run())
-                for sig in (signal.SIGINT, signal.SIGTERM):
-                    asyncio.get_running_loop().add_signal_handler(sig, task.cancel)
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+            asyncio.run(
+                bot.run()
+            )
+
         finally:
-            await asyncio.to_thread(RECORDER.close)
-
-
-def cli():
-    parser = argparse.ArgumentParser(description='BTC 5m paper experiment + offline event replay')
-    parser.add_argument('--replay', nargs='+', metavar='JSONL',
-                        help='recording files or quoted glob, e.g. "replay/tape-*.jsonl"')
-    parser.add_argument('--latency-ms', type=float, default=500.,
-                        help='total simulated decision-to-fill delay, replay only (default 500ms)')
-    parser.add_argument('--stake',type=float,default=STAKE,help='all-in replay stake')
-    args = parser.parse_args()
-    if args.replay:
-        import glob
-        paths = sorted(set(p for pattern in args.replay for p in glob.glob(pattern)))
-        if not paths:
-            parser.error('Geen replay-opnamen gevonden; laat de bot eerst data verzamelen.')
-        replay = TapeReplay(args.latency_ms/1000,args.stake,START_BALANCE)
-        for row in tape_rows(paths):
-            replay.step(row)
-        # Never run pending orders beyond the last recorded receive time.
-        print(json.dumps(replay.result(),indent=2,allow_nan=False))
-    else:
-        asyncio.run(main())
+            store.db.close()
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    cli()
+    main()
