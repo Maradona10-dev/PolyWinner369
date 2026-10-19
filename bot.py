@@ -1,82 +1,31 @@
-"""BTC 5m repricing + public event recording + offline replay — PAPER ONLY.
-Python 3.12. Start as usual: python bot.py
+"""BTC 5m HOLD TO OFFICIAL RESOLUTION — PAPER ONLY, v7.8.
+Python 3.12; python bot.py. Requirements unchanged:
+polymarket-client==0.13.0, requests>=2.32,<3, flask>=3,<4.
 
-v7.7: separate strict ENTRY freshness from bounded EXIT BTC freshness.
-New entries still require BTC <=1 second old. New positions may bridge a brief
-BTC tick gap up to 3 seconds ONLY while executable Polymarket quotes remain fresh.
-Stops/targets keep running; missing/disconnected feeds still trigger an exit.
-This is an unvalidated paper experiment, not evidence of improved performance.
-Profit exits are rechecked after execution delay: a vanished net target does not
-force a voluntary loss, but stops, time limits and data outages always take priority.
-Old positions keep their frozen rules. Replay uses the same new exit evaluator.
+New paper positions hold to the official market payout. NO profit sale, stop
+sale, stale-data sale or 15-second timeout. Full all-in stake can be lost.
+Default/hard cap $5 including taker purchase fee and adverse entry tick.
+PAPER_TRADE_AMOUNT can lower this cap; change HOLD_STAKE_CAP in Python to raise it.
+One original position at a time, one entry per market. Reverse remains shadow.
+Existing positions keep their frozen old policy. History and cash are preserved.
 
-Original signal only; reverse quotes are shadow observations, not trades.
-Risk sizing reduces the all-in stake when the frozen stop would risk more than
-PAPER_MAX_STOP_RISK (default $1). This is a planned trigger loss, NOT a guarantee:
-gaps, failed exits and latency can lose more, up to the entire all-in stake.
-Signal thresholds, fees, stop distances and profit/holding targets are unchanged.
-Candidate cancellations, actual trade metrics, exit data ages and stop overshoots
-are reported. Existing accounts/positions/history are preserved without reset.
+Entry uses the existing BTC impulse and uncalibrated probability model, fresh
+BTC/L2, spread/depth checks and a hypothetical settlement edge AFTER purchase
+costs. This is a new unvalidated strategy, not a proven prediction of the winner.
+No exit trading fee or exit slippage is charged on official settlement.
+Unknown resolution stays pending, with stake reserved, including after restart.
+Binance price, market expiry and last quotes NEVER determine settlement.
 
-Cost-aware paper risk uses immutable per-position exit policies.
-New entries reject round-trip friction above 7 cents/share. The all-in stop is
-max(4 cents, measured entry/exit friction + 2 cents), capped at 10 cents/share.
-This deliberately allows more downside than v7.4; it is an unvalidated PAPER
-experiment, not improved profitability. Fees, depth and stress ticks remain.
-Old open positions retain their original exit limits. Reports separate policy
-versions and show distinct market rounds rather than implying independence.
+Optional environment: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, PAPER_TRADE_AMOUNT,
+PAPER_BALANCE (1000), BOT_DATA_DIR, RAILWAY_VOLUME_MOUNT_PATH, PORT.
+Use persistent storage for polymarket_latency_comparison.json and replay/.
+Legacy account file polymarket_latency_paper.json is retained.
+No wallet, private key, authenticated orders or live execution in this bot.
 
-Observation candidates and paper execution limits are separate.
-Eligible candidates are sampled at most once per 10 seconds, including while
-accounts are blocked. Rejected/cancelled candidates do not consume the cap of
-two actual paper entries per account per market. Existing fill counts migrate
-from closed trades and open positions. Old balances/history are preserved.
-Both filled and rejected quotes have hypothetical 1/2/5/15-second follow-ups;
-the five-minute report shows separate cohorts, missing observations and costs.
-These overlapping observations are not independent trades or account PnL.
-The original BTC signal, sizing, one-tick stress and 15s holding limit remain.
-
-The bounded local receive-order journal retains ~1GiB in replay/.
-Market changes, BTC updates, atomic L2 snapshots/deltas, reconnects, eligible
-signals and 100ms decision clocks are recorded without blocking on disk.
-Existing ledgers are preserved. A recording/clock failure blocks NEW entries.
-
-Replay your recorded events (no network/Telegram/ledger writes):
-    python bot.py --replay 'replay/tape-*.jsonl' --latency-ms 250 --stake 5
+The 1/2/5/15s markouts are hypothetical sale research, NOT held-position PnL.
+Replay uses current policy on recorded signals; without official settlement
+records it leaves positions unresolved and cannot evaluate this hold strategy.
     python bot.py --replay 'replay/tape-*.jsonl' --latency-ms 500 --stake 5
-    python bot.py --replay 'replay/tape-*.jsonl' --latency-ms 1000 --stake 5
-Adjust replay/ to your BOT_DATA_DIR or Railway volume directory if configured.
-Replay varies execution delay/stake with the recorded signal generator fixed.
-It never looks at later quotes, assumes a maker fill, or invents settlement.
-Unfinished positions/pending orders are explicitly reported at the tape end.
-This is an independent taker simulator, not Marketlens SDK integration.
-No external historical-data account or API key is required. No performance
-claim follows from the synthetic tests; collect real events before comparison.
-
-requirements.txt (existing):
-    polymarket-client==0.13.0
-    requests>=2.32,<3
-    flask>=3,<4
-The pinned SDK supplies websockets>=13,<16. No wallet or trading API is used.
-
-Optional environment: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, PAPER_TRADE_AMOUNT
-(default 7.50 all-in cap), PAPER_MAX_STOP_RISK (default 1.00),
-PAPER_BALANCE (default 1000), BOT_DATA_DIR, PORT.
-Use a Railway volume for persistence. The separate ledger is
-polymarket_latency_comparison.json, with two separate fictitious accounts.
-Old polymarket_latency_paper.json is retained; an old position is managed to exit.
-Changing PAPER_BALANCE does not reset a ledger. New ORIGINAL positions use the
-same net +0.01/share target, cost-aware stop rule and 15s maximum hold attempt.
-Each arm pays its own friction and freezes its own resulting stop at entry.
-Reverse no longer debits its historical paper account; its quotes are still measured.
-Both sides use their own ask/bid depth, fees and one adverse tick each way.
-Markouts at 1/2/5/15s continue after exits and never change account cash.
-Missing/late observations remain missing, including across a restart.
-Reverse is a research counterfactual, not a claim of positive model edge.
-
-This is an uncalibrated quote-repricing model, NOT an established win probability.
-Paper executions use fresh REST depth AFTER a simulated delay, both fees and
-one adverse tick per side. They still cannot prove executable live returns.
 """
 import asyncio
 import contextlib
@@ -104,12 +53,16 @@ from polymarket import AsyncPublicClient
 from polymarket.streams import MarketSpec
 from websockets.asyncio.client import connect
 
-VERSION = "7.7-BTC-ExitQuality-PAPER"
-PREVIOUS_VERSION = "7.6-BTC-RiskBudget-PAPER"
+VERSION = "7.8-BTC-Hold5m-PAPER"
+PREVIOUS_VERSION = "7.7-BTC-ExitQuality-PAPER"
 VERSION_LABEL = VERSION.split('-')[0]
-COMPATIBLE_LEDGERS = {"7.0-BTC-Repricing-PAPER", "7.1-BTC-Repricing-PAPER", "7.2-BTC-Paired-PAPER", "7.3-BTC-Replay-PAPER", "7.4-BTC-Candidate-PAPER", "7.5-BTC-CostAware-PAPER", PREVIOUS_VERSION, VERSION}
-REPLAY_VERSIONS = {"7.3-BTC-Replay-PAPER", "7.4-BTC-Candidate-PAPER", "7.5-BTC-CostAware-PAPER", PREVIOUS_VERSION, VERSION}
-STAKE = float(os.getenv("PAPER_TRADE_AMOUNT", "7.50"))
+COMPATIBLE_LEDGERS = {"7.0-BTC-Repricing-PAPER", "7.1-BTC-Repricing-PAPER", "7.2-BTC-Paired-PAPER", "7.3-BTC-Replay-PAPER", "7.4-BTC-Candidate-PAPER", "7.5-BTC-CostAware-PAPER", "7.6-BTC-RiskBudget-PAPER", PREVIOUS_VERSION, VERSION}
+REPLAY_VERSIONS = {"7.3-BTC-Replay-PAPER", "7.4-BTC-Candidate-PAPER", "7.5-BTC-CostAware-PAPER", "7.6-BTC-RiskBudget-PAPER", PREVIOUS_VERSION, VERSION}
+HOLD_TO_RESOLUTION = True
+HOLD_STAKE_CAP = 5.00  # Entire amount including purchase fee is at risk.
+STAKE = min(HOLD_STAKE_CAP, float(os.getenv("PAPER_TRADE_AMOUNT", "5.00")))
+if not math.isfinite(STAKE) or STAKE <= 0:
+    raise ValueError("PAPER_TRADE_AMOUNT moet positief en eindig zijn")
 MAX_STOP_RISK = float(os.getenv("PAPER_MAX_STOP_RISK", "1.00"))
 REVERSE_PAPER_ENABLED = False  # Research quotes only; never enables live trading.
 START_BALANCE = float(os.getenv("PAPER_BALANCE", "1000"))
@@ -413,7 +366,7 @@ def model_probability(anchor, spot, now, expiry):
     return min(.995, max(.005, NORMAL.cdf(numerator/(sigma*math.sqrt(t1)))))
 
 
-def entry_assessment(book, market, direction, anchor, spot_price, budget, now):
+def entry_assessment(book, market, direction, anchor, spot_price, budget, now, hold=False):
     remaining = market["expiry"]-now
     if not ENTRY_TIME_MIN <= remaining <= ENTRY_TIME_MAX:
         raise Skip("outside_entry_window")
@@ -431,6 +384,12 @@ def entry_assessment(book, market, direction, anchor, spot_price, budget, now):
     quote = buy_quote(book, market, budget, now)
     if ref-quote["price"] < MIN_GROSS_EDGE:
         raise Skip("gross_edge")
+    if hold:
+        # Model probability is an uncalibrated hypothesis, NOT guaranteed payout.
+        edge = ref - MODEL_MARGIN - quote['spent']/quote['qty']
+        if edge < MIN_NET_EDGE:
+            raise Skip('settlement_edge_after_entry_costs')
+        return quote, ref, 1., edge
     # Quote scenario: fair mid less half-spread, uncertainty and adverse sell tick.
     target_bid = min(.99, ref-book.spread()/2-MODEL_MARGIN)
     target_fill = target_bid-SLIPPAGE_TICKS*book.tick
@@ -441,6 +400,37 @@ def entry_assessment(book, market, direction, anchor, spot_price, budget, now):
         raise Skip("edge_after_costs")
     sell_quote(book, market, quote["qty"], now)  # current full-size exit depth
     return quote, ref, target_bid, edge
+
+
+def strategy_assessment(book, market, direction, anchor, spot_price, budget, now):
+    return entry_assessment(book, market, direction, anchor, spot_price,
+                            min(budget,HOLD_STAKE_CAP) if HOLD_TO_RESOLUTION else budget,
+                            now, hold=HOLD_TO_RESOLUTION)
+
+
+def is_hold(position):
+    return (position.get('exit_policy') or {}).get('mode') == 'hold_to_resolution'
+
+
+def strategy_quote(book, market, budget, now, max_stop_risk):
+    if not HOLD_TO_RESOLUTION:
+        return risk_budgeted_quote(book, market, budget, now, max_stop_risk)
+    q = buy_quote(book, market, min(budget,HOLD_STAKE_CAP), now)
+    return q, dict(version=VERSION,mode='hold_to_resolution',
+                   max_loss=q['spent'],planned_stop_loss=q['spent'],
+                   stop_per_share=q['spent']/q['qty'],target_per_share=1.,
+                   max_hold_seconds=None,requested_spend=budget,actual_spend=q['spent'])
+
+
+def entry_round_limit():
+    return 1 if HOLD_TO_RESOLUTION else MAX_PAPER_ENTRIES_PER_ROUND
+
+
+def hold_account_check(account, quote):
+    # Reserve worst-case loss against remaining realized daily budget.
+    remaining = account['cash']-account['day_start']*(1-DAILY_LOSS_FRACTION)
+    if HOLD_TO_RESOLUTION and quote['spent'] > remaining + 1e-9:
+        raise Skip('remaining_daily_loss_budget')
 
 
 class Ledger:
@@ -1072,6 +1062,8 @@ def evaluated_exit(position, now, source, received, book):
     A missing book never produces a synthetic fill. This only requests a sale;
     the executor must still obtain fresh sufficient depth after the delay.
     """
+    if is_hold(position):
+        return None  # Only official resolution may close this position.
     target, stop, hold = position_exit_limits(position)
     if now-position['entered'] >= hold:
         return 'time_limit'
@@ -1354,7 +1346,7 @@ class ComparisonLedger:
                      policy=dict(stake=STAKE, target=LAB_TAKE_PROFIT, stop=STOP_LOSS_PER_SHARE,
                                  stop_buffer=ENTRY_STOP_BUFFER, hold_seconds=MAX_HOLD_SECONDS,
                                  execution_delay=EXECUTION_DELAY, slippage_ticks=SLIPPAGE_TICKS))
-        trial['policy'].update(version=VERSION, risk_mode='cost_aware',
+        trial['policy'].update(version=VERSION, risk_mode='hold_to_resolution' if HOLD_TO_RESOLUTION else 'cost_aware',
                                max_cost=MAX_ROUNDTRIP_COST, post_cost_room=POST_COST_LOSS_ROOM,
                                max_stop=MAX_COST_AWARE_STOP, max_stop_risk=MAX_STOP_RISK,
                                reverse_paper=REVERSE_PAPER_ENABLED)
@@ -1376,7 +1368,7 @@ class ComparisonLedger:
             a = self.data['arms'][name]
             if r['status'] == 'filled' and (a['position'] or r['quote']['spent'] > a['cash']):
                 raise LedgerError('Dubbele of ongedekte paperpositie')
-            if r['status']=='filled' and self.data['fill_counts'][name].get(trial['market']['slug'],0) >= MAX_PAPER_ENTRIES_PER_ROUND:
+            if r['status']=='filled' and self.data['fill_counts'][name].get(trial['market']['slug'],0) >= entry_round_limit():
                 raise LedgerError('Paperinstaplimiet overschreden')
         trial.update(status='observing', entered=now, arms=decisions)
         for name,r in decisions.items():
@@ -1467,7 +1459,7 @@ class ComparisonEngine(Engine):
             if abs(original_book.source-self.spot.source) > MAX_FEED_SKEW:
                 raise Skip('feed_time_skew')
             # Confirm the ORIGINAL trigger again after latency; reverse is its counterfactual.
-            _, ref, _, _ = entry_assessment(original_book, market, direction, anchor,
+            _, ref, _, _ = strategy_assessment(original_book, market, direction, anchor,
                                             self.spot.price, STAKE, now)
             trial['model_reference'] = ref
             trial['btc_at_fill'] = self.spot.price
@@ -1484,34 +1476,45 @@ class ComparisonEngine(Engine):
                         raise Skip('feed_time_skew')
                     if b.spread() > MAX_SPREAD:
                         raise Skip('spread')
-                    q = buy_quote(b, market, STAKE, now)
-                    row.update(quote=q, bid=max(b.bids), ask=min(b.asks), book_source=b.source,
-                               entry_mid=b.mid())
-                    immediate = sell_quote(b, market, q['qty'], now)
-                    row.update(immediate_exit=immediate['received'],
-                               baseline_loss=(q['spent']-immediate['received'])/q['qty'],
-                               costs=cost_breakdown(b,q,immediate))
-                    q, risk_policy = risk_budgeted_quote(b, market, STAKE, now,
-                                                        trial['policy']['max_stop_risk'])
+                    # Retain rejected-entry research quotes without treating them as fills.
+                    q = buy_quote(b,market,min(STAKE,HOLD_STAKE_CAP) if HOLD_TO_RESOLUTION else STAKE,now)
+                    row.update(quote=q,entry_mid=b.mid())
+                    try:
+                        immediate = sell_quote(b,market,q['qty'],now)
+                        row.update(immediate_exit=immediate['received'],
+                                   baseline_loss=(q['spent']-immediate['received'])/q['qty'],
+                                   costs=cost_breakdown(b,q,immediate))
+                    except Skip:
+                        if not HOLD_TO_RESOLUTION:
+                            raise
+                    q, risk_policy = strategy_quote(b, market, STAKE, now,
+                                                     trial['policy']['max_stop_risk'])
                     if name == 'original':
-                        # Depth/quantity may change; the executable signal must still qualify.
-                        entry_assessment(b, market, direction, anchor, self.spot.price, q['spent'], now)
-                    immediate = sell_quote(b, market, q['qty'], now)
-                    row.update(quote=q, immediate_exit=immediate['received'],
-                               baseline_loss=(q['spent']-immediate['received'])/q['qty'],
-                               costs=cost_breakdown(b,q,immediate), exit_policy=risk_policy)
+                        strategy_assessment(b,market,direction,anchor,self.spot.price,q['spent'],now)
+                    row.update(quote=q,bid=max(b.bids),ask=min(b.asks),book_source=b.source,
+                               entry_mid=b.mid(),exit_policy=risk_policy,
+                               immediate_exit=None,baseline_loss=None)
+                    try:
+                        immediate = sell_quote(b,market,q['qty'],now)
+                        row.update(immediate_exit=immediate['received'],
+                                   baseline_loss=(q['spent']-immediate['received'])/q['qty'],
+                                   costs=cost_breakdown(b,q,immediate))
+                    except Skip:
+                        if not HOLD_TO_RESOLUTION:
+                            raise
                     if name == 'reverse' and not trial['policy']['reverse_paper']:
                         row.update(status='shadow', reason='research_only')
                         continue
                     a = self.lab.data['arms'][name]
-                    if a['position']:
+                    if a['position'] or (HOLD_TO_RESOLUTION and any(x['position'] for x in self.lab.data['arms'].values())):
                         raise Skip('paper_position_open')
-                    if self.lab.data['fill_counts'][name].get(market['slug'],0) >= MAX_PAPER_ENTRIES_PER_ROUND:
+                    if self.lab.data['fill_counts'][name].get(market['slug'],0) >= entry_round_limit():
                         raise Skip('paper_round_fill_limit')
                     if now-self.lab.data['last_exit'] < COOLDOWN_SECONDS:
                         raise Skip('paper_exit_cooldown')
                     if a['daily_stopped'] or a['cash'] < q['spent']:
                         raise Skip('account_limit')
+                    hold_account_check(a,q)
                     row['status'] = 'filled'
                 except Skip as exc:
                     row['reason'] = str(exc)
@@ -1524,19 +1527,21 @@ class ComparisonEngine(Engine):
                 label = 'ORIGINEEL' if name == 'original' else 'REVERSE'
                 if r['status'] == 'filled':
                     lines.append(f"{label} {r['direction']}: ${r['quote']['spent']:.2f}, "
-                                 f"koop {r['quote']['price']:.4f}, directe verkoopfrictie "
-                                 f"{r['baseline_loss']:.4f}/aandeel")
+                                 f"koop {r['quote']['price']:.4f}, aankoopfee ${r['quote']['fee']:.4f}")
                 elif r['status'] == 'shadow':
                     lines.append(f"{label} {r['direction']}: alleen vervolgmeting, geen paperpositie/saldowijziging.")
                 else:
                     lines.append(f"{label} {r['direction']}: overgeslagen — {r['reason']}")
-                if r.get('costs'):
+                if r.get('costs') and not HOLD_TO_RESOLUTION:
                     c = r['costs']
                     lines.append(f"Kosten cent/aandeel: spread {100*c['spread']:.2f}, "
                                  f"fees {100*c['fees']:.2f}, extra slippage {100*c['slippage']:.2f}, "
                                  f"diepte/afronding {100*c['depth_and_rounding']:.2f}; "
                                  f"totaal {100*c['total']:.2f} (kostenplafond {100*MAX_ROUNDTRIP_COST:.2f}).")
-                if r.get('exit_policy'):
+                if r.get('exit_policy') and is_hold(r):
+                    lines.append(f"Vasthouden tot officiële uitslag; maximaal verlies ${r['quote']['spent']:.2f}.")
+                    lines.append(f"Einde ronde UTC: {datetime.fromtimestamp(market['expiry'],timezone.utc):%H:%M:%S}; daarna wachten op bevestiging.")
+                elif r.get('exit_policy'):
                     lines.append(f"Netto verliestrigger {100*r['exit_policy']['stop_per_share']:.2f} cent/aandeel; "
                                  f"{100*POST_COST_LOSS_ROOM:.1f} cent ruimte boven aanvangskosten.")
                     lines.append(f"Berekend stopverlies ${r['exit_policy']['planned_stop_loss']:.2f} "
@@ -1625,7 +1630,7 @@ class ComparisonEngine(Engine):
                 try:
                     anchor = self.observe(now)
                     direction = 'UP' if self.spot.price > anchor['spot'] else 'DOWN'
-                    entry_assessment(self.books[direction], self.market, direction, anchor,
+                    strategy_assessment(self.books[direction], self.market, direction, anchor,
                                      self.spot.price, STAKE, now)
                     record('signal', direction=direction, anchor=anchor.copy(),
                            slug=self.market['slug'])
@@ -1668,12 +1673,15 @@ class ComparisonEngine(Engine):
         attempt_started = p['exit_trigger']['time']
         try:
             now = time.time()
+            if is_hold(p) and now < p['market']['expiry']:
+                return
             if now >= p['market']['expiry']:
                 rs = await asyncio.wait_for(self.client.get_resolutions(condition_ids=p['market']['condition']),5)
                 payout = resolved_payout(rs,p['market'],p['direction'])
                 if payout is None:
                     return
-                t = self.lab.close(name,p['qty']*payout,0.,'resolution_fallback',time.time())
+                t = self.lab.close(name,p['qty']*payout,0.,
+                                   'official_resolution' if is_hold(p) else 'resolution_fallback',time.time())
             else:
                 await asyncio.sleep(EXECUTION_DELAY)
                 if time.time() >= p['market']['expiry']:
@@ -1709,7 +1717,7 @@ class ComparisonEngine(Engine):
                 diagnostic += f"\nVerlies ${t['stop_overshoot']:.2f} boven berekend stopverlies (geen fillgarantie)."
             self.notify(f"PAPER {name.upper()} #{p['trial_id']} {p['direction']} gesloten\n"
                         f"{t['reason']} | netto ${t['pnl']:+.2f} | duur {t['seconds']:.1f}s\n"
-                        f"Prijsresultaat ${t['price_pnl']:+.2f}, beide fees ${t['fees']:.4f}\n"
+                        f"Prijsresultaat ${t['price_pnl']:+.2f}, totale fees ${t['fees']:.4f}\n"
                         "Vervolgmetingen blijven doorlopen tot 15s na instap."+diagnostic)
         except LedgerError:
             raise
@@ -1759,7 +1767,8 @@ class ComparisonEngine(Engine):
         recent = current[-200:]
         new_count = sum(t['created'] >= now-REPORT_SECONDS for t in current)
         lines = [VERSION, 'ALLEEN PAPER — ORIGINAL actief; REVERSE alleen meten.',
-                 'Vervolgmetingen zijn geen extra winst/verliesboekingen.',
+                 'Nieuwe posities wachten op officiële uitslag; geen tussentijdse verkoop. Nieuw maximaal verlies = volledige inzet.',
+                 'Vervolgmetingen zijn hypothetische verkopen, geen extra winst/verliesboekingen.',
                  f"Nieuwe kandidaten laatste 5min: {new_count}; deze versie totaal {len(current)}."]
         stages = Counter(t['status'] for t in current)
         cancellations = Counter(t.get('reason','onbekend') for t in current
@@ -1793,7 +1802,11 @@ class ComparisonEngine(Engine):
                              f"{sum(r.get('profit_exit_deferrals',0) for r in own)} bij gesloten trades.")
             if a['daily_stopped']:
                 lines.append(f"{name.upper()}: dagverliesstop actief; posities blijven beheerd.")
-            if a['position']:
+            if a['position'] and is_hold(a['position']):
+                p = a['position']
+                status = 'wacht op officiële uitslag' if now >= p['market']['expiry'] else f"nog {p['market']['expiry']-now:.0f}s tot ronde-einde"
+                lines.append(f"Open {p['direction']}: inzet ${p['spent']:.2f} gereserveerd; {status}.")
+            elif a['position']:
                 target,stop,hold = position_exit_limits(a['position'])
                 lines.append(f"Open: netto doel {100*target:.1f}c, stoptrigger {100*stop:.2f}c/aandeel, {hold}s.")
             reasons = Counter(tr.get('arms',{}).get(name,{}).get('reason') for tr in current
@@ -1864,21 +1877,12 @@ class ComparisonEngine(Engine):
 
     async def run(self):
         self.notify(f"{VERSION} gestart | ALLEEN PAPER\n"
-                    f"ORIGINAL actief, REVERSE alleen meten. Inzet maximaal ${STAKE:.2f}.\n"
-                    f"Berekend stoprisico maximaal ${MAX_STOP_RISK:.2f}: zo nodig kleinere positie. "
-                    "Geen gegarandeerd maximumverlies bij koerssprongen of mislukte uitstap.\n"
-                    f"Kostenplafond {100*MAX_ROUNDTRIP_COST:.1f} cent/aandeel.\n"
-                    f"Nieuwe netto verliestrigger: max(4 cent, kosten + {100*POST_COST_LOSS_ROOM:.0f} cent), "
-                    f"maximaal {100*MAX_COST_AWARE_STOP:.0f} cent/aandeel.\n"
-                    f"Netto doel +{100*LAB_TAKE_PROFIT:.0f} cent/aandeel; tijdlimiet {MAX_HOLD_SECONDS}s.\n"
-                    f"Nieuwe posities: BTC-tickpauze maximaal {EXIT_BTC_MAX_AGE:.0f}s bij vers orderboek; "
-                    f"instappen blijven maximaal {MAX_BTC_AGE:.0f}s oude BTC-data gebruiken.\n"
-                    "Vrijwillige winstuitstap opnieuw getoetst na vertraging; beschermende exits blijven actief.\n"
-                    "Oude open posities behouden hun uitstapregels.\n"
-                    "Bestaande saldi/historie blijven behouden; ook oude reverse-posities worden gesloten.\n"
-                    "Max. 2 paperinstappen per ronde. Kandidaten blijven gemeten, maximaal elke 10s.\n"
-                    "Compacte status elke 5min; uitgebreide metingen elke 30min.\n"
-                    "BTC/L2-opname + offline replay actief. Geen Marketlens-account nodig.")
+                    f"Inzet maximaal ${STAKE:.2f} inclusief aankoopfee. Volledige inzet kan verloren gaan.\n"
+                    "Nieuwe posities blijven staan tot officiële uitslag; geen stop, winstverkoop of 15s-exit.\n"
+                    "Geen verkoopfee bij afrekening. Onbekende uitslag blijft wachten, nooit gokken op Binance.\n"
+                    "Eén positie tegelijk en één instap per ronde. REVERSE alleen onderzoek.\n"
+                    "BTC-impulsmodel is niet gekalibreerd voor einduitslagen; nieuwe papertest.\n"
+                    "Oude open posities houden hun oorspronkelijke regels; saldi en historie blijven behouden.")
         history = sum(len(a['trades']) for a in self.lab.data['arms'].values())
         self.notify(f"Historie: {'bestaand bestand geladen' if self.lab.loaded_existing else 'NIEUW bestand gestart'}, "
                     f"{history} gesloten papertrades.\n"
@@ -1900,6 +1904,7 @@ class ComparisonEngine(Engine):
                     self.lab.roll_day(now)
                     legacy = self.ledger.data['position']
                     positions = [a['position'] for a in self.lab.data['arms'].values() if a['position']]
+                    self.schedule_exits(now)  # Settlement must work even if expired market feeds fail.
                     required = legacy['market'] if legacy else (positions[0]['market'] if positions else None)
                     if required and self.market != required:
                         await self.switch_market(required)
@@ -1922,7 +1927,7 @@ class ComparisonEngine(Engine):
                         anchor = self.observe(now)
                         direction = 'UP' if self.spot.price > anchor['spot'] else 'DOWN'
                         # Keep the signal generator fixed for both directions.
-                        entry_assessment(self.books[direction],self.market,direction,anchor,
+                        strategy_assessment(self.books[direction],self.market,direction,anchor,
                                          self.spot.price,STAKE,now)
                         trial = self.lab.begin(self.market,direction,now)
                         self.entry_task = asyncio.create_task(self.paired_entry(trial,anchor))
@@ -2101,7 +2106,7 @@ class TapeReplay:
     def __init__(self, latency=.5, stake=7.5, balance=1000.):
         if not 0 <= finite(latency) <= 10 or not 0 < finite(stake) <= finite(balance):
             raise ValueError('Invalid latency/stake/balance')
-        self.latency, self.stake = latency, stake
+        self.latency, self.stake = latency, min(stake,HOLD_STAKE_CAP) if HOLD_TO_RESOLUTION else stake
         self.reverse_paper = REVERSE_PAPER_ENABLED
         self.max_stop_risk = finite(MAX_STOP_RISK)
         if self.max_stop_risk <= 0:
@@ -2150,7 +2155,7 @@ class TapeReplay:
         b = self.get_book(direction,market,now)
         if abs(b.source-self.spot['source']) > MAX_FEED_SKEW:
             raise Skip('feed_time_skew')
-        entry_assessment(b,market,direction,anchor,self.spot['price'],self.stake,now)
+        strategy_assessment(b,market,direction,anchor,self.spot['price'],self.stake,now)
         for name, side in zip(ARM_NAMES,(direction,'DOWN' if direction=='UP' else 'UP')):
             try:
                 if name == 'reverse' and not self.reverse_paper:
@@ -2159,7 +2164,7 @@ class TapeReplay:
                 a = self.accounts[name]
                 if a['position'] or a['stopped']:
                     raise Skip('account_limit')
-                if self.round_counts[(name,market['slug'])] >= MAX_PAPER_ENTRIES_PER_ROUND:
+                if self.round_counts[(name,market['slug'])] >= entry_round_limit():
                     raise Skip('paper_round_fill_limit')
                 if now-self.last_exit < COOLDOWN_SECONDS:
                     raise Skip('paper_exit_cooldown')
@@ -2168,11 +2173,12 @@ class TapeReplay:
                     raise Skip('feed_time_skew')
                 if b.spread() > MAX_SPREAD:
                     raise Skip('spread')
-                q, risk = risk_budgeted_quote(b,market,self.stake,now,self.max_stop_risk)
+                q, risk = strategy_quote(b,market,self.stake,now,self.max_stop_risk)
                 if name == 'original':
-                    entry_assessment(b,market,direction,anchor,self.spot['price'],q['spent'],now)
+                    strategy_assessment(b,market,direction,anchor,self.spot['price'],q['spent'],now)
                 if a['cash'] < q['spent']:
                     raise Skip('account_limit')
+                hold_account_check(a,q)
                 a['cash'] -= q['spent']
                 self.round_counts[(name,market['slug'])] += 1
                 a['position'] = dict(**q,direction=side,market=market,entered=now,
@@ -2327,7 +2333,7 @@ class TapeReplay:
         return dict(version=VERSION,mode='OFFLINE_REPLAY_PAPER',latency_ms=self.latency*1000,
                     stake=self.stake,recorded_signal_stakes=sorted(self.recorded_stakes),
                     recorded_versions=sorted(self.recorded_versions),entry_cap_policy='actual_fills_per_arm',
-                    evaluated_exit_policy=dict(version=VERSION,mode='cost_aware',
+                    evaluated_exit_policy=dict(version=VERSION,mode='hold_to_resolution' if HOLD_TO_RESOLUTION else 'cost_aware',
                         cost_cap=MAX_ROUNDTRIP_COST,post_cost_room=POST_COST_LOSS_ROOM,
                         stop_cap=MAX_COST_AWARE_STOP,max_stop_risk=self.max_stop_risk,
                         reverse_paper=self.reverse_paper,exit_btc_max_age=EXIT_BTC_MAX_AGE,
@@ -2335,7 +2341,7 @@ class TapeReplay:
                     arms=arms,matched_closed_pairs=dict(n=len(paired),**{
                         n:sum(maps[n][i]['pnl'] for i in paired) for n in ARM_NAMES}),
                     pending_orders=len(self.jobs),counters=dict(self.stats),
-                    limitations=['Fixed recorded signal generator; current risk-budget execution policy applied, not an exact old-version replay.',
+                    limitations=['Fixed recorded signal generator; current hold/execution policy applied, not an exact old-version replay.',
                                  'Reverse is observation-only by default; this replay reports no new reverse trades.',
                                  'Taker fills only; no queue priority simulation.',
                                  'No official settlement data: expired/open positions stay unresolved.',
