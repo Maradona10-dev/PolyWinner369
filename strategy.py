@@ -1,5 +1,3 @@
-"""Start de bestaande paperbot na CLOB-authenticatie. Geen live orders."""
-
 import logging
 import os
 import re
