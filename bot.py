@@ -1,4 +1,4 @@
-"""Start BTC Lead PAPER met automatische CLOB-authenticatie."""
+"""Start de bestaande paperbot na CLOB-authenticatie. Geen live orders."""
 
 import logging
 import os
@@ -93,7 +93,6 @@ def headers_for(account):
 
 def load_auth():
     # De Railway-variable blijft bestaan voor een herstart.
-    # Verwijder de key na uitlezen uit deze procesomgeving.
     private_key = os.environ.pop(
         "POLYMARKET_PRIVATE_KEY", ""
     ).strip()
@@ -118,8 +117,7 @@ def load_auth():
     ):
         raise AuthError(
             "Private key heeft een ongeldig formaat. "
-            "Gebruik de volledige exportsleutel "
-            "zonder aanhalingstekens."
+            "Gebruik de volledige exportsleutel."
         )
 
     try:
@@ -163,7 +161,6 @@ def load_auth():
                     if result:
                         return result
 
-                # Nooit sleutels of response-inhoud loggen.
                 print(
                     "Authenticatie niet voltooid "
                     f"(HTTP {response.status_code}); "
@@ -221,8 +218,6 @@ def main():
         )
         raise SystemExit(1) from None
 
-    # Alleen beschikbaar in dit proces.
-    # Niet opslaan in bestanden, rapporten of Telegram.
     for key, env in FIELDS.items():
         os.environ[env] = auth[key]
 
@@ -233,6 +228,18 @@ def main():
     )
 
     import strategy
+
+    # Voorkomt opnieuw starten als per ongeluk de startcode
+    # ook in strategy.py is geplakt.
+    if not all(
+        hasattr(strategy, name)
+        for name in ("Bot", "Reference", "Store")
+    ):
+        raise SystemExit(
+            "Verkeerde strategy.py: plak daar de volledige "
+            "paperstrategie, niet de startcode."
+        )
+
     strategy.main()
 
 
