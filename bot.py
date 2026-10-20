@@ -1,3 +1,4 @@
+print("STARTCONTROLE 21-10-A", flush=True)
 """Start de bestaande paperbot na CLOB-authenticatie. Geen live orders."""
 
 import logging
