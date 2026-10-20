@@ -1,3 +1,4 @@
 polymarket-client==0.13.0
-requests>=2.32.3,<3
-flask>=3.1,<4
+websockets>=13,<16
+requests>=2.32,<3
+eth-account==0.13.7
