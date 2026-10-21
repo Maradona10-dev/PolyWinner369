@@ -1,4 +1,4 @@
-"""BTC Lead v1 — PAPER ONLY. Public books + authenticated, read-only PolyBolt.
+"""BTC Lead v1.1 — API-herstel en start-TWAP-cache. PAPER ONLY. Public books + authenticated, read-only PolyBolt.
 
 No private key, order-signing client, live order endpoint or early sale exists here.
 Wordt gestart vanuit bot.py; dit bestand bevat de paperstrategie.
@@ -23,9 +23,10 @@ import time
 
 import requests
 from polymarket import AsyncPublicClient
+from polymarket.errors import RateLimitError
 from websockets.asyncio.client import connect
 
-VERSION = "1.0-BTC-Lead-TWAP-PAPER"
+VERSION = "1.1-BTC-Lead-TWAP-PAPER"
 # Change settings here, not the old bot's environment flags.
 PAPER_STAKE = 5.0                 # All-in, including simulated entry fee
 INITIAL_CASH = 1000.0
@@ -54,6 +55,71 @@ LOG = logging.getLogger("btc-lead")
 
 class Skip(Exception):
     pass
+
+
+class PublicReads:
+    """Read-only API calls with separate cooldowns and secret-free diagnostics.
+
+    Never retry a measurement within the same checkpoint. An unavailable
+    endpoint does not stop the reference feed or unrelated API operations.
+    """
+    TIMEOUTS = {"markt": 8, "orderboek": 3, "afrekening": 5}
+
+    def __init__(self, notify=None):
+        self.notify = notify
+        self.states = {}
+
+    def ready(self, operation):
+        return time.time() >= self.states.get(operation, {}).get("retry_at", 0)
+
+    async def call(self, operation, function, **kwargs):
+        state = self.states.setdefault(operation, {
+            "failures": 0, "retry_at": 0, "last_ok": None,
+            "last_error": None, "last_notice": None,
+        })
+        if not self.ready(operation):
+            raise Skip("api_wachttijd_" + operation)
+        try:
+            result = await asyncio.wait_for(function(**kwargs), self.TIMEOUTS[operation])
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            now = time.time()
+            status = 429 if isinstance(exc, RateLimitError) else getattr(exc, "status", None)
+            if type(status) is not int or not 100 <= status <= 599:
+                status = None
+            state["failures"] += 1
+            delay = min(300, 10 * 2 ** min(state["failures"] - 1, 5))
+            if status in (400, 401, 403, 422):
+                delay = max(60, delay)
+            suggested = getattr(exc, "retry_after", None)
+            if (type(suggested) in (int, float) and math.isfinite(suggested)
+                    and suggested >= 0):
+                delay = max(delay, suggested)
+            state["retry_at"] = now + delay
+            # Never include exception text, URLs, response bodies or headers.
+            state["last_error"] = {
+                "at": now, "operation": operation, "http_status": status,
+                "type": type(exc).__name__, "wait_seconds": delay,
+            }
+            if state["last_notice"] is None or now - state["last_notice"] >= 300:
+                state["last_notice"] = now
+                message = (f"API {operation}: HTTP {status if status is not None else 'onbekend'} "
+                           f"({type(exc).__name__}). Nieuwe poging op zijn vroegst over {delay:.0f}s.")
+                if self.notify:
+                    self.notify(message)
+                else:
+                    LOG.warning(message)
+            raise Skip(f"api_{operation}_http_{status or 'onbekend'}") from None
+        state.update(failures=0, retry_at=0, last_ok=time.time())
+        return result
+
+    def summary(self, now):
+        return {name: {
+            "consecutive_failures": state["failures"],
+            "retry_in_seconds": max(0, math.ceil(state["retry_at"] - now)),
+            "last_ok": state["last_ok"], "last_error": state["last_error"],
+        } for name, state in self.states.items()}
 
 
 def number(v):
@@ -103,17 +169,19 @@ class Reference:
     """Keep raw Chainlink spot + authoritative TWAP samples; never use Binance."""
     def __init__(self):
         self.points = {SPOT: {}, TWAP: {}}
+        self.anchors = {}
         self.connected = False
         self.state = "wachten_op_feed"
         self.sequences = {}
         self.acks = set()
 
     def reset(self):
-        # Reconnect requires a fresh snapshot; no stale buffers carried across gaps.
+        # Keep exact historical start prices, but require fresh live buffers.
         self.points = {SPOT: {}, TWAP: {}}
         self.sequences.clear()
         self.acks.clear()
         self.connected = False
+        self.state = "wachten_op_feed"
 
     def apply(self, msg, now):
         channel = msg.get("channel")
@@ -146,12 +214,17 @@ class Reference:
             if item.get("is_carried_forward") or p.get("is_carried_forward"):
                 raise Skip("feed_doorgerolde_prijs")
             existing = self.points[channel].get(ts)
+            if channel == TWAP and ts in self.anchors:
+                existing = self.anchors[ts]
             if existing and not math.isclose(existing[0], value, rel_tol=1e-12):
                 raise Skip("feed_herziening")
             self.points[channel][ts] = (value, now)
+            if channel == TWAP and ts % 300 == 0:
+                self.anchors.setdefault(ts, (value, now))
             added.append((channel, ts, value, now))
         for kind in self.points:
             self.points[kind] = {t: v for t, v in self.points[kind].items() if t >= now-900}
+        self.anchors = {t: v for t, v in self.anchors.items() if t >= now-900}
         self.connected = self.acks == {SPOT, TWAP}
         self.state = "verbonden" if self.connected else "wachten_op_abonnement"
         return added
@@ -169,7 +242,7 @@ class Reference:
 
     def strike(self, start):
         # Exact boundary only: a TWAP one second later is a different price-to-beat.
-        point = self.points[TWAP].get(float(start))
+        point = self.anchors.get(float(start)) or self.points[TWAP].get(float(start))
         if point is None:
             raise Skip("start_twap_ontbreekt_wacht_volgende_ronde")
         return point[0]
@@ -259,9 +332,9 @@ def quote(book, market, side, budget, now):
             "price_bin": min(9, int((notional/qty)*10)), "book_ts": book.timestamp.timestamp()}
 
 
-async def discover(client, start):
+async def discover(client, start, api=None):
     slug = f"btc-updown-5m-{start}"
-    m = await asyncio.wait_for(client.get_market(slug=slug), 8)
+    m = await (api or PublicReads()).call("markt", client.get_market, slug=slug)
     s = m.state
     if m.slug != slug or not m.condition_id or s.end_date is None or abs(s.end_date.timestamp()-start-300)>0.1:
         raise Skip("verkeerde_markt_of_eindtijd")
@@ -367,6 +440,17 @@ class Store:
         with self.db:
             self.db.executemany("INSERT OR IGNORE INTO ticks VALUES(?,?,?,?)", rows)
 
+    def start_prices(self, now):
+        # Existing validated TWAP ticks only. Never restore live prices as fresh.
+        rows = self.db.execute(
+            "SELECT ts,value,received FROM ticks WHERE channel=? AND ts>=? AND ts<=? AND received<=?",
+            (TWAP, now-900, now, now),
+        ).fetchall()
+        return {ts: (value, received) for ts, value, received in rows
+                if math.isfinite(ts) and ts % 300 == 0
+                and math.isfinite(value) and value > 0
+                and math.isfinite(received) and received >= ts-0.5}
+
     def estimate(self, checkpoint, feature, q, now):
         rows = self.db.execute("""SELECT o.start,o.at,m.resolved_at,o.result
           FROM observations o JOIN markets m USING(start)
@@ -432,11 +516,16 @@ class Store:
 class Bot:
     def __init__(self, store):
         self.store, self.ref = store, Reference()
+        self.ref.anchors = store.start_prices(time.time())
         self.market = None
         self.last_report = self.last_discovery = self.last_resolve = 0
         self.last_cleanup = 0
         self.last_cell = None
         self.messages = asyncio.Queue(maxsize=50)
+        self.api = PublicReads(self.notify)
+        self.previous_counts = Counter(dict(store.db.execute("SELECT reason,count FROM skips")))
+        self.previous_observed = store.db.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+        self.previous_report_at = time.time()
         self.health = {"version":VERSION,"mode":"PAPER","status":"starting"}
         self.started = time.time()
         self.attempted = set()
@@ -519,11 +608,13 @@ class Bot:
         rows = self.store.db.execute("""SELECT start,data FROM markets WHERE resolved_at IS NULL
              AND start+300<=? ORDER BY last_poll LIMIT 8""",(now,)).fetchall()
         for row in rows:
+            if not self.api.ready("afrekening"):
+                break
             market = json.loads(row["data"])
             with self.store.db:
                 self.store.db.execute("UPDATE markets SET last_poll=? WHERE start=?",(time.time(),row["start"]))
             try:
-                rs = await asyncio.wait_for(client.get_resolutions(condition_ids=market["condition"]),5)
+                rs = await self.api.call("afrekening", client.get_resolutions, condition_ids=market["condition"])
                 pay = payout(rs,market)
                 if pay is None:
                     continue
@@ -551,7 +642,7 @@ class Bot:
         self.attempted.add((start,checkpoint))
         # Fixed sampling times, independent of direction/price/edge. Never retry until lucky.
         f = self.ref.feature(market,time.time())
-        book = await asyncio.wait_for(client.get_order_book(asset_id=market["assets"][f["side"]]),3)
+        book = await self.api.call("orderboek", client.get_order_book, asset_id=market["assets"][f["side"]])
         now = time.time()
         f = self.ref.feature(market,now)
         if abs(f["remaining"]-checkpoint)>2:
@@ -569,7 +660,7 @@ class Bot:
             raise Skip("onvoldoende_netto_edge")
         self.store.can_enter(start,q["spent"])
         await asyncio.sleep(max(LATENCY_SECONDS,market.get("seconds_delay",0)))
-        book2 = await asyncio.wait_for(client.get_order_book(asset_id=market["assets"][f["side"]]),3)
+        book2 = await self.api.call("orderboek", client.get_order_book, asset_id=market["assets"][f["side"]])
         now2 = time.time()
         f2 = self.ref.feature(market,now2)
         if abs(f2["remaining"]-checkpoint)>3:
@@ -589,6 +680,7 @@ class Bot:
                     f"Vasthouden tot officiële uitslag. https://polymarket.com/event/{market['slug']}")
 
     def report(self):
+        now = time.time()
         a = self.store.account()
         db = self.store.db
         closed,wins,pnl = db.execute("SELECT COUNT(*),COALESCE(SUM(pnl>0),0),COALESCE(SUM(pnl),0) FROM positions WHERE resolved_at IS NOT NULL").fetchone()
@@ -596,9 +688,33 @@ class Bot:
         observed = db.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
         resolved = db.execute("SELECT COUNT(*) FROM markets WHERE resolved_at IS NOT NULL").fetchone()[0]
         skips = dict(db.execute("SELECT reason,count FROM skips ORDER BY count DESC LIMIT 6").fetchall())
+        counts = Counter(dict(db.execute("SELECT reason,count FROM skips")))
+        recent = dict((counts-self.previous_counts).most_common(6))
+        added = observed-self.previous_observed
+        interval = max(0, now-self.previous_report_at)
+        last_measurement = db.execute("SELECT MAX(at) FROM observations").fetchone()[0]
+        labelled_markets = db.execute(
+            "SELECT COUNT(DISTINCT start) FROM observations WHERE result IN (0,1)"
+        ).fetchone()[0]
+        observation_age = None if last_measurement is None else max(0, now-last_measurement)
+        stalled = now-self.started >= 900 and (observation_age is None or observation_age >= 900)
+        api_status = self.api.summary(now)
+        api_lines = []
+        for operation, state in api_status.items():
+            if state["consecutive_failures"]:
+                error = state["last_error"]
+                api_lines.append(f"{operation}: HTTP {error['http_status'] or 'onbekend'} "
+                                 f"({error['type']}), wachttijd {state['retry_in_seconds']}s")
+            else:
+                api_lines.append(f"{operation}: laatste aanvraag gelukt")
+        current_start = int(now//300)*300
+        anchor_ready = current_start in self.ref.anchors or current_start in self.ref.points[TWAP]
         report = {"version":VERSION,"at":time.time(),"account":a,"closed":closed,"wins":wins,
                   "net_pnl":pnl,"open":opened,"reserved":reserved,"observations":observed,
                   "resolved_markets":resolved,"last_cell":self.last_cell,"skips":skips,
+                  "observations_added":added,"interval_seconds":interval,"recent_skips":recent,
+                  "last_observation_at":last_measurement,"collection_stalled":stalled,
+                  "labelled_markets":labelled_markets,"api":api_status,"start_twap_ready":anchor_ready,
                   "trades":[dict(r) for r in db.execute("SELECT * FROM positions ORDER BY start DESC LIMIT 1000")]}
         for trade in report["trades"]:
             trade["details"] = json.loads(trade["details"])
@@ -613,19 +729,26 @@ class Bot:
         self.notify(f"{VERSION}\nFeed: {self.ref.state}\nPaper vrij {a['cash']:.2f} | gereserveerd {reserved:.2f} | open {opened}\n"
                     f"Afgerond {closed}, winst {wins}, netto {pnl:+.2f} USD\n"
                     f"Dataset: {observed} meetpunten, {resolved} afgeronde rondes\n"
+                    f"Nieuwe meetpunten: +{added} in {interval/60:.1f} min; {labelled_markets} rondes met trainingslabels\n"
+                    f"Dataverzameling: {'STILSTAND ≥15 min' if stalled else 'opbouw/controle'}\n"
+                    f"Start-TWAP huidige ronde: {'bewaard' if anchor_ready else 'ontbreekt'}\n"
+                    f"API: {'; '.join(api_lines) or 'nog geen aanvraag'}\n"
                     f"Laatste vergelijkbare cel: {json.dumps(self.last_cell,ensure_ascii=False)}\n"
-                    f"Controles: {json.dumps(skips,ensure_ascii=False)}\n"
+                    f"Controles sinds vorig rapport: {json.dumps(recent,ensure_ascii=False)}\n"
                     "Geen kansen ingebouwd uit onbevestigde percentages. Eerst data verzamelen; daarna alleen edge na kosten.")
+        self.previous_counts, self.previous_observed = counts, observed
+        self.previous_report_at = now
 
     async def cycle(self, client):
         now = time.time()
         self.store.roll_day(now)
         now = time.time()
         start = int(now//300)*300
-        if (self.market is None or self.market["start"]!=start) and now-self.last_discovery>=10:
+        if ((self.market is None or self.market["start"]!=start)
+                and now-self.last_discovery>=10 and self.api.ready("markt")):
             self.last_discovery = now
             self.market = None
-            self.market = await discover(client,start)
+            self.market = await discover(client,start,self.api)
             self.store.market(self.market)
             self.attempted = {x for x in self.attempted if x[0]==start}
         if self.market and self.market["start"]==start:
@@ -636,7 +759,8 @@ class Bot:
                     break
 
     async def run(self):
-        self.notify(f"{VERSION} gestart. Nieuwe paperproef: BTC, {PAPER_STAKE:.2f} USD all-in, maximaal één positie.\n"
+        self.notify(f"{VERSION} gestart. BTC, {PAPER_STAKE:.2f} USD all-in, maximaal één positie.\n"
+                    "Bestaande database behouden. API-diagnose, wachttijden en herstel start-TWAP actief.\n"
                     "Historische cellen worden opgebouwd uit officiële resultaten; zonder voldoende data geen orders.\n"
                     "Bewaar btc_lead_v1.sqlite3 op een Railway-volume. Oude bot stoppen om dubbele processen te voorkomen.")
         async with AsyncPublicClient() as client:
