@@ -1,4 +1,4 @@
-"""BTC Lead v1.2 — opslagcontrole, vaste metingen en herstartveiligheid.
+"""BTC Lead v1.3 — prospectieve toetsing en export via Telegram.
 
 PAPER ONLY. Start via bot.py dat import strategy; strategy.main() uitvoert.
 De database en bestaande historische categorieën blijven compatibel met v1.1.
@@ -21,6 +21,7 @@ import shutil
 import signal
 import sqlite3
 import threading
+import tempfile
 import time
 import uuid
 
@@ -29,7 +30,7 @@ from polymarket import AsyncPublicClient
 from polymarket.errors import RateLimitError
 from websockets.asyncio.client import connect
 
-VERSION = "1.2-BTC-Lead-TWAP-PAPER"
+VERSION = "1.3-BTC-Lead-TWAP-PAPER"
 PAPER_STAKE = 5.0
 INITIAL_CASH = 1000.0
 MIN_NET_EDGE = 0.03
@@ -118,6 +119,25 @@ def atomic_json(path, data):
         os.close(directory)
 
 
+def mounted_path(path):
+    if os.path.ismount(path):
+        return True
+    # Linux may report a same-filesystem bind mount as False in ismount().
+    try:
+        for line in Path('/proc/self/mountinfo').read_text().splitlines():
+            fields=line.split()
+            if len(fields)<5:
+                continue
+            mountpoint=fields[4]
+            for encoded, decoded in ((r'\040',' '),(r'\011','\t'),(r'\012','\n'),(r'\134','\\')):
+                mountpoint=mountpoint.replace(encoded,decoded)
+            if Path(mountpoint).resolve()==path:
+                return True
+    except OSError:
+        pass
+    return False
+
+
 def storage_status(directory):
     directory = directory.resolve()
     mount = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
@@ -126,8 +146,9 @@ def storage_status(directory):
     mounted = False
     if mount:
         root = Path(mount).resolve()
-        mounted = directory.is_relative_to(root) and os.path.ismount(root)
+        mounted = directory.is_relative_to(root) and mounted_path(root)
     return {"path": str(directory), "railway": railway, "volume_verified": mounted,
+            "mount_path_configured": bool(mount),
             "entries_allowed": not railway or mounted,
             "status": ("volume_gecontroleerd" if mounted else
                        "Railway_volume_niet_bevestigd" if railway else "lokale_opslag")}
@@ -401,6 +422,248 @@ def payout(resolutions, market):
     return {side: values[index] for side, index in market["indices"].items()}
 
 
+def validation_protocol():
+    """Fixed rules for forward evaluation; changing rules starts a new cohort."""
+    return {"decision_model": "BTC_LEAD_RULES_V1_2", "schema": SCHEMA, "stake": PAPER_STAKE,
+        "min_edge": MIN_NET_EDGE, "min_samples": MIN_SAMPLES, "min_days": MIN_DAYS,
+        "train_days": TRAIN_DAYS, "checkpoints": list(CHECKPOINTS),
+        "gap_edges": list(GAP_EDGES[:-1])+["inf"], "max_price": MAX_PRICE,
+        "max_spread": MAX_SPREAD, "slippage_ticks": SLIPPAGE_TICKS,
+        "feed_max_age": FEED_MAX_AGE, "book_max_age": BOOK_MAX_AGE, "max_tick_gap": MAX_TICK_GAP,
+        "latency_seconds": LATENCY_SECONDS, "fee": "market_metadata_per_level",
+        "max_daily_entries": MAX_DAILY_ENTRIES, "max_daily_loss": MAX_DAILY_LOSS,
+        "test_min_closed": 200, "test_min_utc_days": 14,
+        "interval": "UTC_day_block_bootstrap_2000_seed_731",
+        "fill_model": "PAPER_taker_quote_after_latency_plus_slippage",
+        "decision": "past_resolved_matching_cells_wilson_lower"}
+
+
+def audit_trades(db, protocol_id=None):
+    """Audit recorded PAPER fills and rebuild pre-entry history.
+
+    Never turns a reference observation into a trade. Arithmetic checks are
+    separate from evidence of profitability; raw fills remain simulations.
+    """
+    audit_at=time.time()
+    errors, audited, prospective = [], [], []
+    prospective_open = 0
+    positions = [dict(row) for row in db.execute("SELECT * FROM positions ORDER BY entered,start")]
+    account = dict(db.execute("SELECT * FROM account WHERE id=1").fetchone())
+    protocol = None
+    if protocol_id is None:
+        candidates = []
+        for key, value in db.execute("SELECT key,value FROM metadata WHERE key LIKE 'validation_%'"):
+            try:
+                record = json.loads(value)
+                candidates.append((record["started"], key[len("validation_"):], record))
+            except (TypeError, ValueError, KeyError):
+                errors.append({"check": "protocol_metadata_ongeldig"})
+        if candidates:
+            _, protocol_id, protocol = max(candidates, key=lambda item: item[0])
+    else:
+        row = db.execute("SELECT value FROM metadata WHERE key=?", ("validation_"+protocol_id,)).fetchone()
+        if row:
+            protocol = json.loads(row[0])
+    if protocol is not None and protocol.get("protocol") != validation_protocol():
+        # Old cohorts require their matching code/configuration to replay decisions.
+        errors.append({"check": "protocol_komt_niet_overeen_met_deze_code"})
+    spent_total, proceeds_total = 0.0, 0.0
+    for trade in positions:
+        start = trade["start"]
+        try:
+            for key in ("spent", "fee", "qty", "entered"):
+                if not math.isfinite(trade[key]):
+                    raise ValueError()
+            if not 0 < trade["spent"] or not 0 < trade["qty"] or not 0 <= trade["fee"] <= trade["spent"]:
+                raise ValueError()
+            spent_total += trade["spent"]
+            details = json.loads(trade["details"])
+            is_current = protocol_id is not None and details.get("validation_protocol") == protocol_id
+            market_row = db.execute("SELECT * FROM markets WHERE start=?", (start,)).fetchone()
+            if market_row is None or trade["side"] not in ("UP", "DOWN"):
+                raise ValueError()
+            m = json.loads(market_row["data"])
+            if not start <= trade["entered"] < m["end"] or trade["entered"]>audit_at:
+                errors.append({"start": start, "check": "instap_buiten_marktronde"})
+            if trade["resolved_at"] is None:
+                if is_current:
+                    prospective_open += 1
+                if trade["proceeds"] is not None or trade["pnl"] is not None:
+                    errors.append({"start": start, "check": "open_positie_met_eindresultaat"})
+            else:
+                for key in ("proceeds", "pnl", "resolved_at"):
+                    if not math.isfinite(trade[key]):
+                        raise ValueError()
+                proceeds_total += trade["proceeds"]
+                pay = market_row["up"] if trade["side"] == "UP" else market_row["down"]
+                other = market_row["down"] if trade["side"] == "UP" else market_row["up"]
+                if (pay is None or other is None or not 0<=pay<=1 or not 0<=other<=1
+                        or not math.isclose(pay+other,1,abs_tol=1e-8)
+                        or market_row["resolved_at"] is None
+                        or trade["resolved_at"] < max(trade["entered"],m["end"]) or trade["resolved_at"]>audit_at):
+                    raise ValueError()
+                if not math.isclose(trade["proceeds"],trade["qty"]*pay,abs_tol=1e-6):
+                    errors.append({"start": start, "check": "uitbetaling_verschilt_van_aandelen_maal_opgeslagen_payout"})
+                if not math.isclose(trade["pnl"],trade["proceeds"]-trade["spent"],abs_tol=1e-6):
+                    errors.append({"start": start, "check": "netto_pnl_klopt_niet"})
+                audited.append(trade)
+                if is_current:
+                    prospective.append(trade)
+            if is_current:
+                f, q, estimate = details["feature"], details["quote"], details["estimate"]
+                if (not all(math.isfinite(f[key]) for key in ("remaining","at","reference","strike","gap_bp","spot_ts"))
+                        or not all(math.isfinite(q[key]) for key in ("spread","vwap","all_in","spent","fee","qty","book_ts"))
+                        or f["strike"]<=0 or f["reference"]<=0):
+                    raise ValueError()
+                if protocol is None or trade["entered"] < protocol["started"]:
+                    errors.append({"start": start, "check": "instap_voor_vastleggen_testprotocol"})
+                cp = min(CHECKPOINTS, key=lambda x: abs(x-f["remaining"]))
+                observation = db.execute("SELECT * FROM observations WHERE start=? AND checkpoint=?",(start,cp)).fetchone()
+                if observation is None:
+                    raise ValueError()
+                when = observation["at"]
+                rows = db.execute("""SELECT o.start,o.at,m.resolved_at,o.result
+                    FROM observations o JOIN markets m USING(start)
+                    WHERE o.checkpoint=? AND o.kind=? AND o.side=? AND o.gap_bin=? AND o.price_bin=?
+                    AND o.start>=? AND m.resolved_at<? AND o.result IN (0,1)""",
+                    (cp,f["kind"],f["side"],f["gap_bin"],q["price_bin"],when-TRAIN_DAYS*86400,when)).fetchall()
+                rebuilt = history_estimate(rows,when)
+                if (not rebuilt["ready"] or estimate.get("n") != rebuilt["n"]
+                        or estimate.get("wins") != rebuilt["wins"]
+                        or estimate.get("days") != rebuilt["days"]
+                        or not math.isclose(estimate["p"],rebuilt["p"],abs_tol=1e-10)
+                        or not math.isclose(estimate["lower"],rebuilt["lower"],abs_tol=1e-10)):
+                    errors.append({"start": start, "check": "kansschatting_niet_reproduceerbaar_uit_toen_bekende_uitslagen"})
+                signed_bp=(f["reference"]/f["strike"]-1)*10000
+                if (trade["side"] != f["side"] or f["side"] != ("UP" if signed_bp>0 else "DOWN")
+                        or gap_bin(signed_bp) != f["gap_bin"]
+                        or (observation["kind"],observation["side"],observation["gap_bin"],observation["price_bin"])
+                        != (f["kind"],f["side"],f["gap_bin"],q["price_bin"])):
+                    errors.append({"start": start, "check": "signaal_of_historische_categorie_wijkt_af"})
+                if (abs(f["remaining"]-cp)>3 or not math.isclose(f["at"],trade["entered"],abs_tol=1e-6)
+                        or trade["entered"]-when+1e-6 < max(LATENCY_SECONDS,m.get("seconds_delay",0))
+                        or not -0.5 <= trade["entered"]-q["book_ts"] <= BOOK_MAX_AGE):
+                    errors.append({"start": start, "check": "tijd_of_latencycontrole_mislukt"})
+                if (rebuilt["lower"]-q["all_in"] < MIN_NET_EDGE-1e-9
+                        or trade["spent"] > PAPER_STAKE+1e-6
+                        or not 0<q["spread"]<=MAX_SPREAD
+                        or q["vwap"]>MAX_PRICE+2e-6):
+                    errors.append({"start": start, "check": "instapvoorwaarden_niet_gehaald"})
+                if (not math.isclose(q["spent"],trade["spent"],abs_tol=1e-6)
+                        or not math.isclose(q["qty"],trade["qty"],abs_tol=1e-6)
+                        or not math.isclose(q["fee"],trade["fee"],abs_tol=1e-6)
+                        or not math.isclose(q["all_in"]*q["qty"],q["spent"],abs_tol=1e-6)
+                        or not math.isclose(q["vwap"]*q["qty"]+q["fee"],q["spent"],abs_tol=1e-6)):
+                    errors.append({"start": start, "check": "aankoopkosten_of_aandelen_kloppen_niet"})
+                boundary=datetime.fromtimestamp(trade["entered"],timezone.utc).replace(hour=0,minute=0,second=0,microsecond=0).timestamp()
+                prior_spent=db.execute("SELECT COALESCE(SUM(spent),0) FROM positions WHERE entered<?",(trade["entered"],)).fetchone()[0]
+                prior_proceeds=db.execute("SELECT COALESCE(SUM(proceeds),0) FROM positions WHERE resolved_at<=?",(trade["entered"],)).fetchone()[0]
+                prior_pnl=db.execute("SELECT COALESCE(SUM(pnl),0) FROM positions WHERE resolved_at<?",(boundary,)).fetchone()[0]
+                earlier_today=db.execute("SELECT COUNT(*) FROM positions WHERE entered>=? AND entered<?",(boundary,trade["entered"])).fetchone()[0]
+                overlap=db.execute("SELECT 1 FROM positions WHERE entered<? AND (resolved_at IS NULL OR resolved_at>?) LIMIT 1",(trade["entered"],trade["entered"])).fetchone()
+                cash_before=account["initial"]-prior_spent+prior_proceeds
+                if (overlap or earlier_today>=MAX_DAILY_ENTRIES or cash_before<trade["spent"]
+                        or cash_before-trade["spent"]<(account["initial"]+prior_pnl)*(1-MAX_DAILY_LOSS)-1e-6):
+                    errors.append({"start": start, "check": "risicolimiet_of_overlappende_positie"})
+        except (KeyError, TypeError, ValueError, ZeroDivisionError, OverflowError):
+            errors.append({"start": start, "check": "onvolledige_of_ongeldige_handel"})
+    if not math.isclose(account["cash"],account["initial"]-spent_total+proceeds_total,abs_tol=1e-6):
+        errors.append({"check": "kasboek_sluit_niet_aan"})
+    prospective.sort(key=lambda x:(x["resolved_at"],x["start"]))
+    n = len(prospective)
+    wins = sum(t["pnl"]>0 for t in prospective)
+    pnl = sum(t["pnl"] for t in prospective)
+    fees = sum(t["fee"] for t in prospective)
+    notional = sum(t["spent"] for t in prospective)
+    equity = peak = drawdown = 0.0
+    days = {}
+    for trade in prospective:
+        equity += trade["pnl"]
+        peak = max(peak,equity)
+        drawdown = max(drawdown,peak-equity)
+        bucket = days.setdefault(day(trade["entered"]),[0.0,0.0])
+        bucket[0] += trade["pnl"]; bucket[1] += trade["spent"]
+    interval = None
+    verdict = "GEEN_AFGERONDE_TRADES" if n == 0 else "VOORLOPIG_ONVOLDOENDE_HANDELSRESULTATEN"
+    # Days are resampled as blocks; never treat repeated checkpoints as independent trades.
+    if n>=200 and len(days)>=14:
+        rng = random.Random(731)
+        blocks = list(days.values())
+        samples = []
+        for _ in range(2000):
+            draw = [rng.choice(blocks) for _ in blocks]
+            samples.append(sum(x[0] for x in draw)/sum(x[1] for x in draw))
+        samples.sort()
+        interval = [samples[49],samples[1949]]
+        verdict = ("POSITIEF_BINNEN_DEZE_PAPERPROEF" if interval[0]>0 else
+                   "NEGATIEF_BINNEN_DEZE_PAPERPROEF" if interval[1]<0 else "GEEN_OVERTUIGENDE_POSITIEVE_EDGE")
+    if errors:
+        verdict = "CONTROLEFOUTEN_EERST_HERSTELLEN"
+    return {"at":time.time(),"version":VERSION,"protocol_id":protocol_id,
+        "protocol":protocol,"errors":errors,"verdict":verdict,
+        "all_recorded_positions":len(positions),"all_closed_positions":len(audited),
+        "prospective_closed":n,"prospective_open":prospective_open,
+        "wins":wins,"win_rate":wins/n if n else None,"utc_days":len(days),
+        "net_pnl":pnl,"estimated_entry_fees":fees,"turnover":notional,
+        "net_return_on_turnover":pnl/notional if notional else None,
+        "max_realised_drawdown":drawdown,"day_block_interval_95":interval,
+        "minimum_evaluation":{"closed_trades":200,"utc_days":14},
+        "limitations":["PAPER fills are simulated, not exchange-confirmed executions.",
+            "Fee arithmetic is checked; full historical L2 books are unavailable for independent fill reconstruction.",
+            "Stored official payouts are checked against the ledger; the audit does not query the oracle independently.",
+            "A positive interval for this period does not guarantee future profit."]}
+
+
+def validation_text(result):
+    n=result["prospective_closed"]
+    win=f"{result['win_rate']:.1%}" if n else "n.v.t."
+    return (f"HANDELSCONTROLE {VERSION}\nProtocol: {result['protocol_id'] or 'nog geen prospectieve proef'}\n"
+        f"Afgeronde trades in deze proef: {n}; open {result['prospective_open']}\n"
+        f"Netto PAPER {result['net_pnl']:+.2f} USD; geschatte fees {result['estimated_entry_fees']:.4f}\n"
+        f"Winratio {win}; UTC-handelsdagen {result['utc_days']}\n"
+        f"Grootste gerealiseerde terugval {result['max_realised_drawdown']:.2f} USD\n"
+        f"Administratie/besliscontrole: {len(result['errors'])} fouten\n"
+        f"Oordeel: {result['verdict']}\n"
+        "Voor een voorlopig statistisch oordeel: 200 afgeronde trades op 14 UTC-handelsdagen.\n"
+        "Paperfills blijven simulaties. /export levert de onderzoeksdatabase voor nadere controle.")
+
+
+def export_research_database(source_path):
+    """Consistent read transaction, compact standalone SQLite file, no secrets/ticks."""
+    handle = tempfile.NamedTemporaryFile(prefix="btc_onderzoek_",suffix=".sqlite3",dir=source_path.parent,delete=False)
+    target_path=Path(handle.name); handle.close()
+    source=sqlite3.connect(source_path.as_uri()+"?mode=ro",uri=True,timeout=5)
+    target=sqlite3.connect(target_path)
+    tables=("account","markets","observations","positions","skips","metadata",
+            "measurement_attempts","reference_observations","invalid_anchors")
+    try:
+        source.execute("BEGIN")
+        for table in tables:
+            schema=source.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone()
+            if schema is None:
+                continue
+            target.execute(schema[0])
+            cursor=source.execute("SELECT * FROM "+table)
+            placeholders=','.join('?' for _ in cursor.description)
+            while True:
+                rows=cursor.fetchmany(500)
+                if not rows: break
+                target.executemany("INSERT INTO "+table+" VALUES("+placeholders+")",rows)
+        target.execute("CREATE TABLE export_info(at REAL, scope TEXT)")
+        target.execute("INSERT INTO export_info VALUES(?,?)",(time.time(),"research_snapshot_without_raw_ticks_or_credentials"))
+        target.commit()
+        if target.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+            raise StorageError("Onderzoeksexport mislukt bij integriteitscontrole.")
+        if target_path.stat().st_size>45*1024*1024:
+            raise StorageError("Onderzoeksexport te groot voor deze Telegram-overdracht; download via Railway.")
+        return target_path
+    except BaseException:
+        target_path.unlink(missing_ok=True)
+        raise
+    finally:
+        source.close(); target.close()
+
+
 class Store:
     def __init__(self, path):
         self.path = Path(path).resolve()
@@ -466,6 +729,11 @@ class Store:
                         raise StorageError("Database bevat minder historie dan de opslagmarker; controleer herstel of opslagpad.")
             self.startup = "bestaande_database" if existed else "NIEUWE_LEGE_DATABASE"
             self.resumed_counts = counts
+            self.protocol = validation_protocol()
+            self.protocol_id = hashlib.sha256(json.dumps(self.protocol, sort_keys=True).encode()).hexdigest()[:16]
+            with self.db:
+                self.db.execute("INSERT OR IGNORE INTO metadata VALUES(?,?)",
+                    ("validation_"+self.protocol_id, json.dumps({"started": time.time(), "protocol": self.protocol})))
             self.check_disk()
             if existed:
                 self.backup()
@@ -624,7 +892,8 @@ class Store:
 
     def enter(self, market, feature, quote_data, estimate, now):
         self.can_enter(market["start"], quote_data["spent"])
-        details = json.dumps({"feature": feature, "quote": quote_data, "estimate": estimate})
+        details = json.dumps({"feature": feature, "quote": quote_data, "estimate": estimate,
+                              "validation_protocol": self.protocol_id})
         with self.db:
             self.db.execute("INSERT INTO positions VALUES(?,?,?,?,?,?,?,NULL,NULL,NULL)",
                 (market["start"], feature["side"], quote_data["qty"], quote_data["spent"], quote_data["fee"], now, details))
@@ -715,6 +984,98 @@ class Bot:
                         LOG.warning("Telegram niet bezorgd; controleer configuratie/verbinding.")
             finally:
                 self.messages.task_done()
+
+    def validation_report(self):
+        result=audit_trades(self.store.db,self.store.protocol_id)
+        atomic_json(self.store.path.parent/'btc_lead_validation.json',result)
+        self.notify(validation_text(result)+"\nOpslag: "+self.store.storage["status"])
+        return result
+
+    async def handle_command(self, message, token, chat):
+        if str(message.get('chat',{}).get('id','')) != chat:
+            return False
+        if message.get('from',{}).get('is_bot'):
+            return False
+        at=message.get('date',0)
+        if not isinstance(at,(int,float)) or at<self.started-1 or not 0<=time.time()-at<=120:
+            return False
+        text=message.get('text','').strip().split()
+        command=text[0].split('@')[0].lower() if text else ''
+        if command not in ('/toets','/export'):
+            return False
+        if command=='/toets':
+            self.validation_report()
+            return True
+        if message.get('chat',{}).get('type') != 'private':
+            self.notify('Een onderzoeksexport wordt uitsluitend in de ingestelde privéchat geleverd.')
+            return True
+        now=time.monotonic()
+        if now-self.notices.get('export_request',-1e20)<60:
+            self.notify('Wacht een minuut tussen twee exports.')
+            return True
+        self.notices['export_request']=now
+        self.store.check_disk()
+        path=None
+        try:
+            path=await asyncio.to_thread(export_research_database,self.store.path)
+            def send_document():
+                try:
+                    with path.open('rb') as document:
+                        response=requests.post(f'https://api.telegram.org/bot{token}/sendDocument',
+                            data={'chat_id':chat,'caption':'BTC onderzoeksdatabase: consistente momentopname, zonder ruwe ticks of credentials. Deel dit bestand met ChatGPT voor controle.'},
+                            files={'document':(path.name,document,'application/vnd.sqlite3')},timeout=(5,30))
+                    return response.status_code==200 and response.json().get('ok') is True
+                except Exception:
+                    return False
+            if not await asyncio.to_thread(send_document):
+                self.notify('Onderzoeksexport niet bezorgd. Controleer verbinding en probeer /export later opnieuw.')
+        except (OSError,sqlite3.Error,StorageError):
+            self.notify('Onderzoeksexport mislukt. Controleer vrije opslag en Railway-logs; gegevens zijn niet verwijderd.')
+        finally:
+            if path is not None:
+                path.unlink(missing_ok=True)
+        return True
+
+    async def telegram_commands(self):
+        token=os.getenv('TELEGRAM_BOT_TOKEN','').strip()
+        if token.startswith('bot'): token=token[3:]
+        chat=os.getenv('TELEGRAM_CHAT_ID','').strip()
+        if not token or not chat:
+            return
+        row=self.store.db.execute("SELECT value FROM metadata WHERE key='telegram_update_offset'").fetchone()
+        offset=int(row[0]) if row else 0
+        while True:
+            def get_updates():
+                try:
+                    response=requests.get(f'https://api.telegram.org/bot{token}/getUpdates',
+                        params={'offset':offset,'timeout':5,'limit':100,'allowed_updates':'["message"]'},timeout=(5,8))
+                    payload=response.json()
+                    if response.status_code==200 and payload.get('ok') is True and isinstance(payload.get('result'),list):
+                        return response.status_code,payload['result'],0
+                    retry=payload.get('parameters',{}).get('retry_after',10)
+                    return response.status_code,[],retry if type(retry) in (int,float) and math.isfinite(retry) and retry>=0 else 10
+                except Exception:
+                    return 0,[],10
+            status,updates,retry=await asyncio.to_thread(get_updates)
+            if status!=200:
+                self.notice('telegram_commands',f'Telegram-opdrachten niet beschikbaar (HTTP {status or "onbekend"}). Bij 409: controleer webhook of een tweede botproces.',900)
+                await asyncio.sleep(max(10,retry))
+                continue
+            for update in updates:
+                identifier=update.get('update_id')
+                if type(identifier) is not int or identifier<offset:
+                    continue
+                offset=identifier+1
+                # Persist BEFORE processing: never replay an export after a crash.
+                with self.store.db:
+                    self.store.db.execute("INSERT INTO metadata VALUES('telegram_update_offset',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(offset),))
+                try:
+                    await self.handle_command(update.get('message',{}),token,chat)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.notice('telegram_command_failed','Telegram-opdracht afgebroken: '+type(exc).__name__)
+            await asyncio.sleep(1)
 
     async def reference_feed(self):
         auth = {"apiKey": os.getenv("POLYMARKET_API_KEY", "").strip(),
@@ -842,6 +1203,8 @@ class Bot:
         if estimate["lower"]-quote_data["all_in"] < MIN_NET_EDGE:
             raise Skip("onvoldoende_netto_edge")
         self.store.can_enter(market["start"], quote_data["spent"])
+        if audit_trades(self.store.db, self.store.protocol_id)["errors"]:
+            raise Skip("handelscontrole_mislukt_eerst_herstellen")
         await asyncio.sleep(max(LATENCY_SECONDS, market.get("seconds_delay", 0)))
         book_after = await self.api.call("orderboek", client.get_order_book, asset_id=market["assets"][requested_side])
         now_after = time.time()
@@ -971,7 +1334,7 @@ class Bot:
             f"API: {'; '.join(api_lines) or 'nog geen aanvraag'}\n"
             f"Laatste categorie: {cell_text}\n"
             f"Controles sinds vorig rapport: {json.dumps(recent, ensure_ascii=False)}\n"
-            "PAPER. Geen bewijs van winstgevendheid zolang er geen getoetste handelsresultaten zijn.")
+            "PAPER. Gebruik /toets voor de handelscontrole en /export voor de onderzoeksdatabase.")
         self.previous_counts, self.previous_observed = counters, counts["observations"]
         self.previous_report_at = now
 
@@ -1005,6 +1368,9 @@ class Bot:
             telegram = asyncio.create_task(self.telegram())
             settlement = asyncio.create_task(self.settlement_worker(client))
             maintenance = asyncio.create_task(self.maintenance())
+            commands = asyncio.create_task(self.telegram_commands())
+            self.last_validation = 0
+            self.notify("Handelscontrole actief. /toets = rapport; /export = onderzoeksdatabase. Alleen opdrachten uit de ingestelde Telegram-chat worden verwerkt.")
             try:
                 while not self.stop.is_set():
                     for task in (feed, settlement, maintenance):
@@ -1028,6 +1394,11 @@ class Bot:
                     self.health.update(status="running" if fresh else "degraded", feed=self.ref.state,
                         last_cycle=now, reference_fresh=fresh, storage=self.store.storage["status"],
                         last_api=self.api.summary())
+                    if commands.done() and commands.exception() is not None:
+                        self.notice("commands_error", "Telegram-opdrachten gestopt: "+type(commands.exception()).__name__)
+                    if now-self.last_validation >= 86400:
+                        self.last_validation = now
+                        self.validation_report()
                     if now-self.last_report >= 900:
                         self.last_report = now
                         self.store.check_disk()
@@ -1038,7 +1409,7 @@ class Bot:
                         pass
             finally:
                 self.health["status"] = "stopping"
-                tasks = [feed, settlement, maintenance]
+                tasks = [feed, settlement, maintenance, commands]
                 if self.discovery is not None:
                     tasks.append(self.discovery)
                 for task in tasks:
@@ -1109,4 +1480,18 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser=argparse.ArgumentParser(description="BTC Lead PAPER of alleen-lezen handelscontrole")
+    parser.add_argument("--audit", metavar="DATABASE", help="lees een onderzoeksexport zonder bot of netwerk te starten")
+    args=parser.parse_args()
+    if args.audit:
+        audit_path=Path(args.audit).resolve()
+        connection=sqlite3.connect(audit_path.as_uri()+"?mode=ro",uri=True)
+        connection.row_factory=sqlite3.Row
+        try:
+            connection.execute("BEGIN")
+            print(json.dumps(audit_trades(connection),indent=2,ensure_ascii=False,allow_nan=False))
+        finally:
+            connection.close()
+    else:
+        main()
