@@ -1,1730 +1,762 @@
-"""BTC Lead v1.3 — prospectieve toetsing en export via Telegram.
+#!/usr/bin/env python3
+"""LIQUIDITY GUARD v1 — uitsluitend PAPERTRADING, Python 3.10+.
 
-PAPER ONLY. Start via bot.py dat import strategy; strategy.main() uitvoert.
-De database en bestaande historische categorieën blijven compatibel met v1.1.
+STARTEN
+  python liquidity_bot.py --self-test    # offline controles; geen berichten/orders
+  python liquidity_bot.py --once        # een publieke datascan; geen Telegram
+  python liquidity_bot.py               # continu; stop met Ctrl+C
 
-=== TIJDELIJKE TEST-INSTELLINGEN (27 okt 2026) ===
-- MIN_NET_EDGE = 0.00 (was 0.03)
-- MIN_SAMPLES = 40 (was 100)
-- MIN_DAYS = 2 (was 3)
-- Volume-blokkade uitgezet
-Verwijder of zet terug naar productie-waarden zodra je genoeg paper trades hebt gezien.
+Geen pip-pakketten nodig. Op Render: Python-service, start command
+`python liquidity_bot.py`. PORT activeert een HTTP-healthserver. Gebruik een
+persistent disk en STATE_FILE=/var/data/liquidity.sqlite3 om simulaties bij
+herstart/redeploy te behouden. Zonder persistent disk kan de historie verdwijnen.
+
+Optionele environment variables:
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   meldingen naar jouw chat
+  INITIAL_CAPITAL=1000                  USDT, alleen bij een nieuwe database
+  STATE_FILE=liquidity.sqlite3          database met saldo, posities en trades
+  PORT                                 alleen voor hosting-healthcheck
+Omgevingsvariabelen worden door je host/shell ingesteld; .env wordt niet gelezen.
+Geen exchange-account/API-key nodig. PAPER_TRADING=false wordt GEWEIGERD.
+
+ONTWERP EN AFWIJKINGEN VAN DE AFBEELDING
+De afbeelding is een onderzoeksopdracht, geen bewezen tradingstrategie. Dit is
+een concrete, experimentele vertaling voor BTCUSDT, ETHUSDT en SOLUSDT op Binance
+spot. Alleen long; geen futures, leverage, funding, short-orders of echte orders.
+De publieke REST-documentatie is gecontroleerd op 20 oktober 2026:
+https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md
+https://github.com/binance/binance-spot-api-docs/blob/master/faqs/market_data_only.md
+
+Elke circa 10 seconden: spread, zichtbare diepte binnen +/-10 basispunten van mid,
+orderboek-onbalans en agressieve koopomzet. De transactiemeting gebruikt maximaal
+de laatste 1000 aggTrades binnen 30 seconden; dit is GEEN gegarandeerd volledig
+30-secondenvenster. Alleen data met een laatste transactie <=15 seconden oud.
+Orderboek heeft geen exchange-tijdstempel: RTT <=3 s en een oplopende update-ID
+zijn controles, geen garantie tegen vertraagde data. Maximaal 500 niveaus per
+zijde; bij onvoldoende bereik over de gekozen band worden entries geblokkeerd.
+
+Regimes: OPWARMEN, STABIEL, FRAGIEL, ONDUIDELIJK. Baseline = medianen van maximaal
+1 uur recente, geldige eigen snapshots; NIET de 20 dagen uit de afbeelding.
+Na elke start minimaal 5 minuten en 30 samples opwarmen. Een gat >30 s reset dit.
+FRAGIEL bij spread >8 bps of >2x baseline, diepte per kant <50.000 USDT of
+<55% baseline. Deze drempels zijn aannames, geen geoptimaliseerde parameters.
+
+ENTRY: stabiel regime, >=20 miljoen USDT 24h-omzet, drie opeenvolgende snapshots
+met boek-onbalans >=0,15 en agressieve koopomzet >=58%; gesloten 5m-candle boven
+EMA20 boven EMA50, EMA20 stijgt, groene candle sluit boven vorige close, omzet
+minstens mediaan vorige 20 candles. Niet meer dan 0,5 ATR boven die candle kopen.
+Bevestigingen gebruiken overlappende trades; ze zijn niet statistisch onafhankelijk.
+
+EXIT: waargenomen best bid raakt SL of TP, 3 fragiele snapshots of max 4 uur.
+Stopafstand = max(1,5 ATR14, 0,5% van instap). TP = 1,8x bruto stopafstand.
+Risicobudget 0,5% geschat vermogen/trade, inclusief geraamde fees en stop-slippage;
+max 25% vermogen als inleg per positie, max 2 posities en 6 entries/UTC-dag.
+Na >=3% dagelijkse equity-daling of 3 verliestrades achtereen geen nieuwe entries
+tot volgende UTC-dag; bestaande exits blijven werken. Dit is GEEN gegarandeerde
+verlieslimiet en forceert geen sluiting. Bij ontbrekende portefeuilleprijzen geen
+entries/dagreset. Dagbasis is eerste volledige waardering van de UTC-dag.
+
+SIMULATIE
+Instap loopt door asks, uitstap door bids; 0,10% fee per kant en 0,02% extra
+ongunstige slippage per kant. Stop/TP zijn polling-triggers, geen exchange-orders.
+Gaps worden tegen het waargenomen boek verwerkt, NIET tegen de oude stopprijs.
+Kortstondige stop/TP-aanrakingen tussen polls of tijdens downtime worden gemist;
+er is geen retrospectieve uitvoering. Bij onvoldoende boekdiepte blijft een exit
+open en volgt een foutmelding. Vermogen gebruikt laatste beschikbare exitwaarde
+(kan bij storing verouderd zijn); nieuwe entries vereisen verse positieschattingen.
+Geen queue-, marktimpact-, latency- of exchange-filtermodel (lot/tick/min-notional);
+bedragen zijn fractionele paper-eenheden. Resultaten voorspellen geen live rendement.
+Geen HFT, backtest, VPIN, spoofingdetectie, dealer-gamma, ETF-flows, options/OTC,
+annuleringsratio's, 20-daagse marktvergelijking of winstgarantie.
+
+Telegram: startup, paper-entry/exit, storingen en status elke 30 minuten; geen
+remote besturing. Berichten worden asynchroon verzonden; verzending kan mislukken.
+De SQLite events-tabel is het blijvende logboek. Een tweede proces op dezelfde
+database wordt geblokkeerd. Bewaar de database; verwijdering reset de simulatie.
 """
-import asyncio
-import bisect
-from collections import Counter
-from contextlib import suppress
+
+import argparse
+from collections import Counter, deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-import fcntl
-import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
 import math
 import os
 from pathlib import Path
-import random
-import shutil
+import queue
 import signal
 import sqlite3
+import statistics
 import threading
-import tempfile
 import time
-import uuid
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
-import requests
-from polymarket import AsyncPublicClient
-from polymarket.errors import RateLimitError
-from websockets.asyncio.client import connect
-
-VERSION = "1.3-BTC-Lead-TWAP-PAPER"
-PAPER_STAKE = 5.0
-INITIAL_CASH = 1000.0
-
-# ========== TIJDELIJKE TESTWAARDEN ==========
-MIN_NET_EDGE = 0.00          # was 0.03
-MIN_SAMPLES = 40             # was 100
-MIN_DAYS = 2                 # was 3
-# ===========================================
-
-TRAIN_DAYS = 30
+SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
+API = "https://data-api.binance.vision"
+POLL_SECONDS = 10
+FEE = 0.001
+SLIPPAGE = 0.0002
+RISK = 0.005
+MAX_ALLOCATION = 0.25
 MAX_DAILY_LOSS = 0.03
-MAX_DAILY_ENTRIES = 12
-MAX_PRICE = 0.95
-MAX_SPREAD = 0.04
-FEED_MAX_AGE = 2.5
-MAX_TICK_GAP = 3.0
-BOOK_MAX_AGE = 3.0
-LATENCY_SECONDS = 0.5
-SLIPPAGE_TICKS = 1
-CHECKPOINTS = (297, 285, 240, 180, 120, 90, 60, 45, 30, 15)
-GAP_EDGES = (0, 2, 5, 10, 20, 50, float("inf"))
-SCHEMA = "btc_chainlink60_projected_v1"
-DATA_DIR = Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or os.getenv("BOT_DATA_DIR", "data"))
-DB_NAME = "btc_lead_v1.sqlite3"
-WS_URL = "wss://ws-live-v2.polymarket.com/ws"
-SPOT, TWAP = "price.crypto", "price.crypto.twap"
-LOG = logging.getLogger("btc-lead")
+MAX_POSITIONS = 2
+MIN_DEPTH = 50_000.0
+MIN_VOLUME = 20_000_000.0
+LOG = logging.getLogger("liquidity")
+STOP = threading.Event()
+HEALTH = {"mode": "PAPER ONLY", "last_success": None}
 
 
-class Skip(Exception):
+class DataError(Exception):
     pass
 
 
-class StorageError(RuntimeError):
-    pass
+def positive(value):
+    n = float(value)
+    if not math.isfinite(n) or n <= 0:
+        raise DataError("Ongeldige numerieke marktwaarde")
+    return n
 
 
-def number(value):
-    result = float(value)
-    if not math.isfinite(result):
-        raise Skip("niet_eindig_getal")
-    return result
+class Market:
+    def __init__(self):
+        self.pause_until = 0.0
+        self.cache = {}
+        self.offset = 0.0
+        self.synced = 0.0
 
-
-def day(timestamp):
-    return datetime.fromtimestamp(timestamp, timezone.utc).date().isoformat()
-
-
-def unix_ms(value):
-    result = number(value) / 1000
-    if result < 1_600_000_000:
-        raise Skip("timestamp_eenheid")
-    return result
-
-
-def gap_bin(bp):
-    return max(0, min(len(GAP_EDGES) - 2, bisect.bisect_right(GAP_EDGES, abs(bp)) - 1))
-
-
-def wilson_lower(wins, n, z=1.96):
-    if n <= 0:
-        return 0.0
-    p = wins / n
-    return (p + z * z / (2 * n) - z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))) / (1 + z * z / n)
-
-
-def history_estimate(rows, now):
-    valid = [r for r in rows if now - TRAIN_DAYS * 86400 <= r[0] < now
-             and r[1] < r[2] < now and r[3] in (0, 1)]
-    unique = {r[0]: r for r in valid}
-    n = len(unique)
-    wins = sum(r[3] for r in unique.values())
-    days = len({day(r[0]) for r in unique.values()})
-    return {"n": n, "wins": wins, "days": days, "p": wins / n if n else None,
-            "lower": wilson_lower(wins, n), "ready": n >= MIN_SAMPLES and days >= MIN_DAYS}
-
-
-def atomic_json(path, data):
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8") as output:
-        json.dump(data, output, indent=2, ensure_ascii=False, allow_nan=False)
-        output.flush()
-        os.fsync(output.fileno())
-    os.replace(temporary, path)
-    directory = os.open(str(path.parent), os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
-
-
-def mounted_path(path):
-    if os.path.ismount(path):
-        return True
-    try:
-        for line in Path("/proc/self/mountinfo").read_text().splitlines():
-            fields = line.split()
-            if len(fields) < 5:
-                continue
-            mountpoint = fields[4]
-            for encoded, decoded in ((r"\040", " "), (r"\011", "\t"), (r"\012", "\n"), (r"\134", "\\")):
-                mountpoint = mountpoint.replace(encoded, decoded)
-            if Path(mountpoint).resolve() == path:
-                return True
-    except OSError:
-        pass
-    return False
-
-
-def storage_status(directory):
-    directory = directory.resolve()
-    mount = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
-    railway = bool(os.getenv("RAILWAY_SERVICE_ID") or os.getenv("RAILWAY_PROJECT_ID")
-                   or os.getenv("RAILWAY_ENVIRONMENT_ID"))
-    mounted = False
-    if mount:
-        root = Path(mount).resolve()
-        mounted = directory.is_relative_to(root) and mounted_path(root)
-    return {
-        "path": str(directory),
-        "railway": railway,
-        "volume_verified": mounted,
-        "mount_path_configured": bool(mount),
-        # ========== TIJDELIJK GEFROCEERD VOOR TEST ==========
-        "entries_allowed": True,
-        # ===================================================
-        "status": ("volume_gecontroleerd" if mounted else
-                   "Railway_volume_niet_bevestigd" if railway else "lokale_opslag")
-    }
-
-
-class PublicReads:
-    TIMEOUTS = {"markt": 8, "orderboek": 3, "afrekening": 5}
-
-    def __init__(self, notify=None):
-        self.notify, self.states = notify, {}
-
-    def ready(self, operation):
-        return time.monotonic() >= self.states.get(operation, {}).get("retry_mono", 0)
-
-    async def call(self, operation, function, **kwargs):
-        state = self.states.setdefault(operation, {
-            "failures": 0, "retry_mono": 0,
-            "last_ok": None, "last_error": None, "last_notice": None
-        })
-        if not self.ready(operation):
-            raise Skip("api_wachttijd_" + operation)
+    def get(self, path, **params):
+        if time.monotonic() < self.pause_until:
+            raise DataError("API-pauze wegens limiet/blokkade")
+        started = time.monotonic()
         try:
-            result = await asyncio.wait_for(function(**kwargs), self.TIMEOUTS[operation])
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            now, mono = time.time(), time.monotonic()
-            status = 429 if isinstance(exc, RateLimitError) else getattr(exc, "status", None)
-            if type(status) is not int or not 100 <= status <= 599:
-                status = None
-            state["failures"] += 1
-            delay = min(300, 10 * 2 ** min(state["failures"] - 1, 5))
-            if status in (400, 401, 403, 422):
-                delay = max(60, delay)
-            suggested = getattr(exc, "retry_after", None)
-            if type(suggested) in (int, float) and math.isfinite(suggested) and suggested >= 0:
-                delay = max(delay, suggested)
-            state["retry_mono"] = mono + delay
-            state["last_error"] = {
-                "at": now, "operation": operation, "http_status": status,
-                "type": type(exc).__name__, "wait_seconds": delay
-            }
-            if state["last_notice"] is None or mono - state["last_notice"] >= 300:
-                state["last_notice"] = mono
-                message = (f"API {operation}: HTTP {status or 'onbekend'} "
-                           f"({type(exc).__name__}); wachttijd {delay:.0f}s.")
-                if status in (401, 403):
-                    message += " Toegang/configuratie controleren als dit aanhoudt."
-                (self.notify or LOG.warning)(message)
-            raise Skip(f"api_{operation}_http_{status or 'onbekend'}") from None
-        state.update(failures=0, retry_mono=0, last_ok=time.time())
+            req = Request(API + path + "?" + urlencode(params),
+                          headers={"User-Agent": "LiquidityGuard-Paper/1.0"})
+            with urlopen(req, timeout=5) as response:
+                result = json.load(response)
+        except HTTPError as exc:
+            if exc.code in (418, 429):
+                try:
+                    delay = max(60, float(exc.headers.get("Retry-After", "120")))
+                except ValueError:
+                    delay = 120
+                self.pause_until = max(self.pause_until, time.monotonic() + delay)
+            elif exc.code in (403, 451):
+                self.pause_until = max(self.pause_until, time.monotonic() + 900)
+            raise DataError(f"Publieke API HTTP {exc.code}") from None
+        except (URLError, TimeoutError, OSError, ValueError):
+            raise DataError("Publieke API niet bereikbaar of ongeldige JSON") from None
+        if time.monotonic() - started > 3:
+            raise DataError("Data-aanvraag duurde meer dan 3 seconden")
+        if isinstance(result, dict) and "code" in result:
+            raise DataError("Publieke API retourneert een foutcode")
         return result
 
-    def summary(self):
-        now = time.monotonic()
-        return {
-            name: {
-                "consecutive_failures": state["failures"],
-                "retry_in_seconds": max(0, math.ceil(state["retry_mono"] - now)),
-                "last_ok": state["last_ok"],
-                "last_error": state["last_error"]
-            }
-            for name, state in self.states.items()
-        }
+    def now(self):
+        return time.time() + self.offset
+
+    def sync(self):
+        if time.monotonic() - self.synced < 300:
+            return
+        before = time.time()
+        stamp = self.get("/api/v3/time")["serverTime"] / 1000
+        self.offset = stamp - (before + time.time()) / 2
+        self.synced = time.monotonic()
+
+    def book(self, symbol):
+        raw = self.get("/api/v3/depth", symbol=symbol, limit=500)
+        bids = [(positive(p), positive(q)) for p, q in raw["bids"]]
+        asks = [(positive(p), positive(q)) for p, q in raw["asks"]]
+        if not bids or not asks or bids[0][0] >= asks[0][0]:
+            raise DataError("Leeg/gekruist orderboek")
+        if bids != sorted(bids, reverse=True) or asks != sorted(asks):
+            raise DataError("Orderboek niet gesorteerd")
+        return {"bids": bids, "asks": asks, "id": int(raw["lastUpdateId"]),
+                "received": time.monotonic()}
+
+    def context(self, symbol):
+        now = self.now()
+        # Fetch candle/ticker again if a 5-minute boundary was crossed.
+        key = int(now // 300)
+        cached = self.cache.get(symbol)
+        if cached and cached[0] == key and time.monotonic() - cached[1] < 60:
+            return cached[2], cached[3]
+        candles = self.get("/api/v3/klines", symbol=symbol, interval="5m", limit=120)
+        ticker = self.get("/api/v3/ticker/24hr", symbol=symbol)
+        self.cache[symbol] = (key, time.monotonic(), candles, ticker)
+        return candles, ticker
+
+    def trades(self, symbol):
+        return self.get("/api/v3/aggTrades", symbol=symbol, limit=1000)
 
 
-class Reference:
-    def __init__(self):
-        self.points = {SPOT: {}, TWAP: {}}
-        self.anchors, self.invalid_anchors = {}, set()
-        self.connected, self.state = False, "wachten_op_feed"
-        self.sequences, self.acks = {}, set()
-
-    def reset(self):
-        self.points = {SPOT: {}, TWAP: {}}
-        self.sequences.clear()
-        self.acks.clear()
-        self.connected, self.state = False, "wachten_op_feed"
-
-    def apply(self, msg, now):
-        channel = msg.get("channel")
-        if channel not in self.points:
-            return []
-        if msg.get("v") != 1:
-            raise Skip("feed_protocol")
-        seq = msg.get("seq")
-        if type(seq) is not int:
-            raise Skip("feed_sequence_ontbreekt")
-        previous = self.sequences.get(channel)
-        if msg.get("dropped", 0) or (previous is not None and seq != previous + 1):
-            raise Skip("feed_sequence_gat")
-        payload = msg.get("payload", {})
-        if payload.get("symbol") != "btcusd" or payload.get("source") != "chainlink":
-            raise Skip("verkeerde_referentiebron")
-        if channel == TWAP and payload.get("window_seconds") != 60:
-            raise Skip("verkeerd_twap_venster")
-        items = payload.get("data", []) if msg.get("snapshot") is True else [payload]
-        if not isinstance(items, list):
-            raise Skip("feed_snapshot_formaat")
-        pending = {}
-        for item in items:
-            ts = unix_ms(item["timestamp"])
-            value = number(item.get("full_accuracy_value", item.get("value")))
-            if value <= 0 or ts > now + 0.5 or now - ts > 600:
-                raise Skip("feed_prijs_of_tijd")
-            if item.get("is_carried_forward") or payload.get("is_carried_forward"):
-                raise Skip("feed_doorgerolde_prijs")
-            existing = pending.get(ts) or self.points[channel].get(ts)
-            if channel == TWAP and ts in self.anchors:
-                existing = self.anchors[ts]
-            if existing and not math.isclose(existing[0], value, rel_tol=1e-12):
-                if channel == TWAP and ts % 300 == 0:
-                    self.invalid_anchors.add(ts)
-                raise Skip("feed_herziening")
-            pending[ts] = (value, now)
-        self.sequences[channel] = seq
-        self.points[channel].update(pending)
-        if channel == TWAP:
-            for ts, value in pending.items():
-                if ts % 300 == 0:
-                    self.anchors.setdefault(ts, value)
-        for kind in self.points:
-            self.points[kind] = {t: v for t, v in self.points[kind].items() if t >= now - 900}
-        self.anchors = {t: v for t, v in self.anchors.items() if t >= now - 900}
-        self.invalid_anchors = {t for t in self.invalid_anchors if t >= now - 900}
-        self.connected = self.acks == {SPOT, TWAP}
-        self.state = "verbonden" if self.connected else "wachten_op_abonnement"
-        return [(channel, ts, value[0], value[1]) for ts, value in pending.items()]
-
-    def current(self, now):
-        if not self.connected or not self.points[SPOT] or not self.points[TWAP]:
-            raise Skip("chainlink_niet_gereed")
-        for kind in (SPOT, TWAP):
-            ts = max(self.points[kind])
-            _, received = self.points[kind][ts]
-            if not 0 <= now - ts <= FEED_MAX_AGE or not 0 <= now - received <= FEED_MAX_AGE:
-                raise Skip("chainlink_verouderd")
-        ts = max(self.points[SPOT])
-        return ts, self.points[SPOT][ts][0]
-
-    def strike(self, start, now):
-        if start in self.invalid_anchors:
-            raise Skip("start_twap_herzien_geblokkeerd")
-        point = self.anchors.get(float(start)) or self.points[TWAP].get(float(start))
-        if point is None or point[1] > now:
-            raise Skip("start_twap_ontbreekt")
-        return point[0]
-
-    def projected(self, end, now, spot):
-        begin = end - 60
-        samples = sorted((t, v[0]) for t, v in self.points[SPOT].items() if t <= now and v[1] <= now)
-        before = [(t, v) for t, v in samples if t <= begin]
-        if not before or begin - before[-1][0] > MAX_TICK_GAP:
-            raise Skip("eind_twap_historie_ontbreekt")
-        last_ts, last_price = before[-1]
-        cursor, integral = begin, 0.0
-        for ts, price in samples:
-            if ts <= begin:
-                continue
-            if ts - last_ts > MAX_TICK_GAP:
-                raise Skip("eind_twap_datagat")
-            integral += last_price * (ts - cursor)
-            cursor, last_ts, last_price = ts, ts, price
-        if now - last_ts > FEED_MAX_AGE:
-            raise Skip("eind_twap_verouderd")
-        integral += last_price * (now - cursor)
-        return (integral + spot * (end - now)) / 60, integral, now - begin
-
-    def feature(self, market, now):
-        remaining = market["end"] - now
-        if not 0 < remaining <= 300:
-            raise Skip("buiten_ronde")
-        spot_ts, spot = self.current(now)
-        strike = self.strike(market["start"], now)
-        if remaining <= 60:
-            reference, integral, elapsed = self.projected(market["end"], now, spot)
-            kind = "projected_twap"
-        else:
-            reference, integral, elapsed, kind = spot, None, 0.0, "spot_lead"
-        bp = (reference / strike - 1) * 10000
-        if abs(bp) < 1e-8:
-            raise Skip("geen_voorsprong")
-        return {
-            "kind": kind, "side": "UP" if bp > 0 else "DOWN", "gap_bp": abs(bp),
-            "gap_bin": gap_bin(bp), "strike": strike, "spot": spot, "spot_ts": spot_ts,
-            "reference": reference, "integral": integral, "elapsed_final": elapsed,
-            "remaining": remaining, "at": now
-        }
+def ema(values, period):
+    out = [values[0]]
+    alpha = 2 / (period + 1)
+    for value in values[1:]:
+        out.append(alpha * value + (1 - alpha) * out[-1])
+    return out
 
 
-def quote(book, market, side, budget, now):
-    if str(book.asset_id) != market["assets"][side] or str(book.condition_id) != market["condition"]:
-        raise Skip("verkeerd_orderboek")
-    if book.timestamp is None or not -0.5 <= now - book.timestamp.timestamp() <= BOOK_MAX_AGE:
-        raise Skip("orderboek_verouderd")
-    tick, minimum = number(book.tick_size), number(book.min_order_size)
-    if not 0 < tick < 1 or minimum <= 0 or budget <= 0:
-        raise Skip("orderboek_metadata")
-    bids = [(number(x.price), number(x.size)) for x in book.bids]
-    asks = [(number(x.price), number(x.size)) for x in book.asks]
-    if any(not 0 < p < 1 or size < 0 for p, size in bids + asks):
-        raise Skip("ongeldig_orderboek")
-    bids = [(p, s) for p, s in bids if s > 0]
-    asks = [(p, s) for p, s in asks if s > 0]
-    if not asks or not bids:
-        raise Skip("leeg_orderboek")
-    spread = min(p for p, s in asks) - max(p for p, s in bids)
-    if not 0 < spread <= MAX_SPREAD:
-        raise Skip("spread")
-    left, qty, fees, notional = budget, 0.0, 0.0, 0.0
-    for raw, size in sorted(asks):
-        price = raw + tick * SLIPPAGE_TICKS
-        if price > MAX_PRICE:
-            break
-        fee = market["fee_rate"] * (price * (1 - price)) ** market["fee_exponent"]
-        take = min(size, left / (price + fee))
-        qty += take
-        fees += take * fee
-        notional += take * price
-        left -= take * (price + fee)
-        if left < 1e-9:
-            break
-    if left > 1e-6:
-        raise Skip("onvoldoende_dieptes_onder_prijsplafond")
-    qty = math.floor(qty * 1e6) / 1e6
-    if qty < minimum:
-        raise Skip("minimum_aandelen")
-    return {
-        "qty": qty, "spent": notional + fees, "fee": fees, "vwap": notional / qty,
-        "all_in": (notional + fees) / qty, "spread": spread,
-        "price_bin": min(9, int((notional / qty) * 10)), "book_ts": book.timestamp.timestamp()
-    }
+def candle_signal(raw, now):
+    closed = [c for c in raw if int(c[6]) < now * 1000]
+    if len(closed) < 60 or not 0 <= now * 1000 - int(closed[-1][6]) <= 360_000:
+        raise DataError("Onvoldoende of verouderde gesloten candles")
+    if any(int(b[0]) - int(a[0]) != 300_000 for a, b in zip(closed, closed[1:])):
+        raise DataError("Gat in candlehistorie")
+    closes = [positive(c[4]) for c in closed]
+    fast, slow = ema(closes, 20), ema(closes, 50)
+    ranges = [max(positive(c[2]) - positive(c[3]),
+                  abs(float(c[2]) - closes[i - 1]),
+                  abs(float(c[3]) - closes[i - 1]))
+              for i, c in enumerate(closed) if i > 0]
+    atr = statistics.mean(ranges[:14])
+    for tr in ranges[14:]:
+        atr = (atr * 13 + tr) / 14
+    positive(atr)
+    c = closed[-1]
+    volume_ok = positive(c[7]) >= statistics.median([positive(x[7]) for x in closed[-21:-1]])
+    trend = closes[-1] > fast[-1] > slow[-1] and fast[-1] > fast[-2]
+    momentum = closes[-1] > positive(c[1]) and closes[-1] > closes[-2]
+    return {"ok": trend and momentum and volume_ok, "atr": atr,
+            "close": closes[-1], "candle": int(c[0])}
 
 
-async def discover(client, start, api):
-    slug = f"btc-updown-5m-{start}"
-    m = await api.call("markt", client.get_market, slug=slug)
-    state = m.state
-    if (m.slug != slug or not m.condition_id or state.end_date is None
-            or abs(state.end_date.timestamp() - start - 300) > 0.1):
-        raise Skip("verkeerde_markt_of_eindtijd")
-    if state.closed or not state.active or not state.accepting_orders or not state.enable_order_book:
-        raise Skip("markt_niet_open")
-    description = (m.description or "").lower()
-    if "chainlink" not in description or not any(x in description for x in ("twap", "time-weighted", "time weighted")):
-        raise Skip("twap_marktregels_niet_bevestigd")
-    source = str(m.resolution.source or "")
-    if not source.startswith("https://data.chain.link/") or "btc-usd-twap-60s" not in source:
-        raise Skip("60s_btc_resolutiebron_niet_bevestigd")
-    schedule = m.trading.fee_schedule
-    if m.trading.fees_enabled is not False and schedule is None:
-        raise Skip("fee_onbekend")
-    rate = number(schedule.rate) if schedule and m.trading.fees_enabled is not False else 0.0
-    exponent = number(schedule.exponent) if schedule else 1.0
-    if not 0 <= rate <= 1 or not 0 <= exponent <= 10:
-        raise Skip("fee_schema_ongeldig")
-    version = getattr(m.version, "value", m.version)
-    if version not in ("v1", "v2"):
-        raise Skip("marktversie_onbekend")
-    assets, indices = {}, {}
-    for index, outcome in enumerate((m.outcomes.yes, m.outcomes.no)):
-        label = outcome.label.strip().upper()
-        asset = outcome.position_id if version == "v2" else outcome.token_id
-        if label not in ("UP", "DOWN") or not asset:
-            raise Skip("uitkomst_mapping")
-        assets[label], indices[label] = str(asset), index
-    if len(assets) != 2 or len(set(assets.values())) != 2:
-        raise Skip("uitkomst_mapping")
-    return {
-        "start": start, "end": start + 300, "slug": slug, "condition": str(m.condition_id),
-        "assets": assets, "indices": indices, "fee_rate": rate, "fee_exponent": exponent,
-        "seconds_delay": max(0, number(m.trading.seconds_delay or 0)),
-        "rules_hash": hashlib.sha256((description + source).encode()).hexdigest(),
-        "description": description, "resolution_source": source
-    }
+def trade_pressure(trades, now):
+    recent = [t for t in trades if 0 <= now * 1000 - int(t["T"]) <= 30_000]
+    if len(recent) < 10 or now * 1000 - max(int(t["T"]) for t in recent) > 15_000:
+        raise DataError("Te weinig recente transacties")
+    total = sum(positive(t["p"]) * positive(t["q"]) for t in recent)
+    # m=True means buyer is maker: the aggressor is a SELLER.
+    buys = sum(float(t["p"]) * float(t["q"]) for t in recent if t["m"] is False)
+    return buys / total
 
 
-def payout(resolutions, market):
-    matches = [r for r in resolutions if str(r.condition_id) == market["condition"]
-               and getattr(r.status, "value", r.status) == "resolved"]
-    if len(matches) != 1 or matches[0].payouts is None:
-        return None
-    values = [number(x) for x in matches[0].payouts]
-    if len(values) != 2 or any(x < 0 or x > 1 for x in values) or abs(sum(values) - 1) > 1e-8:
-        raise Skip("ongeldige_officiele_uitbetaling")
-    return {side: values[index] for side, index in market["indices"].items()}
+def book_metrics(book):
+    bid, ask = book["bids"][0][0], book["asks"][0][0]
+    mid = (bid + ask) / 2
+    low, high = mid * 0.999, mid * 1.001
+    covered = book["bids"][-1][0] <= low and book["asks"][-1][0] >= high
+    buy_depth = sum(p * q for p, q in book["bids"] if p >= low)
+    sell_depth = sum(p * q for p, q in book["asks"] if p <= high)
+    total = buy_depth + sell_depth
+    return {"spread": (ask - bid) / mid * 10_000, "bid_depth": buy_depth,
+            "ask_depth": sell_depth, "covered": covered,
+            "imbalance": (buy_depth - sell_depth) / total if total else 0}
 
 
-def validation_protocol():
-    return {
-        "decision_model": "BTC_LEAD_RULES_V1_2", "schema": SCHEMA, "stake": PAPER_STAKE,
-        "min_edge": MIN_NET_EDGE, "min_samples": MIN_SAMPLES, "min_days": MIN_DAYS,
-        "train_days": TRAIN_DAYS, "checkpoints": list(CHECKPOINTS),
-        "gap_edges": list(GAP_EDGES[:-1]) + ["inf"], "max_price": MAX_PRICE,
-        "max_spread": MAX_SPREAD, "slippage_ticks": SLIPPAGE_TICKS,
-        "feed_max_age": FEED_MAX_AGE, "book_max_age": BOOK_MAX_AGE, "max_tick_gap": MAX_TICK_GAP,
-        "latency_seconds": LATENCY_SECONDS, "fee": "market_metadata_per_level",
-        "max_daily_entries": MAX_DAILY_ENTRIES, "max_daily_loss": MAX_DAILY_LOSS,
-        "test_min_closed": 200, "test_min_utc_days": 14,
-        "interval": "UTC_day_block_bootstrap_2000_seed_731",
-        "fill_model": "PAPER_taker_quote_after_latency_plus_slippage",
-        "decision": "past_resolved_matching_cells_wilson_lower"
-    }
+def regime(history, m, now):
+    if not m["covered"]:
+        return "ONDUIDELIJK"
+    if len(history) < 30 or now - history[0][0] < 300:
+        return "OPWARMEN"
+    spread = statistics.median(x[1] for x in history)
+    bids = statistics.median(x[2] for x in history)
+    asks = statistics.median(x[3] for x in history)
+    fragile = (m["spread"] > 8 or m["spread"] > 2 * spread
+               or m["bid_depth"] < max(MIN_DEPTH, 0.55 * bids)
+               or m["ask_depth"] < max(MIN_DEPTH, 0.55 * asks))
+    return "FRAGIEL" if fragile else "STABIEL"
 
 
-def audit_trades(db, protocol_id=None):
-    audit_at = time.time()
-    errors, audited, prospective = [], [], []
-    prospective_open = 0
-    positions = [dict(row) for row in db.execute("SELECT * FROM positions ORDER BY entered,start")]
-    account = dict(db.execute("SELECT * FROM account WHERE id=1").fetchone())
-    protocol = None
-    if protocol_id is None:
-        candidates = []
-        for key, value in db.execute("SELECT key,value FROM metadata WHERE key LIKE 'validation_%'"):
-            try:
-                record = json.loads(value)
-                candidates.append((record["started"], key[len("validation_"):], record))
-            except (TypeError, ValueError, KeyError):
-                errors.append({"check": "protocol_metadata_ongeldig"})
-        if candidates:
-            _, protocol_id, protocol = max(candidates, key=lambda item: item[0])
-    else:
-        row = db.execute("SELECT value FROM metadata WHERE key=?", ("validation_" + protocol_id,)).fetchone()
-        if row:
-            protocol = json.loads(row[0])
-    if protocol is not None and protocol.get("protocol") != validation_protocol():
-        errors.append({"check": "protocol_komt_niet_overeen_met_deze_code"})
-    spent_total, proceeds_total = 0.0, 0.0
-    for trade in positions:
-        start = trade["start"]
-        try:
-            for key in ("spent", "fee", "qty", "entered"):
-                if not math.isfinite(trade[key]):
-                    raise ValueError()
-            if not 0 < trade["spent"] or not 0 < trade["qty"] or not 0 <= trade["fee"] <= trade["spent"]:
-                raise ValueError()
-            spent_total += trade["spent"]
-            details = json.loads(trade["details"])
-            is_current = protocol_id is not None and details.get("validation_protocol") == protocol_id
-            market_row = db.execute("SELECT * FROM markets WHERE start=?", (start,)).fetchone()
-            if market_row is None or trade["side"] not in ("UP", "DOWN"):
-                raise ValueError()
-            m = json.loads(market_row["data"])
-            if not start <= trade["entered"] < m["end"] or trade["entered"] > audit_at:
-                errors.append({"start": start, "check": "instap_buiten_marktronde"})
-            if trade["resolved_at"] is None:
-                if is_current:
-                    prospective_open += 1
-                if trade["proceeds"] is not None or trade["pnl"] is not None:
-                    errors.append({"start": start, "check": "open_positie_met_eindresultaat"})
-            else:
-                for key in ("proceeds", "pnl", "resolved_at"):
-                    if not math.isfinite(trade[key]):
-                        raise ValueError()
-                proceeds_total += trade["proceeds"]
-                pay = market_row["up"] if trade["side"] == "UP" else market_row["down"]
-                other = market_row["down"] if trade["side"] == "UP" else market_row["up"]
-                if (pay is None or other is None or not 0 <= pay <= 1 or not 0 <= other <= 1
-                        or not math.isclose(pay + other, 1, abs_tol=1e-8)
-                        or market_row["resolved_at"] is None
-                        or trade["resolved_at"] < max(trade["entered"], m["end"]) or trade["resolved_at"] > audit_at):
-                    raise ValueError()
-                if not math.isclose(trade["proceeds"], trade["qty"] * pay, abs_tol=1e-6):
-                    errors.append({"start": start, "check": "uitbetaling_verschilt_van_aandelen_maal_opgeslagen_payout"})
-                if not math.isclose(trade["pnl"], trade["proceeds"] - trade["spent"], abs_tol=1e-6):
-                    errors.append({"start": start, "check": "netto_pnl_klopt_niet"})
-                audited.append(trade)
-                if is_current:
-                    prospective.append(trade)
-            if is_current:
-                f, q, estimate = details["feature"], details["quote"], details["estimate"]
-                if (not all(math.isfinite(f[key]) for key in ("remaining", "at", "reference", "strike", "gap_bp", "spot_ts"))
-                        or not all(math.isfinite(q[key]) for key in ("spread", "vwap", "all_in", "spent", "fee", "qty", "book_ts"))
-                        or f["strike"] <= 0 or f["reference"] <= 0):
-                    raise ValueError()
-                if protocol is None or trade["entered"] < protocol["started"]:
-                    errors.append({"start": start, "check": "instap_voor_vastleggen_testprotocol"})
-                cp = min(CHECKPOINTS, key=lambda x: abs(x - f["remaining"]))
-                observation = db.execute(
-                    "SELECT * FROM observations WHERE start=? AND checkpoint=?", (start, cp)
-                ).fetchone()
-                if observation is None:
-                    raise ValueError()
-                when = observation["at"]
-                rows = db.execute("""
-                    SELECT o.start,o.at,m.resolved_at,o.result
-                    FROM observations o JOIN markets m USING(start)
-                    WHERE o.checkpoint=? AND o.kind=? AND o.side=? AND o.gap_bin=? AND o.price_bin=?
-                    AND o.start>=? AND m.resolved_at<? AND o.result IN (0,1)
-                """, (cp, f["kind"], f["side"], f["gap_bin"], q["price_bin"],
-                      when - TRAIN_DAYS * 86400, when)).fetchall()
-                rebuilt = history_estimate(rows, when)
-                if (not rebuilt["ready"] or estimate.get("n") != rebuilt["n"]
-                        or estimate.get("wins") != rebuilt["wins"]
-                        or estimate.get("days") != rebuilt["days"]
-                        or not math.isclose(estimate["p"], rebuilt["p"], abs_tol=1e-10)
-                        or not math.isclose(estimate["lower"], rebuilt["lower"], abs_tol=1e-10)):
-                    errors.append({"start": start, "check": "kansschatting_niet_reproduceerbaar_uit_toen_bekende_uitslagen"})
-                signed_bp = (f["reference"] / f["strike"] - 1) * 10000
-                if (trade["side"] != f["side"] or f["side"] != ("UP" if signed_bp > 0 else "DOWN")
-                        or gap_bin(signed_bp) != f["gap_bin"]
-                        or (observation["kind"], observation["side"], observation["gap_bin"], observation["price_bin"])
-                        != (f["kind"], f["side"], f["gap_bin"], q["price_bin"])):
-                    errors.append({"start": start, "check": "signaal_of_historische_categorie_wijkt_af"})
-                if (abs(f["remaining"] - cp) > 3 or not math.isclose(f["at"], trade["entered"], abs_tol=1e-6)
-                        or trade["entered"] - when + 1e-6 < max(LATENCY_SECONDS, m.get("seconds_delay", 0))
-                        or not -0.5 <= trade["entered"] - q["book_ts"] <= BOOK_MAX_AGE):
-                    errors.append({"start": start, "check": "tijd_of_latencycontrole_mislukt"})
-                if (rebuilt["lower"] - q["all_in"] < MIN_NET_EDGE - 1e-9
-                        or trade["spent"] > PAPER_STAKE + 1e-6
-                        or not 0 < q["spread"] <= MAX_SPREAD
-                        or q["vwap"] > MAX_PRICE + 2e-6):
-                    errors.append({"start": start, "check": "instapvoorwaarden_niet_gehaald"})
-                if (not math.isclose(q["spent"], trade["spent"], abs_tol=1e-6)
-                        or not math.isclose(q["qty"], trade["qty"], abs_tol=1e-6)
-                        or not math.isclose(q["fee"], trade["fee"], abs_tol=1e-6)
-                        or not math.isclose(q["all_in"] * q["qty"], q["spent"], abs_tol=1e-6)
-                        or not math.isclose(q["vwap"] * q["qty"] + q["fee"], q["spent"], abs_tol=1e-6)):
-                    errors.append({"start": start, "check": "aankoopkosten_of_aandelen_kloppen_niet"})
-                boundary = datetime.fromtimestamp(trade["entered"], timezone.utc).replace(
-                    hour=0, minute=0, second=0, microsecond=0
-                ).timestamp()
-                prior_spent = db.execute(
-                    "SELECT COALESCE(SUM(spent),0) FROM positions WHERE entered<?", (trade["entered"],)
-                ).fetchone()[0]
-                prior_proceeds = db.execute(
-                    "SELECT COALESCE(SUM(proceeds),0) FROM positions WHERE resolved_at<=?", (trade["entered"],)
-                ).fetchone()[0]
-                prior_pnl = db.execute(
-                    "SELECT COALESCE(SUM(pnl),0) FROM positions WHERE resolved_at<?", (boundary,)
-                ).fetchone()[0]
-                earlier_today = db.execute(
-                    "SELECT COUNT(*) FROM positions WHERE entered>=? AND entered<?", (boundary, trade["entered"])
-                ).fetchone()[0]
-                overlap = db.execute(
-                    "SELECT 1 FROM positions WHERE entered<? AND (resolved_at IS NULL OR resolved_at>?) LIMIT 1",
-                    (trade["entered"], trade["entered"])
-                ).fetchone()
-                cash_before = account["initial"] - prior_spent + prior_proceeds
-                if (overlap or earlier_today >= MAX_DAILY_ENTRIES or cash_before < trade["spent"]
-                        or cash_before - trade["spent"] < (account["initial"] + prior_pnl) * (1 - MAX_DAILY_LOSS) - 1e-6):
-                    errors.append({"start": start, "check": "risicolimiet_of_overlappende_positie"})
-        except (KeyError, TypeError, ValueError, ZeroDivisionError, OverflowError):
-            errors.append({"start": start, "check": "onvolledige_of_ongeldige_handel"})
-    if not math.isclose(account["cash"], account["initial"] - spent_total + proceeds_total, abs_tol=1e-6):
-        errors.append({"check": "kasboek_sluit_niet_aan"})
-    prospective.sort(key=lambda x: (x["resolved_at"], x["start"]))
-    n = len(prospective)
-    wins = sum(t["pnl"] > 0 for t in prospective)
-    pnl = sum(t["pnl"] for t in prospective)
-    fees = sum(t["fee"] for t in prospective)
-    notional = sum(t["spent"] for t in prospective)
-    equity = peak = drawdown = 0.0
-    days = {}
-    for trade in prospective:
-        equity += trade["pnl"]
-        peak = max(peak, equity)
-        drawdown = max(drawdown, peak - equity)
-        bucket = days.setdefault(day(trade["entered"]), [0.0, 0.0])
-        bucket[0] += trade["pnl"]
-        bucket[1] += trade["spent"]
-    interval = None
-    verdict = "GEEN_AFGERONDE_TRADES" if n == 0 else "VOORLOPIG_ONVOLDOENDE_HANDELSRESULTATEN"
-    if n >= 200 and len(days) >= 14:
-        rng = random.Random(731)
-        blocks = list(days.values())
-        samples = []
-        for _ in range(2000):
-            draw = [rng.choice(blocks) for _ in blocks]
-            samples.append(sum(x[0] for x in draw) / sum(x[1] for x in draw))
-        samples.sort()
-        interval = [samples[49], samples[1949]]
-        verdict = ("POSITIEF_BINNEN_DEZE_PAPERPROEF" if interval[0] > 0 else
-                   "NEGATIEF_BINNEN_DEZE_PAPERPROEF" if interval[1] < 0 else "GEEN_OVERTUIGENDE_POSITIEVE_EDGE")
-    if errors:
-        verdict = "CONTROLEFOUTEN_EERST_HERSTELLEN"
-    return {
-        "at": time.time(), "version": VERSION, "protocol_id": protocol_id,
-        "protocol": protocol, "errors": errors, "verdict": verdict,
-        "all_recorded_positions": len(positions), "all_closed_positions": len(audited),
-        "prospective_closed": n, "prospective_open": prospective_open,
-        "wins": wins, "win_rate": wins / n if n else None, "utc_days": len(days),
-        "net_pnl": pnl, "estimated_entry_fees": fees, "turnover": notional,
-        "net_return_on_turnover": pnl / notional if notional else None,
-        "max_realised_drawdown": drawdown, "day_block_interval_95": interval,
-        "minimum_evaluation": {"closed_trades": 200, "utc_days": 14},
-        "limitations": [
-            "PAPER fills are simulated, not exchange-confirmed executions.",
-            "Fee arithmetic is checked; full historical L2 books are unavailable for independent fill reconstruction.",
-            "Stored official payouts are checked against the ledger; the audit does not query the oracle independently.",
-            "A positive interval for this period does not guarantee future profit."
-        ]
-    }
-
-
-def validation_text(result):
-    n = result["prospective_closed"]
-    win = f"{result['win_rate']:.1%}" if n else "n.v.t."
-    return (
-        f"HANDELSCONTROLE {VERSION}\n"
-        f"Protocol: {result['protocol_id'] or 'nog geen prospectieve proef'}\n"
-        f"Afgeronde trades in deze proef: {n}; open {result['prospective_open']}\n"
-        f"Netto PAPER {result['net_pnl']:+.2f} USD; geschatte fees {result['estimated_entry_fees']:.4f}\n"
-        f"Winratio {win}; UTC-handelsdagen {result['utc_days']}\n"
-        f"Grootste gerealiseerde terugval {result['max_realised_drawdown']:.2f} USD\n"
-        f"Administratie/besliscontrole: {len(result['errors'])} fouten\n"
-        f"Oordeel: {result['verdict']}\n"
-        "Voor een voorlopig statistisch oordeel: 200 afgeronde trades op 14 UTC-handelsdagen.\n"
-        "Paperfills blijven simulaties. /export levert de onderzoeksdatabase voor nadere controle."
-    )
-
-
-def export_research_database(source_path):
-    handle = tempfile.NamedTemporaryFile(
-        prefix="btc_onderzoek_", suffix=".sqlite3", dir=source_path.parent, delete=False
-    )
-    target_path = Path(handle.name)
-    handle.close()
-    source = sqlite3.connect(source_path.as_uri() + "?mode=ro", uri=True, timeout=5)
-    target = sqlite3.connect(target_path)
-    tables = (
-        "account", "markets", "observations", "positions", "skips", "metadata",
-        "measurement_attempts", "reference_observations", "invalid_anchors"
-    )
-    try:
-        source.execute("BEGIN")
-        for table in tables:
-            schema = source.execute(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
-            ).fetchone()
-            if schema is None:
-                continue
-            target.execute(schema[0])
-            cursor = source.execute("SELECT * FROM " + table)
-            placeholders = ",".join("?" for _ in cursor.description)
-            while True:
-                rows = cursor.fetchmany(500)
-                if not rows:
-                    break
-                target.executemany("INSERT INTO " + table + " VALUES(" + placeholders + ")", rows)
-        target.execute("CREATE TABLE export_info(at REAL, scope TEXT)")
-        target.execute(
-            "INSERT INTO export_info VALUES(?,?)",
-            (time.time(), "research_snapshot_without_raw_ticks_or_credentials")
-        )
-        target.commit()
-        if target.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-            raise StorageError("Onderzoeksexport mislukt bij integriteitscontrole.")
-        if target_path.stat().st_size > 45 * 1024 * 1024:
-            raise StorageError("Onderzoeksexport te groot voor deze Telegram-overdracht; download via Railway.")
-        return target_path
-    except BaseException:
-        target_path.unlink(missing_ok=True)
-        raise
-    finally:
-        source.close()
-        target.close()
+def fill(levels, qty, buy):
+    if qty <= 0:
+        raise DataError("Ongeldige ordergrootte")
+    remaining, value = qty, 0.0
+    for price, size in levels:
+        take = min(remaining, size)
+        value += take * price
+        remaining -= take
+        if remaining <= qty * 1e-10:
+            return value / qty * (1 + SLIPPAGE if buy else 1 - SLIPPAGE)
+    raise DataError("Onvoldoende boekdiepte voor volledige paper-uitvoering")
 
 
 class Store:
-    def __init__(self, path):
-        self.path = Path(path).resolve()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.manifest_path = self.path.parent / "btc_lead_storage.json"
-        self.storage = storage_status(self.path.parent)
-        previous = None
-        if self.manifest_path.exists():
-            try:
-                previous = json.loads(self.manifest_path.read_text(encoding="utf-8"))
-                if not isinstance(previous, dict) or not previous.get("database_id"):
-                    raise ValueError()
-            except (ValueError, OSError):
-                raise StorageError("Opslagmarker onleesbaar; database niet automatisch vervangen.") from None
-        existed = self.path.is_file() and self.path.stat().st_size > 0
-        if previous and not existed:
-            raise StorageError(
-                "Opslagmarker aanwezig maar database ontbreekt. Herstel de bestaande database; geen lege vervanger aangemaakt."
-            )
-        self.db = sqlite3.connect(self.path, timeout=5)
-        self.db.row_factory = sqlite3.Row
-        try:
-            if self.db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-                raise StorageError("SQLite-controle mislukt; herstel uit een gecontroleerde back-up.")
-            self.db.execute("PRAGMA journal_mode=WAL")
-            self.db.execute("PRAGMA synchronous=FULL")
-            self.db.executescript("""
-                CREATE TABLE IF NOT EXISTS account(
-                    id INTEGER PRIMARY KEY CHECK(id=1), schema TEXT,
-                    initial REAL, cash REAL, day TEXT, day_start REAL, entries INTEGER
-                );
-                CREATE TABLE IF NOT EXISTS markets(
-                    start INTEGER PRIMARY KEY, data TEXT NOT NULL,
-                    resolved_at REAL, up REAL, down REAL, last_poll REAL DEFAULT 0
-                );
-                CREATE TABLE IF NOT EXISTS observations(
-                    start INTEGER, checkpoint INTEGER, at REAL,
-                    kind TEXT, side TEXT, gap_bin INTEGER, price_bin INTEGER, details TEXT,
-                    result INTEGER, PRIMARY KEY(start,checkpoint)
-                );
-                CREATE INDEX IF NOT EXISTS obs_cell ON observations(checkpoint,kind,side,gap_bin,price_bin);
-                CREATE TABLE IF NOT EXISTS positions(
-                    start INTEGER PRIMARY KEY, side TEXT, qty REAL,
-                    spent REAL, fee REAL, entered REAL, details TEXT,
-                    resolved_at REAL, proceeds REAL, pnl REAL
-                );
-                CREATE TABLE IF NOT EXISTS ticks(
-                    channel TEXT, ts REAL, value REAL, received REAL,
-                    PRIMARY KEY(channel,ts)
-                );
-                CREATE TABLE IF NOT EXISTS skips(reason TEXT PRIMARY KEY, count INTEGER);
-                CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS measurement_attempts(
-                    start INTEGER, checkpoint INTEGER,
-                    at REAL NOT NULL, status TEXT NOT NULL, PRIMARY KEY(start,checkpoint)
-                );
-                CREATE TABLE IF NOT EXISTS reference_observations(
-                    start INTEGER, checkpoint INTEGER,
-                    at REAL NOT NULL, details TEXT NOT NULL, PRIMARY KEY(start,checkpoint)
-                );
-                CREATE TABLE IF NOT EXISTS invalid_anchors(start REAL PRIMARY KEY);
-            """)
-            with self.db:
-                self.db.execute(
-                    "INSERT OR IGNORE INTO account VALUES(1,?,?,?,?,?,0)",
-                    (SCHEMA, INITIAL_CASH, INITIAL_CASH, day(time.time()), INITIAL_CASH)
-                )
-                self.db.execute(
-                    "INSERT OR IGNORE INTO metadata VALUES('database_id',?)",
-                    (uuid.uuid4().hex,)
-                )
-            self.database_id = self.db.execute(
-                "SELECT value FROM metadata WHERE key='database_id'"
-            ).fetchone()[0]
-            expected = os.getenv("BOT_EXPECTED_DB_ID", "").strip()
-            if expected and expected != self.database_id:
-                raise StorageError("Database-ID wijkt af van BOT_EXPECTED_DB_ID. Controleer volume en opslagpad.")
-            if self.account()["schema"] != SCHEMA:
-                raise StorageError("Database hoort bij een andere strategie; niet overschrijven.")
-            self.verify()
-            counts = self.counts()
-            if previous:
-                if previous["database_id"] != self.database_id:
-                    raise StorageError("Database-ID verschilt van de opslagmarker; niet verder schrijven.")
-                for key in ("observations", "markets", "positions"):
-                    if counts[key] < previous.get("counts", {}).get(key, 0):
-                        raise StorageError(
-                            "Database bevat minder historie dan de opslagmarker; controleer herstel of opslagpad."
-                        )
-            self.startup = "bestaande_database" if existed else "NIEUWE_LEGE_DATABASE"
-            self.resumed_counts = counts
-            self.protocol = validation_protocol()
-            self.protocol_id = hashlib.sha256(
-                json.dumps(self.protocol, sort_keys=True).encode()
-            ).hexdigest()[:16]
-            with self.db:
-                self.db.execute(
-                    "INSERT OR IGNORE INTO metadata VALUES(?,?)",
-                    ("validation_" + self.protocol_id, json.dumps({"started": time.time(), "protocol": self.protocol}))
-                )
-            self.check_disk()
-            if existed:
-                self.backup()
-            self.save_manifest()
-        except Exception:
-            self.db.close()
-            raise
+    def __init__(self, path, initial):
+        Path(path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(str(Path(path).expanduser()), timeout=0)
+        # SQLite keeps the exclusive database lock across commits in this mode.
+        self.db.execute("PRAGMA locking_mode=EXCLUSIVE")
+        self.db.execute("PRAGMA synchronous=FULL")
+        self.db.execute("CREATE TABLE IF NOT EXISTS state (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, timestamp TEXT, payload TEXT)")
+        row = self.db.execute("SELECT payload FROM state WHERE id=1").fetchone()
+        self.s = json.loads(row[0]) if row else {
+            "version": 1, "cash": initial, "positions": {}, "last_entry": {},
+            "day": "", "day_equity": initial, "halt": False, "losses": 0,
+            "daily_entries": 0, "trades": 0, "wins": 0, "realized": 0.0}
+        if self.s.get("version") != 1:
+            raise ValueError("Onbekende databaseversie; niet automatisch resetten")
+        if not math.isfinite(self.s["cash"]) or self.s["cash"] < 0:
+            raise ValueError("Ongeldig opgeslagen saldo")
+        self.save()
 
-    def account(self):
-        return dict(self.db.execute("SELECT * FROM account WHERE id=1").fetchone())
-
-    def counts(self):
-        return {
-            table: self.db.execute("SELECT COUNT(*) FROM " + table).fetchone()[0]
-            for table in ("observations", "markets", "positions", "reference_observations")
-        }
-
-    def verify(self):
-        account = self.account()
-        spent, proceeds = self.db.execute(
-            "SELECT COALESCE(SUM(spent),0),COALESCE(SUM(proceeds),0) FROM positions"
-        ).fetchone()
-        values = (account["initial"], account["cash"], spent, proceeds)
-        if not all(isinstance(v, (float, int)) and math.isfinite(v) for v in values):
-            raise StorageError("Paperboekhouding bevat ongeldige bedragen.")
-        if not math.isclose(account["cash"], account["initial"] - spent + proceeds, abs_tol=1e-6):
-            raise StorageError("Paperboekhouding sluit niet aan; gestopt.")
-        orphan = self.db.execute(
-            "SELECT 1 FROM positions p LEFT JOIN markets m USING(start) WHERE m.start IS NULL LIMIT 1"
-        ).fetchone()
-        if orphan:
-            raise StorageError("Paperpositie zonder marktgegevens; herstel nodig voor afrekening.")
-
-    def check_disk(self):
-        if shutil.disk_usage(self.path.parent).free < 50 * 1024 * 1024:
-            raise StorageError("Minder dan 50 MB vrije opslag; vergroot of ruim het volume op.")
-
-    def save_manifest(self):
-        atomic_json(self.manifest_path, {
-            "database_id": self.database_id,
-            "at": time.time(),
-            "version": VERSION,
-            "counts": self.counts(),
-            "database_path": str(self.path)
-        })
-
-    def backup(self):
-        folder = self.path.parent / "backups"
-        folder.mkdir(exist_ok=True)
-        destination = folder / ("btc_lead_" + day(time.time()) + ".sqlite3")
-        if destination.exists():
-            return
-        self.check_disk()
-        temporary = destination.with_suffix(".tmp")
-        if shutil.disk_usage(self.path.parent).free < self.path.stat().st_size + 50 * 1024 * 1024:
-            raise StorageError("Onvoldoende vrije ruimte voor een consistente databaseback-up.")
-        source = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=5)
-        target = sqlite3.connect(temporary)
-        try:
-            source.backup(target, pages=512)
-            if target.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-                raise StorageError("Back-upcontrole mislukt.")
-        finally:
-            target.close()
-            source.close()
-        with temporary.open("rb") as stream:
-            os.fsync(stream.fileno())
-        os.replace(temporary, destination)
-        for old in sorted(folder.glob("btc_lead_*.sqlite3"))[:-2]:
-            old.unlink()
-
-    def roll_day(self, now):
-        account = self.account()
-        if account["day"] != day(now):
-            reserved = self.db.execute(
-                "SELECT COALESCE(SUM(spent),0) FROM positions WHERE resolved_at IS NULL"
-            ).fetchone()[0]
-            with self.db:
-                self.db.execute(
-                    "UPDATE account SET day=?,day_start=?,entries=0 WHERE id=1",
-                    (day(now), account["cash"] + reserved)
-                )
-
-    def skip(self, reason):
+    def save(self, event=None):
         with self.db:
-            self.db.execute(
-                "INSERT INTO skips VALUES(?,1) ON CONFLICT(reason) DO UPDATE SET count=count+1",
-                (reason,)
-            )
+            self.db.execute("INSERT OR REPLACE INTO state VALUES (1, ?)",
+                            (json.dumps(self.s, allow_nan=False),))
+            if event:
+                self.db.execute("INSERT INTO events(timestamp,payload) VALUES (?,?)",
+                                (datetime.now(timezone.utc).isoformat(), json.dumps(event, allow_nan=False)))
 
-    def market(self, market):
-        row = self.db.execute("SELECT data FROM markets WHERE start=?", (market["start"],)).fetchone()
-        if row:
-            saved = json.loads(row[0])
-            if any(saved.get(key) != market.get(key) for key in ("condition", "assets", "indices", "rules_hash")):
-                raise StorageError("Marktidentiteit of regels veranderden binnen dezelfde ronde.")
-        with self.db:
-            self.db.execute(
-                "INSERT OR IGNORE INTO markets(start,data) VALUES(?,?)",
-                (market["start"], json.dumps(market))
-            )
+    def equity(self):
+        return self.s["cash"] + sum(p["mark_value"] for p in self.s["positions"].values())
 
-    def ticks(self, rows):
-        with self.db:
-            self.db.executemany("INSERT OR IGNORE INTO ticks VALUES(?,?,?,?)", rows)
+    def day_guard(self, now):
+        day = datetime.fromtimestamp(now, timezone.utc).date().isoformat()
+        s, eq = self.s, self.equity()
+        if s["day"] != day:
+            s.update(day=day, day_equity=eq, halt=False, losses=0, daily_entries=0)
+        if eq <= s["day_equity"] * (1 - MAX_DAILY_LOSS) or s["losses"] >= 3:
+            s["halt"] = True
 
-    def invalidate_anchors(self, starts):
-        with self.db:
-            self.db.executemany("INSERT OR IGNORE INTO invalid_anchors VALUES(?)", [(x,) for x in starts])
-
-    def start_prices(self, now):
-        rows = self.db.execute("""
-            SELECT ts,value,received FROM ticks
-            WHERE channel=? AND ts>=? AND ts<=? AND received<=?
-            AND ts NOT IN (SELECT start FROM invalid_anchors)
-        """, (TWAP, now - 900, now, now)).fetchall()
-        return {
-            ts: (value, received) for ts, value, received in rows
-            if math.isfinite(ts) and ts % 300 == 0 and math.isfinite(value) and value > 0
-            and math.isfinite(received) and received >= ts - 0.5
-        }
-
-    def claim_attempt(self, start, checkpoint, now):
-        if self.observed(start, checkpoint):
-            return False
-        with self.db:
-            cursor = self.db.execute(
-                "INSERT OR IGNORE INTO measurement_attempts VALUES(?,?,?,'gestart')",
-                (start, checkpoint, now)
-            )
-        return cursor.rowcount == 1
-
-    def finish_attempt(self, start, checkpoint, status):
-        with self.db:
-            self.db.execute(
-                "UPDATE measurement_attempts SET status=? WHERE start=? AND checkpoint=?",
-                (status, start, checkpoint)
-            )
-
-    def reference_observe(self, start, checkpoint, feature):
-        with self.db:
-            self.db.execute(
-                "INSERT OR IGNORE INTO reference_observations VALUES(?,?,?,?)",
-                (start, checkpoint, feature["at"], json.dumps(feature))
-            )
-
-    def estimate(self, checkpoint, feature, quote_data, now):
-        rows = self.db.execute("""
-            SELECT o.start,o.at,m.resolved_at,o.result
-            FROM observations o JOIN markets m USING(start)
-            WHERE checkpoint=? AND kind=? AND side=? AND gap_bin=? AND price_bin=?
-            AND o.start>=? AND m.resolved_at<? AND o.result IN (0,1)
-        """, (
-            checkpoint, feature["kind"], feature["side"], feature["gap_bin"], quote_data["price_bin"],
-            now - TRAIN_DAYS * 86400, now
-        )).fetchall()
-        return history_estimate(rows, now)
-
-    def observed(self, start, checkpoint):
-        return self.db.execute(
-            "SELECT 1 FROM observations WHERE start=? AND checkpoint=?", (start, checkpoint)
-        ).fetchone() is not None
-
-    def observe(self, market, checkpoint, feature, quote_data, estimate):
-        with self.db:
-            self.db.execute(
-                "INSERT OR IGNORE INTO observations VALUES(?,?,?,?,?,?,?,?,NULL)",
-                (
-                    market["start"], checkpoint, feature["at"], feature["kind"], feature["side"],
-                    feature["gap_bin"], quote_data["price_bin"],
-                    json.dumps({"feature": feature, "quote": quote_data, "estimate_before_result": estimate})
-                )
-            )
-
-    def can_enter(self, start, spent):
-        if not self.storage["entries_allowed"]:
-            raise Skip("paperinstap_geblokkeerd_volume_niet_bevestigd")
-        if not math.isfinite(spent):
-            raise Skip("ongeldig_paperbedrag")
-        if self.db.execute("SELECT 1 FROM positions WHERE start=?", (start,)).fetchone():
-            raise Skip("al_gehandeld_deze_ronde")
-        if self.db.execute("SELECT 1 FROM positions WHERE resolved_at IS NULL").fetchone():
-            raise Skip("positie_of_afrekening_nog_open")
-        account = self.account()
-        if account["entries"] >= MAX_DAILY_ENTRIES:
-            raise Skip("daglimiet_aantal")
-        if spent > PAPER_STAKE + 1e-6 or spent <= 0 or account["cash"] < spent:
-            raise Skip("onvoldoende_paperbudget")
-        if account["cash"] - spent < account["day_start"] * (1 - MAX_DAILY_LOSS) - 1e-6:
-            raise Skip("daglimiet_maximaal_verlies")
-
-    def enter(self, market, feature, quote_data, estimate, now):
-        self.can_enter(market["start"], quote_data["spent"])
-        details = json.dumps({
-            "feature": feature, "quote": quote_data, "estimate": estimate,
-            "validation_protocol": self.protocol_id
-        })
-        with self.db:
-            self.db.execute(
-                "INSERT INTO positions VALUES(?,?,?,?,?,?,?,NULL,NULL,NULL)",
-                (market["start"], feature["side"], quote_data["qty"], quote_data["spent"],
-                 quote_data["fee"], now, details)
-            )
-            self.db.execute(
-                "UPDATE account SET cash=cash-?,entries=entries+1 WHERE id=1",
-                (quote_data["spent"],)
-            )
-        self.verify()
-
-    def settle(self, market, pay, now):
-        if (set(pay) != {"UP", "DOWN"} or any(not math.isfinite(x) or not 0 <= x <= 1 for x in pay.values())
-                or abs(sum(pay.values()) - 1) > 1e-8):
-            raise Skip("ongeldige_officiele_uitbetaling")
-        row = self.db.execute("SELECT resolved_at FROM markets WHERE start=?", (market["start"],)).fetchone()
-        if row is None or row[0] is not None:
+    def open(self, symbol, book, info, now):
+        s = self.s
+        if (s["halt"] or s["daily_entries"] >= 6 or symbol in s["positions"]
+                or len(s["positions"]) >= MAX_POSITIONS
+                or s["last_entry"].get(symbol) == info["candle"]):
             return None
-        trade = self.db.execute(
-            "SELECT * FROM positions WHERE start=? AND resolved_at IS NULL", (market["start"],)
-        ).fetchone()
-        result = None
-        with self.db:
-            self.db.execute(
-                "UPDATE markets SET resolved_at=?,up=?,down=? WHERE start=?",
-                (now, pay["UP"], pay["DOWN"], market["start"])
-            )
-            if sorted(pay.values()) == [0.0, 1.0]:
-                for side in ("UP", "DOWN"):
-                    self.db.execute(
-                        "UPDATE observations SET result=? WHERE start=? AND side=?",
-                        (int(pay[side]), market["start"], side)
-                    )
-            if trade:
-                proceeds = trade["qty"] * pay[trade["side"]]
-                pnl = proceeds - trade["spent"]
-                self.db.execute(
-                    "UPDATE positions SET resolved_at=?,proceeds=?,pnl=? WHERE start=?",
-                    (now, proceeds, pnl, market["start"])
-                )
-                self.db.execute("UPDATE account SET cash=cash+? WHERE id=1", (proceeds,))
-                result = {"side": trade["side"], "pnl": pnl, "proceeds": proceeds}
-        self.verify()
-        return result
+        estimate = book["asks"][0][0] * (1 + SLIPPAGE)
+        distance = max(1.5 * info["atr"], estimate * 0.005)
+        budget = self.equity() * RISK
+        unit_risk = distance + 2 * estimate * (FEE + SLIPPAGE)
+        allocation = min(self.equity() * MAX_ALLOCATION, s["cash"] * 0.95)
+        qty = min(budget / unit_risk, allocation / (estimate * (1 + FEE)))
+        entry = fill(book["asks"], qty, True)
+        distance = max(1.5 * info["atr"], entry * 0.005)
+        # Re-size against actual simulated execution and estimated stop costs.
+        qty = min(qty, budget / (distance + 2 * entry * (FEE + SLIPPAGE)),
+                  allocation / (entry * (1 + FEE)))
+        entry = fill(book["asks"], qty, True)
+        distance = max(1.5 * info["atr"], entry * 0.005)
+        cost = qty * entry * (1 + FEE)
+        if cost < 10 or cost > s["cash"] or distance >= entry:
+            return None
+        stop = entry - distance
+        target = entry + 1.8 * distance
+        mark = qty * fill(book["bids"], qty, False) * (1 - FEE)
+        p = {"qty": qty, "entry": entry, "cost": cost, "stop": stop,
+             "target": target, "opened": now, "mark_value": mark}
+        s["cash"] -= cost
+        s["positions"][symbol] = p
+        s["last_entry"][symbol] = info["candle"]
+        s["daily_entries"] += 1
+        event = {"type": "PAPER_ENTRY", "symbol": symbol, **p}
+        self.save(event)
+        return f"PAPER LONG {symbol}\nInleg {cost:.2f} USDT | entry {entry:.6g}\nSL {stop:.6g} | TP {target:.6g}"
 
-    def close(self):
-        try:
-            self.save_manifest()
-            self.db.execute("PRAGMA wal_checkpoint(PASSIVE)")
-        finally:
-            self.db.close()
+    def close(self, symbol, book, reason, now):
+        s, p = self.s, self.s["positions"][symbol]
+        price = fill(book["bids"], p["qty"], False)
+        proceeds = p["qty"] * price * (1 - FEE)
+        pnl = proceeds - p["cost"]
+        s["cash"] += proceeds
+        s["realized"] += pnl
+        s["trades"] += 1
+        s["wins"] += int(pnl > 0)
+        s["losses"] = s["losses"] + 1 if pnl < 0 else 0
+        del s["positions"][symbol]
+        event = {"type": "PAPER_EXIT", "symbol": symbol, "reason": reason,
+                 "price": price, "pnl_net": pnl, "time": now, "position": p}
+        self.save(event)
+        return f"PAPER EXIT {symbol} | {reason}\nNetto {pnl:+.2f} USDT, inclusief fees/slippage\nTotaal gerealiseerd {s['realized']:+.2f} USDT"
+
+
+class Alerts:
+    def __init__(self, enabled=True):
+        self.token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip().removeprefix("bot")
+        self.chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+        self.enabled = enabled and bool(self.token and self.chat)
+        self.q = queue.Queue(maxsize=100)
+        if self.enabled:
+            threading.Thread(target=self.worker, daemon=True).start()
+
+    def send(self, message):
+        LOG.info(message.replace("\n", " | "))
+        if self.enabled:
+            try:
+                self.q.put_nowait(message)
+            except queue.Full:
+                LOG.warning("Telegram-wachtrij vol; bericht alleen gelogd")
+
+    def worker(self):
+        while True:
+            msg = self.q.get()
+            try:
+                body = urlencode({"chat_id": self.chat, "text": msg}).encode()
+                req = Request(f"https://api.telegram.org/bot{self.token}/sendMessage", data=body)
+                with urlopen(req, timeout=8) as response:
+                    if not json.load(response).get("ok"):
+                        LOG.warning("Telegram weigerde bericht; controleer chat-ID/token")
+            except Exception:
+                # Never log exception/URL: it contains the Telegram token.
+                LOG.warning("Telegram-verzending mislukt; controleer token/chat-ID/netwerk")
+            finally:
+                self.q.task_done()
 
 
 class Bot:
-    def __init__(self, store):
-        self.store, self.ref = store, Reference()
-        self.started = time.time()
-        self.ref.anchors = store.start_prices(self.started)
-        self.ref.invalid_anchors = {
-            r[0] for r in store.db.execute(
-                "SELECT start FROM invalid_anchors WHERE start>=?", (self.started - 900,)
-            )
-        }
-        self.market, self.discovery, self.discovery_start = None, None, None
-        self.last_discovery = self.last_report = self.last_maintenance = 0
-        self.last_cell = None
-        self.messages = asyncio.Queue(maxsize=50)
-        self.api = PublicReads(self.notify)
-        self.previous_counts = Counter(dict(store.db.execute("SELECT reason,count FROM skips")))
-        self.previous_observed = store.counts()["observations"]
-        self.previous_report_at = self.started
-        self.attempted, self.notices = set(), {}
-        self.stop = asyncio.Event()
-        self.health = {"version": VERSION, "mode": "PAPER", "status": "starting", "telegram_failures": 0}
+    def __init__(self, store, market, alerts):
+        self.store, self.market, self.alerts = store, market, alerts
+        self.history = {s: deque(maxlen=360) for s in SYMBOLS}
+        self.confirm = Counter()
+        self.fragile = Counter()
+        self.book_ids = {}
+        self.reasons = {}
+        self.last_error = {}
+        self.last_report = 0.0
+        self.pool = ThreadPoolExecutor(max_workers=3)
 
-    def notify(self, message):
-        LOG.info(message)
-        try:
-            self.messages.put_nowait(message)
-        except asyncio.QueueFull:
-            self.health["telegram_queue_dropped"] = self.health.get("telegram_queue_dropped", 0) + 1
+    def error(self, symbol, exc):
+        self.confirm[symbol] = self.fragile[symbol] = 0
+        self.reasons[symbol] = str(exc)
+        if time.monotonic() - self.last_error.get(symbol, -1e10) > 300:
+            self.alerts.send(f"DATASTORING {symbol}: {exc}. Geen nieuwe instap; exits alleen met geldig boek.")
+            self.last_error[symbol] = time.monotonic()
 
-    def notice(self, key, message, interval=900):
-        now = time.monotonic()
-        if now - self.notices.get(key, -1e20) >= interval:
-            self.notices[key] = now
-            self.notify(message)
-
-    async def telegram(self):
-        token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-        if token.startswith("bot"):
-            token = token[3:]
-        chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-        if not token or not chat:
-            LOG.warning("Telegramconfiguratie ontbreekt; berichten zijn wel zichtbaar in de logs.")
-        while True:
-            message = await self.messages.get()
+    def cycle(self):
+        books = {}
+        futures = {s: self.pool.submit(self.market.book, s) for s in SYMBOLS}
+        for symbol, future in futures.items():
             try:
-                if token and chat:
-                    def send():
-                        try:
-                            response = requests.post(
-                                f"https://api.telegram.org/bot{token}/sendMessage",
-                                json={"chat_id": chat, "text": message[:4000], "disable_web_page_preview": True},
-                                timeout=8
-                            )
-                            return response.status_code == 200 and response.json().get("ok") is True
-                        except Exception:
-                            return False
-                    if not await asyncio.to_thread(send):
-                        self.health["telegram_failures"] += 1
-                        LOG.warning("Telegram niet bezorgd; controleer configuratie/verbinding.")
-            finally:
-                self.messages.task_done()
-
-    def validation_report(self):
-        result = audit_trades(self.store.db, self.store.protocol_id)
-        atomic_json(self.store.path.parent / "btc_lead_validation.json", result)
-        self.notify(validation_text(result) + "\nOpslag: " + self.store.storage["status"])
-        return result
-
-    async def handle_command(self, message, token, chat):
-        if str(message.get("chat", {}).get("id", "")) != chat:
-            return False
-        if message.get("from", {}).get("is_bot"):
-            return False
-        at = message.get("date", 0)
-        if not isinstance(at, (int, float)) or at < self.started - 1 or not 0 <= time.time() - at <= 120:
-            return False
-        text = message.get("text", "").strip().split()
-        command = text[0].split("@")[0].lower() if text else ""
-        if command not in ("/toets", "/export"):
-            return False
-        if command == "/toets":
-            self.validation_report()
-            return True
-        if message.get("chat", {}).get("type") != "private":
-            self.notify("Een onderzoeksexport wordt uitsluitend in de ingestelde privéchat geleverd.")
-            return True
-        now = time.monotonic()
-        if now - self.notices.get("export_request", -1e20) < 60:
-            self.notify("Wacht een minuut tussen twee exports.")
-            return True
-        self.notices["export_request"] = now
-        self.store.check_disk()
-        path = None
-        try:
-            path = await asyncio.to_thread(export_research_database, self.store.path)
-
-            def send_document():
+                books[symbol] = future.result()
+            except (DataError, KeyError, TypeError, ValueError) as exc:
+                self.error(symbol, exc)
+        now = self.market.now()
+        # Manage positions BEFORE slower signal requests, independent of entry filters.
+        complete_marks = True
+        for symbol, p in list(self.store.s["positions"].items()):
+            try:
+                book = books.get(symbol)
+                if not book or time.monotonic() - book["received"] > 5:
+                    raise DataError("Geen vers boek voor open positie")
+                p["mark_value"] = p["qty"] * fill(book["bids"], p["qty"], False) * (1 - FEE)
+            except DataError as exc:
+                complete_marks = False
+                self.error(symbol, exc)
+        # Reset the day before realizing the first exit on the new day.
+        if complete_marks:
+            self.store.day_guard(now)
+        for symbol, p in list(self.store.s["positions"].items()):
+            book = books.get(symbol)
+            if not book or time.monotonic() - book["received"] > 5:
+                continue
+            bid = book["bids"][0][0]
+            why = ("STOP" if bid <= p["stop"] else "TARGET" if bid >= p["target"]
+                   else "MAX 4 UUR" if now - p["opened"] >= 14_400 else None)
+            if why:
                 try:
-                    with path.open("rb") as document:
-                        response = requests.post(
-                            f"https://api.telegram.org/bot{token}/sendDocument",
-                            data={
-                                "chat_id": chat,
-                                "caption": "BTC onderzoeksdatabase: consistente momentopname, zonder ruwe ticks of credentials. Deel dit bestand met ChatGPT voor controle."
-                            },
-                            files={"document": (path.name, document, "application/vnd.sqlite3")},
-                            timeout=(5, 30)
-                        )
-                    return response.status_code == 200 and response.json().get("ok") is True
-                except Exception:
-                    return False
-            if not await asyncio.to_thread(send_document):
-                self.notify("Onderzoeksexport niet bezorgd. Controleer verbinding en probeer /export later opnieuw.")
-        except (OSError, sqlite3.Error, StorageError):
-            self.notify("Onderzoeksexport mislukt. Controleer vrije opslag en Railway-logs; gegevens zijn niet verwijderd.")
-        finally:
-            if path is not None:
-                path.unlink(missing_ok=True)
-        return True
-
-    async def telegram_commands(self):
-        token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-        if token.startswith("bot"):
-            token = token[3:]
-        chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-        if not token or not chat:
-            return
-        row = self.store.db.execute("SELECT value FROM metadata WHERE key='telegram_update_offset'").fetchone()
-        offset = int(row[0]) if row else 0
-        while True:
-            def get_updates():
-                try:
-                    response = requests.get(
-                        f"https://api.telegram.org/bot{token}/getUpdates",
-                        params={"offset": offset, "timeout": 5, "limit": 100, "allowed_updates": '["message"]'},
-                        timeout=(5, 8)
-                    )
-                    payload = response.json()
-                    if response.status_code == 200 and payload.get("ok") is True and isinstance(payload.get("result"), list):
-                        return response.status_code, payload["result"], 0
-                    retry = payload.get("parameters", {}).get("retry_after", 10)
-                    return response.status_code, [], retry if type(retry) in (int, float) and math.isfinite(retry) and retry >= 0 else 10
-                except Exception:
-                    return 0, [], 10
-            status, updates, retry = await asyncio.to_thread(get_updates)
-            if status != 200:
-                self.notice(
-                    "telegram_commands",
-                    f"Telegram-opdrachten niet beschikbaar (HTTP {status or 'onbekend'}). Bij 409: controleer webhook of een tweede botproces.",
-                    900
-                )
-                await asyncio.sleep(max(10, retry))
+                    self.alerts.send(self.store.close(symbol, book, why, now))
+                except DataError as exc:
+                    self.error(symbol, exc)
+        if complete_marks:
+            self.store.day_guard(now)
+        # Clock synchronisation is an entry-data prerequisite, not an exit prerequisite.
+        # A failing /time request must not prevent an already observed stop from exiting.
+        self.market.sync()
+        ok_count = 0
+        for symbol in SYMBOLS:
+            if symbol not in books:
                 continue
-            for update in updates:
-                identifier = update.get("update_id")
-                if type(identifier) is not int or identifier < offset:
-                    continue
-                offset = identifier + 1
-                with self.store.db:
-                    self.store.db.execute(
-                        "INSERT INTO metadata VALUES('telegram_update_offset',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                        (str(offset),)
-                    )
-                try:
-                    await self.handle_command(update.get("message", {}), token, chat)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    self.notice("telegram_command_failed", "Telegram-opdracht afgebroken: " + type(exc).__name__)
-            await asyncio.sleep(1)
-
-    async def reference_feed(self):
-        auth = {
-            "apiKey": os.getenv("POLYMARKET_API_KEY", "").strip(),
-            "secret": os.getenv("POLYMARKET_API_SECRET", "").strip(),
-            "passphrase": os.getenv("POLYMARKET_API_PASSPHRASE", "").strip()
-        }
-        if not all(auth.values()):
-            self.ref.state = "API_credentials_ontbreken"
-            self.notify("Referentiefeed: POLYMARKET_API_KEY, POLYMARKET_API_SECRET of POLYMARKET_API_PASSPHRASE ontbreekt.")
-            return
-        delay = 1
-        while True:
-            self.ref.reset()
-            connected_at = time.monotonic()
             try:
-                async with connect(
-                    WS_URL, open_timeout=10, ping_interval=20, ping_timeout=20,
-                    max_queue=1024, max_size=262144
-                ) as websocket:
-                    await websocket.send(json.dumps({"op": "auth", "rid": "a1", "auth": auth}))
-                    reply = json.loads(await asyncio.wait_for(websocket.recv(), 10))
-                    if reply.get("op") != "authed":
-                        raise Skip("feed_auth_mislukt")
-                    await websocket.send(json.dumps({
-                        "op": "subscribe", "rid": "s1", "subscriptions": [
-                            {"channel": SPOT, "filter": {"symbol": "btcusd", "provider": "chainlink"}},
-                            {"channel": TWAP, "filter": {"symbol": "btcusd", "window_seconds": 60}}
-                        ]
-                    }))
-                    while True:
-                        message = json.loads(await asyncio.wait_for(websocket.recv(), 15))
-                        operation = message.get("op")
-                        if operation == "error":
-                            raise Skip("feed_abonnement_geweigerd")
-                        if operation == "subscribed" and message.get("channel") in (SPOT, TWAP):
-                            if message.get("provider") not in (None, "chainlink"):
-                                raise Skip("feed_verkeerde_provider")
-                            self.ref.acks.add(message["channel"])
-                            continue
-                        if operation is not None:
-                            continue
-                        self.store.ticks(self.ref.apply(message, time.time()))
-                        if time.monotonic() - connected_at >= 60:
-                            delay = 1
-            except asyncio.CancelledError:
-                raise
-            except (sqlite3.Error, StorageError):
-                raise
-            except Exception as exc:
-                self.ref.connected = False
-                self.ref.state = str(exc) if isinstance(exc, Skip) else type(exc).__name__
-                self.store.invalidate_anchors(self.ref.invalid_anchors)
-                self.store.skip("referentie_" + self.ref.state)
-                self.notice("feed", "Referentiefeed onderbroken: " + self.ref.state, 300)
-                await asyncio.sleep(min(30, delay) + random.random())
-                delay = min(30, delay * 2)
-
-    async def resolutions(self, client, now):
-        rows = self.store.db.execute("""
-            SELECT m.start,m.data FROM markets m
-            WHERE m.resolved_at IS NULL AND m.start+300<=? AND m.last_poll<=?
-            ORDER BY EXISTS(SELECT 1 FROM positions p WHERE p.start=m.start AND p.resolved_at IS NULL) DESC,
-                     m.last_poll,m.start LIMIT 8
-        """, (now, now - 30)).fetchall()
-        for row in rows:
-            if not self.api.ready("afrekening"):
-                break
-            market = json.loads(row["data"])
-            with self.store.db:
-                self.store.db.execute("UPDATE markets SET last_poll=? WHERE start=?", (time.time(), row["start"]))
-            try:
-                result = await self.api.call("afrekening", client.get_resolutions, condition_ids=market["condition"])
-                pay = payout(result, market)
-                if pay is not None:
-                    trade = self.store.settle(market, pay, time.time())
-                    if trade:
-                        self.notify(
-                            f"PAPER officieel afgerond {trade['side']} | netto {trade['pnl']:+.2f} USD\n{market['slug']}"
-                        )
-            except Skip as exc:
-                self.store.skip(str(exc))
-            except (sqlite3.Error, StorageError):
-                raise
-            except Exception as exc:
-                self.store.skip("afrekening_" + type(exc).__name__)
-                self.notice("afrekening", "Afrekening: onverwacht antwoord (" + type(exc).__name__ + ").")
-
-    async def settlement_worker(self, client):
-        while True:
-            self.store.roll_day(time.time())
-            await self.resolutions(client, time.time())
-            await asyncio.sleep(10)
-
-    async def measure(self, client, checkpoint):
-        market = self.market
-        start = market["start"]
-        self.attempted.add((start, checkpoint))
-        if not self.store.claim_attempt(start, checkpoint, time.time()):
-            return
-        status = "meetpunt_opgeslagen"
-        try:
-            await self._measure(client, checkpoint, market)
-        except asyncio.CancelledError:
-            status = "onderbroken_bij_stop_of_herstart"
-            raise
-        except Skip as exc:
-            status = str(exc)
-            raise
-        except Exception:
-            status = "onderbroken_of_programmafout"
-            raise
-        finally:
-            self.store.finish_attempt(start, checkpoint, status)
-
-    async def _measure(self, client, checkpoint, market):
-        feature = self.ref.feature(market, time.time())
-        self.store.reference_observe(market["start"], checkpoint, feature)
-        requested_side = feature["side"]
-        book = await self.api.call("orderboek", client.get_order_book, asset_id=market["assets"][requested_side])
-        now = time.time()
-        feature = self.ref.feature(market, now)
-        if abs(feature["remaining"] - checkpoint) > 2:
-            raise Skip("meetmoment_gemist")
-        if feature["side"] != requested_side:
-            raise Skip("richting_veranderd_tijdens_orderboek")
-        quote_data = quote(book, market, requested_side, PAPER_STAKE, now)
-        estimate = self.store.estimate(checkpoint, feature, quote_data, now)
-        self.last_cell = {
-            **estimate, "at": now, "gap_bp": feature["gap_bp"],
-            "remaining": round(feature["remaining"]), "side": requested_side,
-            "all_in": quote_data["all_in"], "net_edge": estimate["lower"] - quote_data["all_in"]
-        }
-
-        # ========== EXTRA DEBUG VOOR TEST ==========
-        edge = estimate["lower"] - quote_data["all_in"]
-        self.notify(
-            f"DEBUG {checkpoint}s | {requested_side} | n={estimate['n']} dagen={estimate['days']} "
-            f"| lower={estimate['lower']:.4f} all_in={quote_data['all_in']:.4f} "
-            f"edge={edge:+.4f} (nodig >={MIN_NET_EDGE:.2f})"
-        )
-        # ===========================================
-
-        self.store.observe(market, checkpoint, feature, quote_data, estimate)
-        if not estimate["ready"]:
-            raise Skip("data_verzamelen_onvoldoende_vergelijkbare_rondes")
-        if estimate["lower"] - quote_data["all_in"] < MIN_NET_EDGE:
-            raise Skip("onvoldoende_netto_edge")
-        self.store.can_enter(market["start"], quote_data["spent"])
-        if audit_trades(self.store.db, self.store.protocol_id)["errors"]:
-            raise Skip("handelscontrole_mislukt_eerst_herstellen")
-        await asyncio.sleep(max(LATENCY_SECONDS, market.get("seconds_delay", 0)))
-        book_after = await self.api.call("orderboek", client.get_order_book, asset_id=market["assets"][requested_side])
-        now_after = time.time()
-        feature_after = self.ref.feature(market, now_after)
-        if abs(feature_after["remaining"] - checkpoint) > 3:
-            raise Skip("instap_te_laat")
-        if any(feature_after[key] != feature[key] for key in ("side", "kind", "gap_bin")):
-            raise Skip("voorsprong_veranderd")
-        quote_after = quote(book_after, market, requested_side, PAPER_STAKE, now_after)
-        if quote_after["price_bin"] != quote_data["price_bin"]:
-            raise Skip("prijsklasse_veranderd")
-        if estimate["lower"] - quote_after["all_in"] < MIN_NET_EDGE:
-            raise Skip("edge_verdwenen_na_latency")
-        self.store.enter(market, feature_after, quote_after, estimate, now_after)
-        self.notify(
-            f"PAPER BTC {requested_side} | all-in {quote_after['spent']:.2f} USD\n"
-            f"Lead {feature_after['gap_bp']:.2f} bp | resterend {feature_after['remaining']:.0f}s\n"
-            f"Historisch {estimate['p']:.1%}, ondergrens {estimate['lower']:.1%}; n={estimate['n']}\n"
-            f"Kost/aandeel {quote_after['all_in']:.4f}; geschatte fee {quote_after['fee']:.4f}\n"
-            f"Vasthouden tot officiële uitslag. https://polymarket.com/event/{market['slug']}"
-        )
-
-    async def cycle(self, client):
-        now = time.time()
-        start = int(now // 300) * 300
-        self.store.roll_day(now)
-        self.attempted = {item for item in self.attempted if item[0] == start}
-        if self.discovery is not None and self.discovery.done():
-            task, requested_start = self.discovery, self.discovery_start
-            self.discovery = None
-            try:
-                market = task.result()
-                if requested_start == start:
-                    self.store.market(market)
-                    self.market = market
-            except Skip as exc:
-                self.store.skip(str(exc))
-            except (sqlite3.Error, StorageError):
-                raise
-            except Exception as exc:
-                self.store.skip("marktantwoord_" + type(exc).__name__)
-        needs_market = self.market is None or self.market["start"] != start
-        if needs_market and self.discovery is None and now - self.last_discovery >= 10 and self.api.ready("markt"):
-            self.last_discovery = now
-            self.discovery_start = start
-            self.discovery = asyncio.create_task(discover(client, start, self.api))
-        remaining = start + 300 - time.time()
-        for checkpoint in CHECKPOINTS:
-            key = (start, checkpoint)
-            if key in self.attempted:
-                continue
-            due = start + 300 - checkpoint
-            if due < self.started or remaining > checkpoint:
-                continue
-            if checkpoint - remaining > 1.5:
-                self.attempted.add(key)
-                if self.store.claim_attempt(start, checkpoint, time.time()):
-                    reason = "meetmoment_gemist_markt_niet_gereed" if needs_market else "meetmoment_gemist_planning"
-                    self.store.finish_attempt(start, checkpoint, reason)
-                    self.store.skip(reason)
-                continue
-            if needs_market:
-                continue
-            await self.measure(client, checkpoint)
-            break
-
-    def report(self):
-        now = time.time()
-        account, db = self.store.account(), self.store.db
-        closed, wins, pnl = db.execute(
-            "SELECT COUNT(*),COALESCE(SUM(pnl>0),0),COALESCE(SUM(pnl),0) FROM positions WHERE resolved_at IS NOT NULL"
-        ).fetchone()
-        opened, reserved, oldest = db.execute(
-            "SELECT COUNT(*),COALESCE(SUM(spent),0),MIN(start) FROM positions WHERE resolved_at IS NULL"
-        ).fetchone()
-        counts = self.store.counts()
-        resolved = db.execute("SELECT COUNT(*) FROM markets WHERE resolved_at IS NOT NULL").fetchone()[0]
-        labelled = db.execute("SELECT COUNT(DISTINCT start) FROM observations WHERE result IN (0,1)").fetchone()[0]
-        counters = Counter(dict(db.execute("SELECT reason,count FROM skips")))
-        recent = dict((counters - self.previous_counts).most_common(8))
-        added = counts["observations"] - self.previous_observed
-        interval = max(0, now - self.previous_report_at)
-        last_at = db.execute("SELECT MAX(at) FROM observations").fetchone()[0]
-        stalled = now - self.started >= 900 and (last_at is None or now - last_at >= 900)
-        most_developed = db.execute("""
-            SELECT COUNT(DISTINCT o.start) AS n FROM observations o
-            JOIN markets m USING(start) WHERE o.result IN (0,1) AND o.start>=? AND m.resolved_at<?
-            GROUP BY checkpoint,kind,side,gap_bin,price_bin ORDER BY n DESC LIMIT 1
-        """, (now - TRAIN_DAYS * 86400, now)).fetchone()
-        largest_n = most_developed[0] if most_developed else 0
-        current_start = int(now // 300) * 300
-        anchor_ready = current_start in self.ref.anchors and current_start not in self.ref.invalid_anchors
-        api_status = self.api.summary()
-        api_lines = []
-        for operation, state in api_status.items():
-            if state["consecutive_failures"]:
-                api_lines.append(
-                    f"{operation}: HTTP {state['last_error']['http_status'] or 'onbekend'}, wacht {state['retry_in_seconds']}s"
-                )
-            elif state["last_ok"] is not None:
-                api_lines.append(f"{operation}: gelukt ({max(0, now - state['last_ok']):.0f}s geleden)")
-        cell = self.last_cell
-        if cell:
-            chance = f"{cell['p']:.1%}" if cell["p"] is not None else "onbekend"
-            cell_text = (
-                f"{cell['side']}, n={cell['n']}/{MIN_SAMPLES}, dagen={cell['days']}/{MIN_DAYS}; "
-                f"historisch {chance}, ondergrens {cell['lower']:.1%}, kosten {cell['all_in']:.4f}; "
-                f"edge {cell['net_edge']:+.4f} (nodig {MIN_NET_EDGE:.2f}); {now - cell['at']:.0f}s geleden"
-            )
-        else:
-            cell_text = "nog geen uitvoerbaar meetpunt sinds herstart"
-        pending_age = max(0, now - oldest - 300) if oldest is not None else 0
-        if pending_age >= 1800:
-            self.notice(
-                "pending",
-                "Paperpositie wacht >30 min na markteinde op officiële afrekening. Budget blijft gereserveerd.",
-                1800
-            )
-        report = {
-            "version": VERSION, "at": now, "database_id": self.store.database_id,
-            "storage": self.store.storage, "startup": self.store.startup, "account": account,
-            "closed": closed, "wins": wins, "net_pnl": pnl, "open": opened, "reserved": reserved,
-            **counts, "resolved_markets": resolved, "labelled_markets": labelled,
-            "observations_added": added, "interval_seconds": interval, "last_observation_at": last_at,
-            "collection_stalled": stalled, "recent_skips": recent, "api": api_status,
-            "last_cell": cell, "largest_cell_n": largest_n, "start_twap_ready": anchor_ready,
-            "pending_settlement_seconds": pending_age,
-            "trades": [dict(row) for row in db.execute("SELECT * FROM positions ORDER BY start DESC LIMIT 1000")]
-        }
-        for trade in report["trades"]:
-            trade["details"] = json.loads(trade["details"])
-        self.store.save_manifest()
-        atomic_json(self.store.path.parent / "btc_lead_report.json", report)
-        self.notify(
-            f"{VERSION}\nFeed: {self.ref.state}\n"
-            f"Opslag: {self.store.storage['status']} | DB-ID {self.store.database_id}\n"
-            f"Paper vrij {account['cash']:.2f} | gereserveerd {reserved:.2f} | open {opened}\n"
-            f"Afgeronde trades {closed}, winst {wins}, netto {pnl:+.2f} USD\n"
-            f"Uitvoerbare meetpunten {counts['observations']} (+{added} in {interval / 60:.1f} min); "
-            f"{resolved} afgeronde markten, {labelled} met trainingslabels\n"
-            f"Extra referentiemetingen sinds v1.2: {counts['reference_observations']}\n"
-            f"Grootste historische categorie: {largest_n}/{MIN_SAMPLES} rondes\n"
-            f"Dataverzameling: {'STILSTAND ≥15 min' if stalled else 'opbouw/controle'}\n"
-            f"Start-TWAP: {'bewaard' if anchor_ready else 'ontbreekt/geblokkeerd'}\n"
-            f"API: {'; '.join(api_lines) or 'nog geen aanvraag'}\n"
-            f"Laatste categorie: {cell_text}\n"
-            f"Controles sinds vorig rapport: {json.dumps(recent, ensure_ascii=False)}\n"
-            "PAPER. Gebruik /toets voor de handelscontrole en /export voor de onderzoeksdatabase."
-        )
-        self.previous_counts, self.previous_observed = counters, counts["observations"]
-        self.previous_report_at = now
-
-    async def maintenance(self):
-        while True:
-            await asyncio.sleep(3600)
-            self.store.check_disk()
-            with self.store.db:
-                self.store.db.execute("DELETE FROM ticks WHERE ts<?", (time.time() - 7 * 86400,))
-                self.store.db.execute("DELETE FROM invalid_anchors WHERE start<?", (time.time() - 7 * 86400,))
-            await asyncio.to_thread(self.store.backup)
-
-    async def run(self):
-        startup = self.store.startup
-        counts = self.store.resumed_counts
-        self.notify(
-            f"{VERSION} gestart | PAPER {PAPER_STAKE:.2f} USD\n"
-            f"Opslag: {self.store.storage['status']}\nPad: {self.store.path}\n"
-            f"Database: {startup}\nDB-ID: {self.store.database_id}\n"
-            f"Teruggevonden: {counts['observations']} meetpunten, {counts['positions']} paperposities.\n"
-            f"Eerste vaste meting: 3s na de bel. Instap vereist {MIN_SAMPLES} vergelijkbare rondes en {MIN_DAYS} UTC-kalenderdagen.\n"
-            f"=== TIJDELIJKE TESTMODUS ACTIEF ===\n"
-            f"MIN_NET_EDGE={MIN_NET_EDGE} | MIN_SAMPLES={MIN_SAMPLES} | MIN_DAYS={MIN_DAYS}\n"
-            f"Volume-blokkade uitgezet. Zet terug naar productie-waarden na testen."
-        )
-        if startup == "NIEUWE_LEGE_DATABASE":
-            self.notify(
-                "LET OP: deze start vond geen bestaande database. Als je al meetpunten had, controleer volume/opslagpad. "
-                "Alleen gegevens op dit pad kunnen worden hervat."
-            )
-        if not self.store.storage["entries_allowed"]:
-            self.notify(
-                "Railway-volume niet bevestigd. Verzamelen gaat door; paperinstappen zijn geblokkeerd. "
-                "Koppel een echt volume en bewaar daarop de bestaande database. Maak de volumevariabelen niet zelf aan."
-            )
-        loop = asyncio.get_running_loop()
-        for signum in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(signum, self.stop.set)
-        async with AsyncPublicClient() as client:
-            feed = asyncio.create_task(self.reference_feed())
-            telegram = asyncio.create_task(self.telegram())
-            settlement = asyncio.create_task(self.settlement_worker(client))
-            maintenance = asyncio.create_task(self.maintenance())
-            commands = asyncio.create_task(self.telegram_commands())
-            self.last_validation = 0
-            self.notify(
-                "Handelscontrole actief. /toets = rapport; /export = onderzoeksdatabase. "
-                "Alleen opdrachten uit de ingestelde Telegram-chat worden verwerkt."
-            )
-            try:
-                while not self.stop.is_set():
-                    for task in (feed, settlement, maintenance):
-                        if task.done() and (task.exception() is not None or task is not feed):
-                            raise task.exception() or RuntimeError("Achtergrondtaak onverwacht gestopt")
-                    try:
-                        await self.cycle(client)
-                    except Skip as exc:
-                        self.store.skip(str(exc))
-                    except (sqlite3.Error, RuntimeError, OSError):
-                        raise
-                    except Exception as exc:
-                        self.store.skip("cyclus_" + type(exc).__name__)
-                        self.notice("cyclus", "Cyclus overgeslagen: " + type(exc).__name__)
-                    now = time.time()
-                    try:
-                        self.ref.current(now)
-                        fresh = True
-                    except Skip:
-                        fresh = False
-                    self.health.update(
-                        status="running" if fresh else "degraded",
-                        feed=self.ref.state,
-                        last_cycle=now,
-                        reference_fresh=fresh,
-                        storage=self.store.storage["status"],
-                        last_api=self.api.summary()
-                    )
-                    if commands.done() and commands.exception() is not None:
-                        self.notice(
-                            "commands_error",
-                            "Telegram-opdrachten gestopt: " + type(commands.exception()).__name__
-                        )
-                    if now - self.last_validation >= 86400:
-                        self.last_validation = now
-                        self.validation_report()
-                    if now - self.last_report >= 900:
-                        self.last_report = now
-                        self.store.check_disk()
-                        self.report()
-                    try:
-                        await asyncio.wait_for(self.stop.wait(), 0.25)
-                    except asyncio.TimeoutError:
-                        pass
-            finally:
-                self.health["status"] = "stopping"
-                tasks = [feed, settlement, maintenance, commands]
-                if self.discovery is not None:
-                    tasks.append(self.discovery)
-                for task in tasks:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                with suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(self.messages.join(), 2)
-                telegram.cancel()
-                await asyncio.gather(telegram, return_exceptions=True)
-                for signum in (signal.SIGTERM, signal.SIGINT):
-                    loop.remove_signal_handler(signum)
+                # Fetch signals, then refresh the book so entry does not use an old snapshot.
+                raw, ticker = self.market.context(symbol)
+                flow = trade_pressure(self.market.trades(symbol), self.market.now())
+                book = self.market.book(symbol)
+                now = self.market.now()
+                info = candle_signal(raw, now)
+                if abs(now * 1000 - int(ticker["closeTime"])) > 120_000:
+                    raise DataError("24h-omzet is verouderd")
+                m = book_metrics(book)
+                if book["id"] <= self.book_ids.get(symbol, -1):
+                    raise DataError("Orderboek-update-ID loopt niet op")
+                self.book_ids[symbol] = book["id"]
+                history = self.history[symbol]
+                if history and now - history[-1][0] > 30:
+                    history.clear()
+                    self.confirm[symbol] = self.fragile[symbol] = 0
+                while history and now - history[0][0] > 3600:
+                    history.popleft()
+                label = regime(history, m, now)
+                if m["covered"]:
+                    history.append((now, m["spread"], m["bid_depth"], m["ask_depth"]))
+                self.fragile[symbol] = self.fragile[symbol] + 1 if label == "FRAGIEL" else 0
+                candidate = (label == "STABIEL" and m["imbalance"] >= 0.15 and flow >= 0.58
+                             and positive(ticker["quoteVolume"]) >= MIN_VOLUME and info["ok"]
+                             and abs(book["asks"][0][0] - info["close"]) <= 0.5 * info["atr"])
+                self.confirm[symbol] = self.confirm[symbol] + 1 if candidate else 0
+                self.reasons[symbol] = (f"{label}, spread {m['spread']:.2f}bps, "
+                                        f"koopdruk {flow:.0%}, bevestiging {self.confirm[symbol]}/3")
+                if self.fragile[symbol] >= 3 and symbol in self.store.s["positions"]:
+                    self.alerts.send(self.store.close(symbol, book, "LIQUIDITEIT FRAGIEL", now))
+                # Require fresh liquidation marks for EVERY currently open position.
+                fresh = complete_marks
+                for held, p in self.store.s["positions"].items():
+                    fresh_book = self.market.book(held)
+                    p["mark_value"] = p["qty"] * fill(fresh_book["bids"], p["qty"], False) * (1 - FEE)
+                if fresh:
+                    self.store.day_guard(now)
+                if fresh and self.confirm[symbol] >= 3:
+                    if time.monotonic() - book["received"] > 3:
+                        raise DataError("Entry-boek te oud na portefeuillecontrole")
+                    message = self.store.open(symbol, book, info, now)
+                    if message:
+                        self.alerts.send(message)
+                ok_count += 1
+            except (DataError, KeyError, TypeError, ValueError) as exc:
+                self.error(symbol, exc)
+        self.store.save()
+        if ok_count == len(SYMBOLS):
+            HEALTH["last_success"] = time.time()
+        if time.monotonic() - self.last_report >= 1800:
+            s = self.store.s
+            report = (f"LIQUIDITY GUARD | PAPER\nGeschat vermogen {self.store.equity():.2f} USDT"
+                      f" | cash {s['cash']:.2f}\nOpen {len(s['positions'])} | gesloten {s['trades']}"
+                      f" | netto gerealiseerd {s['realized']:+.2f} USDT\n"
+                      f"Dagpauze {'JA' if s['halt'] else 'nee'} | entries vandaag {s['daily_entries']}/6\n"
+                      + "\n".join(f"{x}: {self.reasons.get(x, 'wacht op data')}" for x in SYMBOLS))
+            self.alerts.send(report)
+            self.last_report = time.monotonic()
 
 
-def health_server(bot):
-    if not os.getenv("PORT"):
-        return None
-
+def health_server(port):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            if self.path not in ("/", "/health", "/ready"):
-                self.send_error(404)
-                return
-            state = dict(bot.health)
-            recent = time.time() - state.get("last_cycle", 0) < 15
-            ready = recent and state.get("reference_fresh", False) and state.get("status") != "stopping"
-            state["ready"] = ready
-            payload = json.dumps(state, allow_nan=False).encode()
-            self.send_response(200 if self.path != "/ready" or ready else 503)
+            last = HEALTH["last_success"]
+            age = time.time() - last if last else None
+            payload = {**HEALTH, "data_age_seconds": age,
+                       "data_ready": age is not None and age < 60}
+            body = json.dumps(payload).encode()
+            code = 503 if self.path == "/ready" and not payload["data_ready"] else 200
+            self.send_response(code)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(payload)
+            self.wfile.write(body)
 
-        def log_message(self, *args):
+        def log_message(self, *_):
             pass
-
-    server = ThreadingHTTPServer(("0.0.0.0", int(os.environ["PORT"])), Handler)
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
 
+def self_test():
+    import tempfile
+    import unittest
+
+    class Tests(unittest.TestCase):
+        def setUp(self):
+            self.tmp = tempfile.TemporaryDirectory()
+            self.path = str(Path(self.tmp.name) / "test.sqlite3")
+            self.store = Store(self.path, 1000)
+            self.book = {"bids": [(99.99, 1000), (99.8, 1000)],
+                         "asks": [(100.01, 1000), (100.2, 1000)]}
+            self.info = {"atr": 1.0, "candle": 123}
+
+        def tearDown(self):
+            self.store.db.close()
+            self.tmp.cleanup()
+
+        def test_fill_walks_book(self):
+            self.assertAlmostEqual(fill([(100, 1), (110, 2)], 2, True), 105 * (1 + SLIPPAGE))
+            with self.assertRaises(DataError):
+                fill([(100, 1)], 2, False)
+
+        def test_fees_and_roundtrip(self):
+            self.store.open("BTCUSDT", self.book, self.info, 1000)
+            self.store.close("BTCUSDT", self.book, "TEST", 1001)
+            s = self.store.s
+            self.assertLess(s["cash"], 1000)
+            self.assertAlmostEqual(s["cash"], 1000 + s["realized"])
+            self.assertEqual(s["trades"], 1)
+
+        def test_gap_is_not_filled_at_stop(self):
+            self.store.open("BTCUSDT", self.book, self.info, 1000)
+            p = dict(self.store.s["positions"]["BTCUSDT"])
+            crash = {"bids": [(90, 1000)]}
+            self.store.close("BTCUSDT", crash, "STOP", 1001)
+            expected = p["qty"] * 90 * (1 - SLIPPAGE) * (1 - FEE) - p["cost"]
+            self.assertAlmostEqual(self.store.s["realized"], expected)
+
+        def test_risk_budget_and_allocation(self):
+            self.store.open("BTCUSDT", self.book, self.info, 1000)
+            p = self.store.s["positions"]["BTCUSDT"]
+            modeled_loss = p["cost"] - p["qty"] * p["stop"] * (1 - SLIPPAGE) * (1 - FEE)
+            self.assertLessEqual(modeled_loss, 1000 * RISK)
+            self.assertLessEqual(p["cost"], 1000 * MAX_ALLOCATION + 1e-9)
+
+        def test_restart_duplicate_and_process_lock(self):
+            self.store.open("BTCUSDT", self.book, self.info, 1000)
+            other = sqlite3.connect(self.path, timeout=0)
+            with self.assertRaises(sqlite3.OperationalError):
+                other.execute("SELECT * FROM state").fetchall()
+            other.close()
+            self.store.close("BTCUSDT", self.book, "TEST", 1001)
+            before = self.store.s["cash"]
+            self.store.db.close()
+            self.store = Store(self.path, 9999)
+            self.assertEqual(self.store.s["cash"], before)
+            self.assertIsNone(self.store.open("BTCUSDT", self.book, self.info, 1002))
+
+        def test_daily_pause_and_reset(self):
+            self.store.day_guard(1000)
+            self.store.s["cash"] = 960
+            self.store.day_guard(1001)
+            self.assertTrue(self.store.s["halt"])
+            self.assertIsNone(self.store.open("BTCUSDT", self.book, self.info, 1002))
+            self.store.day_guard(100_000)
+            self.assertFalse(self.store.s["halt"])
+            self.assertEqual(self.store.s["day_equity"], 960)
+
+        def test_fragility_and_warmup(self):
+            m = book_metrics(self.book)
+            self.assertEqual(regime([], m, 1000), "OPWARMEN")
+            hist = [(i * 10, 2, 100_000, 100_000) for i in range(31)]
+            self.assertEqual(regime(hist, m, 310), "STABIEL")
+            self.assertEqual(regime(hist, {**m, "bid_depth": 10_000}, 310), "FRAGIEL")
+            self.assertEqual(regime(hist, {**m, "covered": False}, 310), "ONDUIDELIJK")
+
+        def test_trade_direction_and_staleness(self):
+            ts = [{"T": 100_000, "p": "100", "q": "1", "m": False} for _ in range(10)]
+            self.assertEqual(trade_pressure(ts, 100), 1)
+            for t in ts:
+                t["m"] = True
+            self.assertEqual(trade_pressure(ts, 100), 0)
+            with self.assertRaises(DataError):
+                trade_pressure(ts, 120)
+
+        def test_unclosed_candle_is_excluded(self):
+            rows = []
+            for i in range(61):
+                p = 100 + i
+                rows.append([i * 300_000, p - .5, p + 1, p - 1, p, 1,
+                             (i + 1) * 300_000 - 1, 100, 1, 1, 1, 0])
+            a = candle_signal(rows, 18_100)
+            rows[-1][4] = 99_999
+            b = candle_signal(rows, 18_100)
+            self.assertEqual(a, b)
+            self.assertTrue(a["ok"])
+
+        def test_full_cycle_entry_exit_and_failed_data(self):
+            class FakeMarket:
+                def __init__(self):
+                    self.t = 36_001.0
+                    self.uid = 0
+                    self.crash = False
+                    self.broken = False
+
+                def sync(self):
+                    pass
+
+                def now(self):
+                    return self.t
+
+                def book(self, symbol):
+                    if self.broken:
+                        raise DataError("synthetische storing")
+                    self.uid += 1
+                    bid, ask = (90, 90.02) if self.crash else (99.99, 100.01)
+                    return {"bids": [(bid, 2000), (bid - .2, 1000)],
+                            "asks": [(ask, 1000), (ask + .2, 1000)],
+                            "id": self.uid, "received": time.monotonic()}
+
+                def context(self, symbol):
+                    rows = []
+                    for i in range(120):
+                        p = 100 - .01 * (119 - i)
+                        rows.append([i * 300_000, p - .005, p + .1, p - .1, p, 1,
+                                     (i + 1) * 300_000 - 1, 100, 1, 1, 1, 0])
+                    return rows, {"closeTime": self.t * 1000, "quoteVolume": 30_000_000}
+
+                def trades(self, symbol):
+                    if self.crash:
+                        raise DataError("transactiestoring na koersgat")
+                    return [{"T": self.t * 1000, "p": "100", "q": "1", "m": False}
+                            for _ in range(20)]
+
+            class Silent:
+                def send(self, _):
+                    pass
+
+            market = FakeMarket()
+            bot = Bot(self.store, market, Silent())
+            try:
+                for symbol in SYMBOLS:
+                    bot.history[symbol].extend((market.t - i * 10, 2, 200_000, 100_000)
+                                               for i in range(32, 0, -1))
+                bot.cycle()
+                self.assertEqual(len(self.store.s["positions"]), 0)
+                market.t += 10
+                bot.cycle()
+                self.assertEqual(len(self.store.s["positions"]), 0)
+                market.t += 10
+                bot.cycle()
+                self.assertEqual(len(self.store.s["positions"]), 2)
+                market.broken = True
+                market.t += 10
+                bot.cycle()
+                self.assertEqual(len(self.store.s["positions"]), 2)
+                self.assertTrue(all(bot.confirm[s] == 0 for s in SYMBOLS))
+                market.broken = False
+                market.crash = True
+                market.t += 10
+                bot.cycle()
+                self.assertEqual(len(self.store.s["positions"]), 0)
+                self.assertEqual(self.store.s["trades"], 2)
+                self.assertLess(self.store.s["realized"], -30)
+                self.assertTrue(self.store.s["halt"])
+            finally:
+                bot.pool.shutdown(wait=True)
+
+    result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Tests))
+    return 0 if result.wasSuccessful() else 1
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Liquidity Guard — PAPER ONLY")
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--once", action="store_true", help="Eén scan, geen Telegram")
+    args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    if not (0 < PAPER_STAKE <= 5 and 0 <= MIN_NET_EDGE < 1 and MIN_SAMPLES >= 20 and MIN_DAYS >= 1):
-        raise RuntimeError("Ongeldige paperconfiguratie")
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    selected = (DATA_DIR / DB_NAME).resolve()
-    if not selected.exists():
-        for alternative in ((Path.cwd() / "data" / DB_NAME).resolve(), Path("/app/data") / DB_NAME):
-            if alternative != selected and alternative.is_file():
-                raise StorageError(
-                    f"Database gevonden op {alternative}, maar gekozen pad is {selected}. "
-                    "Verplaats eerst een consistente SQLite-back-up naar het juiste volume."
-                )
-    with (DATA_DIR / "btc_lead_v1.lock").open("w") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise StorageError("Er draait al een proces op deze database. Gebruik één replica.") from None
-        store = Store(selected)
-        bot = Bot(store)
-        server = health_server(bot)
-        try:
-            asyncio.run(bot.run())
-        finally:
-            if server is not None:
-                server.shutdown()
-                server.server_close()
-            store.close()
+    if args.self_test:
+        return self_test()
+    if os.getenv("PAPER_TRADING", "true").strip().lower() not in ("true", "1", "yes"):
+        parser.error("Deze versie ondersteunt uitsluitend papertrading. Verwijder PAPER_TRADING=false.")
+    initial = positive(os.getenv("INITIAL_CAPITAL", "1000"))
+    store = Store(os.getenv("STATE_FILE", "liquidity.sqlite3"), initial)
+    alerts = Alerts(enabled=not args.once)
+    bot = Bot(store, Market(), alerts)
+    server = health_server(int(os.environ["PORT"])) if os.getenv("PORT") else None
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: STOP.set())
+    alerts.send("LIQUIDITY GUARD gestart | PAPER ONLY\nBTC / ETH / SOL spot; geen echte orders.\nWacht op marktdata; minimaal 5 minuten opwarmen.")
+    try:
+        while not STOP.is_set():
+            start = time.monotonic()
+            try:
+                bot.cycle()
+            except (DataError, KeyError, TypeError, ValueError) as exc:
+                for symbol in SYMBOLS:
+                    bot.confirm[symbol] = bot.fragile[symbol] = 0
+                bot.error("ALGEMEEN", exc)
+            if args.once:
+                return 0 if HEALTH["last_success"] else 2
+            STOP.wait(max(1, POLL_SECONDS - (time.monotonic() - start)))
+    finally:
+        bot.pool.shutdown(wait=True)
+        store.save()
+        store.db.close()
+        if server:
+            server.shutdown()
+        LOG.info("Gestopt. Paper-posities blijven bewaard; tijdens stilstand geen exits.")
+    return 0
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="BTC Lead PAPER of alleen-lezen handelscontrole")
-    parser.add_argument("--audit", metavar="DATABASE", help="lees een onderzoeksexport zonder bot of netwerk te starten")
-    args = parser.parse_args()
-    if args.audit:
-        audit_path = Path(args.audit).resolve()
-        connection = sqlite3.connect(audit_path.as_uri() + "?mode=ro", uri=True)
-        connection.row_factory = sqlite3.Row
-        try:
-            connection.execute("BEGIN")
-            print(json.dumps(audit_trades(connection), indent=2, ensure_ascii=False, allow_nan=False))
-        finally:
-            connection.close()
-    else:
-        main()
+    raise SystemExit(main())
