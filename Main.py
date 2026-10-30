@@ -1,17 +1,22 @@
+import os
 import ccxt
 import time
 import pandas as pd
 from strategy import SMCStrategy
+from telegram_notifier import send_telegram_message
 
-# Initialiseer BloFin via CCXT
+# Lees configuratie uit Railway Environment Variables
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+
+# Initialiseer BloFin exchange via CCXT
 exchange = ccxt.blofin({
     'enableRateLimit': True,
-    # 'apiKey': 'JOUW_BLOFIN_API_KEY',
-    # 'secret': 'JOUW_BLOFIN_SECRET',
-    # 'password': 'JOUW_BLOFIN_PASSPHRASE', # Nodig voor authenticated endpoints
+    'apiKey': os.getenv('BLOFIN_API_KEY'),
+    'secret': os.getenv('BLOFIN_SECRET'),
+    'password': os.getenv('BLOFIN_PASSWORD'),
 })
 
-# Kies de juiste markt op BloFin (bijv. futures contracten zoals BTC/USDT:USDT)
 SYMBOL = 'BTC/USDT:USDT'
 
 def fetch_data():
@@ -26,7 +31,9 @@ def fetch_data():
     return df_1h, df_1m
 
 def run_bot():
-    print(f"Start trading bot voor BloFin ({SYMBOL}) op basis van het Confirmation Model...")
+    start_msg = f"🚀 BloFin Trading Bot is gestart voor {SYMBOL}!"
+    print(start_msg)
+    send_telegram_message(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, start_msg)
     
     while True:
         try:
@@ -37,16 +44,20 @@ def run_bot():
             print(f"{pd.Timestamp.now()} - Huidig signaal: {signal}")
 
             if signal == "SELL":
-                print("🚨 Alle 4 stappen bevestigd! Order wordt geplaatst op BloFin...")
-                # Voorbeeld order logica (pas op met live trading!):
+                alert_msg = f"🚨 *Signaal gedetecteerd!*\nSymbool: {SYMBOL}\nActie: SELL (Confirmation Model bevestigd)"
+                print(alert_msg)
+                send_telegram_message(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, alert_msg)
+                
+                # Zodra je klaar bent om live orders te plaatsen, kun je dit ontkoppelen:
                 # order = exchange.create_market_sell_order(SYMBOL, 0.001)
-                # print(order)
             
-            # Wacht 60 seconden voordat de volgende 1m bar wordt gecheckt
+            # Wacht 60 seconden tot de volgende check
             time.sleep(60)
 
         except Exception as e:
-            print(f"Fout opgetreden: {e}")
+            err_msg = f"❌ Fout opgetreden in Trading Bot: {e}"
+            print(err_msg)
+            send_telegram_message(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, err_msg)
             time.sleep(10)
 
 if __name__ == "__main__":
